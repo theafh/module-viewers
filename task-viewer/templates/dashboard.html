@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Task viewer{% endblock %}
+{% block nav %}
+<form class="nav-form" method="get" action="/">
+    <label for="project">Project</label>
+    <select id="project" name="project" onchange="this.form.submit()">
+        <option value="all" {% if selected == "all" %}selected{% endif %}>All projects</option>
+        {% for project in projects %}
+        <option value="{{ project.id_str }}" {% if selected == project.id_str %}selected{% endif %}>{{ project.name }}</option>
+        {% endfor %}
+    </select>
+</form>
+<form method="post" action="/scan">
+    <input type="hidden" name="project" value="{{ selected }}">
+    <button class="btn btn-secondary" type="submit">Update</button>
+</form>
+<form method="post" action="/repositories">
+    <button class="btn" type="submit">Add repository</button>
+</form>
+<button class="btn btn-secondary" id="theme-toggle" type="button">Light</button>
+{% endblock %}
+{% block content %}
+{% if notice %}
+<p class="banner">{{ notice }}</p>
+{% endif %}
+{% if error %}
+<p class="banner banner-error">{{ error }}</p>
+{% endif %}
+<header class="page-header">
+    <div class="page-header-row">
+        <h1 class="page-title">Task dashboard</h1>
+        <p class="muted">{{ scan_label }}</p>
+    </div>
+</header>
+{% if has_projects %}
+<section class="card">
+    <h2>Repositories</h2>
+    <ul class="repo-list">
+        {% for project in projects %}
+        <li>
+            <div>
+                <strong>{{ project.name }}</strong>
+                <span class="muted">{{ project.path }}</span>
+                <span class="muted">Added {{ project.created_at }} · scanned {{ project.scanned_at }}</span>
+                {% if project.last_error %}
+                <span class="error-text">{{ project.last_error }}</span>
+                {% endif %}
+            </div>
+            <form method="post" action="/repositories/{{ project.id }}/delete" onsubmit="return confirm('Remove this repository from the dashboard?');">
+                <button class="btn btn-secondary btn-small" type="submit">Remove</button>
+            </form>
+        </li>
+        {% endfor %}
+    </ul>
+</section>
+{% else %}
+<section class="card">
+    <h2>Add a repository</h2>
+    <p>Choose a project folder that keeps its task files in <code>tasks/</code>. The dashboard reads those files on this machine and stores the parsed rows in your home directory.</p>
+</section>
+{% endif %}
+<section class="charts">
+    <article class="chart-card" data-chart="weekly">
+        <header>
+            <h2>Tasks shipped vs created by week</h2>
+            <p class="muted summary"></p>
+        </header>
+        <div class="chart-frame"><svg role="img"></svg><div class="tooltip" hidden></div></div>
+    </article>
+    <article class="chart-card" data-chart="cumulative">
+        <header>
+            <h2>Cumulative tasks shipped</h2>
+            <p class="muted summary"></p>
+        </header>
+        <div class="chart-frame"><svg role="img"></svg><div class="tooltip" hidden></div></div>
+    </article>
+    <article class="chart-card wide" data-chart="shipped-calendar">
+        <header>
+            <h2>Tasks shipped, last 365 days</h2>
+            <p class="muted summary"></p>
+        </header>
+        <div class="chart-frame calendar"><svg role="img"></svg><div class="tooltip" hidden></div></div>
+    </article>
+    <article class="chart-card wide" data-chart="created-calendar">
+        <header>
+            <h2>Tasks created, last 365 days</h2>
+            <p class="muted summary"></p>
+        </header>
+        <div class="chart-frame calendar"><svg role="img"></svg><div class="tooltip" hidden></div></div>
+    </article>
+    <article class="chart-card" data-chart="backlog">
+        <header>
+            <h2>Live backlog</h2>
+            <p class="muted summary"></p>
+        </header>
+        <div class="chart-frame"><svg role="img"></svg><div class="tooltip" hidden></div></div>
+    </article>
+    <article class="chart-card" data-chart="age">
+        <header>
+            <h2>Mean backlog age</h2>
+            <p class="muted summary"></p>
+        </header>
+        <div class="chart-frame"><svg role="img"></svg><div class="tooltip" hidden></div></div>
+    </article>
+    <article class="chart-card" data-chart="radar-shipped">
+        <header>
+            <h2>Shipped</h2>
+            <p class="muted summary"></p>
+        </header>
+        <div class="chart-frame radar"><svg role="img"></svg><div class="tooltip" hidden></div></div>
+    </article>
+    <article class="chart-card" data-chart="radar-live">
+        <header>
+            <h2>Live backlog by slice</h2>
+            <p class="muted summary"></p>
+        </header>
+        <div class="chart-frame radar"><svg role="img"></svg><div class="tooltip" hidden></div></div>
+    </article>
+</section>
+{% endblock %}
+{% block scripts %}
+<script id="payload" type="application/json">{{ data_json | safe }}</script>
+<script src="/static/js/dashboard.js?v={{ version }}"></script>
+{% endblock %}

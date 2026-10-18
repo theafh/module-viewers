@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Task viewer{% endblock %}</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <link rel="stylesheet" href="/static/style.css?v={{ version }}">
+    <script>
+        (function () {
+            var stored = localStorage.getItem("task-viewer-theme");
+            if (stored === "light" || stored === "dark") {
+                document.documentElement.setAttribute("data-theme", stored);
+            }
+        })();
+    </script>
+</head>
+
+<body>
+    <nav class="navbar">
+        <a href="/" class="brand">TASK VIEWER</a>
+        <div class="nav-actions">
+            {% block nav %}{% endblock %}
+        </div>
+    </nav>
+    <div class="container">
+        {% block content %}{% endblock %}
+    </div>
+    {% block scripts %}{% endblock %}
+</body>
+
+</html>
