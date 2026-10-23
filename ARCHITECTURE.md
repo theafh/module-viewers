@@ -20,7 +20,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 
 **`task-viewer/src/main.rs`** binds `127.0.0.1:7880`, opens the database, and starts the router.
 
-**`task-viewer/src/web.rs`** owns the routes. The dashboard is `GET /`. Add repository is `POST /repositories` and opens the operating-system folder picker on this machine. Remove is `POST /repositories/{id}/delete`. Update is `POST /scan`. Routes name a repository by its integer id. The folder path is taken from the picker, not from the browser body.
+**`task-viewer/src/web.rs`** owns the routes. The dashboard is `GET /`. The repository list is `GET /repositories`. Add repository is `POST /repositories` and opens the operating-system folder picker on this machine. Remove is `POST /repositories/{id}/delete`. Update is `POST /scan`. Routes name a repository by its integer id. The folder path is taken from the picker, not from the browser body.
 
 **`task-viewer/src/harvest.rs`** walks `tasks/**/*.md`, reads frontmatter, and asks git for the ship day of each finished task. It returns parsed rows and does not write them.
 

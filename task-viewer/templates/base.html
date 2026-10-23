@@ -19,14 +19,22 @@
 
 <body>
     <nav class="navbar">
-        <a href="/" class="brand">TASK VIEWER</a>
+        <div class="nav-start">
+            <a href="/" class="brand">TASK VIEWER</a>
+            <div class="nav-tabs">
+                <a href="/" class="nav-tab{% if page == "dashboard" %} active{% endif %}">Dashboard</a>
+                <a href="/repositories" class="nav-tab{% if page == "repositories" %} active{% endif %}">Repositories</a>
+            </div>
+        </div>
         <div class="nav-actions">
             {% block nav %}{% endblock %}
+            <button class="btn btn-secondary" id="theme-toggle" type="button">Light</button>
         </div>
     </nav>
     <div class="container">
         {% block content %}{% endblock %}
     </div>
+    <script src="/static/js/theme.js?v={{ version }}"></script>
     {% block scripts %}{% endblock %}
 </body>
 

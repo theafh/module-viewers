@@ -51,7 +51,7 @@ pub fn router(state: AppState) -> Router {
     let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
     Router::new()
         .route("/", get(home))
-        .route("/repositories", post(add_repository))
+        .route("/repositories", get(repositories_page).post(add_repository))
         .route("/repositories/{id}/delete", post(remove_repository))
         .route("/scan", post(scan_all))
         .nest_service("/static", ServeDir::new(static_dir))
@@ -96,6 +96,14 @@ struct HomeQuery {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct FlashQuery {
+    #[serde(default)]
+    notice: String,
+    #[serde(default)]
+    error: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct ProjectForm {
     #[serde(default)]
     project: String,
@@ -109,6 +117,23 @@ async fn home(State(state): State<AppState>, Query(query): Query<HomeQuery>) -> 
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "The dashboard could not be rendered.",
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn repositories_page(
+    State(state): State<AppState>,
+    Query(query): Query<FlashQuery>,
+) -> Response {
+    match render_repositories(&state, &query).await {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "repositories render failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The repositories page could not be rendered.",
             )
                 .into_response()
         }
@@ -142,8 +167,9 @@ async fn render_home(state: &AppState, query: &HomeQuery) -> anyhow::Result<Stri
     data_json = data_json.replace('<', "\\u003c");
     let projects = repositories.iter().map(project_view).collect::<Vec<_>>();
     let scan_label = scan_label(&repositories, selected);
-    let page = PageModel {
+    let page = DashboardPage {
         version: VERSION,
+        page: "dashboard",
         projects,
         selected: match selected {
             Some(id) => id.to_string(),
@@ -157,6 +183,21 @@ async fn render_home(state: &AppState, query: &HomeQuery) -> anyhow::Result<Stri
     };
     let context = Context::from_serialize(page)?;
     Ok(state.templates.render("dashboard.html", &context)?)
+}
+
+async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Result<String> {
+    let repositories = db::list_repositories(&state.pool).await?;
+    let projects = repositories.iter().map(project_view).collect::<Vec<_>>();
+    let page = RepositoriesPage {
+        version: VERSION,
+        page: "repositories",
+        projects,
+        notice: query.notice.clone(),
+        error: query.error.clone(),
+        has_projects: !repositories.is_empty(),
+    };
+    let context = Context::from_serialize(page)?;
+    Ok(state.templates.render("repositories.html", &context)?)
 }
 
 fn selected_id(repositories: &[Repository], project: &str) -> Option<i64> {
@@ -198,14 +239,25 @@ fn scan_label(repositories: &[Repository], selected: Option<i64>) -> String {
 }
 
 #[derive(Serialize)]
-struct PageModel {
+struct DashboardPage {
     version: &'static str,
+    page: &'static str,
     projects: Vec<ProjectView>,
     selected: String,
     notice: String,
     error: String,
     scan_label: String,
     data_json: String,
+    has_projects: bool,
+}
+
+#[derive(Serialize)]
+struct RepositoriesPage {
+    version: &'static str,
+    page: &'static str,
+    projects: Vec<ProjectView>,
+    notice: String,
+    error: String,
     has_projects: bool,
 }
 
@@ -223,9 +275,9 @@ struct ProjectView {
 async fn add_repository(State(state): State<AppState>) -> Response {
     let _guard = state.scan.lock().await;
     match pick_and_store(&state).await {
-        Ok(AddOutcome::Added) => redirect("all", "notice", "Repository added."),
-        Ok(AddOutcome::Cancelled) => redirect("all", "notice", ""),
-        Err(message) => redirect("all", "error", message),
+        Ok(AddOutcome::Added) => redirect_repositories("notice", "Repository added."),
+        Ok(AddOutcome::Cancelled) => redirect_repositories("notice", ""),
+        Err(message) => redirect_repositories("error", message),
     }
 }
 
@@ -270,9 +322,9 @@ async fn pick_and_store(state: &AppState) -> Result<AddOutcome, &'static str> {
 async fn remove_repository(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     if let Err(error) = db::delete_repository(&state.pool, id).await {
         tracing::error!(%error, "delete failed");
-        return redirect("all", "error", "The repository could not be removed.");
+        return redirect_repositories("error", "The repository could not be removed.");
     }
-    redirect("all", "notice", "Repository removed.")
+    redirect_repositories("notice", "Repository removed.")
 }
 
 async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) -> Response {
@@ -397,6 +449,13 @@ fn redirect(project: &str, key: &str, message: &str) -> Response {
         encode_query(message)
     ))
     .into_response()
+}
+
+fn redirect_repositories(key: &str, message: &str) -> Response {
+    if message.is_empty() {
+        return Redirect::to("/repositories").into_response();
+    }
+    Redirect::to(&format!("/repositories?{key}={}", encode_query(message))).into_response()
 }
 
 fn encode_query(value: &str) -> String {

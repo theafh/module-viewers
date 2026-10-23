@@ -73,11 +73,42 @@ a {
     z-index: 20;
 }
 
+.nav-start {
+    display: flex;
+    align-items: center;
+    gap: 1.25rem;
+    flex-wrap: wrap;
+}
+
 .brand {
     font-family: var(--font-display);
     letter-spacing: 0.12em;
     color: var(--accent);
     font-size: 1.2rem;
+}
+
+.nav-tabs {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+.nav-tab {
+    color: var(--text-secondary);
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 0.35rem 0.7rem;
+    font-weight: 600;
+}
+
+.nav-tab:hover {
+    color: var(--accent);
+}
+
+.nav-tab.active {
+    color: var(--text-primary);
+    border-color: var(--border);
+    background: var(--input-bg);
 }
 
 .nav-actions,

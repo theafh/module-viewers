@@ -12,16 +12,18 @@ What `task-viewer` does, from the person's side. Structure is `ARCHITECTURE.md`,
 
 ## 2. Navigation
 
-- A sticky bar carries the project filter, Update, Add repository, and the theme control.
+- The sticky bar carries Dashboard and Repositories tabs, plus the theme control. The app opens on Dashboard.
+- On Dashboard, the bar also carries the project filter and Update.
+- On Repositories, the bar carries Add repository.
 - All projects is the default filter.
 - Light and Dark switch the page. The browser remembers the choice.
 
 ## 3. Repositories
 
-- Add repository opens a folder picker. A folder is accepted when it contains `tasks/`.
-- The dashboard lists each repository's name, path, last scan time, and any scan error.
+- The Repositories tab lists each repository's name, path, last scan time, and any scan error.
+- Add repository opens a folder picker. A folder is accepted when it contains `tasks/`. After add or remove, the person stays on Repositories.
 - Remove drops that repository and its parsed rows from `~/.task-viewer` after confirmation.
-- Update scans every configured repository and replaces the parsed rows that still read cleanly.
+- Update on Dashboard scans every configured repository and replaces the parsed rows that still read cleanly.
 
 ## 4. Charts
 

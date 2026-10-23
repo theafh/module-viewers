@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Repositories · Task viewer{% endblock %}
+{% block nav %}
+<form method="post" action="/repositories">
+    <button class="btn" type="submit">Add repository</button>
+</form>
+{% endblock %}
+{% block content %}
+{% if notice %}
+<p class="banner">{{ notice }}</p>
+{% endif %}
+{% if error %}
+<p class="banner banner-error">{{ error }}</p>
+{% endif %}
+<header class="page-header">
+    <div class="page-header-row">
+        <h1 class="page-title">Repositories</h1>
+        <p class="muted">Folders with a <code>tasks/</code> tree on this machine</p>
+    </div>
+</header>
+{% if has_projects %}
+<section class="card">
+    <h2>Configured repositories</h2>
+    <ul class="repo-list">
+        {% for project in projects %}
+        <li>
+            <div>
+                <strong>{{ project.name }}</strong>
+                <span class="muted">{{ project.path }}</span>
+                <span class="muted">Added {{ project.created_at }} · scanned {{ project.scanned_at }}</span>
+                {% if project.last_error %}
+                <span class="error-text">{{ project.last_error }}</span>
+                {% endif %}
+            </div>
+            <form method="post" action="/repositories/{{ project.id }}/delete" onsubmit="return confirm('Remove this repository from the dashboard?');">
+                <button class="btn btn-secondary btn-small" type="submit">Remove</button>
+            </form>
+        </li>
+        {% endfor %}
+    </ul>
+</section>
+{% else %}
+<section class="card">
+    <h2>Add a repository</h2>
+    <p>Choose a project folder that keeps its task files in <code>tasks/</code>. The dashboard reads those files on this machine and stores the parsed rows in your home directory.</p>
+</section>
+{% endif %}
+{% endblock %}

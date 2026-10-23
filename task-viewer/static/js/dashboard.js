@@ -385,19 +385,7 @@
     drawRadar("radar-live", payload.radar_live, "--chart-create", "live", payload.radar_mode);
   }
 
-  var themeButton = document.getElementById("theme-toggle");
-  function syncThemeButton() {
-    var light = document.documentElement.getAttribute("data-theme") === "light";
-    themeButton.textContent = light ? "Dark" : "Light";
-  }
-  themeButton.addEventListener("click", function () {
-    var next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
-    document.documentElement.setAttribute("data-theme", next);
-    localStorage.setItem("task-viewer-theme", next);
-    syncThemeButton();
-    renderAll();
-  });
-  syncThemeButton();
+  window.addEventListener("task-viewer-theme", renderAll);
   renderAll();
   var resizeTimer = 0;
   window.addEventListener("resize", function () {
