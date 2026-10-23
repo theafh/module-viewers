@@ -4,6 +4,8 @@ mod dates;
 mod db;
 mod harvest;
 mod series;
+#[cfg(test)]
+mod test_support;
 mod web;
 
 use std::net::SocketAddr;

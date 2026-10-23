@@ -274,15 +274,13 @@ mod tests {
         test_db,
     };
     use crate::harvest::{ParsedTask, TaskKind};
+    use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_database() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("task-viewer-{nanos}.db"))
+        let dir = unique_temp_dir("db_stores");
+        std::fs::create_dir_all(&dir).expect("db scratch");
+        dir.join("test.db")
     }
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
@@ -327,8 +325,8 @@ mod tests {
         delete_repository(&pool, id).await.expect("delete");
         let after = load_tasks(&pool, None).await.expect("after");
         assert!(after.is_empty());
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 }

@@ -25,6 +25,26 @@ Open <http://127.0.0.1:7880>.
 - **Update** scans every configured repository again.
 - **Light** and **Dark** switch the dashboard appearance. The choice stays in the browser.
 
+### Desktop launcher (Ubuntu / macOS)
+
+```bash
+./scripts/install-desktop.sh
+# or
+make install-desktop
+```
+
+- **Linux:** application-menu entry you can pin to favorites.
+- **macOS:** `~/Applications/Task Viewer.app`, pinned to the Dock automatically.
+  Click toggles start/stop and opens the browser when starting.
+
+Manual control:
+
+```bash
+./scripts/task-viewer.sh start
+./scripts/task-viewer.sh stop
+./scripts/task-viewer.sh status
+```
+
 ## Build
 
 ```bash

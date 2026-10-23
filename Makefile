@@ -1,4 +1,4 @@
-.PHONY: build run test lint format fmt fix audit
+.PHONY: build run test lint format fmt fix audit install-desktop
 
 TEST_RUSTFLAGS=-D warnings
 
@@ -23,3 +23,6 @@ fix:
 
 audit:
 	cargo audit
+
+install-desktop:
+	./scripts/install-desktop.sh

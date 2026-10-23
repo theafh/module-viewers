@@ -8,6 +8,7 @@ What `task-viewer` does, from the person's side. Structure is `ARCHITECTURE.md`,
 - Serves on `127.0.0.1:7880`.
 - Reads repositories the person selects. Those repositories stay where they are.
 - Stores the repository list and the parsed task rows in `~/.task-viewer`.
+- `scripts/install-desktop.sh` installs a macOS Dock or Linux application-menu icon that toggles the process on and off. `scripts/task-viewer.sh` is the start/stop/status/toggle control behind that icon.
 
 ## 2. Navigation
 

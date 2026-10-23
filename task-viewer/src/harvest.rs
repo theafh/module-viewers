@@ -313,18 +313,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{HarvestError, TaskKind, harvest_repository};
+    use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
     use std::fs;
     use std::path::Path;
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn scratch() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("task-viewer-repo-{nanos}"));
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let path = unique_temp_dir(name);
         fs::create_dir_all(&path).expect("scratch");
         path
     }
@@ -354,8 +350,13 @@ mod tests {
 
     #[test]
     fn harvest_uses_the_first_finished_commit_and_keeps_deferred_out_of_shipped() {
-        let repo = scratch();
-        git(&repo, &["init", "-b", "main"], "2026-05-28T12:00:00+00:00");
+        let repo = scratch("harvest_ship");
+        // Empty template skips shared hooks that some hosts refuse to write under temp.
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-28T12:00:00+00:00",
+        );
         fs::create_dir_all(repo.join("tasks/archive")).expect("tasks");
         let finished = repo.join("tasks/archive/scope_one.md");
         fs::write(
@@ -421,7 +422,7 @@ mod tests {
 
     #[test]
     fn harvest_rejects_a_folder_without_tasks() {
-        let repo = scratch();
+        let repo = scratch("harvest_missing");
         let error = harvest_repository(&repo).expect_err("missing");
         assert!(matches!(error, HarvestError::MissingTasks));
         let _ = fs::remove_dir_all(&repo);

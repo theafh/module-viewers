@@ -21,3 +21,5 @@ Thumbs.db
 *.db-shm
 *.db-journal
 .task-viewer
+.task-viewer.pid
+.task-viewer.log

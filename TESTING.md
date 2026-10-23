@@ -5,15 +5,16 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 ## Test Design Principles
 
 - Test observable behaviour: parsed rows, chart series, HTTP host checks, and database contents.
-- Keep tests deterministic and offline. Each test owns a temporary database or a temporary git repository.
+- Keep tests deterministic, isolated, offline, and parallel-safe. Every test owns its state through a per-test temp dir from `unique_temp_dir` (`task-viewer_<name>_<pid>_<nanos>_<n>`). Tests share no paths, no env overrides, and no execution-order assumptions. `cargo test` runs them in parallel.
 - Cover the success path and one failure path for a behaviour that can fail.
 - Match a status, a variant, or a field. Avoid asserting a whole error string when a variant is enough, and assert the stored message when that message is the contract.
 
 ## Test Organization
 
 - Tests live in `#[cfg(test)]` modules in the source file they exercise.
-- Database tests set a thread-local database path and use the current-thread runtime so that path stays on the test thread.
-- Git tests build a temporary repository with `user.email` and `user.name` passed on the command, and with author and committer dates in the environment.
+- Shared helpers live in `#[cfg(test)]` `src/test_support.rs` (`unique_temp_dir`). There is no `[dev-dependencies]` block and no external fixture crate.
+- Database tests set a thread-local database path under a unique temp dir and use the current-thread runtime so that path stays on the test thread.
+- Git tests build a unique temporary repository with `user.email` and `user.name` passed on the command, and with author and committer dates in the environment.
 
 ## What Must Be Covered
 
