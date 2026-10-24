@@ -310,10 +310,13 @@ fn run_git_log(mut command: Command, flag: &str, pattern: &str, rel: &str) -> Lo
     let output = match command
         // Merges are not diffed by default, so a task archived inside a merge
         // commit (say, while resolving it) would never match the pickaxe.
+        // `--diff-merges` implies `-p`; `--no-patch` keeps patch lines, which
+        // can hold a bare date, out of the parsed output.
         .args([
             "log",
             "--follow",
             "--diff-merges=first-parent",
+            "--no-patch",
             "--format=%cI",
             flag,
             pattern,
@@ -338,17 +341,25 @@ fn run_git_log(mut command: Command, flag: &str, pattern: &str, rel: &str) -> Lo
     }
 }
 
+fn git_dir_command(repo: &Path, dir: &Path) -> Command {
+    // With an explicit --work-tree, git reads a relative pathspec from its
+    // working directory when that lies inside the work tree. Run from the
+    // repository root so `rel` resolves the same wherever the server started.
+    let mut command = Command::new(git_bin());
+    command
+        .current_dir(repo)
+        .arg("--git-dir")
+        .arg(dir)
+        .arg("--work-tree")
+        .arg(repo);
+    command
+}
+
 fn git_pickaxe(repo: &Path, rel: &str, flag: &str, pattern: &str) -> Option<NaiveDate> {
     // 1) Explicit --git-dir beats an inherited GIT_DIR (Cursor sets one).
     // Fall back to -C only when git_dir is missing or that call fails to run.
     if let Some(dir) = git_dir(repo) {
-        let mut command = Command::new(git_bin());
-        command
-            .arg("--git-dir")
-            .arg(&dir)
-            .arg("--work-tree")
-            .arg(repo);
-        match run_git_log(command, flag, pattern, rel) {
+        match run_git_log(git_dir_command(repo, &dir), flag, pattern, rel) {
             LogLookup::Found(day) => return Some(day),
             LogLookup::Miss => return None,
             LogLookup::Failed => {}
@@ -366,7 +377,9 @@ fn git_pickaxe(repo: &Path, rel: &str, flag: &str, pattern: &str) -> Option<Naiv
 
 #[cfg(test)]
 mod tests {
-    use super::{HarvestError, TaskKind, git_path, harvest_repository, scrub_git_env};
+    use super::{
+        HarvestError, TaskKind, git_dir_command, git_path, harvest_repository, scrub_git_env,
+    };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
     use std::fs;
@@ -392,6 +405,15 @@ mod tests {
                 .any(|(name, value)| name == key && value.is_none());
             assert!(cleared, "{key} must be removed");
         }
+    }
+
+    #[test]
+    fn harvest_runs_git_dir_lookups_from_the_repository_root() {
+        // A server started inside a configured repository's subdirectory must
+        // not shift the relative pathspec, so the lookup pins its own cwd.
+        let repo = Path::new("/tmp/task-viewer-repo");
+        let command = git_dir_command(repo, &repo.join(".git"));
+        assert_eq!(command.get_current_dir(), Some(repo));
     }
 
     #[test]
@@ -619,6 +641,52 @@ mod tests {
         assert_eq!(
             task.ship_date,
             Some(NaiveDate::from_ymd_opt(2026, 8, 4).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_ignores_a_date_line_next_to_the_status_change() {
+        let repo = scratch("harvest_date_line");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("tasks");
+        // The bare date sits inside the patch context of the status change.
+        let task = repo.join("tasks/archive/scope_dated.md");
+        fs::write(
+            &task,
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n2026-01-02\n# Dated\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "create"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::write(
+            &task,
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-09-30T10:00:00\nstatus: finished\n---\n2026-01-02\n# Dated\n",
+        )
+        .expect("finish");
+        git(&repo, &["add", "-A"], "2026-07-17T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "ship"],
+            "2026-07-17T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_dated.md"))
+            .expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 7, 17).expect("day"))
         );
         let _ = fs::remove_dir_all(&repo);
     }
