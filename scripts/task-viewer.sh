@@ -6,9 +6,35 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BINARY="$PROJECT_DIR/target/release/task-viewer"
-PID_FILE="$PROJECT_DIR/.task-viewer.pid"
-LOG_FILE="$PROJECT_DIR/.task-viewer.log"
 PORT=7880
+
+# Runtime state lives outside the checkout: the log records repository paths.
+case "$(uname -s)" in
+    Darwin) STATE_DIR="$HOME/Library/Logs/task-viewer" ;;
+    *)      STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/task-viewer" ;;
+esac
+PID_FILE="$STATE_DIR/task-viewer.pid"
+LOG_FILE="$STATE_DIR/task-viewer.log"
+BUILD_LOG="$STATE_DIR/build.log"
+STAMP_FILE="$STATE_DIR/task-viewer.binary"
+
+# Files this launcher creates are private to the person who runs it.
+umask 077
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+# Earlier launchers kept both files at the repository root; adopt the PID of a
+# server started that way and drop the old log.
+if [ -f "$PROJECT_DIR/.task-viewer.pid" ]; then
+    if [ ! -f "$PID_FILE" ]; then
+        mv "$PROJECT_DIR/.task-viewer.pid" "$PID_FILE"
+    else
+        rm -f "$PROJECT_DIR/.task-viewer.pid"
+    fi
+fi
+rm -f "$PROJECT_DIR/.task-viewer.log"
+# umask only covers new files; repair modes left by older launchers.
+chmod 600 "$PID_FILE" "$LOG_FILE" "$BUILD_LOG" 2>/dev/null
 
 # Dock / GUI launches have a minimal PATH; pull in rustup cargo when needed.
 if [ -f "$HOME/.cargo/env" ]; then
@@ -40,29 +66,60 @@ notify() {
     esac
 }
 
+# True when the PID is this checkout's release binary. A live PID alone is not
+# enough: PIDs are reused, and another program may own the port.
+is_ours() {
+    local candidate="$1"
+    [ -n "$candidate" ] || return 1
+    local args
+    args=$(ps -p "$candidate" -o args= 2>/dev/null | sed 's/[[:space:]]*$//')
+    [ "$args" = "$BINARY" ]
+}
+
+port_pid() {
+    lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null | head -1
+}
+
 is_running() {
+    local candidate
     if [ -f "$PID_FILE" ]; then
-        pid=$(cat "$PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
+        candidate=$(cat "$PID_FILE")
+        if is_ours "$candidate"; then
             return 0
         fi
         rm -f "$PID_FILE"
     fi
-    if lsof -i :"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    # Adopt a release binary started by hand so stop can reach it. Any other
+    # listener on the port is left alone.
+    candidate=$(port_pid)
+    if is_ours "$candidate"; then
+        echo "$candidate" >"$PID_FILE"
         return 0
     fi
     return 1
 }
 
 get_pid() {
-    if [ -f "$PID_FILE" ]; then
-        cat "$PID_FILE"
-    else
-        lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null | head -1
-    fi
+    cat "$PID_FILE" 2>/dev/null
+}
+
+# True once our process is the one listening on the port.
+is_listening() {
+    is_running && [ "$(port_pid)" = "$(get_pid)" ]
+}
+
+# True when the binary on disk is newer than the one the running server was
+# started from, for example after `make build`. A server started without the
+# launcher has no stamp and counts as outdated.
+is_outdated() {
+    [ ! -f "$STAMP_FILE" ] || [ "$BINARY" -nt "$STAMP_FILE" ]
 }
 
 do_start() {
+    if is_running && is_outdated; then
+        echo "A newer task-viewer binary exists; restarting on it."
+        do_stop
+    fi
     if is_running; then
         echo "task-viewer is already running (PID: $(get_pid))"
         echo "Access at: http://127.0.0.1:$PORT"
@@ -74,6 +131,14 @@ do_start() {
         return 0
     fi
 
+    local holder
+    holder=$(port_pid)
+    if [ -n "$holder" ]; then
+        echo "Port $PORT is held by another process (PID: $holder); not starting task-viewer."
+        notify "task-viewer" "Port $PORT is in use by another program"
+        return 1
+    fi
+
     if [ ! -x "$BINARY" ]; then
         echo "Building task-viewer..."
         notify "task-viewer" "Building release binary (first run)…"
@@ -82,9 +147,9 @@ do_start() {
             notify "task-viewer" "Build failed: cargo not found. Run 'make build' in the project."
             return 1
         fi
-        if ! cargo build --release -p task-viewer >>"$LOG_FILE" 2>&1; then
-            echo "Build failed. Check $LOG_FILE"
-            notify "task-viewer" "Build failed. See .task-viewer.log"
+        if ! cargo build --release -p task-viewer >"$BUILD_LOG" 2>&1; then
+            echo "Build failed. Check $BUILD_LOG"
+            notify "task-viewer" "Build failed. See $BUILD_LOG"
             return 1
         fi
         if [ ! -x "$BINARY" ]; then
@@ -95,18 +160,26 @@ do_start() {
     fi
 
     echo "Starting task-viewer..."
+    # Remember which build this server runs, so a later `make build` is noticed.
+    touch -r "$BINARY" "$STAMP_FILE"
     # Leave the Dock/.app process group. macOS tears that group down when the
     # launcher script exits; nohup alone still dies with the group. Artemis
     # often survives because it was already started outside the Dock session.
     if ! start_detached; then
         echo "Failed to start task-viewer. Check $LOG_FILE"
-        notify "task-viewer" "Failed to start. See .task-viewer.log"
+        notify "task-viewer" "Failed to start. See $LOG_FILE"
         rm -f "$PID_FILE"
         return 1
     fi
-    sleep 1
+    # Wait for our process to own the port; a bind failure ends it instead.
+    for _ in {1..20}; do
+        if is_listening; then
+            break
+        fi
+        sleep 0.5
+    done
 
-    if is_running; then
+    if is_listening; then
         echo "task-viewer started (PID: $(get_pid))"
         echo "Access at: http://127.0.0.1:$PORT"
         notify "task-viewer" "Running at http://127.0.0.1:$PORT"
@@ -116,7 +189,7 @@ do_start() {
         esac
     else
         echo "Failed to start task-viewer. Check $LOG_FILE"
-        notify "task-viewer" "Failed to start. See .task-viewer.log"
+        notify "task-viewer" "Failed to start. See $LOG_FILE"
         rm -f "$PID_FILE"
         return 1
     fi
@@ -143,12 +216,22 @@ os.chdir(project)
 os.umask(0o077)
 devnull = open("/dev/null", "rb")
 os.dup2(devnull.fileno(), 0)
-# Truncate on each start (same as the old nohup redirect).
-log = open(logfile, "wb", buffering=0)
-os.dup2(log.fileno(), 1)
-os.dup2(log.fileno(), 2)
-with open(pidfile, "w", encoding="utf-8") as handle:
-    handle.write(str(os.getpid()))
+
+
+def private_file(path):
+    # Truncate on each start. fchmod also tightens a file an older launcher
+    # created, which the mode argument alone leaves as it was.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    return fd
+
+
+log = private_file(logfile)
+os.dup2(log, 1)
+os.dup2(log, 2)
+pid = private_file(pidfile)
+os.write(pid, str(os.getpid()).encode())
+os.close(pid)
 os.execv(binary, [binary])
 PY
 }
@@ -162,13 +245,12 @@ do_stop() {
 
     pid=$(get_pid)
     echo "Stopping task-viewer (PID: $pid)..."
-    # shellcheck disable=SC2086
-    kill $pid 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
 
     for _ in {1..10}; do
         if ! is_running; then
             echo "task-viewer stopped"
-            rm -f "$PID_FILE"
+            rm -f "$PID_FILE" "$STAMP_FILE"
             notify "task-viewer" "Stopped"
             return 0
         fi
@@ -176,9 +258,10 @@ do_stop() {
     done
 
     echo "Force stopping..."
-    # shellcheck disable=SC2086
-    kill -9 $pid 2>/dev/null || true
-    rm -f "$PID_FILE"
+    if is_ours "$pid"; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE" "$STAMP_FILE"
     echo "task-viewer stopped"
     notify "task-viewer" "Stopped"
 }
@@ -193,7 +276,8 @@ do_status() {
 }
 
 do_toggle() {
-    if is_running; then
+    # An outdated server is restarted on the newer binary instead of stopped.
+    if is_running && ! is_outdated; then
         do_stop
     else
         do_start

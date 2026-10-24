@@ -24,6 +24,8 @@ Durable state is the SQLite file `~/.task-viewer`, or the file named by `TASK_VI
 
 Parsed rows stay in `~/.task-viewer`. The binary makes no outbound request. Chart code and styles are files in this repository, served by the same process.
 
+The desktop launcher keeps its PID file and the server log, which records repository paths, in a per-user directory outside the checkout: `~/Library/Logs/task-viewer/` on macOS and `${XDG_STATE_HOME:-~/.local/state}/task-viewer/` on Linux. The directory is mode `700` and both files are mode `600`. The launcher signals only a PID whose command line is this checkout's release binary.
+
 ## Attack Surface
 
 - The server binds `127.0.0.1:7880`. A `Host` other than loopback (`127.0.0.1`, `localhost`, `[::1]`, with optional `:7880`) is rejected.
@@ -38,7 +40,7 @@ Dependencies stay pinned in `Cargo.lock`. Run `make audit` when they change.
 
 - [ ] No outbound network client introduced.
 - [ ] No secret introduced.
-- [ ] New durable writes stay in `~/.task-viewer` or `TASK_VIEWER_DB`.
+- [ ] New durable writes stay in `~/.task-viewer` or `TASK_VIEWER_DB`, or in the launcher's per-user state directory.
 - [ ] Selected repositories are read, not written.
 - [ ] Routes still name repositories by id.
 - [ ] The listener stays on `127.0.0.1`.

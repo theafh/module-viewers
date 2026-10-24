@@ -230,6 +230,26 @@ fn git_bin() -> &'static str {
     "git"
 }
 
+const GIT_SEARCH_DIRS: [&str; 6] = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+];
+
+fn git_path() -> std::ffi::OsString {
+    // Standard locations first for Dock launches with a minimal PATH, then the
+    // inherited PATH so a git outside them (Nix, a custom prefix) still runs.
+    let mut dirs: Vec<PathBuf> = GIT_SEARCH_DIRS.iter().map(PathBuf::from).collect();
+    if let Some(inherited) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&inherited));
+    }
+    std::env::join_paths(&dirs)
+        .unwrap_or_else(|_| std::env::join_paths(GIT_SEARCH_DIRS).unwrap_or_default())
+}
+
 fn git_dir(repo: &Path) -> Option<PathBuf> {
     let dot = repo.join(".git");
     if dot.is_dir() {
@@ -251,10 +271,7 @@ fn scrub_git_env(command: &mut Command) {
     // only have Xcode.app, and Homebrew git does not need it.
     command
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env(
-            "PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        )
+        .env("PATH", git_path())
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
@@ -291,7 +308,18 @@ enum LogLookup {
 fn run_git_log(mut command: Command, flag: &str, pattern: &str, rel: &str) -> LogLookup {
     scrub_git_env(&mut command);
     let output = match command
-        .args(["log", "--follow", "--format=%cI", flag, pattern, "--", rel])
+        // Merges are not diffed by default, so a task archived inside a merge
+        // commit (say, while resolving it) would never match the pickaxe.
+        .args([
+            "log",
+            "--follow",
+            "--diff-merges=first-parent",
+            "--format=%cI",
+            flag,
+            pattern,
+            "--",
+            rel,
+        ])
         .output()
     {
         Ok(output) => output,
@@ -338,7 +366,7 @@ fn git_pickaxe(repo: &Path, rel: &str, flag: &str, pattern: &str) -> Option<Naiv
 
 #[cfg(test)]
 mod tests {
-    use super::{HarvestError, TaskKind, harvest_repository, scrub_git_env};
+    use super::{HarvestError, TaskKind, git_path, harvest_repository, scrub_git_env};
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
     use std::fs;
@@ -363,6 +391,21 @@ mod tests {
                 .get_envs()
                 .any(|(name, value)| name == key && value.is_none());
             assert!(cleared, "{key} must be removed");
+        }
+    }
+
+    #[test]
+    fn harvest_git_path_keeps_inherited_entries_after_standard_dirs() {
+        let path = git_path();
+        let dirs: Vec<_> = std::env::split_paths(&path).collect();
+        assert_eq!(
+            dirs.first().map(|dir| dir.as_path()),
+            Some(Path::new("/opt/homebrew/bin"))
+        );
+        if let Some(inherited) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&inherited) {
+                assert!(dirs.contains(&dir), "{} must stay on PATH", dir.display());
+            }
         }
     }
 
@@ -502,6 +545,81 @@ mod tests {
             .expect("live");
         assert_eq!(live.kind, TaskKind::Live);
         assert_eq!(live.scope, "scope");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_finds_a_finish_first_committed_in_a_merge() {
+        let repo = scratch("harvest_merge");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-08-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("tasks");
+        let live = repo.join("tasks/scope_merge.md");
+        fs::write(
+            &live,
+            "---\ncreated: 2026-08-01T10:00:00\nupdated: 2026-08-01T10:00:00\nstatus: open\n---\n\n# Merge\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-08-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "create"],
+            "2026-08-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "side"],
+            "2026-08-02T12:00:00+00:00",
+        );
+        fs::write(repo.join("side.txt"), "side\n").expect("side");
+        git(&repo, &["add", "-A"], "2026-08-02T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "side"],
+            "2026-08-02T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-08-03T12:00:00+00:00");
+        fs::write(repo.join("main.txt"), "main\n").expect("main");
+        git(&repo, &["add", "-A"], "2026-08-03T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "main"],
+            "2026-08-03T12:00:00+00:00",
+        );
+
+        // The merge itself archives and finishes the task; neither parent did.
+        git(
+            &repo,
+            &["merge", "--no-ff", "--no-commit", "side"],
+            "2026-08-04T12:00:00+00:00",
+        );
+        let archived = repo.join("tasks/archive/scope_merge.md");
+        fs::rename(&live, &archived).expect("archive");
+        fs::write(
+            &archived,
+            "---\ncreated: 2026-08-01T10:00:00\nupdated: 2026-09-30T10:00:00\nstatus: finished\n---\n\n# Merge\n",
+        )
+        .expect("finish");
+        git(&repo, &["add", "-A"], "2026-08-04T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "merge side"],
+            "2026-08-04T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_merge.md"))
+            .expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 8, 4).expect("day"))
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 
