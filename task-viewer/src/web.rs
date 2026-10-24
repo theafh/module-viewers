@@ -80,7 +80,10 @@ async fn require_local_host(request: axum::extract::Request, next: Next) -> Resp
 }
 
 fn is_local_host(host: &str) -> bool {
-    host == format!("127.0.0.1:{PORT}")
+    // Accept loopback with or without an explicit port. DNS-rebinding Host
+    // values cannot be a loopback name, so bare names stay as tight as :7880.
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+        || host == format!("127.0.0.1:{PORT}")
         || host == format!("localhost:{PORT}")
         || host == format!("[::1]:{PORT}")
 }
@@ -478,7 +481,11 @@ mod tests {
     fn web_accepts_only_the_loopback_host() {
         assert!(is_local_host("127.0.0.1:7880"));
         assert!(is_local_host("localhost:7880"));
+        assert!(is_local_host("[::1]:7880"));
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("localhost"));
         assert!(!is_local_host("example.com"));
         assert!(!is_local_host("127.0.0.1:80"));
+        assert!(!is_local_host("localhost:80"));
     }
 }

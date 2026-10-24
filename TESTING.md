@@ -19,10 +19,10 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 ## What Must Be Covered
 
 - Date parsing for frontmatter timestamps and commit timestamps.
-- Harvest: ship day is the first commit that introduces `status: finished`, deferred tasks have no ship day, live tasks stay live, and a folder without `tasks/` is rejected.
-- Series: same-week create and ship both count, deferred tasks stay out of mean age, all-projects radars count by repository, and a single project counts by scope.
+- Harvest: leave day is the first commit that introduces the archived status (`finished` or `deferred`), including across renames after that commit; finished ship day equals that leave day; a later `updated` bump must not become the ship day; an inherited `GIT_DIR` must not poison pickaxe; deferred tasks have no ship day; live tasks stay live; a folder without `tasks/` is rejected.
+- Series: same-week create and ship both count, deferred tasks age until leave and never ship, all-projects radars count by repository, and a single project counts by scope.
 - Database: insert, replace rows, keep rows when a scan error is recorded, and delete a repository with its rows.
-- Host check: loopback names on port 7880 are accepted.
+- Host check: loopback names are accepted with or without port 7880.
 
 ## Running the Suite
 

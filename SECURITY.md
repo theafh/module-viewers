@@ -26,7 +26,7 @@ Parsed rows stay in `~/.task-viewer`. The binary makes no outbound request. Char
 
 ## Attack Surface
 
-- The server binds `127.0.0.1:7880`. A `Host` other than `127.0.0.1:7880`, `localhost:7880`, or `[::1]:7880` is rejected.
+- The server binds `127.0.0.1:7880`. A `Host` other than loopback (`127.0.0.1`, `localhost`, `[::1]`, with optional `:7880`) is rejected.
 - Static files come from `task-viewer/static/`.
 - Remove asks for confirmation in the page and uses its own POST route.
 

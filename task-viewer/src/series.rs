@@ -276,29 +276,20 @@ fn live_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<LivePoint> {
 }
 
 fn age_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<AgePoint> {
-    let eligible: Vec<&TaskRecord> = tasks
-        .iter()
-        .filter(|task| task.kind != TaskKind::Deferred)
-        .collect();
-    if eligible.is_empty() {
+    if tasks.is_empty() {
         return Vec::new();
     }
-    let start = eligible
-        .iter()
-        .map(|task| task.created)
-        .min()
-        .unwrap_or(today);
+    let start = tasks.iter().map(|task| task.created).min().unwrap_or(today);
     let mut rows = Vec::new();
     let mut cur = start;
     while cur <= today {
         let mut total = 0_i64;
         let mut count = 0_usize;
-        for task in &eligible {
+        for task in tasks {
             if task.created > cur {
                 continue;
             }
-            if task.kind == TaskKind::Finished
-                && let Some(leave) = task.leave_date
+            if let Some(leave) = task.leave_date
                 && leave <= cur
             {
                 continue;
@@ -442,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn series_counts_same_week_create_and_ship_and_drops_deferred_from_age() {
+    fn series_counts_same_week_create_and_ship_and_ages_deferred_until_leave() {
         let created = day(2026, 6, 1);
         let today = day(2026, 6, 8);
         let tasks = vec![
@@ -486,13 +477,22 @@ mod tests {
             .iter()
             .find(|point| point.date == "2026-06-01")
             .expect("age");
-        assert_eq!(age_on_create.n, 0);
+        // Finished left the same day; deferred is still open (age 0).
+        assert_eq!(age_on_create.n, 1);
         let age_next = board
             .mean_age
             .iter()
             .find(|point| point.date == "2026-06-02")
             .expect("age");
-        assert_eq!(age_next.n, 1);
+        // Deferred still open plus the live task created that day.
+        assert_eq!(age_next.n, 2);
+        let age_after_defer = board
+            .mean_age
+            .iter()
+            .find(|point| point.date == "2026-06-03")
+            .expect("age");
+        // Deferred left; only the live task remains unfinished.
+        assert_eq!(age_after_defer.n, 1);
         assert!(monday(day(2026, 6, 7)) == day(2026, 6, 1));
     }
 

@@ -8,7 +8,7 @@ What `task-viewer` does, from the person's side. Structure is `ARCHITECTURE.md`,
 - Serves on `127.0.0.1:7880`.
 - Reads repositories the person selects. Those repositories stay where they are.
 - Stores the repository list and the parsed task rows in `~/.task-viewer`.
-- `scripts/install-desktop.sh` installs a macOS Dock or Linux application-menu icon that toggles the process on and off. `scripts/task-viewer.sh` is the start/stop/status/toggle control behind that icon.
+- `make install` installs a macOS Dock or Linux application-menu icon that toggles the server (start if stopped, stop if running). On first start it builds the release binary when missing, then opens the dashboard. `make start` / `make stop` / `make status` drive the same launcher.
 
 ## 2. Navigation
 
@@ -34,7 +34,7 @@ The dashboard shows eight charts from the stored rows, for all configured reposi
 - Tasks shipped over the last 365 days, colour `log1p(count)`.
 - Tasks created over the last 365 days, colour `log1p(count)`.
 - Live backlog size by day, with a dashed trend.
-- Mean age in days of the unfinished backlog, with a dashed trend. Deferred tasks are excluded.
+- Mean age in days of the unfinished backlog, with a dashed trend. Finished and deferred tasks leave that average on their archive leave day; they never count as shipped when deferred.
 - Shipped radar.
 - Live radar.
 

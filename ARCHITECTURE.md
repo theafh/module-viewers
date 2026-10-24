@@ -22,7 +22,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 
 **`task-viewer/src/web.rs`** owns the routes. The dashboard is `GET /`. The repository list is `GET /repositories`. Add repository is `POST /repositories` and opens the operating-system folder picker on this machine. Remove is `POST /repositories/{id}/delete`. Update is `POST /scan`. Routes name a repository by its integer id. The folder path is taken from the picker, not from the browser body.
 
-**`task-viewer/src/harvest.rs`** walks `tasks/**/*.md`, reads frontmatter, and asks git for the ship day of each finished task. It returns parsed rows and does not write them.
+**`task-viewer/src/harvest.rs`** walks `tasks/**/*.md`, reads frontmatter, and asks git for the leave day of each finished or deferred task. It returns parsed rows and does not write them.
 
 **`task-viewer/src/db.rs`** creates `~/.task-viewer` and reads and writes the two tables.
 
@@ -42,13 +42,13 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 
 - `created` is the frontmatter `created` day of every task file, including tasks that are later deferred.
 - `finished` means the file is under a directory named `archive` and its status is `finished`. Any other archived status is `deferred`. A file outside `archive` is `live`.
-- The ship day of a finished task is the committer day of the earliest `git log --follow` hit that introduces `status: finished` (`-S`, then `-G`). When git returns nothing, the frontmatter `updated` day is the ship day.
-- The leave day is the ship day for a finished task and the `updated` day for a deferred task. Live tasks have no leave day.
+- The leave day of a finished or deferred task is the committer day of the earliest `git log --follow` hit that introduces that task's archived status (`status: finished` or the archived status string, via `-S` then `-G`). Lookups use that repository's `--git-dir` / `--work-tree` (so an inherited `GIT_DIR` cannot redirect them), then plain `-C`, newest-first without `--reverse` so renames still match. When git returns nothing, the frontmatter `updated` day is the leave day. Live tasks have no leave day.
+- The ship day of a finished task is its leave day. Deferred tasks have no ship day.
 - Weeks start on Monday. A task created and shipped in the same week counts in both series.
 - The cumulative, backlog, and mean-age charts include every calendar day from their first day through today. A day with no event keeps the previous level.
 - The two calendars are the last 365 days through today. Colour is `log1p(count)`. Zero stays on the empty track.
 - Live backlog adds one on `created` and subtracts one on the leave day.
-- Mean age is the average age, in days, of tasks that exist and are unfinished at the end of that day. Deferred tasks are omitted from every day of that series.
+- Mean age is the average age, in days, of tasks that exist and are unfinished at the end of that day. A task drops out of that average on its leave day. Calendar days use the date prefix as written (local Berlin wall time until timezone conversion exists).
 - The three line charts carry a least-squares trend.
 - Radar spokes share one axis order, sorted by shipped plus live, then by label. All projects uses the repository name as the label. One project uses the scope.
 

@@ -73,7 +73,7 @@ EOF
     echo "Installation complete!"
     echo "Task Viewer should appear in your application menu; pin it to favorites if you want."
     echo "Clicking the icon toggles start/stop."
-    echo "Manual control: $LAUNCHER_SCRIPT"
+    echo "Also: make start | make stop | make status"
     echo "URL: http://127.0.0.1:$PORT"
 }
 
@@ -179,7 +179,7 @@ EOF
     echo ""
     echo "Installation complete!"
     echo "Clicking the Dock icon toggles start/stop."
-    echo "Manual control: $LAUNCHER_SCRIPT"
+    echo "Also: make start | make stop | make status"
     echo "URL: http://127.0.0.1:$PORT"
     echo ""
     echo "If macOS blocks the first launch: right-click Task Viewer.app → Open."
@@ -196,14 +196,37 @@ pin_to_dock() {
         return 0
     fi
 
-    # Skip if this exact app path is already a persistent Dock tile.
-    if defaults read com.apple.dock persistent-apps 2>/dev/null | grep -F "$app_bundle" >/dev/null 2>&1; then
-        echo "✓ Task Viewer is already on the Dock"
-        return 0
-    fi
-
-    defaults write com.apple.dock persistent-apps -array-add \
-        "<dict><key>tile-data</key><dict><key>file-data</key><dict><key>_CFURLString</key><string>${app_bundle}</string><key>_CFURLStringType</key><integer>0</integer></dict></dict></dict>"
+    # Drop every existing Task Viewer tile first so reinstall never doubles icons.
+    # defaults stores file:// URLs, so a raw path grep misses the live tile.
+    python3 - "$app_bundle" <<'PY'
+import pathlib, plistlib, subprocess, sys
+app = pathlib.Path(sys.argv[1]).resolve().as_uri()
+raw = subprocess.check_output(["defaults", "export", "com.apple.dock", "-"])
+data = plistlib.loads(raw)
+kept = []
+for tile in data.get("persistent-apps", []):
+    td = tile.get("tile-data") or {}
+    bid = td.get("bundle-identifier")
+    label = td.get("file-label")
+    if bid == "local.task-viewer.launcher" or label == "Task Viewer":
+        continue
+    kept.append(tile)
+kept.append({
+    "tile-data": {
+        "file-data": {"_CFURLString": app, "_CFURLStringType": 15},
+        "file-label": "Task Viewer",
+        "bundle-identifier": "local.task-viewer.launcher",
+    },
+    "tile-type": "file-tile",
+})
+data["persistent-apps"] = kept
+# Import via stdin so we never write a world-visible fixed path under /tmp.
+subprocess.run(
+    ["defaults", "import", "com.apple.dock", "-"],
+    input=plistlib.dumps(data, fmt=plistlib.FMT_BINARY),
+    check=True,
+)
+PY
     killall Dock 2>/dev/null || true
     echo "✓ Added Task Viewer to the Dock"
 }

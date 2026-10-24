@@ -29,9 +29,7 @@ Open <http://127.0.0.1:7880>.
 ### Desktop launcher (Ubuntu / macOS)
 
 ```bash
-./scripts/install-desktop.sh
-# or
-make install-desktop
+make install
 ```
 
 - **Linux:** application-menu entry you can pin to favorites.
@@ -41,9 +39,9 @@ make install-desktop
 Manual control:
 
 ```bash
-./scripts/task-viewer.sh start
-./scripts/task-viewer.sh stop
-./scripts/task-viewer.sh status
+make start
+make stop
+make status
 ```
 
 ## Build

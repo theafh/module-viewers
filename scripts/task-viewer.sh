@@ -1,7 +1,7 @@
 #!/bin/bash
-# task-viewer launcher script
+# task-viewer launcher
 # Usage: task-viewer.sh [start|stop|status|restart|toggle]
-# Default (no args): toggle - starts if stopped, stops if running
+# Default (Dock): toggle — start if stopped, stop if running
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -19,6 +19,9 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
 # Always build/run from this repo's target/, not a redirected agent cache.
 unset CARGO_TARGET_DIR
 export CARGO_TARGET_DIR="$PROJECT_DIR/target"
+# Cursor often exports GIT_DIR; harvest must not inherit it.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
+unset GIT_INDEX_FILE GIT_ALTERNATE_OBJECT_DIRECTORIES
 
 cd "$PROJECT_DIR" || exit 1
 
@@ -45,7 +48,6 @@ is_running() {
         fi
         rm -f "$PID_FILE"
     fi
-    # Fallback: check if port is in use
     if lsof -i :"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
         return 0
     fi
@@ -56,7 +58,7 @@ get_pid() {
     if [ -f "$PID_FILE" ]; then
         cat "$PID_FILE"
     else
-        lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null
+        lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null | head -1
     fi
 }
 
@@ -72,7 +74,6 @@ do_start() {
         return 0
     fi
 
-    # Build if binary doesn't exist
     if [ ! -x "$BINARY" ]; then
         echo "Building task-viewer..."
         notify "task-viewer" "Building release binary (first run)…"
@@ -94,8 +95,15 @@ do_start() {
     fi
 
     echo "Starting task-viewer..."
-    nohup "$BINARY" > "$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
+    # Leave the Dock/.app process group. macOS tears that group down when the
+    # launcher script exits; nohup alone still dies with the group. Artemis
+    # often survives because it was already started outside the Dock session.
+    if ! start_detached; then
+        echo "Failed to start task-viewer. Check $LOG_FILE"
+        notify "task-viewer" "Failed to start. See .task-viewer.log"
+        rm -f "$PID_FILE"
+        return 1
+    fi
     sleep 1
 
     if is_running; then
@@ -114,6 +122,37 @@ do_start() {
     fi
 }
 
+# Double-fork + setsid so the binary is not in the Dock launcher's process group.
+start_detached() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        nohup "$BINARY" >"$LOG_FILE" 2>&1 &
+        echo $! >"$PID_FILE"
+        return 0
+    fi
+    python3 - "$BINARY" "$LOG_FILE" "$PID_FILE" "$PROJECT_DIR" <<'PY'
+import os, sys
+
+binary, logfile, pidfile, project = sys.argv[1:5]
+if os.fork() > 0:
+    os._exit(0)
+os.setsid()
+if os.fork() > 0:
+    os._exit(0)
+os.chdir(project)
+# Keep a restrictive umask: umask(0) made the log and PID file world-writable.
+os.umask(0o077)
+devnull = open("/dev/null", "rb")
+os.dup2(devnull.fileno(), 0)
+# Truncate on each start (same as the old nohup redirect).
+log = open(logfile, "wb", buffering=0)
+os.dup2(log.fileno(), 1)
+os.dup2(log.fileno(), 2)
+with open(pidfile, "w", encoding="utf-8") as handle:
+    handle.write(str(os.getpid()))
+os.execv(binary, [binary])
+PY
+}
+
 do_stop() {
     if ! is_running; then
         echo "task-viewer is not running"
@@ -123,10 +162,10 @@ do_stop() {
 
     pid=$(get_pid)
     echo "Stopping task-viewer (PID: $pid)..."
-    kill "$pid" 2>/dev/null
+    # shellcheck disable=SC2086
+    kill $pid 2>/dev/null || true
 
-    # Wait for graceful shutdown
-    for i in {1..10}; do
+    for _ in {1..10}; do
         if ! is_running; then
             echo "task-viewer stopped"
             rm -f "$PID_FILE"
@@ -136,9 +175,9 @@ do_stop() {
         sleep 0.5
     done
 
-    # Force kill if still running
     echo "Force stopping..."
-    kill -9 "$pid" 2>/dev/null
+    # shellcheck disable=SC2086
+    kill -9 $pid 2>/dev/null || true
     rm -f "$PID_FILE"
     echo "task-viewer stopped"
     notify "task-viewer" "Stopped"
