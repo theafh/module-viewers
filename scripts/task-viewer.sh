@@ -76,8 +76,23 @@ is_ours() {
     [ "$args" = "$BINARY" ]
 }
 
+# The PID listening on the port, from lsof or else ss (minimal Linux installs
+# often lack lsof). Empty when neither tool is installed.
 port_pid() {
-    lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null | head -1
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null | head -1
+    elif command -v ss >/dev/null 2>&1; then
+        ss -Hltnp "sport = :$PORT" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1
+    fi
+}
+
+has_port_tool() {
+    command -v lsof >/dev/null 2>&1 || command -v ss >/dev/null 2>&1
+}
+
+# True when something accepts connections on the port, whoever owns it.
+port_answers() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null
 }
 
 is_running() {
@@ -103,19 +118,55 @@ get_pid() {
     cat "$PID_FILE" 2>/dev/null
 }
 
-# True once our process is the one listening on the port.
+# True once our process is the one listening on the port. Without lsof or ss
+# the listener has no name; do_start refuses a port that already answers, and
+# a server that cannot bind exits, so our live process plus an answer counts.
 is_listening() {
-    is_running && [ "$(port_pid)" = "$(get_pid)" ]
+    is_running || return 1
+    if has_port_tool; then
+        [ "$(port_pid)" = "$(get_pid)" ]
+    else
+        port_answers
+    fi
 }
 
 # True when the binary on disk is newer than the one the running server was
-# started from, for example after `make build`. A server started without the
+# started from, for example after a source change. A server started without the
 # launcher has no stamp and counts as outdated.
 is_outdated() {
     [ ! -f "$STAMP_FILE" ] || [ "$BINARY" -nt "$STAMP_FILE" ]
 }
 
+# Build the release binary from this checkout. cargo does nothing when the
+# sources are unchanged, so every start runs the code that is checked out
+# rather than whatever an earlier `make build` left behind.
+build_binary() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        if [ -x "$BINARY" ]; then
+            return 0
+        fi
+        echo "cargo not found; cannot build task-viewer."
+        notify "task-viewer" "Build failed: cargo not found. Run 'make build' in the project."
+        return 1
+    fi
+    if [ ! -x "$BINARY" ]; then
+        echo "Building task-viewer..."
+        notify "task-viewer" "Building release binary (first run)…"
+    fi
+    if ! cargo build --release -p task-viewer >"$BUILD_LOG" 2>&1; then
+        echo "Build failed. Check $BUILD_LOG"
+        notify "task-viewer" "Build failed. See $BUILD_LOG"
+        return 1
+    fi
+    if [ ! -x "$BINARY" ]; then
+        echo "Build finished but binary is missing at $BINARY"
+        notify "task-viewer" "Build failed: binary missing"
+        return 1
+    fi
+}
+
 do_start() {
+    build_binary || return 1
     if is_running && is_outdated; then
         echo "A newer task-viewer binary exists; restarting on it."
         do_stop
@@ -138,29 +189,15 @@ do_start() {
         notify "task-viewer" "Port $PORT is in use by another program"
         return 1
     fi
-
-    if [ ! -x "$BINARY" ]; then
-        echo "Building task-viewer..."
-        notify "task-viewer" "Building release binary (first run)…"
-        if ! command -v cargo >/dev/null 2>&1; then
-            echo "cargo not found; cannot build task-viewer."
-            notify "task-viewer" "Build failed: cargo not found. Run 'make build' in the project."
-            return 1
-        fi
-        if ! cargo build --release -p task-viewer >"$BUILD_LOG" 2>&1; then
-            echo "Build failed. Check $BUILD_LOG"
-            notify "task-viewer" "Build failed. See $BUILD_LOG"
-            return 1
-        fi
-        if [ ! -x "$BINARY" ]; then
-            echo "Build finished but binary is missing at $BINARY"
-            notify "task-viewer" "Build failed: binary missing"
-            return 1
-        fi
+    # A listener the tools cannot name (no lsof or ss, or another user's).
+    if port_answers; then
+        echo "Port $PORT is held by another process; not starting task-viewer."
+        notify "task-viewer" "Port $PORT is in use by another program"
+        return 1
     fi
 
     echo "Starting task-viewer..."
-    # Remember which build this server runs, so a later `make build` is noticed.
+    # Remember which build this server runs, so a later rebuild is noticed.
     touch -r "$BINARY" "$STAMP_FILE"
     # Leave the Dock/.app process group. macOS tears that group down when the
     # launcher script exits; nohup alone still dies with the group. Artemis
@@ -276,11 +313,16 @@ do_status() {
 }
 
 do_toggle() {
-    # An outdated server is restarted on the newer binary instead of stopped.
-    if is_running && ! is_outdated; then
-        do_stop
-    else
+    if ! is_running; then
         do_start
+        return
+    fi
+    # Build first, so a click after a source change restarts the server on
+    # the new code instead of stopping it. A failed build still stops.
+    if build_binary && is_outdated; then
+        do_start
+    else
+        do_stop
     fi
 }
 

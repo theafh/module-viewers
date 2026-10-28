@@ -26,6 +26,8 @@ Parsed rows stay in `~/.task-viewer`. The binary makes no outbound request. Char
 
 The desktop launcher keeps its PID file and the server log, which records repository paths, in a per-user directory outside the checkout: `~/Library/Logs/task-viewer/` on macOS and `${XDG_STATE_HOME:-~/.local/state}/task-viewer/` on Linux. The directory is mode `700` and both files are mode `600`. The launcher signals only a PID whose command line is this checkout's release binary.
 
+`make install` writes the desktop launcher into the person's own desktop configuration. On macOS that is `~/Applications/Task Viewer.app` and a Task Viewer tile in the Dock's `persistent-apps` list (`com.apple.dock`), after which the Dock restarts. On Linux it is `~/.local/share/applications/task-viewer.desktop` and `~/.local/share/icons/hicolor/256x256/apps/task-viewer.png`. These files carry the path to this checkout and nothing from the viewed repositories.
+
 ## Attack Surface
 
 - The server binds `127.0.0.1:7880`. A `Host` other than loopback (`127.0.0.1`, `localhost`, `[::1]`, with optional `:7880`) is rejected.
@@ -40,7 +42,7 @@ Dependencies stay pinned in `Cargo.lock`. Run `make audit` when they change.
 
 - [ ] No outbound network client introduced.
 - [ ] No secret introduced.
-- [ ] New durable writes stay in `~/.task-viewer` or `TASK_VIEWER_DB`, or in the launcher's per-user state directory.
+- [ ] New durable writes stay in `~/.task-viewer` or `TASK_VIEWER_DB`, in the launcher's per-user state directory, or in the desktop install targets named under Data.
 - [ ] Selected repositories are read, not written.
 - [ ] Routes still name repositories by id.
 - [ ] The listener stays on `127.0.0.1`.

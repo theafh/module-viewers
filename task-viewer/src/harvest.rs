@@ -47,6 +47,9 @@ pub struct ParsedTask {
 pub enum HarvestError {
     MissingTasks,
     Io(std::io::Error),
+    // Git could not read a repository that has a `.git`. Charting frontmatter
+    // dates instead would pile every task onto its last bulk `updated` day.
+    Git(String),
 }
 
 impl std::fmt::Display for HarvestError {
@@ -54,6 +57,7 @@ impl std::fmt::Display for HarvestError {
         match self {
             Self::MissingTasks => formatter.write_str("That folder has no tasks directory."),
             Self::Io(error) => write!(formatter, "The scan could not read the repository: {error}"),
+            Self::Git(reason) => write!(formatter, "Git could not read the history: {reason}"),
         }
     }
 }
@@ -147,7 +151,7 @@ pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> 
     }
 
     let mut from_git = 0usize;
-    for (index, leave_day) in leave_dates(&repo, &pending) {
+    for (index, leave_day) in leave_dates(&repo, &pending).map_err(HarvestError::Git)? {
         if let Some(task) = tasks.get_mut(index)
             && let Some(day) = leave_day
         {
@@ -280,29 +284,35 @@ fn scrub_git_env(command: &mut Command) {
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
 }
 
-fn leave_dates(repo: &Path, jobs: &[(usize, String, String)]) -> Vec<(usize, Option<NaiveDate>)> {
+type LeaveDays = Vec<(usize, Option<NaiveDate>)>;
+
+fn leave_dates(repo: &Path, jobs: &[(usize, String, String)]) -> Result<LeaveDays, String> {
     // Sequential on purpose. Parallel git log --follow across hundreds of
     // archive files exhausted process slots and aborted Update.
     jobs.iter()
-        .map(|(index, rel, status)| (*index, first_status_commit_date(repo, rel, status)))
+        .map(|(index, rel, status)| Ok((*index, first_status_commit_date(repo, rel, status)?)))
         .collect()
 }
 
-fn first_status_commit_date(repo: &Path, rel: &str, status: &str) -> Option<NaiveDate> {
+fn first_status_commit_date(
+    repo: &Path,
+    rel: &str,
+    status: &str,
+) -> Result<Option<NaiveDate>, String> {
     let literal = format!("status: {status}");
     let regex = format!(r"^status:[[:space:]]*{status}");
     for (flag, pattern) in [("-S", literal.as_str()), ("-G", regex.as_str())] {
-        if let Some(day) = git_pickaxe(repo, rel, flag, pattern) {
-            return Some(day);
+        if let Some(day) = git_pickaxe(repo, rel, flag, pattern)? {
+            return Ok(Some(day));
         }
     }
-    None
+    Ok(None)
 }
 
 enum LogLookup {
     Found(NaiveDate),
     Miss,
-    Failed,
+    Failed(String),
 }
 
 fn run_git_log(mut command: Command, flag: &str, pattern: &str, rel: &str) -> LogLookup {
@@ -326,13 +336,18 @@ fn run_git_log(mut command: Command, flag: &str, pattern: &str, rel: &str) -> Lo
         .output()
     {
         Ok(output) => output,
-        Err(_) => return LogLookup::Failed,
+        Err(error) => return LogLookup::Failed(format!("git did not start: {error}")),
     };
     if !output.status.success() {
-        return LogLookup::Failed;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().find(|line| !line.trim().is_empty());
+        return LogLookup::Failed(match first {
+            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
+            None => format!("git exited with {}", output.status),
+        });
     }
     let Ok(text) = String::from_utf8(output.stdout) else {
-        return LogLookup::Failed;
+        return LogLookup::Failed("git printed output that is not UTF-8".to_string());
     };
     // Earliest hit. Do not use `--reverse` with `--follow` (drops renames).
     match text.lines().filter_map(parse_iso_date).min() {
@@ -355,23 +370,35 @@ fn git_dir_command(repo: &Path, dir: &Path) -> Command {
     command
 }
 
-fn git_pickaxe(repo: &Path, rel: &str, flag: &str, pattern: &str) -> Option<NaiveDate> {
+fn git_pickaxe(
+    repo: &Path,
+    rel: &str,
+    flag: &str,
+    pattern: &str,
+) -> Result<Option<NaiveDate>, String> {
     // 1) Explicit --git-dir beats an inherited GIT_DIR (Cursor sets one).
     // Fall back to -C only when git_dir is missing or that call fails to run.
-    if let Some(dir) = git_dir(repo) {
-        match run_git_log(git_dir_command(repo, &dir), flag, pattern, rel) {
-            LogLookup::Found(day) => return Some(day),
-            LogLookup::Miss => return None,
-            LogLookup::Failed => {}
+    let dir = git_dir(repo);
+    let mut first_failure = None;
+    if let Some(dir) = &dir {
+        match run_git_log(git_dir_command(repo, dir), flag, pattern, rel) {
+            LogLookup::Found(day) => return Ok(Some(day)),
+            LogLookup::Miss => return Ok(None),
+            LogLookup::Failed(reason) => first_failure = Some(reason),
         }
     }
     // 2) Plain -C with scrubbed env.
-    let repo_s = repo.to_str()?;
     let mut command = Command::new(git_bin());
-    command.args(["-C", repo_s]);
+    command.arg("-C").arg(repo);
     match run_git_log(command, flag, pattern, rel) {
-        LogLookup::Found(day) => Some(day),
-        LogLookup::Miss | LogLookup::Failed => None,
+        LogLookup::Found(day) => Ok(Some(day)),
+        LogLookup::Miss => Ok(None),
+        // A folder with its own `.git` that git cannot read means git cannot
+        // run here (a sandbox, a broken install). Stop the scan rather than
+        // chart frontmatter dates as ship days.
+        LogLookup::Failed(reason) if dir.is_some() => Err(first_failure.unwrap_or(reason)),
+        // No `.git` and no enclosing repository: git has no commit to offer.
+        LogLookup::Failed(_) => Ok(None),
     }
 }
 
@@ -687,6 +714,45 @@ mod tests {
         assert_eq!(
             task.ship_date,
             Some(NaiveDate::from_ymd_opt(2026, 7, 17).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    fn finished_task(repo: &Path) {
+        fs::create_dir_all(repo.join("tasks/archive")).expect("tasks");
+        fs::write(
+            repo.join("tasks/archive/scope_done.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-10-16T10:00:00\nstatus: finished\n---\n\n# Done\n",
+        )
+        .expect("write");
+    }
+
+    #[test]
+    fn harvest_fails_when_git_cannot_read_the_repository() {
+        // A `.git` that git cannot open must fail the scan; falling back to
+        // `updated` would chart every task on its last bulk-update day.
+        let repo = scratch("harvest_git_broken");
+        finished_task(&repo);
+        fs::write(
+            repo.join(".git"),
+            format!("gitdir: {}\n", repo.join("missing.git").display()),
+        )
+        .expect("gitfile");
+        let error = harvest_repository(&repo).expect_err("git failure");
+        assert!(matches!(error, HarvestError::Git(_)));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_uses_updated_for_a_folder_outside_git() {
+        let repo = scratch("harvest_no_git");
+        finished_task(&repo);
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 10, 16).expect("day"))
         );
         let _ = fs::remove_dir_all(&repo);
     }

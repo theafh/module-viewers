@@ -4,7 +4,7 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 
 ## Test Design Principles
 
-- Test observable behaviour: parsed rows, chart series, HTTP host checks, and database contents.
+- Test observable behaviour: parsed rows, chart series, HTTP host checks, and database contents. Where the behaviour depends on process-wide state that a parallel-safe test must not change, such as the inherited git environment or the server's working directory, assert how harvest configures its `git` command instead.
 - Keep tests deterministic, isolated, offline, and parallel-safe. Every test owns its state through a per-test temp dir from `unique_temp_dir` (`task-viewer_<name>_<pid>_<nanos>_<n>`). Tests share no paths, no env overrides, and no execution-order assumptions. `cargo test` runs them in parallel.
 - Cover the success path and one failure path for a behaviour that can fail.
 - Match a status, a variant, or a field. Avoid asserting a whole error string when a variant is enough, and assert the stored message when that message is the contract.
@@ -19,7 +19,7 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 ## What Must Be Covered
 
 - Date parsing for frontmatter timestamps and commit timestamps.
-- Harvest: leave day is the first commit that introduces the archived status (`finished` or `deferred`), including across renames after that commit and when that commit is a merge; finished ship day equals that leave day; a later `updated` bump must not become the ship day; an inherited `GIT_DIR` must not poison pickaxe; a date line in the patch context of the status change must not become the ship day; `--git-dir` lookups run from the repository folder, whatever the server's working directory; deferred tasks have no ship day; live tasks stay live; a folder without `tasks/` is rejected.
+- Harvest: leave day is the first commit that introduces the archived status (`finished` or `deferred`), including across renames after that commit and when that commit is a merge; finished ship day equals that leave day; a later `updated` bump must not become the ship day; an inherited `GIT_DIR` must not poison pickaxe; a date line in the patch context of the status change must not become the ship day; `--git-dir` lookups run from the repository folder, whatever the server's working directory; a `.git` that git cannot read fails the scan instead of falling back to `updated`; a folder outside git falls back to `updated`; deferred tasks have no ship day; live tasks stay live; a folder without `tasks/` is rejected.
 - Series: same-week create and ship both count, deferred tasks age until leave and never ship, all-projects radars count by repository, and a single project counts by scope.
 - Database: insert, replace rows, keep rows when a scan error is recorded, and delete a repository with its rows.
 - Host check: loopback names are accepted with or without port 7880.

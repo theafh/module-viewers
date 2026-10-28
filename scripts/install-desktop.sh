@@ -16,6 +16,21 @@ APP_NAME="Task Viewer"
 
 chmod +x "$LAUNCHER_SCRIPT"
 
+# Quote a path as one desktop-entry Exec argument, so a checkout path with a
+# space or a shell character stays one argument. The quoting rule escapes
+# " ` $ \ with a backslash; the string rule then doubles every backslash, and
+# % becomes %% so it is not read as a field code.
+desktop_exec_arg() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//\`/\\\`}
+    value=${value//\$/\\\$}
+    value=${value//\\/\\\\}
+    value=${value//%/%%}
+    printf '"%s"' "$value"
+}
+
 install_linux() {
     local applications_dir="$HOME/.local/share/applications"
     local icons_dir="$HOME/.local/share/icons/hicolor/256x256/apps"
@@ -49,7 +64,7 @@ Version=1.0
 Type=Application
 Name=Task Viewer
 Comment=Local dashboard for repository tasks trees
-Exec=$LAUNCHER_SCRIPT
+Exec=$(desktop_exec_arg "$LAUNCHER_SCRIPT")
 Icon=task-viewer
 Terminal=false
 Categories=Development;Office;
@@ -120,10 +135,11 @@ install_macos() {
     rm -rf "$app_bundle"
     mkdir -p "$macos_dir" "$resources_dir"
 
+    # %q keeps a path with quotes or $ intact inside the generated script.
     cat > "$launcher_bin" << EOF
 #!/bin/bash
 # Task Viewer Dock launcher — toggles the local server.
-exec "$LAUNCHER_SCRIPT" toggle
+exec $(printf '%q' "$LAUNCHER_SCRIPT") toggle
 EOF
     chmod +x "$launcher_bin"
 

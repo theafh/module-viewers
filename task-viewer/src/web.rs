@@ -366,6 +366,15 @@ async fn refresh_one(pool: &sqlx::SqlitePool, repository_id: i64, path: &std::pa
             let _ = db::set_scan_error(pool, repository_id, "That folder has no tasks directory.")
                 .await;
         }
+        Ok(Err(HarvestError::Git(reason))) => {
+            tracing::error!(%reason, repository_id, "git could not read the history");
+            let _ = db::set_scan_error(
+                pool,
+                repository_id,
+                "Git could not read the history, so the rows were left as they were.",
+            )
+            .await;
+        }
         Ok(Err(HarvestError::Io(error))) => {
             tracing::error!(%error, repository_id, "scan failed");
             let _ = db::set_scan_error(
