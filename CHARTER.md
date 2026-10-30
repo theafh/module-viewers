@@ -24,6 +24,7 @@ module-viewers ships small local tools that read repositories a person already h
 ## Key Invariants
 
 - The source of a chart is the parsed rows in `~/.task-viewer` for the repositories that person configured.
+- A configured repository that has a git history is charted from every version of its `tasks/` tree that its working tree or any of its refs holds, so a task stays on the charts whichever branch happens to be checked out.
 - Update replaces those rows from the current files and git history. It is the only refresh path.
 - A shipped task is an archived task whose status is `finished`. Its ship day is the commit that first introduced that status, or the frontmatter `updated` day when git has no such commit.
 - A deferred archived task counts as created and never as shipped. Its leave day is the commit that first introduced its archived status, or the frontmatter `updated` day when git has no such commit. Mean age includes it from `created` until that leave day.

@@ -22,8 +22,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 
 **`task-viewer/src/web.rs`** owns the routes. The dashboard is `GET /`. The repository list is `GET /repositories`. Add repository is `POST /repositories` and opens the operating-system folder picker on this machine. Remove is `POST /repositories/{id}/delete`. Update is `POST /scan`. Routes name a repository by its integer id. The folder path is taken from the picker, not from the browser body.
 
-**`task-viewer/src/harvest.rs`** walks `tasks/**/*.md`, reads frontmatter, and asks git for the leave day of each finished or deferred task. It returns parsed rows and does not write them.
-
+**`task-viewer/src/harvest.rs`** reads `tasks/**/*.md`, reads frontmatter, and asks git for the leave day of each finished or deferred task. It returns parsed rows and does not write them.
 **`task-viewer/src/db.rs`** creates `~/.task-viewer` and reads and writes the two tables.
 
 **`task-viewer/src/series.rs`** turns the stored rows into the eight chart series for the current filter.
@@ -40,6 +39,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 
 ## Extraction Rules
 
+- A repository with a `.git` is charted from every version of its `tasks/` tree that the working tree or any local or remote-tracking ref holds, so a task stays on the charts whichever branch is checked out. A task is identified by its file name and counts once; the working tree outranks a commit, then an archived path outranks a live one, then the newest commit decides. A folder outside git is charted from its files.
 - `created` is the frontmatter `created` day of every task file, including tasks that are later deferred.
 - `finished` means the file is under a directory named `archive` and its status is `finished`. Any other archived status is `deferred`. A file outside `archive` is `live`.
 - The leave day of a finished or deferred task is the committer day of the earliest `git log --follow` hit that introduces that task's archived status (`status: finished` or the archived status string, via `-S` then `-G`). Lookups run from the repository folder with that repository's `--git-dir` / `--work-tree`, so neither an inherited `GIT_DIR` nor the server's working directory can redirect them. Plain `-C` is the fallback when that folder has no `.git` or the first command fails to run; a lookup that runs and finds nothing stops there. Lookups read newest-first without `--reverse` so renames still match. Merge commits are diffed against their first parent (`--diff-merges=first-parent`), so a task archived while resolving a merge still matches, and `--no-patch` keeps patch lines out of the parsed dates. When git runs and returns nothing, which happens when the archived status is not committed yet, the frontmatter `updated` day is the leave day; a folder outside any git repository takes that day too. When git cannot read a folder that has a `.git` (it does not start, or both lookups exit with an error), the scan of that repository fails, its rows stay as they were, and the repository shows a scan error. Live tasks have no leave day.

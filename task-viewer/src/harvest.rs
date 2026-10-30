@@ -1,7 +1,7 @@
 use chrono::NaiveDate;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
 use crate::dates::parse_iso_date;
@@ -75,26 +75,166 @@ pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> 
         return Err(HarvestError::MissingTasks);
     }
 
-    let mut files = Vec::new();
-    for entry in WalkDir::new(&tasks_root)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-    {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "md") {
-            files.push(path.to_path_buf());
+    // A repository with a `.git` is charted from every version of its `tasks/`
+    // tree that the working tree or any ref holds, so a task stays visible
+    // whichever branch is checked out. A folder outside git is charted from its
+    // files.
+    let files = match git_dir(&repo) {
+        Some(dir) => {
+            // A `.git` that git cannot open fails the scan; charting frontmatter
+            // dates instead would pile every task onto its last bulk `updated`
+            // day.
+            git_read(&repo, &dir, &["rev-parse", "--git-dir"]).map_err(HarvestError::Git)?;
+            union_files(&repo, &dir)?
+        }
+        None => files_on_disk(&repo)?,
+    };
+    harvest_files(&repo, files)
+}
+
+/// Every task file the working tree or any ref holds, one row per task.
+///
+/// A task's identity is its file name, so the same task counts once when one
+/// branch still holds it live while another has archived it. The newest
+/// version wins: the working tree first, then the version whose commit is most
+/// recent.
+/// One version of a task file: its rank, its blob id when it came from a
+/// commit, and its path.
+type Candidate = ((u8, u8, i64), Option<String>, String);
+
+fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, HarvestError> {
+    let listing = git_read(
+        repo,
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .map_err(HarvestError::Git)?;
+    let refs: Vec<&str> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    // Every (ref, path, blob) pair, then the newest touch of each blob once.
+    let mut found: Vec<(String, String)> = Vec::new();
+    let mut all_blobs: Vec<String> = Vec::new();
+    for reference in &refs {
+        let tree = git_read(repo, dir, &["ls-tree", "-r", reference, "--", "tasks"])
+            .map_err(HarvestError::Git)?;
+        let (paths, blobs) = markdown_blobs(&tree);
+        all_blobs.extend(blobs.iter().cloned());
+        found.extend(paths.into_iter().zip(blobs));
+    }
+    let times = blob_days(repo, dir, &all_blobs)?;
+    // Rank a version by how much it should be trusted: the working tree first,
+    // then an archived copy over a live one, then the newest commit. A task
+    // archived on one branch is shipped even when another branch still carries
+    // an older live copy, so the archived version wins.
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (path, sha) in found {
+        let stamp = times.get(&sha).copied().unwrap_or(0);
+        candidates.push((archive_rank(&path, 0, stamp), Some(sha), path));
+    }
+    for (rel, _) in files_on_disk(repo)? {
+        candidates.push((archive_rank(&rel, 1, i64::MAX), None, rel));
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
+    let mut seen = std::collections::HashSet::new();
+    let mut chosen: Vec<(String, Option<String>)> = Vec::new();
+    for (_, blob, path) in candidates {
+        let name = path.rsplit('/').next().unwrap_or_default().to_string();
+        if seen.insert(name) {
+            chosen.push((path, blob));
         }
     }
+    // Read the committed versions in one `git cat-file` process.
+    let blobs: Vec<String> = chosen.iter().filter_map(|(_, blob)| blob.clone()).collect();
+    let mut contents = read_blobs(repo, dir, &blobs)?.into_iter();
+    let mut files = Vec::new();
+    for (path, blob) in chosen {
+        let text = match blob {
+            Some(_) => contents.next().unwrap_or_default(),
+            None => fs::read_to_string(repo.join(&path)).unwrap_or_default(),
+        };
+        files.push((path, text));
+    }
     files.sort();
+    Ok(files)
+}
 
+/// Rank a version of a task: working tree before a commit, then an archived
+/// path before a live one, then the newest commit.
+fn archive_rank(path: &str, from_worktree: u8, stamp: i64) -> (u8, u8, i64) {
+    let archived = u8::from(path.split('/').any(|part| part == "archive"));
+    (from_worktree, archived, stamp)
+}
+
+/// The committer day of the newest commit that touched each blob, keyed by
+/// blob id, in one `git log` process.
+fn blob_days(
+    repo: &Path,
+    dir: &Path,
+    blobs: &[String],
+) -> Result<std::collections::HashMap<String, i64>, HarvestError> {
+    let mut command = git_dir_command(repo, dir);
+    scrub_git_env(&mut command);
+    command.args([
+        "log",
+        "--all",
+        "--format=%ct",
+        "--raw",
+        "--no-renames",
+        "--no-abbrev",
+        "--",
+        "tasks",
+    ]);
+    let output = command
+        .output()
+        .map_err(|error| HarvestError::Git(format!("git did not start: {error}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().find(|line| !line.trim().is_empty());
+        return Err(HarvestError::Git(match first {
+            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
+            None => format!("git exited with {}", output.status),
+        }));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let wanted: std::collections::HashSet<&str> = blobs.iter().map(String::as_str).collect();
+    let mut days: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut stamp = 0_i64;
+    for line in text.lines() {
+        if let Some(raw) = line.strip_prefix(':') {
+            // `:old new oldmode newmode status\tsha\tpath`, oldest refs first.
+            let Some(meta) = raw.split('\t').next() else {
+                continue;
+            };
+            let fields: Vec<&str> = meta.split_whitespace().collect();
+            let Some(sha) = fields.get(3) else { continue };
+            if !wanted.contains(sha) {
+                continue;
+            }
+            // Log order is newest first, so the first hit is the newest touch.
+            days.entry(sha.to_string()).or_insert(stamp);
+        } else if let Ok(value) = line.trim().parse::<i64>() {
+            stamp = value;
+        }
+    }
+    Ok(days)
+}
+
+fn harvest_files(
+    repo: &Path,
+    files: Vec<(String, String)>,
+) -> Result<Vec<ParsedTask>, HarvestError> {
     let mut pending = Vec::new();
     let mut tasks = Vec::new();
 
-    for path in files {
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(_) => continue,
-        };
+    for (rel, text) in files {
         let Some(fields) = frontmatter(&text) else {
             continue;
         };
@@ -111,26 +251,13 @@ pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> 
             .get("updated")
             .and_then(|value| parse_iso_date(value))
             .unwrap_or(created);
-        let rel = path
-            .strip_prefix(&repo)
-            .unwrap_or(path.as_path())
-            .to_string_lossy()
-            .replace('\\', "/");
-        let in_archive = path
-            .components()
-            .any(|component| component.as_os_str() == "archive");
+        let in_archive = rel.split('/').any(|part| part == "archive");
         let kind = classify(in_archive, &status);
-        let scope = path
-            .file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_default()
+        let name = rel.rsplit('/').next().unwrap_or_default();
+        let scope = name
             .split_once('_')
             .map(|(prefix, _)| prefix.to_string())
-            .unwrap_or_else(|| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            });
+            .unwrap_or_else(|| name.to_string());
         let index = tasks.len();
         // Always pickaxe against this folder with a path relative to it.
         // Never ask `rev-parse` first: an inherited GIT_DIR can point that at
@@ -151,7 +278,7 @@ pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> 
     }
 
     let mut from_git = 0usize;
-    for (index, leave_day) in leave_dates(&repo, &pending).map_err(HarvestError::Git)? {
+    for (index, leave_day) in leave_dates(repo, &pending).map_err(HarvestError::Git)? {
         if let Some(task) = tasks.get_mut(index)
             && let Some(day) = leave_day
         {
@@ -179,6 +306,135 @@ pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> 
         "harvest complete"
     );
     Ok(tasks)
+}
+
+/// Split an `ls-tree -r` listing into task paths and their blob ids.
+fn markdown_blobs(listing: &str) -> (Vec<String>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut blobs = Vec::new();
+    for line in listing.lines() {
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        if !path.ends_with(".md") {
+            continue;
+        }
+        let mut fields = meta.split_whitespace();
+        let (Some(_mode), Some(kind), Some(sha)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if kind != "blob" {
+            continue;
+        }
+        paths.push(path.to_string());
+        blobs.push(sha.to_string());
+    }
+    (paths, blobs)
+}
+
+/// Read many blobs in one `git cat-file` process, in the order they are given.
+fn read_blobs(repo: &Path, dir: &Path, blobs: &[String]) -> Result<Vec<String>, HarvestError> {
+    let mut command = Command::new(git_bin());
+    command
+        .current_dir(repo)
+        .arg("--git-dir")
+        .arg(dir)
+        .arg("--work-tree")
+        .arg(repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    scrub_git_env(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| HarvestError::Git(format!("git did not start: {error}")))?;
+    let mut input = String::new();
+    for sha in blobs {
+        input.push_str(sha);
+        input.push('\n');
+    }
+    // Feed stdin from its own thread: a full stdout pipe would otherwise stop
+    // the child from draining stdin and deadlock the write below.
+    let writer = child.stdin.take().map(|mut stdin| {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(input.as_bytes());
+        })
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|error| HarvestError::Git(format!("git did not finish: {error}")))?;
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().find(|line| !line.trim().is_empty());
+        return Err(HarvestError::Git(match first {
+            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
+            None => format!("git exited with {}", output.status),
+        }));
+    }
+    parse_batch(&output.stdout, blobs.len())
+}
+
+fn parse_batch(output: &[u8], expected: usize) -> Result<Vec<String>, HarvestError> {
+    let mut contents = Vec::with_capacity(expected);
+    let mut rest = output;
+    for _ in 0..expected {
+        let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
+            return Err(HarvestError::Git(
+                "git printed a truncated object header.".to_string(),
+            ));
+        };
+        let header = String::from_utf8_lossy(&rest[..newline]).into_owned();
+        let size = header
+            .split_whitespace()
+            .nth(2)
+            .and_then(|field| field.parse::<usize>().ok())
+            .ok_or_else(|| {
+                HarvestError::Git(format!("git printed an unreadable object header: {header}"))
+            })?;
+        let start = newline + 1;
+        let end = start.saturating_add(size);
+        let body = rest.get(start..end).ok_or_else(|| {
+            HarvestError::Git("git printed less content than it announced.".to_string())
+        })?;
+        let text = String::from_utf8(body.to_vec())
+            .map_err(|_| HarvestError::Git("git printed a task that is not UTF-8.".to_string()))?;
+        contents.push(text);
+        rest = rest.get(end..).unwrap_or_default();
+        rest = rest.strip_prefix(b"\n").unwrap_or(rest);
+    }
+    Ok(contents)
+}
+
+/// The markdown files of `tasks/` as the folder holds them, for a folder
+/// outside git.
+fn files_on_disk(repo: &Path) -> Result<Vec<(String, String)>, HarvestError> {
+    let mut files = Vec::new();
+    for entry in WalkDir::new(repo.join("tasks"))
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "md") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(repo)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        files.push((rel, text));
+    }
+    files.sort();
+    Ok(files)
 }
 
 fn classify(in_archive: bool, status: &str) -> TaskKind {
@@ -317,24 +573,18 @@ enum LogLookup {
 
 fn run_git_log(mut command: Command, flag: &str, pattern: &str, rel: &str) -> LogLookup {
     scrub_git_env(&mut command);
-    let output = match command
-        // Merges are not diffed by default, so a task archived inside a merge
-        // commit (say, while resolving it) would never match the pickaxe.
-        // `--diff-merges` implies `-p`; `--no-patch` keeps patch lines, which
-        // can hold a bare date, out of the parsed output.
-        .args([
-            "log",
-            "--follow",
-            "--diff-merges=first-parent",
-            "--no-patch",
-            "--format=%cI",
-            flag,
-            pattern,
-            "--",
-            rel,
-        ])
-        .output()
-    {
+    let mut args = vec![
+        "log",
+        "--follow",
+        "--diff-merges=first-parent",
+        "--no-patch",
+        "--format=%cI",
+        // Every ref counts, so a task archived on a branch that is not checked
+        // out keeps its ship day.
+        "--all",
+    ];
+    args.extend([flag, pattern, "--", rel]);
+    let output = match command.args(&args).output() {
         Ok(output) => output,
         Err(error) => return LogLookup::Failed(format!("git did not start: {error}")),
     };
@@ -400,6 +650,25 @@ fn git_pickaxe(
         // No `.git` and no enclosing repository: git has no commit to offer.
         LogLookup::Failed(_) => Ok(None),
     }
+}
+
+/// Run a read-only git command against this folder and return its stdout.
+fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = git_dir_command(repo, dir);
+    scrub_git_env(&mut command);
+    let output = command
+        .args(args)
+        .output()
+        .map_err(|error| format!("git did not start: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().find(|line| !line.trim().is_empty());
+        return Err(match first {
+            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
+            None => format!("git exited with {}", output.status),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]
@@ -762,6 +1031,188 @@ mod tests {
         let repo = scratch("harvest_missing");
         let error = harvest_repository(&repo).expect_err("missing");
         assert!(matches!(error, HarvestError::MissingTasks));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    fn write_task(repo: &Path, rel: &str, created: &str, status: &str) {
+        let path = repo.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("parent");
+        }
+        fs::write(
+            path,
+            format!(
+                "---\ncreated: {created}T10:00:00\nupdated: {created}T10:00:00\nstatus: {status}\n---\n\n# Task\n"
+            ),
+        )
+        .expect("write task");
+    }
+
+    #[test]
+    fn harvest_charts_a_task_that_only_another_branch_holds() {
+        // A task archived on a branch that is not checked out still counts, so
+        // the charts do not lose it when the checkout moves.
+        let repo = scratch("harvest_union_branch");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_on_main.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "main task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task(
+            &repo,
+            "tasks/archive/scope_shipped.md",
+            "2026-05-02",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "ship on feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        // Back on the default branch, which does not carry the archived task.
+        git(&repo, &["checkout", "main"], "2026-06-02T12:00:00+00:00");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let shipped = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_shipped.md"))
+            .expect("shipped on the feature branch");
+        assert_eq!(shipped.kind, TaskKind::Finished);
+        assert_eq!(
+            shipped.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_counts_an_archived_task_once_when_a_branch_still_holds_it_live() {
+        // The same task archived on one branch and live on the checked-out one
+        // is one task, and the checked-out version decides its kind, so the
+        // charts neither double-count it nor ship it before the branch lands.
+        let repo = scratch("harvest_union_dedup");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_same.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "live task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "shipping"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::remove_file(repo.join("tasks/scope_same.md")).expect("remove live");
+        write_task(
+            &repo,
+            "tasks/archive/scope_same.md",
+            "2026-05-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive it"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-06-02T12:00:00+00:00");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let matching: Vec<_> = tasks
+            .iter()
+            .filter(|task| task.path.ends_with("scope_same.md"))
+            .collect();
+        assert_eq!(matching.len(), 1);
+        // `main` is checked out, so its live copy is the one that counts.
+        assert_eq!(matching[0].kind, TaskKind::Live);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_prefers_the_working_tree_over_a_committed_version() {
+        // An uncommitted archive is what the person is looking at, so it counts
+        // even though no commit carries it yet.
+        let repo = scratch("harvest_union_worktree");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_pending.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "open task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // Staged, not committed.
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::rename(
+            repo.join("tasks/scope_pending.md"),
+            repo.join("tasks/archive/scope_pending.md"),
+        )
+        .expect("rename");
+        write_task(
+            &repo,
+            "tasks/archive/scope_pending.md",
+            "2026-05-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-07-01T12:00:00+00:00");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let pending = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_pending.md"))
+            .expect("pending");
+        assert_eq!(pending.kind, TaskKind::Finished);
+        // No commit carries the finished status, so the `updated` day stands in.
+        assert_eq!(
+            pending.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 1).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_default_branch_that_is_master() {
+        let repo = scratch("harvest_master");
+        git(
+            &repo,
+            &["init", "-b", "master", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_master.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "master task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].path, "tasks/scope_master.md");
         let _ = fs::remove_dir_all(&repo);
     }
 }
