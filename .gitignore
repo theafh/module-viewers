@@ -23,3 +23,6 @@ Thumbs.db
 .task-viewer
 .task-viewer.pid
 .task-viewer.log
+
+# Local scratch fixtures
+.tmp_agt_p8/
