@@ -681,9 +681,13 @@ fn archived_leave_lookup(
         }
     };
     scrub_git_env(&mut command);
+    // `-z` prints every path raw. Without it git C-quotes a path holding a
+    // non-ASCII byte or a double quote, and the quoted form matches neither the
+    // raw folder prefix nor any object.
     let output = command
         .args([
             "log",
+            "-z",
             "--follow",
             "--diff-merges=first-parent",
             "--name-only",
@@ -702,12 +706,16 @@ fn archived_leave_lookup(
             None => format!("git exited with {}", output.status),
         });
     }
-    let text = String::from_utf8(output.stdout)
-        .map_err(|_| "git printed output that is not UTF-8".to_string())?;
-    let records = parse_archive_log(&text);
+    let records = parse_archive_log(&output.stdout);
     let mut exprs = Vec::new();
     let mut days = Vec::new();
     for (day, commit, path) in records {
+        // Both `cat-file` passes read one expression per line, so a path that
+        // holds a newline would split its expression and shift every later
+        // answer onto the wrong record.
+        if path.contains('\n') {
+            continue;
+        }
         // `--name-only` names paths from the repository root. A path outside
         // this folder belongs to no archive of it.
         if !path.strip_prefix(prefix).is_some_and(is_archived_path) {
@@ -733,17 +741,27 @@ fn archived_leave_lookup(
     Ok(earliest)
 }
 
-/// Split a `--format=%cI %H --name-only` walk into date, commit, and path.
-fn parse_archive_log(text: &str) -> Vec<(NaiveDate, String, String)> {
+/// Split a `git log -z --format=%cI %H --name-only` walk into date, commit,
+/// and path.
+///
+/// Under `-z` git ends each `<date> <id>` header with a NUL and a newline and
+/// each raw path with a NUL, so the walk reads
+/// `<date> <id>\0\n<path>\0<date> <id>\0\n<path>\0`. Each NUL-separated field
+/// loses one leading newline and decodes lossily: a header opens a record and
+/// any other field is a path of the current one. A path that is not valid
+/// UTF-8 thus names no object, so the batch-check pass drops its record and
+/// the records after it still count.
+fn parse_archive_log(output: &[u8]) -> Vec<(NaiveDate, String, String)> {
     let mut records = Vec::new();
     let mut current: Option<(NaiveDate, String)> = None;
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
+    for field in output.split(|byte| *byte == 0) {
+        let field = field.strip_prefix(b"\n").unwrap_or(field);
+        if field.is_empty() {
             continue;
         }
+        let field = String::from_utf8_lossy(field);
         // A commit id is 40 hex digits under SHA-1 and 64 under SHA-256.
-        if let Some((raw_date, hash)) = line.split_once(' ')
+        if let Some((raw_date, hash)) = field.split_once(' ')
             && let Some(day) = parse_iso_date(raw_date)
             && matches!(hash.len(), 40 | 64)
             && hash.chars().all(|ch| ch.is_ascii_hexdigit())
@@ -752,7 +770,7 @@ fn parse_archive_log(text: &str) -> Vec<(NaiveDate, String, String)> {
             continue;
         }
         if let Some((day, hash)) = &current {
-            records.push((*day, hash.clone(), line.to_string()));
+            records.push((*day, hash.clone(), field.into_owned()));
         }
     }
     records
@@ -909,8 +927,8 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HarvestError, TaskKind, git_dir_command, git_path, harvest_repository, parse_archive_log,
-        scrub_git_env,
+        HarvestError, ParsedTask, TaskKind, git_dir_command, git_path, harvest_repository,
+        parse_archive_log, scrub_git_env,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -1608,6 +1626,7 @@ mod tests {
             .arg(&repo)
             .args([
                 "log",
+                "-z",
                 "--follow",
                 "--diff-merges=first-parent",
                 "--name-only",
@@ -1625,7 +1644,7 @@ mod tests {
             .output()
             .expect("git log");
         assert!(walk.status.success(), "git log --follow must run");
-        let records = parse_archive_log(&String::from_utf8_lossy(&walk.stdout));
+        let records = parse_archive_log(&walk.stdout);
         assert!(
             records.iter().any(|(day, _, path)| {
                 path == "tasks/scope_live.md"
@@ -1943,5 +1962,173 @@ mod tests {
         );
         assert_eq!(task.leave_date, task.ship_date);
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Archive `rel` as `implemented` in a commit on 2026-05-10, rewrite it to
+    /// `finished` with `updated` 2026-06-01 in a commit on 2026-06-10, and
+    /// harvest the one task the repository then holds.
+    fn harvest_implemented_then_finished(name: &str, rel: &str) -> ParsedTask {
+        let repo = scratch(name);
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(&repo, rel, "2026-05-01", "2026-05-01", "implemented");
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive implemented"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(&repo, rel, "2026-05-01", "2026-06-01", "finished");
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "rename to finished"],
+            "2026-06-10T12:00:00+00:00",
+        );
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let _ = fs::remove_dir_all(&repo);
+        let [task]: [ParsedTask; 1] = tasks.try_into().expect("one task");
+        task
+    }
+
+    #[test]
+    fn harvest_dates_a_non_ascii_task_name_from_its_first_archive_commit() {
+        let rel = "tasks/archive/scope_über.md";
+        let task = harvest_implemented_then_finished("harvest_non_ascii_name", rel);
+        assert_eq!(task.path, rel);
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+    }
+
+    #[test]
+    fn harvest_dates_a_double_quoted_task_name_from_its_first_archive_commit() {
+        let rel = "tasks/archive/scope_\"quoted\".md";
+        let task = harvest_implemented_then_finished("harvest_quoted_name", rel);
+        assert_eq!(task.path, rel);
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+    }
+
+    #[test]
+    fn harvest_dates_nested_folders_named_with_a_non_ascii_character_or_a_double_quote() {
+        // Neither folder has its own `.git`, so the walk runs in the enclosing
+        // repository and strips the raw folder prefix from each walk path.
+        let parent = scratch("harvest_nested_raw_names");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        let folders = ["nästed", "fo\"lder"];
+        for folder in folders {
+            write_task_dated(
+                &parent,
+                &format!("{folder}/tasks/archive/scope_nested.md"),
+                "2026-05-01",
+                "2026-05-01",
+                "finished",
+            );
+        }
+        git(&parent, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "archive nested"],
+            "2026-05-10T12:00:00+00:00",
+        );
+
+        for folder in folders {
+            let tasks = harvest_repository(&parent.join(folder))
+                .unwrap_or_else(|error| panic!("{folder}: {error}"));
+            let task = tasks.first().expect("task");
+            assert_eq!(task.kind, TaskKind::Finished, "{folder}");
+            assert_eq!(
+                task.ship_date,
+                Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day")),
+                "{folder}"
+            );
+            assert_eq!(task.leave_date, task.ship_date, "{folder}");
+        }
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_skips_a_walk_record_whose_path_holds_a_newline() {
+        // The rename commit's path would split its `cat-file` expression over
+        // two lines and shift the first archive commit's answer off its record.
+        let repo = scratch("harvest_newline_path");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::write(
+            repo.join("tasks/archive/scope_a.md"),
+            task_with_body("2026-05-01", "implemented"),
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive implemented"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        let renamed = "tasks/archive/scope_a\nb.md";
+        fs::rename(repo.join("tasks/archive/scope_a.md"), repo.join(renamed)).expect("rename");
+        fs::write(repo.join(renamed), task_with_body("2026-06-01", "finished")).expect("finish");
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "rename with a newline"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.path, renamed);
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_walk_parser_keeps_the_record_after_a_path_that_is_not_utf8() {
+        let first = "a".repeat(40);
+        let second = "b".repeat(40);
+        let mut output = Vec::new();
+        output.extend_from_slice(format!("2026-05-10T12:00:00+00:00 {first}\0\n").as_bytes());
+        output.extend_from_slice(b"tasks/archive/scope_\xff.md\0");
+        output.extend_from_slice(format!("2026-06-10T12:00:00+00:00 {second}\0\n").as_bytes());
+        output.extend_from_slice(b"tasks/archive/scope_valid.md\0");
+
+        let records = parse_archive_log(&output);
+        // The invalid byte decodes lossily, so that path names no object.
+        assert_eq!(
+            records.first().map(|(_, _, path)| path.as_str()),
+            Some("tasks/archive/scope_\u{FFFD}.md")
+        );
+        assert_eq!(
+            records.get(1),
+            Some(&(
+                NaiveDate::from_ymd_opt(2026, 6, 10).expect("day"),
+                second,
+                "tasks/archive/scope_valid.md".to_string()
+            ))
+        );
     }
 }
