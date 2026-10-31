@@ -127,10 +127,6 @@ install_macos() {
     local macos_dir="$contents/MacOS"
     local resources_dir="$contents/Resources"
     local launcher_bin="$macos_dir/task-viewer-launcher"
-    local native_arch="x86_64"
-    if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
-        native_arch="arm64"
-    fi
 
     echo "Installing Task Viewer.app for the Mac Dock..."
     echo "Project directory: $PROJECT_DIR"
@@ -168,10 +164,6 @@ EOF
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
-    <key>LSArchitecturePriority</key>
-    <array>
-        <string>$native_arch</string>
-    </array>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>

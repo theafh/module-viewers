@@ -408,54 +408,18 @@ async fn scan_core(
             tracing::error!("a scan worker stopped");
             continue;
         };
-        match outcome {
-            Ok(Ok(tasks)) => {
-                if let Err(error) = db::replace_tasks(pool, repository_id, &tasks).await {
-                    tracing::error!(%error, repository_id, "replace failed");
-                    let _ = db::set_scan_error(
-                        pool,
-                        repository_id,
-                        "The parsed rows could not be saved.",
-                    )
-                    .await;
-                }
-            }
-            Ok(Err(HarvestError::MissingTasks)) => {
-                let _ =
-                    db::set_scan_error(pool, repository_id, "That folder has no tasks directory.")
-                        .await;
-            }
-            Ok(Err(HarvestError::Git(reason))) => {
-                tracing::error!(%reason, repository_id, "git could not read the history");
-                let _ = db::set_scan_error(
-                    pool,
-                    repository_id,
-                    "Git could not read the history, so the rows were left as they were.",
-                )
-                .await;
-            }
-            Ok(Err(HarvestError::Io(error))) => {
-                tracing::error!(%error, repository_id, "scan failed");
-                let _ = db::set_scan_error(
-                    pool,
-                    repository_id,
-                    "The scan could not read the repository.",
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::error!(%error, repository_id, "scan task stopped");
-                let _ =
-                    db::set_scan_error(pool, repository_id, "The scan stopped before it finished.")
-                        .await;
-            }
-        }
+        store_outcome(pool, repository_id, outcome).await;
     }
 }
 
-async fn refresh_one(pool: &sqlx::SqlitePool, repository_id: i64, path: &std::path::Path) {
-    let owned = path.to_path_buf();
-    match tokio::task::spawn_blocking(move || harvest::harvest_repository(&owned)).await {
+/// Record one harvest outcome, whether it arrived through the parallel join loop
+/// or a single repository refresh, so both paths report the same messages.
+async fn store_outcome(
+    pool: &sqlx::SqlitePool,
+    repository_id: i64,
+    outcome: Result<Result<Vec<ParsedTask>, HarvestError>, tokio::task::JoinError>,
+) {
+    match outcome {
         Ok(Ok(tasks)) => {
             if let Err(error) = db::replace_tasks(pool, repository_id, &tasks).await {
                 tracing::error!(%error, repository_id, "replace failed");
@@ -492,6 +456,12 @@ async fn refresh_one(pool: &sqlx::SqlitePool, repository_id: i64, path: &std::pa
                 .await;
         }
     }
+}
+
+async fn refresh_one(pool: &sqlx::SqlitePool, repository_id: i64, path: &std::path::Path) {
+    let owned = path.to_path_buf();
+    let outcome = tokio::task::spawn_blocking(move || harvest::harvest_repository(&owned)).await;
+    store_outcome(pool, repository_id, outcome).await;
 }
 
 fn pick_folder() -> Result<Option<PathBuf>, &'static str> {
