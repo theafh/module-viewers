@@ -8,34 +8,62 @@ use axum::{
 };
 use serde::Deserialize;
 use serde::Serialize;
+use std::num::IntErrorKind;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use tera::{Context, Tera};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::db::{self, Repository};
-use crate::harvest::{self, HarvestError};
+use crate::harvest::{self, HarvestError, ParsedTask};
 use crate::series::{self, RadarMode};
 
 pub const PORT: u16 = 7880;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const DEFAULT_SCAN_WORKERS: usize = 4;
+pub const MAX_SCAN_WORKERS: usize = 32;
+
+/// Turn `TASK_VIEWER_SCAN_WORKERS` into the number of repositories Update
+/// harvests at once. Unset, zero, negative, and non-numeric values fall back
+/// to the default; a value above the maximum is clamped.
+pub fn scan_worker_cap(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return DEFAULT_SCAN_WORKERS;
+    };
+    match raw.trim().parse::<i64>() {
+        Ok(value) if (1..=MAX_SCAN_WORKERS as i64).contains(&value) => value as usize,
+        Ok(value) if value > MAX_SCAN_WORKERS as i64 => MAX_SCAN_WORKERS,
+        Err(error) if *error.kind() == IntErrorKind::PosOverflow => MAX_SCAN_WORKERS,
+        _ => {
+            tracing::warn!(
+                value = %raw,
+                "TASK_VIEWER_SCAN_WORKERS is not a usable worker count; using the default"
+            );
+            DEFAULT_SCAN_WORKERS
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pool: sqlx::SqlitePool,
     templates: Arc<Tera>,
     scan: Arc<Mutex<()>>,
+    scan_workers: usize,
 }
 
 impl AppState {
     pub fn new(pool: sqlx::SqlitePool, templates: Tera) -> Self {
+        let raw = std::env::var("TASK_VIEWER_SCAN_WORKERS").ok();
         Self {
             pool,
             templates: Arc::new(templates),
             scan: Arc::new(Mutex::new(())),
+            scan_workers: scan_worker_cap(raw.as_deref()),
         }
     }
 }
@@ -340,15 +368,89 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
             return redirect(&project, "error", "The repository list could not be read.");
         }
     };
-    for repo in repositories {
-        refresh_one(
-            &state.pool,
-            repo.repository_id,
-            PathBuf::from(&repo.path).as_path(),
-        )
-        .await;
-    }
+    scan_core(
+        &state.pool,
+        &repositories,
+        state.scan_workers,
+        Arc::new(harvest::harvest_repository),
+    )
+    .await;
     redirect(&project, "notice", "Charts updated.")
+}
+
+type HarvestFn = dyn Fn(&std::path::Path) -> Result<Vec<ParsedTask>, HarvestError> + Send + Sync;
+
+/// Harvest the repositories up to `cap` at once, then store each finished
+/// result one repository at a time so no two writes overlap on SQLite.
+async fn scan_core(
+    pool: &sqlx::SqlitePool,
+    repositories: &[Repository],
+    cap: usize,
+    harvest: Arc<HarvestFn>,
+) {
+    let permits = Arc::new(Semaphore::new(cap.max(1)));
+    let mut harvests = JoinSet::new();
+    for repository in repositories {
+        let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+            continue;
+        };
+        let harvest = Arc::clone(&harvest);
+        let repository_id = repository.repository_id;
+        let path = PathBuf::from(&repository.path);
+        harvests.spawn(async move {
+            let _permit = permit;
+            let outcome = tokio::task::spawn_blocking(move || harvest(&path)).await;
+            (repository_id, outcome)
+        });
+    }
+    while let Some(finished) = harvests.join_next().await {
+        let Ok((repository_id, outcome)) = finished else {
+            tracing::error!("a scan worker stopped");
+            continue;
+        };
+        match outcome {
+            Ok(Ok(tasks)) => {
+                if let Err(error) = db::replace_tasks(pool, repository_id, &tasks).await {
+                    tracing::error!(%error, repository_id, "replace failed");
+                    let _ = db::set_scan_error(
+                        pool,
+                        repository_id,
+                        "The parsed rows could not be saved.",
+                    )
+                    .await;
+                }
+            }
+            Ok(Err(HarvestError::MissingTasks)) => {
+                let _ =
+                    db::set_scan_error(pool, repository_id, "That folder has no tasks directory.")
+                        .await;
+            }
+            Ok(Err(HarvestError::Git(reason))) => {
+                tracing::error!(%reason, repository_id, "git could not read the history");
+                let _ = db::set_scan_error(
+                    pool,
+                    repository_id,
+                    "Git could not read the history, so the rows were left as they were.",
+                )
+                .await;
+            }
+            Ok(Err(HarvestError::Io(error))) => {
+                tracing::error!(%error, repository_id, "scan failed");
+                let _ = db::set_scan_error(
+                    pool,
+                    repository_id,
+                    "The scan could not read the repository.",
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::error!(%error, repository_id, "scan task stopped");
+                let _ =
+                    db::set_scan_error(pool, repository_id, "The scan stopped before it finished.")
+                        .await;
+            }
+        }
+    }
 }
 
 async fn refresh_one(pool: &sqlx::SqlitePool, repository_id: i64, path: &std::path::Path) {
@@ -484,7 +586,37 @@ fn encode_query(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_local_host;
+    use super::{HarvestFn, is_local_host, scan_core, scan_worker_cap};
+    use crate::db;
+    use crate::harvest;
+    use crate::test_support::unique_temp_dir;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn temp_database(name: &str) -> PathBuf {
+        let dir = unique_temp_dir(name);
+        std::fs::create_dir_all(&dir).expect("db scratch");
+        dir.join("test.db")
+    }
+
+    fn live_repository(name: &str) -> PathBuf {
+        let repo = unique_temp_dir(name);
+        std::fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        std::fs::write(
+            repo.join("tasks/scope_live.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Live\n",
+        )
+        .expect("task");
+        repo
+    }
+
+    fn cleanup(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
 
     #[test]
     fn web_accepts_only_the_loopback_host() {
@@ -496,5 +628,154 @@ mod tests {
         assert!(!is_local_host("example.com"));
         assert!(!is_local_host("127.0.0.1:80"));
         assert!(!is_local_host("localhost:80"));
+    }
+
+    #[test]
+    fn web_parses_the_scan_worker_cap() {
+        assert_eq!(scan_worker_cap(None), 4);
+        assert_eq!(scan_worker_cap(Some("3")), 3);
+        assert_eq!(scan_worker_cap(Some("0")), 4);
+        assert_eq!(scan_worker_cap(Some("many")), 4);
+        assert_eq!(scan_worker_cap(Some("300")), 32);
+        assert_eq!(scan_worker_cap(Some("99999999999999999999")), 32);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_runs_harvests_up_to_the_cap() {
+        let path = temp_database("scan_parallel");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        for index in 0..4 {
+            let repo = unique_temp_dir("scan_parallel_repo");
+            db::insert_repository(&pool, &format!("repo{index}"), &repo.to_string_lossy())
+                .await
+                .expect("insert");
+        }
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let harvest: Arc<HarvestFn> = {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            Arc::new(move |_: &Path| {
+                let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(running, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+        };
+        scan_core(&pool, &repositories, 2, harvest).await;
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_stores_rows_for_every_repository() {
+        let path = temp_database("scan_store_all");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let mut folders = Vec::new();
+        for index in 0..3 {
+            let repo = live_repository(&format!("scan_store_{index}"));
+            db::insert_repository(&pool, &format!("repo{index}"), &repo.to_string_lossy())
+                .await
+                .expect("insert");
+            folders.push(repo);
+        }
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        scan_core(
+            &pool,
+            &repositories,
+            2,
+            Arc::new(harvest::harvest_repository),
+        )
+        .await;
+        let after = db::list_repositories(&pool).await.expect("after");
+        for repository in &after {
+            assert!(repository.last_error.is_none());
+            assert!(repository.scanned_at.is_some());
+            let rows = db::load_tasks(&pool, Some(repository.repository_id))
+                .await
+                .expect("rows");
+            assert_eq!(rows.len(), 1);
+        }
+        for folder in folders {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_keeps_earlier_rows_when_tasks_is_missing() {
+        let path = temp_database("scan_missing");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let missing = unique_temp_dir("scan_missing_repo");
+        std::fs::create_dir_all(&missing).expect("missing folder");
+        let missing_id = db::insert_repository(&pool, "missing", &missing.to_string_lossy())
+            .await
+            .expect("insert");
+        sqlx::query(
+            "INSERT INTO tasks
+                (repository_id, path, scope, kind, created, updated, ship_date, leave_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(missing_id)
+        .bind("tasks/scope_old.md")
+        .bind("scope")
+        .bind("live")
+        .bind("2026-05-01")
+        .bind("2026-05-01")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("earlier rows");
+        let mut folders = Vec::new();
+        for index in 0..2 {
+            let repo = live_repository(&format!("scan_missing_live_{index}"));
+            db::insert_repository(&pool, &format!("repo{index}"), &repo.to_string_lossy())
+                .await
+                .expect("insert");
+            folders.push(repo);
+        }
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        scan_core(
+            &pool,
+            &repositories,
+            2,
+            Arc::new(harvest::harvest_repository),
+        )
+        .await;
+        let after = db::list_repositories(&pool).await.expect("after");
+        let missing_after = after
+            .iter()
+            .find(|repository| repository.repository_id == missing_id)
+            .expect("missing repository");
+        assert_eq!(
+            missing_after.last_error.as_deref(),
+            Some("That folder has no tasks directory.")
+        );
+        let rows = db::load_tasks(&pool, Some(missing_id))
+            .await
+            .expect("earlier rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope, "scope");
+        for repository in after
+            .iter()
+            .filter(|repository| repository.repository_id != missing_id)
+        {
+            assert!(repository.last_error.is_none());
+            let rows = db::load_tasks(&pool, Some(repository.repository_id))
+                .await
+                .expect("rows");
+            assert_eq!(rows.len(), 1);
+        }
+        for folder in folders {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+        let _ = std::fs::remove_dir_all(missing);
+        cleanup(&path);
     }
 }

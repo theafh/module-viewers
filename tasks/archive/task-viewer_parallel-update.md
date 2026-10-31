@@ -2,9 +2,11 @@
 description: "Run Update's per-repository harvests in parallel, capped by TASK_VIEWER_SCAN_WORKERS (default 4), while database writes stay one repository at a time."
 scope: task-viewer
 created: 2026-10-24T16:47:55
-updated: 2026-10-30T23:41:07
-status: ready
+updated: 2026-10-31T15:41:09
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Parallel Update with a configurable worker cap

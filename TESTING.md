@@ -23,6 +23,7 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 - Harvest ref: a task archived on a branch that is not checked out still counts and keeps that commit's ship day; a task archived on one branch while the checked-out branch holds it live counts once, as the checked-out version; an uncommitted archive counts and falls back to the frontmatter `updated` day.
 - Series: same-week create and ship both count, deferred tasks age until leave and never ship, all-projects radars count by repository, and a single project counts by scope.
 - Database: insert, replace rows, keep rows when a scan error is recorded, and delete a repository with its rows.
+- Scan: the worker cap parses unset, in-range, zero, non-numeric, and above-maximum values; Update harvests up to the cap at once, stores every repository's rows, and keeps an earlier store with the missing-tasks error when a folder has no `tasks/` directory.
 - Host check: loopback names are accepted with or without port 7880.
 
 ## Running the Suite
