@@ -153,7 +153,7 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
     }
     // Read the committed versions in one `git cat-file` process.
     let blobs: Vec<String> = chosen.iter().filter_map(|(_, blob)| blob.clone()).collect();
-    let mut contents = read_blobs(repo, dir, &blobs)?.into_iter();
+    let mut contents = read_blobs(repo, Some(dir), &blobs)?.into_iter();
     let mut files = Vec::new();
     for (path, blob) in chosen {
         let text = match blob {
@@ -334,19 +334,20 @@ fn markdown_blobs(listing: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// Read many blobs in one `git cat-file` process, in the order they are given.
-fn read_blobs(repo: &Path, dir: &Path, blobs: &[String]) -> Result<Vec<String>, HarvestError> {
-    let mut command = Command::new(git_bin());
+fn read_blobs(
+    repo: &Path,
+    dir: Option<&Path>,
+    blobs: &[String],
+) -> Result<Vec<String>, HarvestError> {
+    if blobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut command = cat_file_command(repo, dir);
     command
-        .current_dir(repo)
-        .arg("--git-dir")
-        .arg(dir)
-        .arg("--work-tree")
-        .arg(repo)
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    scrub_git_env(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| HarvestError::Git(format!("git did not start: {error}")))?;
@@ -378,6 +379,80 @@ fn read_blobs(repo: &Path, dir: &Path, blobs: &[String]) -> Result<Vec<String>, 
         }));
     }
     parse_batch(&output.stdout, blobs.len())
+}
+
+/// The indexes of expressions that name an object present in the repository.
+fn existing_object_indices(
+    repo: &Path,
+    dir: Option<&Path>,
+    exprs: &[String],
+) -> Result<Vec<usize>, HarvestError> {
+    if exprs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut command = cat_file_command(repo, dir);
+    command
+        .args(["cat-file", "--batch-check"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| HarvestError::Git(format!("git did not start: {error}")))?;
+    let input = format!("{}\n", exprs.join("\n"));
+    let writer = child.stdin.take().map(|mut stdin| {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(input.as_bytes());
+        })
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|error| HarvestError::Git(format!("git did not finish: {error}")))?;
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().find(|line| !line.trim().is_empty());
+        return Err(HarvestError::Git(match first {
+            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
+            None => format!("git exited with {}", output.status),
+        }));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut indices = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if index >= exprs.len() {
+            break;
+        }
+        // A missing object prints `<expr> missing`; a present one prints its
+        // type and size. Skip the missing ones before feeding the batch.
+        if !line.ends_with(" missing") {
+            indices.push(index);
+        }
+    }
+    Ok(indices)
+}
+
+/// Build a `git cat-file` command routed the same way as the other lookups.
+fn cat_file_command(repo: &Path, dir: Option<&Path>) -> Command {
+    let mut command = Command::new(git_bin());
+    match dir {
+        Some(dir) => {
+            command
+                .current_dir(repo)
+                .arg("--git-dir")
+                .arg(dir)
+                .arg("--work-tree")
+                .arg(repo);
+        }
+        None => {
+            command.arg("-C").arg(repo);
+        }
+    }
+    scrub_git_env(&mut command);
+    command
 }
 
 fn parse_batch(output: &[u8], expected: usize) -> Result<Vec<String>, HarvestError> {
@@ -543,11 +618,171 @@ fn scrub_git_env(command: &mut Command) {
 type LeaveDays = Vec<(usize, Option<NaiveDate>)>;
 
 fn leave_dates(repo: &Path, jobs: &[(usize, String, String)]) -> Result<LeaveDays, String> {
+    let prefix = if jobs.iter().any(|(_, _, status)| status == "finished") {
+        folder_prefix(repo)
+    } else {
+        String::new()
+    };
     // Sequential on purpose. Parallel git log --follow across hundreds of
     // archive files exhausted process slots and aborted Update.
     jobs.iter()
-        .map(|(index, rel, status)| Ok((*index, first_status_commit_date(repo, rel, status)?)))
+        .map(|(index, rel, status)| {
+            let day = if status == "finished" {
+                first_archived_commit_date(repo, rel, &prefix)?
+            } else {
+                first_status_commit_date(repo, rel, status)?
+            };
+            Ok((*index, day))
+        })
         .collect()
+}
+
+/// The committer day of the earliest commit that archives a finished task.
+///
+/// A finished task counts from the commit whose path lies under `archive` and
+/// whose content carries `status: finished` or `status: implemented`, so a
+/// later bulk rename of `implemented` to `finished` does not move its ship day.
+/// `prefix` is the folder's place inside the repository that holds it, so only
+/// an `archive` directory inside the folder counts.
+fn first_archived_commit_date(
+    repo: &Path,
+    rel: &str,
+    prefix: &str,
+) -> Result<Option<NaiveDate>, String> {
+    let dir = git_dir(repo);
+    let mut first_failure = None;
+    if let Some(dir) = &dir {
+        match archived_leave_lookup(repo, rel, Some(dir), prefix) {
+            Ok(Some(day)) => return Ok(Some(day)),
+            Ok(None) => return Ok(None),
+            Err(reason) => first_failure = Some(reason),
+        }
+    }
+    match archived_leave_lookup(repo, rel, None, prefix) {
+        Ok(Some(day)) => Ok(Some(day)),
+        Ok(None) => Ok(None),
+        Err(reason) if dir.is_some() => Err(first_failure.unwrap_or(reason)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn archived_leave_lookup(
+    repo: &Path,
+    rel: &str,
+    dir: Option<&Path>,
+    prefix: &str,
+) -> Result<Option<NaiveDate>, String> {
+    let mut command = match dir {
+        Some(dir) => git_dir_command(repo, dir),
+        None => {
+            let mut command = Command::new(git_bin());
+            command.arg("-C").arg(repo);
+            command
+        }
+    };
+    scrub_git_env(&mut command);
+    let output = command
+        .args([
+            "log",
+            "--follow",
+            "--diff-merges=first-parent",
+            "--name-only",
+            "--format=%cI %H",
+            "--all",
+            "--",
+            rel,
+        ])
+        .output()
+        .map_err(|error| format!("git did not start: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().find(|line| !line.trim().is_empty());
+        return Err(match first {
+            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
+            None => format!("git exited with {}", output.status),
+        });
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| "git printed output that is not UTF-8".to_string())?;
+    let records = parse_archive_log(&text);
+    let mut exprs = Vec::new();
+    let mut days = Vec::new();
+    for (day, commit, path) in records {
+        // `--name-only` names paths from the repository root. A path outside
+        // this folder belongs to no archive of it.
+        if !path.strip_prefix(prefix).is_some_and(is_archived_path) {
+            continue;
+        }
+        exprs.push(format!("{commit}:{path}"));
+        days.push(day);
+    }
+    let indices = existing_object_indices(repo, dir, &exprs).map_err(|error| error.to_string())?;
+    let blobs: Vec<String> = indices.iter().map(|&index| exprs[index].clone()).collect();
+    let contents = read_blobs(repo, dir, &blobs).map_err(|error| error.to_string())?;
+    let mut earliest: Option<NaiveDate> = None;
+    for (index, text) in indices.iter().zip(contents) {
+        if !has_archived_status(&text) {
+            continue;
+        }
+        let day = days[*index];
+        earliest = Some(match earliest {
+            Some(current) => current.min(day),
+            None => day,
+        });
+    }
+    Ok(earliest)
+}
+
+/// Split a `--format=%cI %H --name-only` walk into date, commit, and path.
+fn parse_archive_log(text: &str) -> Vec<(NaiveDate, String, String)> {
+    let mut records = Vec::new();
+    let mut current: Option<(NaiveDate, String)> = None;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        // A commit id is 40 hex digits under SHA-1 and 64 under SHA-256.
+        if let Some((raw_date, hash)) = line.split_once(' ')
+            && let Some(day) = parse_iso_date(raw_date)
+            && matches!(hash.len(), 40 | 64)
+            && hash.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            current = Some((day, hash.to_string()));
+            continue;
+        }
+        if let Some((day, hash)) = &current {
+            records.push((*day, hash.clone(), line.to_string()));
+        }
+    }
+    records
+}
+
+/// The folder's path inside the repository that holds it, ending in `/`, or
+/// empty when the folder is that repository's root or lies outside git.
+fn folder_prefix(repo: &Path) -> String {
+    if git_dir(repo).is_some() {
+        return String::new();
+    }
+    let mut command = Command::new(git_bin());
+    command.arg("-C").arg(repo);
+    scrub_git_env(&mut command);
+    match command.args(["rev-parse", "--show-prefix"]).output() {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn is_archived_path(path: &str) -> bool {
+    path.split('/').any(|part| part == "archive")
+}
+
+fn has_archived_status(text: &str) -> bool {
+    frontmatter(text)
+        .and_then(|fields| fields.get("status").cloned())
+        .is_some_and(|status| status == "finished" || status == "implemented")
 }
 
 fn first_status_commit_date(
@@ -674,7 +909,8 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HarvestError, TaskKind, git_dir_command, git_path, harvest_repository, scrub_git_env,
+        HarvestError, TaskKind, git_dir_command, git_path, harvest_repository, parse_archive_log,
+        scrub_git_env,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -938,6 +1174,7 @@ mod tests {
             task.ship_date,
             Some(NaiveDate::from_ymd_opt(2026, 8, 4).expect("day"))
         );
+        assert_eq!(task.leave_date, task.ship_date);
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -1035,6 +1272,10 @@ mod tests {
     }
 
     fn write_task(repo: &Path, rel: &str, created: &str, status: &str) {
+        write_task_dated(repo, rel, created, created, status);
+    }
+
+    fn write_task_dated(repo: &Path, rel: &str, created: &str, updated: &str, status: &str) {
         let path = repo.join(rel);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("parent");
@@ -1042,7 +1283,7 @@ mod tests {
         fs::write(
             path,
             format!(
-                "---\ncreated: {created}T10:00:00\nupdated: {created}T10:00:00\nstatus: {status}\n---\n\n# Task\n"
+                "---\ncreated: {created}T10:00:00\nupdated: {updated}T10:00:00\nstatus: {status}\n---\n\n# Task\n"
             ),
         )
         .expect("write task");
@@ -1213,6 +1454,494 @@ mod tests {
         let tasks = harvest_repository(&repo).expect("harvest");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].path, "tasks/scope_master.md");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_an_archived_implemented_task_from_its_first_archive_commit() {
+        let repo = scratch("harvest_archived_implemented");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_old.md",
+            "2026-05-01",
+            "2026-05-01",
+            "implemented",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive implemented"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_old.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "rename to finished"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_an_archived_status_without_a_space_after_the_colon() {
+        let repo = scratch("harvest_archived_tight_status");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("tasks");
+        fs::write(
+            repo.join("tasks/archive/scope_tight.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus:finished\n---\n\n# Task\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive tight status"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_tight.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "add the space"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// A task whose body outweighs the two frontmatter lines an archive commit
+    /// changes, so git pairs the move with the live path and `--follow` reaches
+    /// the live commit.
+    fn task_with_body(updated: &str, status: &str) -> String {
+        format!(
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: {updated}T10:00:00\nstatus: {status}\n---\n\n\
+             # Live\n\n\
+             ## Goal\n\nShip the task once it has been implemented while still live.\n\n\
+             ## Context\n\nThe task is implemented in the live tasks folder before anyone archives it.\n\n\
+             ## Approach\n\nMove the file into the archive folder when the work is finished.\n\n\
+             ## Acceptance\n\n- [ ] The ship day is the day the task reaches the archive folder.\n"
+        )
+    }
+
+    #[test]
+    fn harvest_dates_a_task_archived_after_being_implemented_live() {
+        let repo = scratch("harvest_live_implemented");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        // Only the archived-path filter keeps the live commit `--follow`
+        // reaches from becoming the ship day.
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_live.md"),
+            task_with_body("2026-05-01", "implemented"),
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "implement live"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::rename(
+            repo.join("tasks/scope_live.md"),
+            repo.join("tasks/archive/scope_live.md"),
+        )
+        .expect("archive");
+        fs::write(
+            repo.join("tasks/archive/scope_live.md"),
+            task_with_body("2026-06-01", "finished"),
+        )
+        .expect("finish");
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive finished"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        // The walk harvest runs must list the live-phase commit, or this test
+        // cannot tell a working archived-path filter from a missing one.
+        let walk = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "log",
+                "--follow",
+                "--diff-merges=first-parent",
+                "--name-only",
+                "--format=%cI %H",
+                "--all",
+                "--",
+                "tasks/archive/scope_live.md",
+            ])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("git log");
+        assert!(walk.status.success(), "git log --follow must run");
+        let records = parse_archive_log(&String::from_utf8_lossy(&walk.stdout));
+        assert!(
+            records.iter().any(|(day, _, path)| {
+                path == "tasks/scope_live.md"
+                    && *day == NaiveDate::from_ymd_opt(2026, 5, 10).expect("day")
+            }),
+            "--follow must reach the live implemented commit: {records:?}"
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_path_only_archive_move() {
+        let repo = scratch("harvest_path_only_move");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/scope_move.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "finish live"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::rename(
+            repo.join("tasks/scope_move.md"),
+            repo.join("tasks/archive/scope_move.md"),
+        )
+        .expect("move");
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "move to archive"],
+            "2026-06-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_move.md",
+            "2026-05-01",
+            "2026-07-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-07-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "bump updated"],
+            "2026-07-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_ignores_missing_archived_objects_and_keeps_the_first_day() {
+        let repo = scratch("harvest_deleted_restored");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_gone.md",
+            "2026-05-01",
+            "2026-05-01",
+            "implemented",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive implemented"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        fs::remove_file(repo.join("tasks/archive/scope_gone.md")).expect("delete");
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "delete"],
+            "2026-06-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_gone.md",
+            "2026-05-01",
+            "2026-07-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-07-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "restore finished"],
+            "2026-07-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+
+        let repo = scratch("harvest_deleted_branch");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_branch.md",
+            "2026-05-01",
+            "2026-05-01",
+            "implemented",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive implemented"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "side"],
+            "2026-05-11T12:00:00+00:00",
+        );
+        fs::remove_file(repo.join("tasks/archive/scope_branch.md")).expect("delete on branch");
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "delete on side"],
+            "2026-06-10T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-06-11T12:00:00+00:00");
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_branch.md",
+            "2026-05-01",
+            "2026-07-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-07-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "rename to finished"],
+            "2026-07-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_nested_folder_from_the_enclosing_repository() {
+        let parent = scratch("harvest_nested_parent");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "nested/tasks/archive/scope_nested.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        git(&parent, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "archive nested"],
+            "2026-05-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&parent.join("nested")).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_ignores_an_archive_directory_above_a_nested_folder() {
+        let parent = scratch("harvest_archive_above_nested");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        // The configured folder itself sits under a directory named
+        // `archive`, so the live-phase path holds that name too.
+        let folder = parent.join("archive/nested");
+        fs::create_dir_all(folder.join("tasks")).expect("tasks");
+        fs::write(
+            folder.join("tasks/scope_above.md"),
+            task_with_body("2026-05-01", "implemented"),
+        )
+        .expect("write");
+        git(&parent, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "implement live"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        fs::create_dir_all(folder.join("tasks/archive")).expect("archive");
+        fs::rename(
+            folder.join("tasks/scope_above.md"),
+            folder.join("tasks/archive/scope_above.md"),
+        )
+        .expect("archive");
+        fs::write(
+            folder.join("tasks/archive/scope_above.md"),
+            task_with_body("2026-06-01", "finished"),
+        )
+        .expect("finish");
+        git(&parent, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "archive finished"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&folder).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_dates_an_archived_task_in_a_sha256_repository() {
+        let repo = scratch("harvest_sha256");
+        git(
+            &repo,
+            &[
+                "init",
+                "-b",
+                "main",
+                "--template=",
+                "--object-format=sha256",
+            ],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_wide.md",
+            "2026-05-01",
+            "2026-05-01",
+            "implemented",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive implemented"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_wide.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "rename to finished"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
         let _ = fs::remove_dir_all(&repo);
     }
 }

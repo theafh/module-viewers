@@ -2,8 +2,8 @@
 description: "Run Update's per-repository harvests in parallel, capped by TASK_VIEWER_SCAN_WORKERS (default 4), while database writes stay one repository at a time."
 scope: task-viewer
 created: 2026-10-24T16:47:55
-updated: 2026-10-24T16:47:55
-status: open
+updated: 2026-10-30T23:41:07
+status: ready
 reported-by: Andreas Hoffmann
 ---
 
@@ -24,12 +24,12 @@ Make Update scan several configured repositories at once, with no more than a co
 
 ## Approach
 
-1. Add a pure function that turns the optional raw value of `TASK_VIEWER_SCAN_WORKERS` into the worker cap. An unset variable gives 4. A whole number of 1 or more gives that number. `0`, a negative value, or text that is not a number gives 4 and logs a `tracing::warn!` that names the rejected value. Read the variable once at startup and keep the cap in `AppState`.
-2. Split the scan into two phases in `web.rs`. The harvest phase starts one `spawn_blocking` harvest per repository, gated by a `tokio::sync::Semaphore` with as many permits as the cap and collected in a `tokio::task::JoinSet`. The store phase is the single loop that takes each finished result from the `JoinSet` and writes it with the same `replace_tasks` / `set_scan_error` outcomes and messages `refresh_one` uses today. Because only that loop writes, at most one write is in flight at any time.
-3. Put the scan core in a function that takes the pool, the repository list, the cap and the harvest function as parameters. `scan_all` passes `harvest::harvest_repository`, and the tests pass an instrumented stand-in. Keep the scan lock in `scan_all` as it is.
+1. Add a pure function that turns the optional raw value of `TASK_VIEWER_SCAN_WORKERS` into the worker cap. An unset variable gives 4. A whole number from 1 to `MAX_SCAN_WORKERS` gives that number. A whole number above `MAX_SCAN_WORKERS` gives `MAX_SCAN_WORKERS`. `MAX_SCAN_WORKERS` is 32, which keeps the concurrent `git` subprocess count far below the hundreds that once exhausted process slots while leaving headroom over the default of 4. `0`, a negative value, or text that is not a number gives 4 and logs a `tracing::warn!` that names the rejected value. Read the variable once at startup and keep the cap in `AppState`.
+2. Split the scan into two phases in `web.rs`. The harvest phase starts one `spawn_blocking` harvest per repository, gated by a `tokio::sync::Semaphore` with as many permits as the cap and collected in a `tokio::task::JoinSet`. The permit is acquired before `spawn_blocking` is called, so the blocking threads and the `git` subprocesses in flight are bounded by the cap. The store phase is the single loop that takes each finished result from the `JoinSet` and writes it with the same `replace_tasks` / `set_scan_error` outcomes and messages `refresh_one` uses today. Because only that loop writes, at most one write is in flight at any time.
+3. Put the scan core in a function that takes the pool, the repository list, the cap and the harvest function as parameters. `scan_all` calls the scan core once with the whole repository list from `db::list_repositories`, `harvest::harvest_repository` and the cap, and the tests pass an instrumented stand-in. Keep the scan lock in `scan_all` as it is.
 4. Rewrite the passages that describe Update in place:
    - In `ARCHITECTURE.md`, the `web.rs` paragraph states that Update harvests up to the cap at once and stores results one repository at a time. The sentence introducing `TASK_VIEWER_DB` gains `TASK_VIEWER_SCAN_WORKERS` with its default.
-   - In `FEATURES.md`, the Repositories bullet "Update on Dashboard scans every configured repository and replaces the parsed rows that still read cleanly." becomes a statement that Update scans up to `TASK_VIEWER_SCAN_WORKERS` repositories at once (default 4).
+   - In `FEATURES.md`, the first sentence of the Repositories bullet, "Update on Dashboard scans every configured repository and replaces the parsed rows that still read cleanly.", is rewritten in place as "Update scans every configured repository, up to `TASK_VIEWER_SCAN_WORKERS` at once (default 4), and replaces the parsed rows that still read cleanly."
    - `README.md` gains one line naming the variable and its default next to the run instructions.
    - The `What Must Be Covered` list in `TESTING.md` gains the scan behaviours that Acceptance proves.
 
@@ -40,9 +40,11 @@ Make Update scan several configured repositories at once, with no more than a co
 
 ## Acceptance
 
-- [ ] A unit test of the cap function covers four inputs: unset gives 4, `"3"` gives 3, `"0"` gives 4, and `"many"` gives 4.
+- [ ] A unit test of the cap function covers five inputs: unset gives 4, `"3"` gives 3, `"0"` gives 4, `"many"` gives 4, and `"300"` gives 32.
 - [ ] A test runs the scan core with a cap of 2 over four repositories and a stand-in harvest that blocks for a fixed interval and records how many harvests are running at once. The recorded maximum never exceeds 2 and reaches 2.
 - [ ] A test runs the scan core with a cap of 2 over at least three temporary repositories built with `unique_temp_dir`. Afterwards every repository's rows are stored and none has a scan error.
-- [ ] `rg 'replace_tasks|set_scan_error' task-viewer/src/web.rs` shows these calls only in the store loop and in `refresh_one`, and none of them inside a spawned task.
-- [ ] `FEATURES.md` no longer carries the old Update bullet. Its replacement and the `ARCHITECTURE.md` paragraph each name `TASK_VIEWER_SCAN_WORKERS` and the default of 4 once.
+- [ ] A test runs the scan core over three repositories with a cap of 2, where one repository's folder has no `tasks/` directory and already holds rows from an earlier store. Afterwards that repository still holds those earlier rows and carries exactly "That folder has no tasks directory." as its scan error, while the other two store their rows with no scan error.
+- [ ] `rg -n 'replace_tasks|set_scan_error' task-viewer/src/web.rs` shows every hit inside the scan core's store loop or in `refresh_one`, and none of them inside a spawned task.
+- [ ] `scan_all` calls the scan core once with the repository list from `db::list_repositories`, `harvest::harvest_repository`, and the cap held in `AppState`, and contains no per-repository loop.
+- [ ] `FEATURES.md` no longer carries the old Update bullet. Its replacement and the `ARCHITECTURE.md` paragraph each name `TASK_VIEWER_SCAN_WORKERS` and the default of 4 once, and the `FEATURES.md` replacement still states that Update covers every configured repository and replaces the parsed rows that still read cleanly.
 - [ ] `README.md` names the variable and its default, and the `TESTING.md` `What Must Be Covered` list includes the cap parsing and the parallel scan.

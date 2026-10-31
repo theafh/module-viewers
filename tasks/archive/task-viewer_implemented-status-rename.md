@@ -2,9 +2,11 @@
 description: "Date a finished task from the commit that first archived it as implemented, so a later bulk rename of implemented to finished stops becoming every such task's ship day."
 scope: task-viewer
 created: 2026-10-24T18:26:29
-updated: 2026-10-30T21:31:43
-status: ready
+updated: 2026-10-31T13:36:32
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Treat an archived implemented-to-finished change as a status rename
