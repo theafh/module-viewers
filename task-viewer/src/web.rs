@@ -368,17 +368,30 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
             return redirect(&project, "error", "The repository list could not be read.");
         }
     };
-    scan_core(
+    let report = scan_core(
         &state.pool,
         &repositories,
         state.scan_workers,
         Arc::new(harvest::harvest_repository),
     )
     .await;
-    redirect(&project, "notice", "Charts updated.")
+    scan_response(&project, &report)
 }
 
 type HarvestFn = dyn Fn(&std::path::Path) -> Result<Vec<ParsedTask>, HarvestError> + Send + Sync;
+
+/// One repository whose scan left a scan error behind.
+struct ScanFailure {
+    repository: String,
+    message: &'static str,
+}
+
+/// What one Update run did: how many repositories it attempted and which ones
+/// failed, so the dashboard can report the run truthfully.
+struct ScanReport {
+    attempted: usize,
+    failures: Vec<ScanFailure>,
+}
 
 /// Harvest the repositories up to `cap` at once, then store each finished
 /// result one repository at a time so no two writes overlap on SQLite.
@@ -387,7 +400,7 @@ async fn scan_core(
     repositories: &[Repository],
     cap: usize,
     harvest: Arc<HarvestFn>,
-) {
+) -> ScanReport {
     let permits = Arc::new(Semaphore::new(cap.max(1)));
     let mut harvests = JoinSet::new();
     for repository in repositories {
@@ -403,57 +416,77 @@ async fn scan_core(
             (repository_id, outcome)
         });
     }
+    let mut failures = Vec::new();
     while let Some(finished) = harvests.join_next().await {
+        // The spawned wrapper carries every stop inside its tuple, so this
+        // branch is unreachable and its `continue` changes no outcome.
         let Ok((repository_id, outcome)) = finished else {
             tracing::error!("a scan worker stopped");
             continue;
         };
-        store_outcome(pool, repository_id, outcome).await;
+        if let Some(message) = store_outcome(pool, repository_id, outcome).await {
+            failures.push(ScanFailure {
+                repository: repository_name(repositories, repository_id),
+                message,
+            });
+        }
+    }
+    ScanReport {
+        attempted: repositories.len(),
+        failures,
     }
 }
 
+fn repository_name(repositories: &[Repository], repository_id: i64) -> String {
+    repositories
+        .iter()
+        .find(|repository| repository.repository_id == repository_id)
+        .map(|repository| repository.name.clone())
+        .unwrap_or_else(|| format!("repository {repository_id}"))
+}
+
+const SAVE_ERROR: &str = "The parsed rows could not be saved.";
+const MISSING_TASKS_ERROR: &str = "That folder has no tasks directory.";
+const GIT_ERROR: &str = "Git could not read the history, so the rows were left as they were.";
+const IO_ERROR: &str = "The scan could not read the repository.";
+const STOPPED_ERROR: &str = "The scan stopped before it finished.";
+
 /// Record one harvest outcome, whether it arrived through the parallel join loop
-/// or a single repository refresh, so both paths report the same messages.
+/// or a single repository refresh, so both paths report the same messages. The
+/// message a failed outcome stored is returned for the run report.
 async fn store_outcome(
     pool: &sqlx::SqlitePool,
     repository_id: i64,
     outcome: Result<Result<Vec<ParsedTask>, HarvestError>, tokio::task::JoinError>,
-) {
+) -> Option<&'static str> {
     match outcome {
         Ok(Ok(tasks)) => {
             if let Err(error) = db::replace_tasks(pool, repository_id, &tasks).await {
                 tracing::error!(%error, repository_id, "replace failed");
-                let _ =
-                    db::set_scan_error(pool, repository_id, "The parsed rows could not be saved.")
-                        .await;
+                let _ = db::set_scan_error(pool, repository_id, SAVE_ERROR).await;
+                Some(SAVE_ERROR)
+            } else {
+                None
             }
         }
         Ok(Err(HarvestError::MissingTasks)) => {
-            let _ = db::set_scan_error(pool, repository_id, "That folder has no tasks directory.")
-                .await;
+            let _ = db::set_scan_error(pool, repository_id, MISSING_TASKS_ERROR).await;
+            Some(MISSING_TASKS_ERROR)
         }
         Ok(Err(HarvestError::Git(reason))) => {
             tracing::error!(%reason, repository_id, "git could not read the history");
-            let _ = db::set_scan_error(
-                pool,
-                repository_id,
-                "Git could not read the history, so the rows were left as they were.",
-            )
-            .await;
+            let _ = db::set_scan_error(pool, repository_id, GIT_ERROR).await;
+            Some(GIT_ERROR)
         }
         Ok(Err(HarvestError::Io(error))) => {
             tracing::error!(%error, repository_id, "scan failed");
-            let _ = db::set_scan_error(
-                pool,
-                repository_id,
-                "The scan could not read the repository.",
-            )
-            .await;
+            let _ = db::set_scan_error(pool, repository_id, IO_ERROR).await;
+            Some(IO_ERROR)
         }
         Err(error) => {
             tracing::error!(%error, repository_id, "scan task stopped");
-            let _ = db::set_scan_error(pool, repository_id, "The scan stopped before it finished.")
-                .await;
+            let _ = db::set_scan_error(pool, repository_id, STOPPED_ERROR).await;
+            Some(STOPPED_ERROR)
         }
     }
 }
@@ -461,7 +494,34 @@ async fn store_outcome(
 async fn refresh_one(pool: &sqlx::SqlitePool, repository_id: i64, path: &std::path::Path) {
     let owned = path.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || harvest::harvest_repository(&owned)).await;
-    store_outcome(pool, repository_id, outcome).await;
+    let _ = store_outcome(pool, repository_id, outcome).await;
+}
+
+/// The dashboard banner a scan run deserves: the success notice only when every
+/// repository harvested, and an error naming each failed repository otherwise.
+fn scan_flash(report: &ScanReport) -> (&'static str, String) {
+    if report.failures.is_empty() {
+        return ("notice", "Charts updated.".to_string());
+    }
+    let clean = report.attempted.saturating_sub(report.failures.len());
+    let failed = report
+        .failures
+        .iter()
+        .map(|failure| format!("{} ({})", failure.repository, failure.message))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (
+        "error",
+        format!(
+            "Charts updated for {clean} of {} repositories. Failed: {failed}.",
+            report.attempted
+        ),
+    )
+}
+
+fn scan_response(project: &str, report: &ScanReport) -> Response {
+    let (key, message) = scan_flash(report);
+    redirect(project, key, &message)
 }
 
 fn pick_folder() -> Result<Option<PathBuf>, &'static str> {
@@ -556,10 +616,14 @@ fn encode_query(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{HarvestFn, is_local_host, scan_core, scan_worker_cap};
+    use super::{
+        HarvestFn, ScanFailure, ScanReport, encode_query, is_local_host, scan_core, scan_flash,
+        scan_response, scan_worker_cap,
+    };
     use crate::db;
-    use crate::harvest;
+    use crate::harvest::{self, HarvestError};
     use crate::test_support::unique_temp_dir;
+    use axum::http::header;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -747,5 +811,145 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(missing);
         cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_report_names_the_failed_repository() {
+        let path = temp_database("scan_report_failure");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let clean = live_repository("scan_report_clean");
+        let broken = unique_temp_dir("scan_report_broken");
+        db::insert_repository(&pool, "clean", &clean.to_string_lossy())
+            .await
+            .expect("insert clean");
+        db::insert_repository(&pool, "broken", &broken.to_string_lossy())
+            .await
+            .expect("insert broken");
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        let broken_path = broken.clone();
+        let harvest: Arc<HarvestFn> = Arc::new(move |path: &Path| {
+            if path == broken_path {
+                Err(HarvestError::Git("no history".to_string()))
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let report = scan_core(&pool, &repositories, 2, harvest).await;
+        assert_eq!(report.attempted, 2);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].repository, "broken");
+        assert_eq!(
+            report.failures[0].message,
+            "Git could not read the history, so the rows were left as they were."
+        );
+        let _ = std::fs::remove_dir_all(clean);
+        let _ = std::fs::remove_dir_all(broken);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_report_names_a_stopped_worker() {
+        let path = temp_database("scan_report_stopped");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let stopped = unique_temp_dir("scan_report_stopped_repo");
+        db::insert_repository(&pool, "stopped", &stopped.to_string_lossy())
+            .await
+            .expect("insert");
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        let harvest: Arc<HarvestFn> = Arc::new(|_: &Path| panic!("harvest stopped"));
+        let report = scan_core(&pool, &repositories, 1, harvest).await;
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].repository, "stopped");
+        assert_eq!(
+            report.failures[0].message,
+            "The scan stopped before it finished."
+        );
+        let after = db::list_repositories(&pool).await.expect("after");
+        assert_eq!(
+            after[0].last_error.as_deref(),
+            Some("The scan stopped before it finished.")
+        );
+        let _ = std::fs::remove_dir_all(stopped);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn web_scan_banner_names_every_failed_repository() {
+        let report = ScanReport {
+            attempted: 9,
+            failures: vec![
+                ScanFailure {
+                    repository: "sysadmin".to_string(),
+                    message: "Git could not read the history, so the rows were left as they were.",
+                },
+                ScanFailure {
+                    repository: "notes".to_string(),
+                    message: "That folder has no tasks directory.",
+                },
+            ],
+        };
+        let (key, message) = scan_flash(&report);
+        assert_eq!(key, "error");
+        assert_eq!(
+            message,
+            "Charts updated for 7 of 9 repositories. Failed: sysadmin (Git could not read the history, so the rows were left as they were.), notes (That folder has no tasks directory.)."
+        );
+        assert!(!message.ends_with("Charts updated."));
+    }
+
+    #[test]
+    fn web_scan_banner_reports_a_clean_run() {
+        let report = ScanReport {
+            attempted: 2,
+            failures: Vec::new(),
+        };
+        let (key, message) = scan_flash(&report);
+        assert_eq!(key, "notice");
+        assert_eq!(message, "Charts updated.");
+    }
+
+    #[test]
+    fn web_scan_response_redirects_with_the_true_outcome() {
+        let failed = ScanReport {
+            attempted: 2,
+            failures: vec![ScanFailure {
+                repository: "sysadmin".to_string(),
+                message: "Git could not read the history, so the rows were left as they were.",
+            }],
+        };
+        let failure_location = scan_response("all", &failed)
+            .headers()
+            .get(header::LOCATION)
+            .expect("failure location")
+            .to_str()
+            .expect("failure location text")
+            .to_string();
+        assert_eq!(
+            failure_location,
+            format!(
+                "/?project=all&error={}",
+                encode_query(
+                    "Charts updated for 1 of 2 repositories. Failed: sysadmin (Git could not read the history, so the rows were left as they were.)."
+                )
+            )
+        );
+        let clean = ScanReport {
+            attempted: 2,
+            failures: Vec::new(),
+        };
+        let clean_location = scan_response("all", &clean)
+            .headers()
+            .get(header::LOCATION)
+            .expect("clean location")
+            .to_str()
+            .expect("clean location text")
+            .to_string();
+        assert_eq!(
+            clean_location,
+            format!("/?project=all&notice={}", encode_query("Charts updated."))
+        );
     }
 }

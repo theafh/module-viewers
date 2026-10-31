@@ -2,9 +2,11 @@
 description: "Make Update report which repositories failed and why instead of always redirecting with the Charts updated notice."
 scope: task-viewer
 created: 2026-10-31T16:09:10
-updated: 2026-10-31T17:10:26
-status: ready
+updated: 2026-10-31T20:48:16
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Report scan failures from Update instead of always claiming success
