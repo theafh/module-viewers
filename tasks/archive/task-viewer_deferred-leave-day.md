@@ -2,9 +2,11 @@
 description: "Date a deferred archived task from the first commit that introduces its archived status, not an earlier live status commit."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T07:43:44
-status: ready
+updated: 2026-11-05T08:42:52
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Date deferred tasks from the first archived status commit

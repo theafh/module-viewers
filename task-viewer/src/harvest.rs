@@ -618,7 +618,10 @@ fn scrub_git_env(command: &mut Command) {
 type LeaveDays = Vec<(usize, Option<NaiveDate>)>;
 
 fn leave_dates(repo: &Path, jobs: &[(usize, String, String)]) -> Result<LeaveDays, String> {
-    let prefix = if jobs.iter().any(|(_, _, status)| status == "finished") {
+    let prefix = if jobs
+        .iter()
+        .any(|(_, _, status)| status == "finished" || status == "deferred")
+    {
         folder_prefix(repo)
     } else {
         String::new()
@@ -627,38 +630,42 @@ fn leave_dates(repo: &Path, jobs: &[(usize, String, String)]) -> Result<LeaveDay
     // archive files exhausted process slots and aborted Update.
     jobs.iter()
         .map(|(index, rel, status)| {
-            let day = if status == "finished" {
-                first_archived_commit_date(repo, rel, &prefix)?
-            } else {
-                first_status_commit_date(repo, rel, status)?
+            let day = match status.as_str() {
+                "finished" | "deferred" => first_archived_commit_date(repo, rel, &prefix, status)?,
+                _ => first_status_commit_date(repo, rel, status)?,
             };
             Ok((*index, day))
         })
         .collect()
 }
 
-/// The committer day of the earliest commit that archives a finished task.
+/// The committer day of the earliest commit that archives a task with
+/// `expected` status.
 ///
 /// A finished task counts from the commit whose path lies under `archive` and
 /// whose content carries `status: finished` or `status: implemented`, so a
 /// later bulk rename of `implemented` to `finished` does not move its ship day.
-/// `prefix` is the folder's place inside the repository that holds it, so only
-/// an `archive` directory inside the folder counts.
+/// A deferred task counts from the commit whose path lies under `archive` and
+/// whose content carries `status: deferred`, so a deferral made while the task
+/// was live does not move its leave day. `prefix` is the folder's place inside
+/// the repository that holds it, so only an `archive` directory inside the
+/// folder counts.
 fn first_archived_commit_date(
     repo: &Path,
     rel: &str,
     prefix: &str,
+    expected: &str,
 ) -> Result<Option<NaiveDate>, String> {
     let dir = git_dir(repo);
     let mut first_failure = None;
     if let Some(dir) = &dir {
-        match archived_leave_lookup(repo, rel, Some(dir), prefix) {
+        match archived_leave_lookup(repo, rel, Some(dir), prefix, expected) {
             Ok(Some(day)) => return Ok(Some(day)),
             Ok(None) => return Ok(None),
             Err(reason) => first_failure = Some(reason),
         }
     }
-    match archived_leave_lookup(repo, rel, None, prefix) {
+    match archived_leave_lookup(repo, rel, None, prefix, expected) {
         Ok(Some(day)) => Ok(Some(day)),
         Ok(None) => Ok(None),
         Err(reason) if dir.is_some() => Err(first_failure.unwrap_or(reason)),
@@ -671,6 +678,7 @@ fn archived_leave_lookup(
     rel: &str,
     dir: Option<&Path>,
     prefix: &str,
+    expected: &str,
 ) -> Result<Option<NaiveDate>, String> {
     let mut command = match dir {
         Some(dir) => git_dir_command(repo, dir),
@@ -729,7 +737,7 @@ fn archived_leave_lookup(
     let contents = read_blobs(repo, dir, &blobs).map_err(|error| error.to_string())?;
     let mut earliest: Option<NaiveDate> = None;
     for (index, text) in indices.iter().zip(contents) {
-        if !has_archived_status(&text) {
+        if !has_archived_status(&text, expected) {
             continue;
         }
         let day = days[*index];
@@ -797,10 +805,13 @@ fn is_archived_path(path: &str) -> bool {
     path.split('/').any(|part| part == "archive")
 }
 
-fn has_archived_status(text: &str) -> bool {
+fn has_archived_status(text: &str, expected: &str) -> bool {
     frontmatter(text)
         .and_then(|fields| fields.get("status").cloned())
-        .is_some_and(|status| status == "finished" || status == "implemented")
+        .is_some_and(|status| match expected {
+            "finished" => status == "finished" || status == "implemented",
+            other => status == other,
+        })
 }
 
 fn first_status_commit_date(
@@ -1121,6 +1132,100 @@ mod tests {
     }
 
     #[test]
+    fn harvest_dates_a_task_deferred_live_from_its_archive_commit() {
+        // A deferred status that appeared while the task was live must not
+        // become its leave day; the archive commit does.
+        let repo = scratch("harvest_deferred_live");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_deferred.md"),
+            task_with_body("2026-05-01", "deferred"),
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "defer live"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::rename(
+            repo.join("tasks/scope_deferred.md"),
+            repo.join("tasks/archive/scope_deferred.md"),
+        )
+        .expect("archive");
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive deferred"],
+            "2026-06-01T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        assert!(task.ship_date.is_none());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_an_archived_task_from_its_deferred_status_commit() {
+        // The status reaches `deferred` only in the later archive commit, so
+        // the earlier archived `open` commit must not become the leave day.
+        let repo = scratch("harvest_archived_deferred_later");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-15T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_defer.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-05-15T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive open"],
+            "2026-05-15T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_defer.md",
+            "2026-05-01",
+            "2026-06-15",
+            "deferred",
+        );
+        git(&repo, &["add", "-A"], "2026-06-15T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "defer"],
+            "2026-06-15T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 15).expect("day"))
+        );
+        assert!(task.ship_date.is_none());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn harvest_finds_a_finish_first_committed_in_a_merge() {
         let repo = scratch("harvest_merge");
         git(
@@ -1354,6 +1459,68 @@ mod tests {
             shipped.ship_date,
             Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
         );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_task_deferred_on_a_branch_that_is_not_checked_out() {
+        // A task deferred and archived on another branch still counts, and its
+        // leave day is that branch's archive commit, not the live deferral.
+        let repo = scratch("harvest_deferred_other_branch");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_on_main.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "main task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "feature"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(
+            &repo,
+            "tasks/scope_branch_deferred.md",
+            "2026-05-01",
+            "deferred",
+        );
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "defer live on feature"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::rename(
+            repo.join("tasks/scope_branch_deferred.md"),
+            repo.join("tasks/archive/scope_branch_deferred.md"),
+        )
+        .expect("archive");
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive deferred on feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-06-02T12:00:00+00:00");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_branch_deferred.md"))
+            .expect("deferred on the feature branch");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        assert!(task.ship_date.is_none());
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -1909,6 +2076,54 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day"))
         );
         assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_dates_a_deferred_task_in_a_nested_folder_under_an_archive_directory() {
+        // The configured folder itself sits under a directory named `archive`,
+        // so a missing folder prefix would date the live commit from the outer
+        // `archive` name instead of the real archive move.
+        let parent = scratch("harvest_deferred_archive_above_nested");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let folder = parent.join("archive/nested");
+        fs::create_dir_all(folder.join("tasks")).expect("tasks");
+        fs::write(
+            folder.join("tasks/scope_above.md"),
+            task_with_body("2026-05-01", "deferred"),
+        )
+        .expect("write");
+        git(&parent, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "defer live"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(folder.join("tasks/archive")).expect("archive");
+        fs::rename(
+            folder.join("tasks/scope_above.md"),
+            folder.join("tasks/archive/scope_above.md"),
+        )
+        .expect("archive");
+        git(&parent, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "archive deferred"],
+            "2026-06-01T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&folder).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        assert!(task.ship_date.is_none());
         let _ = fs::remove_dir_all(&parent);
     }
 
