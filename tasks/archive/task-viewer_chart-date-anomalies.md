@@ -2,9 +2,11 @@
 description: "Keep the live backlog and weekly charts consistent when a leave date precedes created or a ship event precedes the first created day."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T22:14:00
-status: ready
+updated: 2026-11-05T22:30:15
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Keep charts sane when dates are out of order

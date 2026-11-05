@@ -47,7 +47,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 - Weeks start on Monday. A task created and shipped in the same week counts in both series.
 - The cumulative, backlog, and mean-age charts include every calendar day from their first day through today. A day with no event keeps the previous level.
 - The two calendars are the last 365 days through today. Colour is `log1p(count)`. Zero stays on the empty track.
-- Live backlog adds one on `created` and subtracts one on the leave day.
+- Live backlog adds one on `created` and subtracts one on the leave day. A leave day before `created` counts from `created`, so a record whose dates are out of order cannot leave the task in the backlog forever.
 - Mean age is the average age, in days, of tasks that exist and are unfinished at the end of that day. A task drops out of that average on its leave day. Calendar days use the date prefix as written (local Berlin wall time until timezone conversion exists).
 - The three line charts carry a least-squares trend.
 - Radar spokes share one axis order, sorted by shipped plus live, then by label. All projects uses the repository name as the label. One project uses the scope.

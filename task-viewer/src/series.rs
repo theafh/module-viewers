@@ -171,7 +171,7 @@ fn weekly_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<WeekPoint> {
             *shipped.entry(monday(day)).or_insert(0) += 1;
         }
     }
-    let Some((&start, _)) = created.iter().next() else {
+    let Some(start) = created.keys().chain(shipped.keys()).min().copied() else {
         return Vec::new();
     };
     let end = monday(today);
@@ -248,7 +248,10 @@ fn live_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<LivePoint> {
     for task in tasks {
         *delta.entry(task.created).or_insert(0) += 1;
         if let Some(leave) = task.leave_date {
-            *delta.entry(leave).or_insert(0) -= 1;
+            // The backlog cannot lose a task before it exists; a leave day
+            // before `created` counts from `created`. The stored row keeps its
+            // real ship day for the weekly and cumulative walks.
+            *delta.entry(leave.max(task.created)).or_insert(0) -= 1;
         }
     }
     let start = tasks.iter().map(|task| task.created).min().unwrap_or(today);
@@ -494,6 +497,91 @@ mod tests {
         // Deferred left; only the live task remains unfinished.
         assert_eq!(age_after_defer.n, 1);
         assert!(monday(day(2026, 6, 7)) == day(2026, 6, 1));
+    }
+
+    #[test]
+    fn series_live_backlog_clamps_a_leave_day_before_created() {
+        let created = day(2026, 6, 10);
+        let today = day(2026, 6, 15);
+        let tasks = vec![task(
+            "alpha",
+            "scope",
+            TaskKind::Finished,
+            created,
+            Some(day(2026, 6, 1)),
+            Some(day(2026, 6, 1)),
+        )];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        assert_eq!(board.live_backlog.first().expect("first").live, 0);
+        assert_eq!(board.live_backlog.last().expect("last").live, 0);
+        assert!(board.live_backlog.iter().all(|point| point.live == 0));
+    }
+
+    #[test]
+    fn series_cumulative_includes_a_ship_day_before_the_first_created_day() {
+        let today = day(2026, 6, 15);
+        let tasks = vec![
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Live,
+                day(2026, 6, 10),
+                None,
+                None,
+            ),
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Finished,
+                day(2026, 6, 10),
+                Some(day(2026, 6, 1)),
+                Some(day(2026, 6, 1)),
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let early = board
+            .cumulative
+            .iter()
+            .find(|point| point.date == "2026-06-01")
+            .expect("early ship day");
+        assert_eq!(early.shipped, 1);
+        let last = board.cumulative.last().expect("cumulative");
+        assert_eq!(last.cumulative, board.counts.shipped_events as i64);
+    }
+
+    #[test]
+    fn series_weekly_includes_a_ship_week_before_the_first_created_week() {
+        let today = day(2026, 6, 15);
+        let ship_day = day(2026, 6, 1);
+        let tasks = vec![
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Live,
+                day(2026, 6, 10),
+                None,
+                None,
+            ),
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Finished,
+                day(2026, 6, 10),
+                Some(ship_day),
+                Some(ship_day),
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let week = board
+            .weekly
+            .iter()
+            .find(|point| point.week == crate::dates::format_date(monday(ship_day)))
+            .expect("early ship week");
+        assert_eq!(week.shipped, 1);
+        assert_eq!(
+            board.weekly.iter().map(|point| point.shipped).sum::<i64>(),
+            board.counts.shipped_events as i64
+        );
     }
 
     #[test]
