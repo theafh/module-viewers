@@ -622,9 +622,9 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, HarvestFn, ProjectForm, ScanFailure, ScanReport, add_repository, encode_query,
-        init_templates, is_local_host, scan_all, scan_core, scan_flash, scan_response,
-        scan_worker_cap,
+        AppState, HarvestFn, PickerFn, ProjectForm, ScanFailure, ScanReport, add_repository,
+        encode_query, init_templates, is_local_host, scan_all, scan_core, scan_flash,
+        scan_response, scan_worker_cap,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError};
@@ -989,7 +989,7 @@ mod tests {
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
-        let picker: Arc<super::PickerFn> = Arc::new(move || {
+        let picker: Arc<PickerFn> = Arc::new(move || {
             let _ = entered_tx.blocking_send(());
             if let Ok(release) = release_rx.lock() {
                 let _ = release.recv();
@@ -1059,6 +1059,102 @@ mod tests {
         assert_eq!(redirect_location(&response), "/repositories");
         let repositories = db::list_repositories(&state.pool).await.expect("list");
         assert!(repositories.is_empty());
+        cleanup(&path);
+    }
+
+    /// Add must hold the scan lock across the store phase, so its insert and
+    /// initial refresh cannot race Update's row writes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_holds_the_scan_lock_across_the_store() {
+        let (mut state, path) = app_state("add_holds_lock").await;
+        let folder = live_repository("add_holds_lock_repo");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+        let guard = state.scan.lock().await;
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(200),
+            add_repository(State(state.clone())),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "Add must wait for the scan lock before it stores"
+        );
+
+        drop(guard);
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=Repository%20added."
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_reports_a_picker_error() {
+        let (mut state, path) = app_state("add_picker_error").await;
+        state.picker = Arc::new(|| Err("No picker available."));
+
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            format!(
+                "/repositories?error={}",
+                encode_query("No picker available.")
+            )
+        );
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert!(repositories.is_empty());
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_rejects_a_folder_without_tasks() {
+        let (mut state, path) = app_state("add_no_tasks").await;
+        let folder = unique_temp_dir("add_no_tasks_repo");
+        std::fs::create_dir_all(&folder).expect("scratch");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            format!(
+                "/repositories?error={}",
+                encode_query("That folder has no tasks directory.")
+            )
+        );
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert!(repositories.is_empty());
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_rejects_a_duplicate_repository() {
+        let (mut state, path) = app_state("add_duplicate").await;
+        let folder = live_repository("add_duplicate_repo");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+
+        let first = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&first),
+            "/repositories?notice=Repository%20added."
+        );
+        let second = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&second),
+            format!(
+                "/repositories?error={}",
+                encode_query("That repository is already on the dashboard.")
+            )
+        );
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert_eq!(repositories.len(), 1);
+        let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 }
