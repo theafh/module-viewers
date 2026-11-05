@@ -2,8 +2,8 @@
 description: "Date a deferred archived task from the first commit that introduces its archived status, not an earlier live status commit."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T07:00:45
-status: open
+updated: 2026-11-05T07:43:44
+status: ready
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -19,13 +19,16 @@ A deferred task's leave day is the committer day of the earliest commit in which
 
 ## Approach
 
-Generalize the finished-task archive walk so it accepts the expected status: run the same `git log -z --follow --diff-merges=first-parent --name-only --format=%cI %H --all -- <rel>` walk, keep records whose path passes the existing prefix strip and `is_archived_path`, read each record's blob, and keep the earliest day whose frontmatter status equals the deferred status. Reuse `existing_object_indices` and `read_blobs` so deletion commits and missing objects are skipped as they are today. Keep `first_status_commit_date` as the fallback for a folder outside git, where no commit exists and the frontmatter `updated` day remains the leave day.
+Generalize the finished-task archive walk so it accepts the expected status: run the same `git log -z --follow --diff-merges=first-parent --name-only --format=%cI %H --all -- <rel>` walk, widen the finished-only `folder_prefix` condition in `leave_dates` to compute the prefix for any batch holding a finished or deferred job, keep records whose path passes that prefix strip and `is_archived_path`, read each record's blob, and keep the earliest day whose frontmatter status equals the deferred status. Reuse `existing_object_indices` and `read_blobs` so deletion commits and missing objects are skipped as they are today. Keep `first_status_commit_date` as the fallback for a folder outside git, where no commit exists and the frontmatter `updated` day remains the leave day. Rewrite in place the `ARCHITECTURE.md` `## Extraction Rules` sentence that begins "For a deferred task the lookup is the `-S` then `-G` pickaxe that introduces the archived status string", so that sentence describes the same archived-path walk with the deferred status filter and the pickaxe no longer appears as the deferred lookup.
 
-**Out of scope:** The finished-task walk and its `finished`/`implemented` status aliases, which already filter by archived path.
+**Out of scope:** The leave and ship days the finished-task path already returns, and its `finished`/`implemented` status aliases.
 
 ## Acceptance
 
 - A test builds a repository with a live `status: deferred` commit on 2026-05-01 and a later archive commit on 2026-06-01 that keeps the same status, harvests it, and asserts `leave_date` is 2026-06-01 and `ship_date` is `None`.
+- A test whose configured folder sits under a directory named `archive` builds a live `status: deferred` commit on 2026-05-01 and a later archive commit on 2026-06-01 that keeps the same status, harvests the nested folder, and asserts `leave_date` is 2026-06-01.
 - A test keeps the existing deferred case where the status first appears in the archive commit and asserts the archive day is still returned.
-- A test for a deferred task whose status appears only on a non-checked-out branch asserts the branch's archive day is returned.
-- The new tests fail against the current `first_status_commit_date` and pass after the walk change.
+- A test archives the task with `status: open` on 2026-05-15 and rewrites it to `status: deferred` in a later archive commit on 2026-06-15, harvests it, and asserts `leave_date` is 2026-06-15.
+- A test places a live `status: deferred` commit on 2026-05-01 and a later archive commit carrying the same status on 2026-06-01, both on a branch that is not checked out, harvests with the default branch checked out, and asserts the branch's archive day, 2026-06-01, is returned.
+- Every new test whose fixture places a live `status: deferred` commit before the archive commit fails against the current `first_status_commit_date` and passes after the walk change.
+- `ARCHITECTURE.md`'s `## Extraction Rules` bullet beginning "The leave day of a finished or deferred task" describes the deferred lookup as the archived-path walk, and the sentence beginning "For a deferred task the lookup is the `-S` then `-G` pickaxe" is gone, so one canonical statement of the deferred lookup remains.
