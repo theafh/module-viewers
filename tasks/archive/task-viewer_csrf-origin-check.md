@@ -2,9 +2,11 @@
 description: "Reject cross-site state-changing POSTs with an Origin or Sec-Fetch-Site check while keeping same-origin form posts working."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T18:12:32
-status: ready
+updated: 2026-11-05T22:51:11
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Reject cross-site state-changing POSTs

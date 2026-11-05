@@ -1,7 +1,7 @@
 use axum::{
     Router,
     extract::{Form, Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -111,7 +111,38 @@ async fn require_local_host(request: axum::extract::Request, next: Next) -> Resp
         )
             .into_response();
     }
+    if request.method() == Method::POST && !is_same_origin_post(request.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "task-viewer accepts form posts from its own page only.",
+        )
+            .into_response();
+    }
     next.run(request).await
+}
+
+/// The origins a browser page on this machine uses to reach the dashboard.
+const LOOPBACK_ORIGINS: [&str; 3] = [
+    "http://127.0.0.1:7880",
+    "http://localhost:7880",
+    "http://[::1]:7880",
+];
+
+/// A `POST` is same-origin when its `Origin` names a loopback origin. A request
+/// that carries no `Origin` falls back to `Sec-Fetch-Site`, whose `cross-site`
+/// value is the only one rejected; older browsers send neither header.
+fn is_same_origin_post(headers: &HeaderMap) -> bool {
+    match headers.get(header::ORIGIN) {
+        Some(origin) => origin
+            .to_str()
+            .is_ok_and(|origin| LOOPBACK_ORIGINS.contains(&origin)),
+        None => {
+            headers
+                .get("sec-fetch-site")
+                .and_then(|value| value.to_str().ok())
+                != Some("cross-site")
+        }
+    }
 }
 
 fn is_local_host(host: &str) -> bool {
@@ -639,21 +670,23 @@ fn encode_query(value: &str) -> String {
 mod tests {
     use super::{
         AppState, HarvestFn, PickerFn, ProjectForm, ScanFailure, ScanReport, StoreHookFn,
-        add_repository, encode_query, init_templates, is_local_host, remove_repository, scan_all,
-        scan_core, scan_flash, scan_response, scan_worker_cap,
+        add_repository, encode_query, init_templates, is_local_host, remove_repository, router,
+        scan_all, scan_core, scan_flash, scan_response, scan_worker_cap,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, TaskKind};
     use crate::test_support::unique_temp_dir;
     use axum::Form;
+    use axum::body::Body;
     use axum::extract::Path as UrlPath;
     use axum::extract::State;
-    use axum::http::header;
+    use axum::http::{Method, Request, StatusCode, header};
     use std::future::ready;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tower::ServiceExt;
 
     /// The production store hook: it resolves at once, so a scan stores without
     /// pausing inside the write transaction.
@@ -708,6 +741,212 @@ mod tests {
         assert!(!is_local_host("example.com"));
         assert!(!is_local_host("127.0.0.1:80"));
         assert!(!is_local_host("localhost:80"));
+    }
+
+    /// One form POST carrying the loopback Host a same-machine browser sends,
+    /// with an optional `Origin` and `Sec-Fetch-Site`.
+    fn form_post(
+        uri: &str,
+        origin: Option<&str>,
+        fetch_site: Option<&str>,
+    ) -> axum::extract::Request {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:7880")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        if let Some(fetch_site) = fetch_site {
+            request = request.header("sec-fetch-site", fetch_site);
+        }
+        request
+            .body(Body::from("project=all"))
+            .expect("form request")
+    }
+
+    async fn send(state: AppState, request: axum::extract::Request) -> axum::response::Response {
+        router(state)
+            .oneshot(request)
+            .await
+            .expect("router responds")
+    }
+
+    /// A repository whose scan has not run yet, so a rejected POST leaves a
+    /// visible `scanned_at` of `None`.
+    async fn state_with_repository(name: &str) -> (AppState, PathBuf, PathBuf, i64) {
+        let (state, path) = app_state(name).await;
+        let folder = live_repository(&format!("{name}_repo"));
+        let id = db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        (state, path, folder, id)
+    }
+
+    async fn assert_not_scanned(state: &AppState, id: i64) {
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        let repository = repositories
+            .iter()
+            .find(|repository| repository.repository_id == id)
+            .expect("repository");
+        assert!(
+            repository.scanned_at.is_none(),
+            "the rejected post must not scan"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rejects_a_cross_origin_scan() {
+        let (state, path, folder, id) = state_with_repository("origin_scan_reject").await;
+        let response = send(
+            state.clone(),
+            form_post("/scan", Some("https://example.com"), None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_not_scanned(&state, id).await;
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rejects_a_cross_origin_scan_with_fetch_site_none() {
+        let (state, path, folder, id) = state_with_repository("origin_scan_none_reject").await;
+        let response = send(
+            state.clone(),
+            form_post("/scan", Some("https://example.com"), Some("none")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_not_scanned(&state, id).await;
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_accepts_the_loopback_ipv4_origin_for_a_scan() {
+        let (state, path) = app_state("origin_ipv4_accept").await;
+        let response = send(
+            state.clone(),
+            form_post("/scan", Some("http://127.0.0.1:7880"), None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect_location(&response),
+            "/?project=all&notice=Charts%20updated."
+        );
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_accepts_the_localhost_origin_for_a_scan() {
+        let (state, path) = app_state("origin_localhost_accept").await;
+        let response = send(
+            state.clone(),
+            form_post("/scan", Some("http://localhost:7880"), None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect_location(&response),
+            "/?project=all&notice=Charts%20updated."
+        );
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_accepts_the_ipv6_loopback_origin_for_a_scan() {
+        let (state, path) = app_state("origin_ipv6_accept").await;
+        let response = send(
+            state.clone(),
+            form_post("/scan", Some("http://[::1]:7880"), None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect_location(&response),
+            "/?project=all&notice=Charts%20updated."
+        );
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rejects_a_cross_origin_add() {
+        let (mut state, path) = app_state("origin_add_reject").await;
+        state.picker = Arc::new(|| Ok(None));
+        let response = send(
+            state.clone(),
+            form_post("/repositories", Some("https://example.com"), None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert!(repositories.is_empty(), "the rejected post adds nothing");
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rejects_a_cross_origin_remove() {
+        let (state, path, folder, id) = state_with_repository("origin_remove_reject").await;
+        let response = send(
+            state.clone(),
+            form_post(
+                &format!("/repositories/{id}/delete"),
+                Some("https://example.com"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert!(
+            repositories
+                .iter()
+                .any(|repository| repository.repository_id == id),
+            "the rejected post removes nothing"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_accepts_a_post_without_an_origin() {
+        let (state, path) = app_state("origin_absent_accept").await;
+        let response = send(state.clone(), form_post("/scan", None, None)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect_location(&response),
+            "/?project=all&notice=Charts%20updated."
+        );
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rejects_a_cross_site_post_without_an_origin() {
+        let (state, path, folder, id) = state_with_repository("fetch_site_reject").await;
+        let response = send(state.clone(), form_post("/scan", None, Some("cross-site"))).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_not_scanned(&state, id).await;
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_get_is_unaffected_by_the_origin_check() {
+        let (state, path) = app_state("origin_get_unaffected").await;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(header::HOST, "127.0.0.1:7880")
+            .header(header::ORIGIN, "https://example.com")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .expect("get request");
+        let response = send(state.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        cleanup(&path);
     }
 
     #[test]

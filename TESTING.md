@@ -12,7 +12,7 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 ## Test Organization
 
 - Tests live in `#[cfg(test)]` modules in the source file they exercise.
-- Shared helpers live in `#[cfg(test)]` `src/test_support.rs` (`unique_temp_dir`). There is no `[dev-dependencies]` block and no external fixture crate.
+- Shared helpers live in `#[cfg(test)]` `src/test_support.rs` (`unique_temp_dir`). The `[dev-dependencies]` block in `task-viewer/Cargo.toml` adds `tower` with its `util` feature for `tower::ServiceExt::oneshot` tests through `router(state)`.
 - Database tests set a thread-local database path under a unique temp dir and use the current-thread runtime so that path stays on the test thread.
 - Git tests build a unique temporary repository with `user.email` and `user.name` passed on the command, and with author and committer dates in the environment.
 
@@ -24,7 +24,7 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 - Series: same-week create and ship both count, a leave day before `created` returns the live backlog to zero instead of leaving the task inflated, a ship day before the first created day still appears in the cumulative chart and ends at `counts.shipped_events`, a ship week before the first created week still appears in the weekly chart with its shipped sum, deferred tasks age until leave and never ship, all-projects radars count by repository, and a single project counts by scope.
 - Database: insert, replace rows, keep rows when a scan error is recorded, and delete a repository with its rows.
 - Scan: the worker cap parses unset, in-range, zero, non-numeric, and above-maximum values; Update harvests up to the cap at once, stores every repository's rows, and keeps an earlier store with the missing-tasks error when a folder has no `tasks/` directory.
-- Host check: loopback names are accepted with or without port 7880.
+- Host check: loopback names are accepted with or without port 7880; a POST from another origin, or one without an `Origin` whose `Sec-Fetch-Site` is `cross-site`, is rejected with 403 and leaves no side effect.
 
 ## Running the Suite
 

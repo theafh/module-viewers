@@ -31,6 +31,7 @@ The desktop launcher keeps its PID file and the server log, which records reposi
 ## Attack Surface
 
 - The server binds `127.0.0.1:7880`. A `Host` other than loopback (`127.0.0.1`, `localhost`, `[::1]`, with optional `:7880`) is rejected.
+- A state-changing `POST` is accepted only when its `Origin` names a loopback origin (`http://127.0.0.1:7880`, `http://localhost:7880`, or `http://[::1]:7880`), or, without an `Origin`, when `Sec-Fetch-Site` is not `cross-site`. Every other `POST` gets 403 before its route runs.
 - Static files come from `task-viewer/static/`.
 - Remove asks for confirmation in the page and uses its own POST route.
 
@@ -46,5 +47,6 @@ Dependencies stay pinned in `Cargo.lock`. Run `make audit` when they change.
 - [ ] Selected repositories are read, not written.
 - [ ] Routes still name repositories by id.
 - [ ] The listener stays on `127.0.0.1`.
+- [ ] Cross-site `POST`s stay rejected before their route runs.
 - [ ] User-facing text stays escaped.
 - [ ] Remove still asks for confirmation.
