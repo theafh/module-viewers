@@ -48,12 +48,15 @@ pub fn scan_worker_cap(raw: Option<&str>) -> usize {
     }
 }
 
+type PickerFn = dyn Fn() -> Result<Option<PathBuf>, &'static str> + Send + Sync;
+
 #[derive(Clone)]
 pub struct AppState {
     pool: sqlx::SqlitePool,
     templates: Arc<Tera>,
     scan: Arc<Mutex<()>>,
     scan_workers: usize,
+    picker: Arc<PickerFn>,
 }
 
 impl AppState {
@@ -64,6 +67,7 @@ impl AppState {
             templates: Arc::new(templates),
             scan: Arc::new(Mutex::new(())),
             scan_workers: scan_worker_cap(raw.as_deref()),
+            picker: Arc::new(pick_folder),
         }
     }
 }
@@ -304,30 +308,31 @@ struct ProjectView {
 }
 
 async fn add_repository(State(state): State<AppState>) -> Response {
+    let picker = Arc::clone(&state.picker);
+    let picked = match tokio::task::spawn_blocking(move || picker()).await {
+        Ok(Ok(picked)) => picked,
+        Ok(Err(message)) => return redirect_repositories("error", message),
+        Err(_) => {
+            return redirect_repositories("error", "The folder picker needs a graphical session.");
+        }
+    };
+    let Some(picked) = picked else {
+        return redirect_repositories("notice", "");
+    };
+    let path = match std::fs::canonicalize(&picked) {
+        Ok(path) if path.join("tasks").is_dir() => path,
+        _ => return redirect_repositories("error", "That folder has no tasks directory."),
+    };
     let _guard = state.scan.lock().await;
-    match pick_and_store(&state).await {
-        Ok(AddOutcome::Added) => redirect_repositories("notice", "Repository added."),
-        Ok(AddOutcome::Cancelled) => redirect_repositories("notice", ""),
+    match store_repository(&state, &path).await {
+        Ok(()) => redirect_repositories("notice", "Repository added."),
         Err(message) => redirect_repositories("error", message),
     }
 }
 
-enum AddOutcome {
-    Added,
-    Cancelled,
-}
-
-async fn pick_and_store(state: &AppState) -> Result<AddOutcome, &'static str> {
-    let picked = tokio::task::spawn_blocking(pick_folder)
-        .await
-        .map_err(|_| "The folder picker needs a graphical session.")??;
-    let Some(picked) = picked else {
-        return Ok(AddOutcome::Cancelled);
-    };
-    let path = std::fs::canonicalize(&picked).map_err(|_| "That folder has no tasks directory.")?;
-    if !path.join("tasks").is_dir() {
-        return Err("That folder has no tasks directory.");
-    }
+/// Store one already-chosen folder as a repository and refresh its rows.
+/// The caller holds the scan lock across this call.
+async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<(), &'static str> {
     let path_text = path.to_string_lossy().into_owned();
     if db::path_exists(&state.pool, &path_text)
         .await
@@ -342,12 +347,12 @@ async fn pick_and_store(state: &AppState) -> Result<AddOutcome, &'static str> {
         .into_iter()
         .map(|repo| repo.name)
         .collect::<Vec<_>>();
-    let name = db::unique_name(&path, &names);
+    let name = db::unique_name(path, &names);
     let id = db::insert_repository(&state.pool, &name, &path_text)
         .await
         .map_err(|_| "The repository could not be saved.")?;
-    refresh_one(&state.pool, id, &path).await;
-    Ok(AddOutcome::Added)
+    refresh_one(&state.pool, id, path).await;
+    Ok(())
 }
 
 async fn remove_repository(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
@@ -617,12 +622,15 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HarvestFn, ScanFailure, ScanReport, encode_query, is_local_host, scan_core, scan_flash,
-        scan_response, scan_worker_cap,
+        AppState, HarvestFn, ProjectForm, ScanFailure, ScanReport, add_repository, encode_query,
+        init_templates, is_local_host, scan_all, scan_core, scan_flash, scan_response,
+        scan_worker_cap,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError};
     use crate::test_support::unique_temp_dir;
+    use axum::Form;
+    use axum::extract::State;
     use axum::http::header;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -951,5 +959,106 @@ mod tests {
             clean_location,
             format!("/?project=all&notice={}", encode_query("Charts updated."))
         );
+    }
+
+    async fn app_state(name: &str) -> (AppState, PathBuf) {
+        let path = temp_database(name);
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        (
+            AppState::new(pool, init_templates().expect("templates")),
+            path,
+        )
+    }
+
+    fn redirect_location(response: &axum::response::Response) -> String {
+        response
+            .headers()
+            .get(header::LOCATION)
+            .expect("redirect location")
+            .to_str()
+            .expect("redirect location text")
+            .to_string()
+    }
+
+    /// Add must not hold the scan lock while the picker is open, so an
+    /// unattended dialog leaves Update free to run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_releases_the_scan_lock_while_the_picker_is_open() {
+        let (mut state, path) = app_state("add_picker_lock").await;
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let picker: Arc<super::PickerFn> = Arc::new(move || {
+            let _ = entered_tx.blocking_send(());
+            if let Ok(release) = release_rx.lock() {
+                let _ = release.recv();
+            }
+            Ok(None)
+        });
+        state.picker = picker;
+
+        let add = tokio::spawn(add_repository(State(state.clone())));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the picker is entered")
+            .expect("the picker signalled");
+
+        // The picker is still held here; Update must finish without waiting on it.
+        let update = tokio::time::timeout(
+            Duration::from_secs(2),
+            scan_all(State(state.clone()), Form(ProjectForm::default())),
+        )
+        .await
+        .expect("Update acquires the scan lock while the picker is held");
+        assert_eq!(
+            redirect_location(&update),
+            "/?project=all&notice=Charts%20updated."
+        );
+
+        release_tx.send(()).expect("release the picker");
+        let added = tokio::time::timeout(Duration::from_secs(5), add)
+            .await
+            .expect("Add finishes after the picker returns")
+            .expect("Add task joins");
+        assert_eq!(redirect_location(&added), "/repositories");
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_inserts_and_refreshes_the_repository() {
+        let (mut state, path) = app_state("add_stores").await;
+        let folder = live_repository("add_stores_repo");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=Repository%20added."
+        );
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert_eq!(repositories.len(), 1);
+        assert!(repositories[0].last_error.is_none());
+        assert!(repositories[0].scanned_at.is_some());
+        let rows = db::load_tasks(&state.pool, Some(repositories[0].repository_id))
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope, "scope");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_cancelled_picker_redirects_without_a_message() {
+        let (mut state, path) = app_state("add_cancelled").await;
+        state.picker = Arc::new(|| Ok(None));
+
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(redirect_location(&response), "/repositories");
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert!(repositories.is_empty());
+        cleanup(&path);
     }
 }
