@@ -622,7 +622,11 @@ fn scrub_git_env(command: &mut Command) {
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        // An inherited config override outranks the repository config a fixture
+        // pins, so it must not reach the listing under test.
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS");
 }
 
 type LeaveDays = Vec<(usize, Option<NaiveDate>)>;
@@ -969,8 +973,16 @@ mod tests {
         command.env("GIT_DIR", "/tmp/poisoned.git");
         command.env("GIT_WORK_TREE", "/tmp/poisoned-work");
         command.env("GIT_INDEX_FILE", "/tmp/poisoned-index");
+        command.env("GIT_CONFIG_COUNT", "1");
+        command.env("GIT_CONFIG_PARAMETERS", "'core.quotePath'='false'");
         scrub_git_env(&mut command);
-        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
             let cleared = command
                 .get_envs()
                 .any(|(name, value)| name == key && value.is_none());
@@ -1021,6 +1033,7 @@ mod tests {
             .env_remove("GIT_COMMON_DIR")
             .env_remove("GIT_OBJECT_DIRECTORY")
             .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_CONFIG_COUNT")
             .output()
             .expect("git");
         assert!(
@@ -1474,12 +1487,18 @@ mod tests {
 
     #[test]
     fn harvest_charts_a_branch_only_task_with_a_non_ascii_name() {
-        // `ls-tree` without `-z` C-quotes this path, so the listing ends in a
-        // quote and the task is dropped when only another branch holds it.
+        // The fixture pins `core.quotePath`, the default that makes `ls-tree`
+        // without `-z` C-quote this path, so the listing ends in a quote and
+        // the task is dropped when only another branch holds it.
         let repo = scratch("harvest_union_non_ascii");
         git(
             &repo,
             &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["config", "core.quotePath", "true"],
             "2026-05-01T12:00:00+00:00",
         );
         write_task(&repo, "tasks/scope_on_main.md", "2026-05-01", "open");

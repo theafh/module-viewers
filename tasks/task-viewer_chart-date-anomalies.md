@@ -1,9 +1,9 @@
 ---
-description: "Keep the live backlog, weekly, and cumulative charts consistent when a leave date precedes created or a ship event precedes the first created day."
+description: "Keep the live backlog and weekly charts consistent when a leave date precedes created or a ship event precedes the first created day."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T17:59:15
-status: checked
+updated: 2026-11-05T22:14:00
+status: ready
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -11,7 +11,7 @@ reported-by: "Andreas Hoffmann"
 
 ## Goal
 
-A task whose leave date precedes its created date, or whose ship date precedes the first created day, no longer distorts the live backlog, weekly, or cumulative charts.
+A task whose leave date precedes its created date, or whose ship date precedes the first created day, no longer distorts the live backlog or weekly charts. The cumulative chart already handles an early ship day and keeps its current start, guarded by a regression test.
 
 ## Context
 
@@ -26,7 +26,7 @@ Clamp only inside the backlog series: `live_points` treats a task's leave day as
 ## Acceptance
 
 - A series test with `created` 2026-06-10 and `leave_date` 2026-06-01 asserts the live backlog returns to zero and does not stay inflated.
-- A series test with a shipped event before the first created task asserts the cumulative chart includes that event and its final total equals `counts.shipped_events`.
+- A regression test with a shipped event before the first created task asserts the cumulative chart includes that event and its final total equals `counts.shipped_events`; `cumulative_points` already starts at the first shipped day, so this test passes before the change and keeps that behaviour from regressing.
 - A series test with a shipped event before the first created task asserts that the weekly chart contains the point whose `week` equals `format_date(monday(ship_date))` for that event with `shipped` 1, and that the sum of weekly shipped equals `counts.shipped_events`.
 - A series test with a same-week create and ship still counts both, preserving the existing test.
 - The `ARCHITECTURE.md` live-backlog bullet states the leave-before-`created` clamp, the `TESTING.md` "Series:" bullet names the clamped-leave and early-ship cases, and no passage in either file still states the unclamped backlog rule.
