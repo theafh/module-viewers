@@ -121,12 +121,15 @@ async fn require_local_host(request: axum::extract::Request, next: Next) -> Resp
     next.run(request).await
 }
 
-/// The origins a browser page on this machine uses to reach the dashboard.
-const LOOPBACK_ORIGINS: [&str; 3] = [
-    "http://127.0.0.1:7880",
-    "http://localhost:7880",
-    "http://[::1]:7880",
-];
+/// The origins a browser page on this machine uses to reach the dashboard,
+/// built from `PORT` so the allowlist cannot drift from the listener.
+fn loopback_origins() -> [String; 3] {
+    [
+        format!("http://127.0.0.1:{PORT}"),
+        format!("http://localhost:{PORT}"),
+        format!("http://[::1]:{PORT}"),
+    ]
+}
 
 /// A `POST` is same-origin when its `Origin` names a loopback origin. A request
 /// that carries no `Origin` falls back to `Sec-Fetch-Site`, whose `cross-site`
@@ -135,7 +138,7 @@ fn is_same_origin_post(headers: &HeaderMap) -> bool {
     match headers.get(header::ORIGIN) {
         Some(origin) => origin
             .to_str()
-            .is_ok_and(|origin| LOOPBACK_ORIGINS.contains(&origin)),
+            .is_ok_and(|origin| loopback_origins().iter().any(|allowed| allowed == origin)),
         None => {
             headers
                 .get("sec-fetch-site")
@@ -821,6 +824,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_not_scanned(&state, id).await;
         let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_accepts_a_loopback_origin_despite_fetch_site_cross_site() {
+        let (state, path) = app_state("origin_cross_site_accept").await;
+        let response = send(
+            state.clone(),
+            form_post("/scan", Some("http://127.0.0.1:7880"), Some("cross-site")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect_location(&response),
+            "/?project=all&notice=Charts%20updated."
+        );
         cleanup(&path);
     }
 
