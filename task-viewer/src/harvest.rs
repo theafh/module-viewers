@@ -123,8 +123,12 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
     let mut found: Vec<(String, String)> = Vec::new();
     let mut all_blobs: Vec<String> = Vec::new();
     for reference in &refs {
-        let tree = git_read(repo, dir, &["ls-tree", "-r", reference, "--", "tasks"])
-            .map_err(HarvestError::Git)?;
+        let tree = git_read(
+            repo,
+            dir,
+            &["ls-tree", "-r", "-z", reference, "--", "tasks"],
+        )
+        .map_err(HarvestError::Git)?;
         let (paths, blobs) = markdown_blobs(&tree);
         all_blobs.extend(blobs.iter().cloned());
         found.extend(paths.into_iter().zip(blobs));
@@ -308,12 +312,18 @@ fn harvest_files(
     Ok(tasks)
 }
 
-/// Split an `ls-tree -r` listing into task paths and their blob ids.
+/// Split an `ls-tree -r -z` listing into task paths and their blob ids.
+///
+/// Under `-z` git separates records with NUL and prints each path raw, so a
+/// name holding a non-ASCII character or a double quote reaches us unquoted
+/// instead of C-quoted and dropped. `git_read` decodes the output lossily, as
+/// the archive walk does, so a path that is not valid UTF-8 keeps its place in
+/// the listing.
 fn markdown_blobs(listing: &str) -> (Vec<String>, Vec<String>) {
     let mut paths = Vec::new();
     let mut blobs = Vec::new();
-    for line in listing.lines() {
-        let Some((meta, path)) = line.split_once('\t') else {
+    for record in listing.split('\0') {
+        let Some((meta, path)) = record.split_once('\t') else {
             continue;
         };
         if !path.ends_with(".md") {
@@ -1453,6 +1463,104 @@ mod tests {
         let shipped = tasks
             .iter()
             .find(|task| task.path.ends_with("scope_shipped.md"))
+            .expect("shipped on the feature branch");
+        assert_eq!(shipped.kind, TaskKind::Finished);
+        assert_eq!(
+            shipped.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_branch_only_task_with_a_non_ascii_name() {
+        // `ls-tree` without `-z` C-quotes this path, so the listing ends in a
+        // quote and the task is dropped when only another branch holds it.
+        let repo = scratch("harvest_union_non_ascii");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_on_main.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "main task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task(
+            &repo,
+            "tasks/archive/scope_über.md",
+            "2026-05-02",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "ship on feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-06-02T12:00:00+00:00");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let shipped = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_über.md"))
+            .expect("shipped on the feature branch");
+        assert_eq!(shipped.kind, TaskKind::Finished);
+        assert_eq!(
+            shipped.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_branch_only_task_with_a_double_quoted_name() {
+        // `ls-tree` without `-z` C-quotes this path too, so only the raw
+        // listing charts the task when only another branch holds it.
+        let repo = scratch("harvest_union_double_quoted");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_on_main.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "main task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task(
+            &repo,
+            "tasks/archive/scope_\"quoted\".md",
+            "2026-05-02",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "ship on feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-06-02T12:00:00+00:00");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let shipped = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_\"quoted\".md"))
             .expect("shipped on the feature branch");
         assert_eq!(shipped.kind, TaskKind::Finished);
         assert_eq!(
