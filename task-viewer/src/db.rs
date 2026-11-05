@@ -4,10 +4,18 @@ use sqlx::{
     Pool, Sqlite,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::harvest::ParsedTask;
+
+/// A hook `replace_tasks` awaits between its delete and its inserts, inside the
+/// open write transaction. Production installs one that resolves at once; a
+/// test installs one that holds the transaction past the busy timeout so a
+/// concurrent Remove has to wait on the scan lock rather than the write lock.
+pub type StoreHookFn = dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
 
 pub const SCHEMA: &str = include_str!("schema.sql");
 
@@ -122,12 +130,16 @@ pub async fn replace_tasks(
     pool: &Pool<Sqlite>,
     repository_id: i64,
     tasks: &[ParsedTask],
+    store_hook: &StoreHookFn,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM tasks WHERE repository_id = ?")
         .bind(repository_id)
         .execute(&mut *tx)
         .await?;
+    // The delete has taken SQLite's write lock; the hook runs here so a test can
+    // hold that lock while it drives a concurrent Remove.
+    store_hook().await;
     for task in tasks {
         sqlx::query(
             "INSERT INTO tasks
@@ -270,12 +282,16 @@ pub(crate) mod test_db {
 #[cfg(test)]
 mod tests {
     use super::{
-        delete_repository, init, list_repositories, load_tasks, replace_tasks, set_scan_error,
-        test_db,
+        StoreHookFn, delete_repository, init, list_repositories, load_tasks, replace_tasks,
+        set_scan_error, test_db,
     };
     use crate::harvest::{ParsedTask, TaskKind};
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::future::ready;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn temp_database() -> std::path::PathBuf {
         let dir = unique_temp_dir("db_stores");
@@ -287,6 +303,22 @@ mod tests {
         NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
     }
 
+    fn task() -> ParsedTask {
+        ParsedTask {
+            path: "tasks/archive/scope_one.md".to_string(),
+            scope: "scope".to_string(),
+            kind: TaskKind::Finished,
+            created: date(2026, 5, 28),
+            updated: date(2026, 8, 1),
+            ship_date: Some(date(2026, 7, 17)),
+            leave_date: Some(date(2026, 7, 17)),
+        }
+    }
+
+    fn immediate_hook() -> Arc<StoreHookFn> {
+        Arc::new(|| Box::pin(ready(())))
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn db_stores_repositories_and_parsed_tasks() {
         let path = temp_database();
@@ -295,16 +327,10 @@ mod tests {
         let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
             .await
             .expect("insert");
-        let tasks = vec![ParsedTask {
-            path: "tasks/archive/scope_one.md".to_string(),
-            scope: "scope".to_string(),
-            kind: TaskKind::Finished,
-            created: date(2026, 5, 28),
-            updated: date(2026, 8, 1),
-            ship_date: Some(date(2026, 7, 17)),
-            leave_date: Some(date(2026, 7, 17)),
-        }];
-        replace_tasks(&pool, id, &tasks).await.expect("replace");
+        let tasks = vec![task()];
+        replace_tasks(&pool, id, &tasks, immediate_hook().as_ref())
+            .await
+            .expect("replace");
         let loaded = load_tasks(&pool, None).await.expect("load");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].project, "ai-modules");
@@ -325,6 +351,74 @@ mod tests {
         delete_repository(&pool, id).await.expect("delete");
         let after = load_tasks(&pool, None).await.expect("after");
         assert!(after.is_empty());
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    /// The store hook runs inside the open write transaction, after the delete
+    /// that takes SQLite's write lock, so a concurrent write waits on it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_replace_awaits_the_store_hook_inside_the_write_transaction() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        let probe = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .foreign_keys(true)
+                    .busy_timeout(Duration::from_millis(100)),
+            )
+            .await
+            .expect("probe");
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let hook: Arc<StoreHookFn> = Arc::new(move || {
+            let entered_tx = entered_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let _ = entered_tx.send(()).await;
+                let release = release_rx.lock().await.take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+            })
+        });
+        let store = tokio::spawn({
+            let pool = pool.clone();
+            let hook = Arc::clone(&hook);
+            async move { replace_tasks(&pool, id, &[task()], hook.as_ref()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the hook runs")
+            .expect("the hook signalled");
+
+        let blocked = sqlx::query("UPDATE repositories SET name = name WHERE repository_id = ?")
+            .bind(id)
+            .execute(&probe)
+            .await;
+        assert!(
+            blocked.is_err(),
+            "the delete before the hook still holds the write lock"
+        );
+
+        release_tx.send(()).expect("release the store");
+        tokio::time::timeout(Duration::from_secs(10), store)
+            .await
+            .expect("the store finishes")
+            .expect("the store task joins")
+            .expect("replace");
+        let stored = load_tasks(&pool, Some(id)).await.expect("stored rows");
+        assert_eq!(stored.len(), 1);
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }

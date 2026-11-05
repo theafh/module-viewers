@@ -25,7 +25,7 @@ An open Add repository dialog no longer blocks Update. The picker runs before th
 
 **Picker seam:** hold the picker in `AppState` as `picker: Arc<PickerFn>`, where `PickerFn = dyn Fn() -> Result<Option<PathBuf>, &'static str> + Send + Sync`, mirroring the existing `HarvestFn` alias beside it. `AppState::new` sets it to `pick_folder`, so `main.rs` keeps its current call unchanged, and `add_repository` runs a clone of `state.picker` through `spawn_blocking` before it takes the lock. The tests live in `web.rs`'s `mod tests`, which can assign the private field on a state built by `AppState::new`; the seam adds no test-only constructor and no new production entry point. The tests drive `add_repository`, not `store_repository`, so the handler's lock placement stays under test.
 
-**Coordination:** this renames `pick_and_store` to `store_repository`, so `tasks/task-viewer_add-remove-outcomes.md` re-points its `refresh_one` return-value change at `store_repository`; `add_repository` still takes the lock, so `tasks/task-viewer_remove-scan-lock.md`'s `add_repository` anchor holds.
+**Coordination:** this renames `pick_and_store` to `store_repository`, so `tasks/task-viewer_add-remove-outcomes.md` re-points its `refresh_one` return-value change at `store_repository`; `add_repository` still takes the lock, so `tasks/archive/task-viewer_remove-scan-lock.md`'s `add_repository` anchor holds.
 
 **Out of scope:** Running multiple folder pickers at once.
 

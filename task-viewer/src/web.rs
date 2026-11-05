@@ -8,6 +8,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde::Serialize;
+use std::future::ready;
 use std::num::IntErrorKind;
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,7 +19,7 @@ use tokio::task::JoinSet;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::db::{self, Repository};
+use crate::db::{self, Repository, StoreHookFn};
 use crate::harvest::{self, HarvestError, ParsedTask};
 use crate::series::{self, RadarMode};
 
@@ -57,6 +58,7 @@ pub struct AppState {
     scan: Arc<Mutex<()>>,
     scan_workers: usize,
     picker: Arc<PickerFn>,
+    store_hook: Arc<StoreHookFn>,
 }
 
 impl AppState {
@@ -68,6 +70,7 @@ impl AppState {
             scan: Arc::new(Mutex::new(())),
             scan_workers: scan_worker_cap(raw.as_deref()),
             picker: Arc::new(pick_folder),
+            store_hook: Arc::new(|| Box::pin(ready(()))),
         }
     }
 }
@@ -351,11 +354,14 @@ async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<()
     let id = db::insert_repository(&state.pool, &name, &path_text)
         .await
         .map_err(|_| "The repository could not be saved.")?;
-    refresh_one(&state.pool, id, path).await;
+    refresh_one(&state.pool, &state.store_hook, id, path).await;
     Ok(())
 }
 
 async fn remove_repository(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    // Serialize Remove with Update so a scan cannot store rows for a repository
+    // this delete removes, and a delete never waits out the write-lock timeout.
+    let _guard = state.scan.lock().await;
     if let Err(error) = db::delete_repository(&state.pool, id).await {
         tracing::error!(%error, "delete failed");
         return redirect_repositories("error", "The repository could not be removed.");
@@ -378,6 +384,7 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
         &repositories,
         state.scan_workers,
         Arc::new(harvest::harvest_repository),
+        &state.store_hook,
     )
     .await;
     scan_response(&project, &report)
@@ -405,6 +412,7 @@ async fn scan_core(
     repositories: &[Repository],
     cap: usize,
     harvest: Arc<HarvestFn>,
+    store_hook: &Arc<StoreHookFn>,
 ) -> ScanReport {
     let permits = Arc::new(Semaphore::new(cap.max(1)));
     let mut harvests = JoinSet::new();
@@ -429,7 +437,7 @@ async fn scan_core(
             tracing::error!("a scan worker stopped");
             continue;
         };
-        if let Some(message) = store_outcome(pool, repository_id, outcome).await {
+        if let Some(message) = store_outcome(pool, repository_id, outcome, store_hook).await {
             failures.push(ScanFailure {
                 repository: repository_name(repositories, repository_id),
                 message,
@@ -463,10 +471,13 @@ async fn store_outcome(
     pool: &sqlx::SqlitePool,
     repository_id: i64,
     outcome: Result<Result<Vec<ParsedTask>, HarvestError>, tokio::task::JoinError>,
+    store_hook: &Arc<StoreHookFn>,
 ) -> Option<&'static str> {
     match outcome {
         Ok(Ok(tasks)) => {
-            if let Err(error) = db::replace_tasks(pool, repository_id, &tasks).await {
+            if let Err(error) =
+                db::replace_tasks(pool, repository_id, &tasks, store_hook.as_ref()).await
+            {
                 tracing::error!(%error, repository_id, "replace failed");
                 let _ = db::set_scan_error(pool, repository_id, SAVE_ERROR).await;
                 Some(SAVE_ERROR)
@@ -496,10 +507,15 @@ async fn store_outcome(
     }
 }
 
-async fn refresh_one(pool: &sqlx::SqlitePool, repository_id: i64, path: &std::path::Path) {
+async fn refresh_one(
+    pool: &sqlx::SqlitePool,
+    store_hook: &Arc<StoreHookFn>,
+    repository_id: i64,
+    path: &std::path::Path,
+) {
     let owned = path.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || harvest::harvest_repository(&owned)).await;
-    let _ = store_outcome(pool, repository_id, outcome).await;
+    let _ = store_outcome(pool, repository_id, outcome, store_hook).await;
 }
 
 /// The dashboard banner a scan run deserves: the success notice only when every
@@ -622,20 +638,42 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, HarvestFn, PickerFn, ProjectForm, ScanFailure, ScanReport, add_repository,
-        encode_query, init_templates, is_local_host, scan_all, scan_core, scan_flash,
-        scan_response, scan_worker_cap,
+        AppState, HarvestFn, PickerFn, ProjectForm, ScanFailure, ScanReport, StoreHookFn,
+        add_repository, encode_query, init_templates, is_local_host, remove_repository, scan_all,
+        scan_core, scan_flash, scan_response, scan_worker_cap,
     };
     use crate::db;
-    use crate::harvest::{self, HarvestError};
+    use crate::harvest::{self, HarvestError, ParsedTask, TaskKind};
     use crate::test_support::unique_temp_dir;
     use axum::Form;
+    use axum::extract::Path as UrlPath;
     use axum::extract::State;
     use axum::http::header;
+    use std::future::ready;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// The production store hook: it resolves at once, so a scan stores without
+    /// pausing inside the write transaction.
+    fn immediate_store_hook() -> Arc<StoreHookFn> {
+        Arc::new(|| Box::pin(ready(())))
+    }
+
+    /// One parsed row, so a store actually inserts and can trip the foreign key
+    /// when its repository is deleted mid-scan.
+    fn parsed_task() -> ParsedTask {
+        ParsedTask {
+            path: "tasks/scope_live.md".to_string(),
+            scope: "scope".to_string(),
+            kind: TaskKind::Live,
+            created: chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("date"),
+            updated: chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("date"),
+            ship_date: None,
+            leave_date: None,
+        }
+    }
 
     fn temp_database(name: &str) -> PathBuf {
         let dir = unique_temp_dir(name);
@@ -707,7 +745,7 @@ mod tests {
                 Ok(Vec::new())
             })
         };
-        scan_core(&pool, &repositories, 2, harvest).await;
+        scan_core(&pool, &repositories, 2, harvest, &immediate_store_hook()).await;
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         cleanup(&path);
     }
@@ -731,6 +769,7 @@ mod tests {
             &repositories,
             2,
             Arc::new(harvest::harvest_repository),
+            &immediate_store_hook(),
         )
         .await;
         let after = db::list_repositories(&pool).await.expect("after");
@@ -788,6 +827,7 @@ mod tests {
             &repositories,
             2,
             Arc::new(harvest::harvest_repository),
+            &immediate_store_hook(),
         )
         .await;
         let after = db::list_repositories(&pool).await.expect("after");
@@ -843,7 +883,7 @@ mod tests {
                 Ok(Vec::new())
             }
         });
-        let report = scan_core(&pool, &repositories, 2, harvest).await;
+        let report = scan_core(&pool, &repositories, 2, harvest, &immediate_store_hook()).await;
         assert_eq!(report.attempted, 2);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].repository, "broken");
@@ -867,7 +907,7 @@ mod tests {
             .expect("insert");
         let repositories = db::list_repositories(&pool).await.expect("list");
         let harvest: Arc<HarvestFn> = Arc::new(|_: &Path| panic!("harvest stopped"));
-        let report = scan_core(&pool, &repositories, 1, harvest).await;
+        let report = scan_core(&pool, &repositories, 1, harvest, &immediate_store_hook()).await;
         assert_eq!(report.attempted, 1);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].repository, "stopped");
@@ -1154,6 +1194,192 @@ mod tests {
         );
         let repositories = db::list_repositories(&state.pool).await.expect("list");
         assert_eq!(repositories.len(), 1);
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Remove takes the scan lock, so a delete cannot land between a harvest and
+    /// its store and roll that store back on the foreign key.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_remove_waits_for_the_running_scan() {
+        let (state, path) = app_state("remove_scan_lock").await;
+        let folder = live_repository("remove_scan_lock_repo");
+        let removed_id = db::insert_repository(&state.pool, "removed", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let harvest: Arc<HarvestFn> = Arc::new(move |_: &Path| {
+            let _ = entered_tx.blocking_send(());
+            if let Ok(release) = release_rx.lock() {
+                let _ = release.recv();
+            }
+            Ok(vec![parsed_task()])
+        });
+        let scan_state = state.clone();
+        let scan = tokio::spawn(async move {
+            let _guard = scan_state.scan.lock().await;
+            scan_core(
+                &scan_state.pool,
+                &repositories,
+                1,
+                harvest,
+                &scan_state.store_hook,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the harvest is entered")
+            .expect("the harvest signalled");
+
+        let remove = tokio::spawn(remove_repository(State(state.clone()), UrlPath(removed_id)));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !remove.is_finished(),
+            "Remove must wait for the scan lock instead of deleting mid-scan"
+        );
+
+        release_tx.send(()).expect("release the harvest");
+        let report = tokio::time::timeout(Duration::from_secs(10), scan)
+            .await
+            .expect("the scan finishes")
+            .expect("the scan task joins");
+        assert!(
+            report.failures.is_empty(),
+            "no scan failure names the removed repository"
+        );
+        let response = tokio::time::timeout(Duration::from_secs(10), remove)
+            .await
+            .expect("Remove finishes")
+            .expect("Remove task joins");
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=Repository%20removed."
+        );
+
+        let after = db::list_repositories(&state.pool).await.expect("after");
+        assert!(
+            !after
+                .iter()
+                .any(|repository| repository.repository_id == removed_id),
+            "the repository is gone"
+        );
+        let rows = db::load_tasks(&state.pool, None).await.expect("rows");
+        assert!(rows.is_empty(), "no rows remain");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Remove takes the scan lock, so it never queues on the SQLite write lock a
+    /// store holds past the busy timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_remove_waits_out_a_held_store_write_lock() {
+        let (mut state, path) = app_state("remove_write_lock").await;
+        let folder = live_repository("remove_write_lock_repo");
+        let removed_id = db::insert_repository(&state.pool, "removed", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let store_hook: Arc<StoreHookFn> = Arc::new(move || {
+            let entered_tx = entered_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let _ = entered_tx.send(()).await;
+                let release = release_rx.lock().await.take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+            })
+        });
+        state.store_hook = store_hook;
+
+        let scan_state = state.clone();
+        let scan = tokio::spawn(async move {
+            let _guard = scan_state.scan.lock().await;
+            scan_core(
+                &scan_state.pool,
+                &repositories,
+                1,
+                Arc::new(harvest::harvest_repository),
+                &scan_state.store_hook,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the store is entered")
+            .expect("the store signalled");
+
+        let remove = tokio::spawn(remove_repository(State(state.clone()), UrlPath(removed_id)));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !remove.is_finished(),
+            "Remove must wait for the scan lock, not the write-lock busy timeout"
+        );
+
+        release_tx.send(()).expect("release the store");
+        let report = tokio::time::timeout(Duration::from_secs(10), scan)
+            .await
+            .expect("the scan finishes")
+            .expect("the scan task joins");
+        assert!(
+            report.failures.is_empty(),
+            "the store finishes without SQLITE_BUSY"
+        );
+        let response = tokio::time::timeout(Duration::from_secs(10), remove)
+            .await
+            .expect("Remove finishes")
+            .expect("Remove task joins");
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=Repository%20removed."
+        );
+        let after = db::list_repositories(&state.pool).await.expect("after");
+        assert!(
+            !after
+                .iter()
+                .any(|repository| repository.repository_id == removed_id),
+            "the repository is gone"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// A remove with no scan running still deletes the repository and its rows
+    /// and redirects with the existing notice.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_remove_deletes_the_repository_and_its_rows() {
+        let (state, path) = app_state("remove_rows").await;
+        let folder = live_repository("remove_rows_repo");
+        let removed_id = db::insert_repository(&state.pool, "removed", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        db::replace_tasks(
+            &state.pool,
+            removed_id,
+            &[parsed_task()],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("rows");
+
+        let response = remove_repository(State(state.clone()), UrlPath(removed_id)).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=Repository%20removed."
+        );
+        let after = db::list_repositories(&state.pool).await.expect("after");
+        assert!(after.is_empty());
+        let rows = db::load_tasks(&state.pool, None).await.expect("rows");
+        assert!(rows.is_empty());
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
