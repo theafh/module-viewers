@@ -1322,6 +1322,11 @@ mod tests {
                     "--",
                     rel,
                 ])
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_INDEX_FILE")
                 .output()
                 .expect("git log");
             assert!(
@@ -1350,6 +1355,11 @@ mod tests {
                 "--",
                 "tasks/unrelated.md",
             ])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .expect("git log");
         assert!(
