@@ -1,7 +1,15 @@
 (function () {
   var NS = "http://www.w3.org/2000/svg";
   var payloadNode = document.getElementById("payload");
-  var payload = payloadNode ? JSON.parse(payloadNode.textContent) : null;
+  var payload = null;
+  if (payloadNode) {
+    try {
+      payload = JSON.parse(payloadNode.textContent);
+    } catch (error) {
+      payload = null;
+    }
+  }
+  var CARD_NAMES = ["weekly", "cumulative", "shipped-calendar", "created-calendar", "backlog", "age", "radar-shipped", "radar-live"];
   var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
   function cssVar(name) {
@@ -238,7 +246,7 @@
     parsed.forEach(function (day) { cells.push(day); });
     var columns = Math.ceil(cells.length / 7);
     var labelW = 28;
-    var cell = Math.min(14, Math.floor((width - labelW - 8) / columns) - 2);
+    var cell = Math.max(1, Math.min(14, Math.floor((width - labelW - 8) / columns) - 2));
     var gap = 2;
     var maxLog = Math.log1p(peak);
     var tip = tipFor(root.querySelector(".chart-frame"));
@@ -293,7 +301,7 @@
     svg.setAttribute("viewBox", "0 0 " + width + " " + height);
     var cx = width / 2;
     var cy = height / 2 + 4;
-    var radius = Math.min(width, height) / 2 - 64;
+    var radius = Math.max(1, Math.min(width, height) / 2 - 64);
     var max = 1;
     rows.forEach(function (row) { max = Math.max(max, row.count); });
     var color = cssVar(colorName);
@@ -352,37 +360,71 @@
     }
   }
 
+  function renderUnavailable(name) {
+    var root = card(name);
+    if (!root) return;
+    var svg = root.querySelector("svg");
+    if (svg) {
+      message(svg, "Charts unavailable");
+    }
+  }
+
+  function renderCard(name, draw) {
+    try {
+      draw();
+    } catch (error) {
+      renderUnavailable(name);
+    }
+  }
+
   function renderAll() {
-    if (!payload) return;
-    drawWeekly();
-    drawLine(
-      "cumulative",
-      payload.cumulative,
-      "--chart-ship",
-      function (row) { return row.cumulative; },
-      function (row) { return dateLabel(parseDay(row.date)) + " · cumulative " + fmt(row.cumulative) + " · shipped " + fmt(row.shipped); },
-      "Running total · dashed line is the linear trend"
-    );
-    drawCalendar("shipped-calendar", payload.shipped_calendar, "--chart-ship", "shipped", payload.calendar_peak_shipped);
-    drawCalendar("created-calendar", payload.created_calendar, "--chart-create", "created", payload.calendar_peak_created);
-    drawLine(
-      "backlog",
-      payload.live_backlog,
-      "--chart-create",
-      function (row) { return row.live; },
-      function (row) { return dateLabel(parseDay(row.date)) + " · live " + fmt(row.live); },
-      "Tasks that exist and are not yet shipped or deferred"
-    );
-    drawLine(
-      "age",
-      payload.mean_age,
-      "--chart-age",
-      function (row) { return row.avg_age; },
-      function (row) { return dateLabel(parseDay(row.date)) + " · mean age " + fmt(row.avg_age) + " days · " + fmt(row.n) + " tasks"; },
-      "Mean age in days of the unfinished backlog · deferred tasks excluded"
-    );
-    drawRadar("radar-shipped", payload.radar_shipped, "--chart-ship", "shipped", payload.radar_mode);
-    drawRadar("radar-live", payload.radar_live, "--chart-create", "live", payload.radar_mode);
+    if (!payload) {
+      CARD_NAMES.forEach(renderUnavailable);
+      return;
+    }
+    renderCard("weekly", drawWeekly);
+    renderCard("cumulative", function () {
+      drawLine(
+        "cumulative",
+        payload.cumulative,
+        "--chart-ship",
+        function (row) { return row.cumulative; },
+        function (row) { return dateLabel(parseDay(row.date)) + " · cumulative " + fmt(row.cumulative) + " · shipped " + fmt(row.shipped); },
+        "Running total · dashed line is the linear trend"
+      );
+    });
+    renderCard("shipped-calendar", function () {
+      drawCalendar("shipped-calendar", payload.shipped_calendar, "--chart-ship", "shipped", payload.calendar_peak_shipped);
+    });
+    renderCard("created-calendar", function () {
+      drawCalendar("created-calendar", payload.created_calendar, "--chart-create", "created", payload.calendar_peak_created);
+    });
+    renderCard("backlog", function () {
+      drawLine(
+        "backlog",
+        payload.live_backlog,
+        "--chart-create",
+        function (row) { return row.live; },
+        function (row) { return dateLabel(parseDay(row.date)) + " · live " + fmt(row.live); },
+        "Tasks that exist and are not yet shipped or deferred"
+      );
+    });
+    renderCard("age", function () {
+      drawLine(
+        "age",
+        payload.mean_age,
+        "--chart-age",
+        function (row) { return row.avg_age; },
+        function (row) { return dateLabel(parseDay(row.date)) + " · mean age " + fmt(row.avg_age) + " days · " + fmt(row.n) + " tasks"; },
+        "Mean age in days of the unfinished backlog · deferred tasks excluded"
+      );
+    });
+    renderCard("radar-shipped", function () {
+      drawRadar("radar-shipped", payload.radar_shipped, "--chart-ship", "shipped", payload.radar_mode);
+    });
+    renderCard("radar-live", function () {
+      drawRadar("radar-live", payload.radar_live, "--chart-create", "live", payload.radar_mode);
+    });
   }
 
   window.addEventListener("task-viewer-theme", renderAll);

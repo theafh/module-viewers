@@ -2059,4 +2059,278 @@ mod tests {
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
+
+    const BROWSER_GUARDS: &str = include_str!("../testdata/browser_guards.js");
+    const THEME_SCRIPT: &str = include_str!("../static/js/theme.js");
+    const DASHBOARD_SCRIPT: &str = include_str!("../static/js/dashboard.js");
+
+    /// Run the real shipped scripts against the stub DOM, then evaluate
+    /// `assertion` in the same realm and return its JSON result. Loading a
+    /// script that throws fails the test, which is how an uncaught error in
+    /// `theme.js` or `dashboard.js` surfaces.
+    fn run_browser(config: &serde_json::Value, assertion: &str) -> serde_json::Value {
+        let runtime = rquickjs::Runtime::new().expect("quickjs runtime");
+        let context = rquickjs::Context::full(&runtime).expect("quickjs context");
+        context.with(|ctx| {
+            ctx.eval::<(), _>(format!("globalThis.__config = {config};"))
+                .expect("config script");
+            ctx.eval::<(), _>(BROWSER_GUARDS).expect("dom harness");
+            ctx.eval::<(), _>(THEME_SCRIPT).expect("theme.js loads");
+            ctx.eval::<(), _>(DASHBOARD_SCRIPT)
+                .expect("dashboard.js loads");
+            let json: String = ctx.eval(assertion).expect("assertion script");
+            serde_json::from_str(&json).expect("assertion json")
+        })
+    }
+
+    /// A browser config. Omitting `payload_text` keeps the harness's default
+    /// payload, which draws every chart.
+    fn browser_config(
+        narrow: bool,
+        storage_throws: bool,
+        payload_text: Option<&str>,
+        css_value: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut config = serde_json::json!({
+            "narrow": narrow,
+            "storageThrows": storage_throws,
+            "cssValue": css_value,
+        });
+        if let Some(text) = payload_text {
+            config["payloadText"] = serde_json::Value::String(text.to_string());
+        }
+        config
+    }
+
+    /// A realistic year of shipped-calendar rows: 365 daily cells need more
+    /// than 52 columns, so the pre-fix cell width is negative at 120px.
+    fn year_of_calendar_rows() -> serde_json::Value {
+        let start = chrono::NaiveDate::from_ymd_opt(2025, 11, 6).expect("start date");
+        let shipped_calendar: Vec<serde_json::Value> = (0..365)
+            .map(|offset| {
+                let date = start + chrono::Duration::days(offset);
+                serde_json::json!({
+                    "date": date.format("%Y-%m-%d").to_string(),
+                    "count": offset % 3,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "counts": {"shipped_events": 10, "created_events": 12},
+            "weekly": [{"week": "2026-01-05", "shipped": 1, "created": 2}],
+            "cumulative": [{"date": "2026-01-05", "cumulative": 1, "shipped": 1, "trend": 1}],
+            "shipped_calendar": shipped_calendar,
+            "created_calendar": [{"date": "2026-01-05", "count": 2}],
+            "calendar_peak_shipped": 2,
+            "calendar_peak_created": 2,
+            "live_backlog": [{"date": "2026-01-05", "live": 1}],
+            "mean_age": [{"date": "2026-01-05", "avg_age": 2, "n": 1}],
+            "radar_shipped": [{"label": "alpha", "count": 1}],
+            "radar_live": [{"label": "alpha", "count": 1}],
+            "radar_mode": "scope"
+        })
+    }
+
+    /// Acceptance 1: a throwing `localStorage` still flips `data-theme`, keeps
+    /// the button label in sync, recolors the charts through the theme event,
+    /// and lets no exception escape the click handler.
+    #[test]
+    fn browser_theme_toggle_survives_throwing_storage() {
+        let config = browser_config(
+            false,
+            true,
+            None,
+            serde_json::json!({"dark": "#111111", "light": "#eeeeee"}),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function fills() {
+    var svg = env.cards["created-calendar"].querySelector("svg");
+    return svg.children
+      .filter(function (node) { return node.name === "rect"; })
+      .map(function (node) { return node.attrs.fill; });
+  }
+  var before = fills();
+  var error = null;
+  try {
+    env.themeButton.click();
+  } catch (caught) {
+    error = String(caught);
+  }
+  return JSON.stringify({
+    error: error,
+    theme: env.html.getAttribute("data-theme"),
+    button: env.themeButton.textContent,
+    before: before,
+    after: fills()
+  });
+})()"#,
+        );
+        assert_eq!(result["error"], serde_json::Value::Null);
+        assert_eq!(result["theme"], "light");
+        assert_eq!(result["button"], "Dark");
+        let before = result["before"].as_array().expect("before fills");
+        assert!(
+            before.iter().any(|fill| fill.as_str() == Some("#111111")),
+            "the dark theme drew the calendar"
+        );
+        let after = result["after"].as_array().expect("after fills");
+        assert!(
+            after.iter().any(|fill| fill.as_str() == Some("#eeeeee")),
+            "the theme event recolored the calendar"
+        );
+        assert!(
+            !after.iter().any(|fill| fill.as_str() == Some("#111111")),
+            "no mark keeps the previous theme color"
+        );
+    }
+
+    /// Acceptance 2: a 120px SVG with a year of calendar rows draws no
+    /// negative-width rect and no negative-radius circle.
+    #[test]
+    fn browser_narrow_viewport_draws_no_negative_geometry() {
+        let payload = year_of_calendar_rows();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            true,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var rects = 0;
+  var badWidths = 0;
+  var circles = 0;
+  var badRadii = 0;
+  env.cardNames.forEach(function (name) {
+    var svg = env.cards[name].querySelector("svg");
+    svg.children.forEach(function (node) {
+      if (node.name === "rect") {
+        rects += 1;
+        if (Number(node.attrs.width) < 0) badWidths += 1;
+      }
+      if (node.name === "circle") {
+        circles += 1;
+        if (Number(node.attrs.r) < 0) badRadii += 1;
+      }
+    });
+  });
+  return JSON.stringify({ rects: rects, badWidths: badWidths, circles: circles, badRadii: badRadii });
+})()"#,
+        );
+        assert!(
+            result["rects"].as_u64().expect("rect count") > 0,
+            "the calendar drew cells"
+        );
+        assert_eq!(result["badWidths"], 0);
+        assert!(
+            result["circles"].as_u64().expect("circle count") > 0,
+            "the radar drew rings"
+        );
+        assert_eq!(result["badRadii"], 0);
+    }
+
+    /// Acceptance 3: a malformed payload renders "Charts unavailable" on every
+    /// chart card, and `dashboard.js` loads without throwing.
+    #[test]
+    fn browser_malformed_payload_renders_the_fallback_on_every_card() {
+        let config = browser_config(
+            false,
+            false,
+            Some("{not json"),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var shown = {};
+  env.cardNames.forEach(function (name) {
+    var svg = env.cards[name].querySelector("svg");
+    shown[name] = svg.children.some(function (node) {
+      return node.name === "text" && node.textContent === "Charts unavailable";
+    });
+  });
+  return JSON.stringify(shown);
+})()"#,
+        );
+        for name in [
+            "weekly",
+            "cumulative",
+            "shipped-calendar",
+            "created-calendar",
+            "backlog",
+            "age",
+            "radar-shipped",
+            "radar-live",
+        ] {
+            assert_eq!(result[name], true, "{name} shows the fallback");
+        }
+    }
+
+    /// Acceptance 4: a parseable payload whose `counts` is absent and whose
+    /// `shipped_calendar` is not an array leaves only the throwing cards
+    /// (weekly and shipped-calendar) on the fallback, while cumulative and
+    /// radar render normally with no uncaught error.
+    #[test]
+    fn browser_one_bad_field_leaves_only_its_cards_unavailable() {
+        let payload = serde_json::json!({
+            "weekly": [{"week": "2026-01-05", "shipped": 1, "created": 2}],
+            "cumulative": [{"date": "2026-01-05", "cumulative": 1, "shipped": 1, "trend": 1}],
+            "shipped_calendar": "not an array",
+            "created_calendar": [{"date": "2026-01-05", "count": 2}],
+            "calendar_peak_shipped": 1,
+            "calendar_peak_created": 2,
+            "live_backlog": [{"date": "2026-01-05", "live": 1}],
+            "mean_age": [{"date": "2026-01-05", "avg_age": 2, "n": 1}],
+            "radar_shipped": [{"label": "alpha", "count": 1}],
+            "radar_live": [{"label": "alpha", "count": 1}],
+            "radar_mode": "scope"
+        });
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function svg(name) {
+    return env.cards[name].querySelector("svg");
+  }
+  function hasText(name, text) {
+    return svg(name).children.some(function (node) {
+      return node.name === "text" && node.textContent === text;
+    });
+  }
+  function hasMark(name, kinds) {
+    return svg(name).children.some(function (node) {
+      return kinds.indexOf(node.name) >= 0;
+    });
+  }
+  return JSON.stringify({
+    weeklyFallback: hasText("weekly", "Charts unavailable"),
+    shippedCalendarFallback: hasText("shipped-calendar", "Charts unavailable"),
+    cumulativeFallback: hasText("cumulative", "Charts unavailable"),
+    cumulativeMarks: hasMark("cumulative", ["path", "rect"]),
+    radarFallback: hasText("radar-shipped", "Charts unavailable"),
+    radarMarks: hasMark("radar-shipped", ["polygon", "circle"])
+  });
+})()"#,
+        );
+        assert_eq!(result["weeklyFallback"], true);
+        assert_eq!(result["shippedCalendarFallback"], true);
+        assert_eq!(result["cumulativeFallback"], false);
+        assert_eq!(result["cumulativeMarks"], true);
+        assert_eq!(result["radarFallback"], false);
+        assert_eq!(result["radarMarks"], true);
+    }
 }

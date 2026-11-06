@@ -9,7 +9,12 @@
     <link rel="stylesheet" href="/static/style.css?v={{ version }}">
     <script>
         (function () {
-            var stored = localStorage.getItem("task-viewer-theme");
+            var stored = null;
+            try {
+                stored = localStorage.getItem("task-viewer-theme");
+            } catch (error) {
+                // A restricted browser blocks storage; keep the default theme.
+            }
             if (stored === "light" || stored === "dark") {
                 document.documentElement.setAttribute("data-theme", stored);
             }
