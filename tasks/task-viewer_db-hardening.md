@@ -2,9 +2,11 @@
 description: "Add a versioned migration path, drop the redundant task index, and create or validate the configured database directory."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T23:35:22
-status: ready
+updated: 2026-11-06T10:45:42
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Harden the database lifecycle

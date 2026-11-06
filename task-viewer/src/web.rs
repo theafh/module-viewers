@@ -20,7 +20,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::db::{self, Repository, StoreHookFn};
-use crate::harvest::{self, HarvestError, ParsedTask};
+use crate::harvest::{self, HarvestError, ParsedTask, PriorTask};
 use crate::series::{self, RadarMode};
 
 pub const PORT: u16 = 7880;
@@ -417,14 +417,15 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
         &state.pool,
         &repositories,
         state.scan_workers,
-        Arc::new(harvest::harvest_repository),
+        Arc::new(harvest::harvest_repository_with_prior),
         &state.store_hook,
     )
     .await;
     scan_response(&project, &report)
 }
 
-type HarvestFn = dyn Fn(&std::path::Path) -> Result<Vec<ParsedTask>, HarvestError> + Send + Sync;
+type HarvestFn =
+    dyn Fn(&std::path::Path, &[PriorTask]) -> Result<Vec<ParsedTask>, HarvestError> + Send + Sync;
 
 /// One repository whose scan left a scan error behind.
 struct ScanFailure {
@@ -457,9 +458,18 @@ async fn scan_core(
         let harvest = Arc::clone(&harvest);
         let repository_id = repository.repository_id;
         let path = PathBuf::from(&repository.path);
+        // Load the rows the last Update stored before this harvest runs, so an
+        // unchanged archived file can reuse its leave day.
+        let prior = match db::load_prior_tasks(pool, repository_id).await {
+            Ok(prior) => prior,
+            Err(error) => {
+                tracing::error!(%error, repository_id, "prior rows could not be read");
+                Vec::new()
+            }
+        };
         harvests.spawn(async move {
             let _permit = permit;
-            let outcome = tokio::task::spawn_blocking(move || harvest(&path)).await;
+            let outcome = tokio::task::spawn_blocking(move || harvest(&path, &prior)).await;
             (repository_id, outcome)
         });
     }
@@ -548,7 +558,16 @@ async fn refresh_one(
     path: &std::path::Path,
 ) {
     let owned = path.to_path_buf();
-    let outcome = tokio::task::spawn_blocking(move || harvest::harvest_repository(&owned)).await;
+    let prior = match db::load_prior_tasks(pool, repository_id).await {
+        Ok(prior) => prior,
+        Err(error) => {
+            tracing::error!(%error, repository_id, "prior rows could not be read");
+            Vec::new()
+        }
+    };
+    let outcome =
+        tokio::task::spawn_blocking(move || harvest::harvest_repository_with_prior(&owned, &prior))
+            .await;
     let _ = store_outcome(pool, repository_id, outcome, store_hook).await;
 }
 
@@ -677,7 +696,7 @@ mod tests {
         scan_all, scan_core, scan_flash, scan_response, scan_worker_cap,
     };
     use crate::db;
-    use crate::harvest::{self, HarvestError, ParsedTask, TaskKind};
+    use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
     use crate::test_support::unique_temp_dir;
     use axum::Form;
     use axum::body::Body;
@@ -708,6 +727,7 @@ mod tests {
             updated: chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("date"),
             ship_date: None,
             leave_date: None,
+            content_hash: "0123456789abcdef".to_string(),
         }
     }
 
@@ -726,6 +746,67 @@ mod tests {
         )
         .expect("task");
         repo
+    }
+
+    /// A git repository holding `count` archived finished tasks, all committed
+    /// on 2026-06-01, so a leave-day walk has a commit to find.
+    fn archived_repository(name: &str, count: usize) -> PathBuf {
+        let repo = unique_temp_dir(name);
+        std::fs::create_dir_all(repo.join("tasks/archive")).expect("tasks");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        for index in 0..count {
+            write_archived(&repo, index, "2026-05-01", "# Task");
+        }
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive tasks"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        repo
+    }
+
+    fn write_archived(repo: &Path, index: usize, updated: &str, body: &str) {
+        std::fs::write(
+            repo.join(format!("tasks/archive/scope_{index}.md")),
+            format!(
+                "---\ncreated: 2026-05-01T10:00:00\nupdated: {updated}T10:00:00\nstatus: finished\n---\n\n{body}\n"
+            ),
+        )
+        .expect("archived task");
+    }
+
+    fn git(repo: &Path, args: &[&str], date: &str) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "-c",
+                "user.email=task-viewer@example.com",
+                "-c",
+                "user.name=task-viewer",
+            ])
+            .args(args)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_CONFIG_COUNT")
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn cleanup(path: &Path) {
@@ -995,7 +1076,7 @@ mod tests {
         let harvest: Arc<HarvestFn> = {
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
-            Arc::new(move |_: &Path| {
+            Arc::new(move |_: &Path, _: &[PriorTask]| {
                 let running = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(running, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(50));
@@ -1026,7 +1107,7 @@ mod tests {
             &pool,
             &repositories,
             2,
-            Arc::new(harvest::harvest_repository),
+            Arc::new(harvest::harvest_repository_with_prior),
             &immediate_store_hook(),
         )
         .await;
@@ -1042,6 +1123,113 @@ mod tests {
         for folder in folders {
             let _ = std::fs::remove_dir_all(folder);
         }
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_update_reuses_prior_leave_days_for_unchanged_archived_tasks() {
+        let path = temp_database("scan_leave_cache");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let repo = archived_repository("scan_leave_cache_repo", 5);
+        let id = db::insert_repository(&pool, "archived", &repo.to_string_lossy())
+            .await
+            .expect("insert");
+        let repositories = db::list_repositories(&pool).await.expect("list");
+
+        let first = scan_core(
+            &pool,
+            &repositories,
+            1,
+            Arc::new(harvest::harvest_repository_with_prior),
+            &immediate_store_hook(),
+        )
+        .await;
+        assert!(first.failures.is_empty());
+        let first_walks = harvest::take_leave_walk_count(&repo);
+        assert_eq!(first_walks, 5, "the first pass walks every archived task");
+
+        // The second pass reads the stored leave days and content hashes before
+        // it harvests, so an unchanged file needs no history walk.
+        let second = scan_core(
+            &pool,
+            &repositories,
+            1,
+            Arc::new(harvest::harvest_repository_with_prior),
+            &immediate_store_hook(),
+        )
+        .await;
+        assert!(second.failures.is_empty());
+        let second_walks = harvest::take_leave_walk_count(&repo);
+        assert!(
+            second_walks < first_walks,
+            "the second pass reuses the stored leave days: {second_walks} walks of {first_walks}"
+        );
+
+        let rows = db::load_tasks(&pool, Some(id)).await.expect("rows");
+        assert_eq!(rows.len(), 5);
+        let archived_day = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).expect("day");
+        for row in rows {
+            assert_eq!(row.leave_date, Some(archived_day));
+            assert_eq!(row.ship_date, Some(archived_day));
+        }
+        let _ = std::fs::remove_dir_all(repo);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_update_rewalks_an_archived_task_whose_bytes_changed() {
+        let path = temp_database("scan_leave_cache_change");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let repo = archived_repository("scan_leave_cache_change_repo", 3);
+        let id = db::insert_repository(&pool, "archived", &repo.to_string_lossy())
+            .await
+            .expect("insert");
+        let repositories = db::list_repositories(&pool).await.expect("list");
+
+        scan_core(
+            &pool,
+            &repositories,
+            1,
+            Arc::new(harvest::harvest_repository_with_prior),
+            &immediate_store_hook(),
+        )
+        .await;
+        assert_eq!(harvest::take_leave_walk_count(&repo), 3);
+
+        // Same path and status, different bytes: the prior content hash no
+        // longer describes the file, so that path's walk must run again while
+        // the other two stay cached.
+        write_archived(&repo, 1, "2026-07-01", "# Changed");
+
+        scan_core(
+            &pool,
+            &repositories,
+            1,
+            Arc::new(harvest::harvest_repository_with_prior),
+            &immediate_store_hook(),
+        )
+        .await;
+        assert_eq!(
+            harvest::take_leave_walk_count(&repo),
+            1,
+            "only the changed path is walked again"
+        );
+
+        let leave: Option<String> =
+            sqlx::query_scalar("SELECT leave_date FROM tasks WHERE repository_id = ? AND path = ?")
+                .bind(id)
+                .bind("tasks/archive/scope_1.md")
+                .fetch_one(&pool)
+                .await
+                .expect("changed row");
+        assert_eq!(
+            leave.as_deref(),
+            Some("2026-06-01"),
+            "the re-walk keeps the archive commit day, not the changed updated day"
+        );
+        let _ = std::fs::remove_dir_all(repo);
         cleanup(&path);
     }
 
@@ -1084,7 +1272,7 @@ mod tests {
             &pool,
             &repositories,
             2,
-            Arc::new(harvest::harvest_repository),
+            Arc::new(harvest::harvest_repository_with_prior),
             &immediate_store_hook(),
         )
         .await;
@@ -1134,7 +1322,7 @@ mod tests {
             .expect("insert broken");
         let repositories = db::list_repositories(&pool).await.expect("list");
         let broken_path = broken.clone();
-        let harvest: Arc<HarvestFn> = Arc::new(move |path: &Path| {
+        let harvest: Arc<HarvestFn> = Arc::new(move |path: &Path, _: &[PriorTask]| {
             if path == broken_path {
                 Err(HarvestError::Git("no history".to_string()))
             } else {
@@ -1164,7 +1352,8 @@ mod tests {
             .await
             .expect("insert");
         let repositories = db::list_repositories(&pool).await.expect("list");
-        let harvest: Arc<HarvestFn> = Arc::new(|_: &Path| panic!("harvest stopped"));
+        let harvest: Arc<HarvestFn> =
+            Arc::new(|_: &Path, _: &[PriorTask]| panic!("harvest stopped"));
         let report = scan_core(&pool, &repositories, 1, harvest, &immediate_store_hook()).await;
         assert_eq!(report.attempted, 1);
         assert_eq!(report.failures.len(), 1);
@@ -1470,7 +1659,7 @@ mod tests {
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
-        let harvest: Arc<HarvestFn> = Arc::new(move |_: &Path| {
+        let harvest: Arc<HarvestFn> = Arc::new(move |_: &Path, _: &[PriorTask]| {
             let _ = entered_tx.blocking_send(());
             if let Ok(release) = release_rx.lock() {
                 let _ = release.recv();
@@ -1566,7 +1755,7 @@ mod tests {
                 &scan_state.pool,
                 &repositories,
                 1,
-                Arc::new(harvest::harvest_repository),
+                Arc::new(harvest::harvest_repository_with_prior),
                 &scan_state.store_hook,
             )
             .await

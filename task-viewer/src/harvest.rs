@@ -41,6 +41,18 @@ pub struct ParsedTask {
     pub updated: NaiveDate,
     pub ship_date: Option<NaiveDate>,
     pub leave_date: Option<NaiveDate>,
+    /// A hash of the file bytes this row was parsed from, so the next harvest
+    /// can reuse the stored leave day while the file is unchanged.
+    pub content_hash: String,
+}
+
+/// The leave day and content hash the database stored for one task path before
+/// this harvest. A matching hash lets the leave-day walk be skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorTask {
+    pub path: String,
+    pub leave_date: Option<NaiveDate>,
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug)]
@@ -68,7 +80,18 @@ impl From<std::io::Error> for HarvestError {
     }
 }
 
+#[cfg(test)]
 pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> {
+    harvest_repository_with_prior(repo, &[])
+}
+
+/// Harvest `repo`, reusing the stored leave day of every archived path whose
+/// content hash still matches the row the database holds. Prior rows arrive as
+/// an argument, so harvest stays read-only of the database.
+pub fn harvest_repository_with_prior(
+    repo: &Path,
+    prior: &[PriorTask],
+) -> Result<Vec<ParsedTask>, HarvestError> {
     let repo = fs::canonicalize(repo)?;
     let tasks_root = repo.join("tasks");
     if !tasks_root.is_dir() {
@@ -79,17 +102,51 @@ pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> 
     // tree that the working tree or any ref holds, so a task stays visible
     // whichever branch is checked out. A folder outside git is charted from its
     // files.
-    let files = match git_dir(&repo) {
+    let git = GitContext::resolve(&repo);
+    let files = match &git.dir {
         Some(dir) => {
             // A `.git` that git cannot open fails the scan; charting frontmatter
             // dates instead would pile every task onto its last bulk `updated`
             // day.
-            git_read(&repo, &dir, &["rev-parse", "--git-dir"]).map_err(HarvestError::Git)?;
-            union_files(&repo, &dir)?
+            git_read(&repo, dir, &["rev-parse", "--git-dir"]).map_err(HarvestError::Git)?;
+            union_files(&repo, dir)?
         }
         None => files_on_disk(&repo)?,
     };
-    harvest_files(&repo, files)
+    harvest_files(&repo, &git, files, prior)
+}
+
+/// The git context resolved once per harvest: the folder's own `.git`, its
+/// place inside an enclosing repository, and whether a repository holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitContext {
+    dir: Option<PathBuf>,
+    prefix: String,
+    inside_repository: bool,
+}
+
+impl GitContext {
+    fn resolve(repo: &Path) -> Self {
+        if let Some(dir) = git_dir(repo) {
+            return Self {
+                dir: Some(dir),
+                prefix: String::new(),
+                inside_repository: true,
+            };
+        }
+        match enclosing_prefix(repo) {
+            Some(prefix) => Self {
+                dir: None,
+                prefix,
+                inside_repository: true,
+            },
+            None => Self {
+                dir: None,
+                prefix: String::new(),
+                inside_repository: false,
+            },
+        }
+    }
 }
 
 /// Every task file the working tree or any ref holds, one row per task.
@@ -233,7 +290,9 @@ fn blob_days(
 
 fn harvest_files(
     repo: &Path,
+    git: &GitContext,
     files: Vec<(String, String)>,
+    prior: &[PriorTask],
 ) -> Result<Vec<ParsedTask>, HarvestError> {
     let mut pending = Vec::new();
     let mut tasks = Vec::new();
@@ -262,12 +321,13 @@ fn harvest_files(
             .split_once('_')
             .map(|(prefix, _)| prefix.to_string())
             .unwrap_or_else(|| name.to_string());
+        let content_hash = content_hash(&text);
         let index = tasks.len();
         // Always pickaxe against this folder with a path relative to it.
         // Never ask `rev-parse` first: an inherited GIT_DIR can point that at
         // another checkout and every leave/ship lookup misses.
         if matches!(kind, TaskKind::Finished | TaskKind::Deferred) {
-            pending.push((index, rel.clone(), status));
+            pending.push((index, rel.clone(), status, content_hash.clone()));
         }
         let (ship_date, leave_date) = dates_for(kind, updated);
         tasks.push(ParsedTask {
@@ -278,11 +338,12 @@ fn harvest_files(
             updated,
             ship_date,
             leave_date,
+            content_hash,
         });
     }
 
     let mut from_git = 0usize;
-    for (index, leave_day) in leave_dates(repo, &pending).map_err(HarvestError::Git)? {
+    for (index, leave_day) in leave_dates(repo, git, &pending, prior).map_err(HarvestError::Git)? {
         if let Some(task) = tasks.get_mut(index)
             && let Some(day) = leave_day
         {
@@ -629,24 +690,78 @@ fn scrub_git_env(command: &mut Command) {
         .env_remove("GIT_CONFIG_PARAMETERS");
 }
 
+/// Test-only tally of leave-day `git log` launches, keyed by repository path so
+/// parallel tests and parallel repositories cannot see each other's counts.
+#[cfg(test)]
+mod walk_count {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn counts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+        static COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+        COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn record(repo: &Path) {
+        if let Ok(mut counts) = counts().lock() {
+            *counts.entry(repo.to_path_buf()).or_insert(0) += 1;
+        }
+    }
+
+    pub(super) fn take(repo: &Path) -> usize {
+        counts()
+            .lock()
+            .ok()
+            .and_then(|mut counts| counts.remove(repo))
+            .unwrap_or(0)
+    }
+}
+
+/// The leave-day `git log` launches recorded for `repo` since the last call,
+/// for a test that asserts the content-hash cache skipped the walk.
+#[cfg(test)]
+pub(crate) fn take_leave_walk_count(repo: &Path) -> usize {
+    // Harvest canonicalizes its repository path, so key the lookup the same way.
+    let repo = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    walk_count::take(&repo)
+}
+
 type LeaveDays = Vec<(usize, Option<NaiveDate>)>;
 
-fn leave_dates(repo: &Path, jobs: &[(usize, String, String)]) -> Result<LeaveDays, String> {
-    let prefix = if jobs
-        .iter()
-        .any(|(_, _, status)| status == "finished" || status == "deferred")
-    {
-        folder_prefix(repo)
-    } else {
-        String::new()
-    };
+/// One archived task awaiting its leave day: its row index, relative path,
+/// frontmatter status, and the content hash of the bytes it was parsed from.
+type LeaveJob = (usize, String, String, String);
+
+fn leave_dates(
+    repo: &Path,
+    git: &GitContext,
+    jobs: &[LeaveJob],
+    prior: &[PriorTask],
+) -> Result<LeaveDays, String> {
+    // A folder outside git has no commit to offer. Return once instead of
+    // spawning a failing git process for every archived task; the `updated`
+    // fallback that `dates_for` seeded stays in place.
+    if !git.inside_repository {
+        return Ok(jobs.iter().map(|(index, ..)| (*index, None)).collect());
+    }
+    let cached: std::collections::HashMap<&str, &PriorTask> =
+        prior.iter().map(|row| (row.path.as_str(), row)).collect();
     // Sequential on purpose. Parallel git log --follow across hundreds of
     // archive files exhausted process slots and aborted Update.
     jobs.iter()
-        .map(|(index, rel, status)| {
+        .map(|(index, rel, status, hash)| {
+            // An unchanged file keeps the leave day the database already holds,
+            // so its history walk is skipped. A changed hash or a missing row
+            // falls through to the walk.
+            if let Some(row) = cached.get(rel.as_str())
+                && row.content_hash.as_deref() == Some(hash.as_str())
+            {
+                return Ok((*index, row.leave_date));
+            }
             let day = match status.as_str() {
-                "finished" | "deferred" => first_archived_commit_date(repo, rel, &prefix, status)?,
-                _ => first_status_commit_date(repo, rel, status)?,
+                "finished" | "deferred" => first_archived_commit_date(repo, git, rel, status)?,
+                _ => first_status_commit_date(repo, git, rel, status)?,
             };
             Ok((*index, day))
         })
@@ -661,28 +776,30 @@ fn leave_dates(repo: &Path, jobs: &[(usize, String, String)]) -> Result<LeaveDay
 /// later bulk rename of `implemented` to `finished` does not move its ship day.
 /// A deferred task counts from the commit whose path lies under `archive` and
 /// whose content carries `status: deferred`, so a deferral made while the task
-/// was live does not move its leave day. `prefix` is the folder's place inside
-/// the repository that holds it, so only an `archive` directory inside the
-/// folder counts.
+/// was live does not move its leave day. The resolved `git` context supplies the
+/// folder's place inside the repository that holds it, so only an `archive`
+/// directory inside the folder counts.
 fn first_archived_commit_date(
     repo: &Path,
+    git: &GitContext,
     rel: &str,
-    prefix: &str,
     expected: &str,
 ) -> Result<Option<NaiveDate>, String> {
-    let dir = git_dir(repo);
+    if !git.inside_repository {
+        return Ok(None);
+    }
     let mut first_failure = None;
-    if let Some(dir) = &dir {
-        match archived_leave_lookup(repo, rel, Some(dir), prefix, expected) {
+    if let Some(dir) = &git.dir {
+        match archived_leave_lookup(repo, rel, Some(dir), &git.prefix, expected) {
             Ok(Some(day)) => return Ok(Some(day)),
             Ok(None) => return Ok(None),
             Err(reason) => first_failure = Some(reason),
         }
     }
-    match archived_leave_lookup(repo, rel, None, prefix, expected) {
+    match archived_leave_lookup(repo, rel, None, &git.prefix, expected) {
         Ok(Some(day)) => Ok(Some(day)),
         Ok(None) => Ok(None),
-        Err(reason) if dir.is_some() => Err(first_failure.unwrap_or(reason)),
+        Err(reason) if git.dir.is_some() => Err(first_failure.unwrap_or(reason)),
         Err(_) => Ok(None),
     }
 }
@@ -694,6 +811,8 @@ fn archived_leave_lookup(
     prefix: &str,
     expected: &str,
 ) -> Result<Option<NaiveDate>, String> {
+    #[cfg(test)]
+    walk_count::record(repo);
     let mut command = match dir {
         Some(dir) => git_dir_command(repo, dir),
         None => {
@@ -799,20 +918,32 @@ fn parse_archive_log(output: &[u8]) -> Vec<(NaiveDate, String, String)> {
 }
 
 /// The folder's path inside the repository that holds it, ending in `/`, or
-/// empty when the folder is that repository's root or lies outside git.
-fn folder_prefix(repo: &Path) -> String {
-    if git_dir(repo).is_some() {
-        return String::new();
-    }
+/// `None` when no enclosing repository holds the folder.
+fn enclosing_prefix(repo: &Path) -> Option<String> {
     let mut command = Command::new(git_bin());
     command.arg("-C").arg(repo);
     scrub_git_env(&mut command);
-    match command.args(["rev-parse", "--show-prefix"]).output() {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+    let output = command.args(["rev-parse", "--show-prefix"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
             .trim_end_matches(['\r', '\n'])
             .to_string(),
-        _ => String::new(),
+    )
+}
+
+/// A stable 64-bit FNV-1a hash of the bytes a task row was parsed from. Only
+/// equality matters: a changed file changes the hash and re-runs its leave-day
+/// walk, while an unchanged file keeps the stored leave day.
+fn content_hash(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    format!("{hash:016x}")
 }
 
 fn is_archived_path(path: &str) -> bool {
@@ -846,9 +977,13 @@ fn escape_posix_ere(value: &str) -> String {
 
 fn first_status_commit_date(
     repo: &Path,
+    git: &GitContext,
     rel: &str,
     status: &str,
 ) -> Result<Option<NaiveDate>, String> {
+    if !git.inside_repository {
+        return Ok(None);
+    }
     let literal = format!("status: {status}");
     // A frontmatter status is free text, so an unescaped metacharacter such as
     // a `[` or `{` would make `-G` exit with `fatal: invalid regex` and abort
@@ -856,7 +991,7 @@ fn first_status_commit_date(
     let escaped = escape_posix_ere(status);
     let regex = format!(r"^status:[[:space:]]*{escaped}");
     for (flag, pattern) in [("-S", literal.as_str()), ("-G", regex.as_str())] {
-        if let Some(day) = git_pickaxe(repo, rel, flag, pattern)? {
+        if let Some(day) = git_pickaxe(repo, git, rel, flag, pattern)? {
             return Ok(Some(day));
         }
     }
@@ -869,7 +1004,15 @@ enum LogLookup {
     Failed(String),
 }
 
-fn run_git_log(mut command: Command, flag: &str, pattern: &str, rel: &str) -> LogLookup {
+fn run_git_log(
+    _repo: &Path,
+    mut command: Command,
+    flag: &str,
+    pattern: &str,
+    rel: &str,
+) -> LogLookup {
+    #[cfg(test)]
+    walk_count::record(_repo);
     scrub_git_env(&mut command);
     let mut args = vec![
         "log",
@@ -920,16 +1063,17 @@ fn git_dir_command(repo: &Path, dir: &Path) -> Command {
 
 fn git_pickaxe(
     repo: &Path,
+    git: &GitContext,
     rel: &str,
     flag: &str,
     pattern: &str,
 ) -> Result<Option<NaiveDate>, String> {
     // 1) Explicit --git-dir beats an inherited GIT_DIR (Cursor sets one).
-    // Fall back to -C only when git_dir is missing or that call fails to run.
-    let dir = git_dir(repo);
+    // Fall back to -C only when the folder has no own `.git` or that call fails
+    // to run.
     let mut first_failure = None;
-    if let Some(dir) = &dir {
-        match run_git_log(git_dir_command(repo, dir), flag, pattern, rel) {
+    if let Some(dir) = &git.dir {
+        match run_git_log(repo, git_dir_command(repo, dir), flag, pattern, rel) {
             LogLookup::Found(day) => return Ok(Some(day)),
             LogLookup::Miss => return Ok(None),
             LogLookup::Failed(reason) => first_failure = Some(reason),
@@ -938,13 +1082,13 @@ fn git_pickaxe(
     // 2) Plain -C with scrubbed env.
     let mut command = Command::new(git_bin());
     command.arg("-C").arg(repo);
-    match run_git_log(command, flag, pattern, rel) {
+    match run_git_log(repo, command, flag, pattern, rel) {
         LogLookup::Found(day) => Ok(Some(day)),
         LogLookup::Miss => Ok(None),
         // A folder with its own `.git` that git cannot read means git cannot
         // run here (a sandbox, a broken install). Stop the scan rather than
         // chart frontmatter dates as ship days.
-        LogLookup::Failed(reason) if dir.is_some() => Err(first_failure.unwrap_or(reason)),
+        LogLookup::Failed(reason) if git.dir.is_some() => Err(first_failure.unwrap_or(reason)),
         // No `.git` and no enclosing repository: git has no commit to offer.
         LogLookup::Failed(_) => Ok(None),
     }
@@ -972,8 +1116,9 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HarvestError, ParsedTask, TaskKind, escape_posix_ere, git_dir_command, git_path,
-        harvest_repository, parse_archive_log, scrub_git_env,
+        HarvestError, ParsedTask, PriorTask, TaskKind, escape_posix_ere, git_dir_command, git_path,
+        harvest_repository, harvest_repository_with_prior, parse_archive_log, scrub_git_env,
+        take_leave_walk_count,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -1171,6 +1316,89 @@ mod tests {
             .expect("live");
         assert_eq!(live.kind, TaskKind::Live);
         assert_eq!(live.scope, "scope");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_reuses_prior_leave_days_without_changing_finished_or_deferred_dates() {
+        let repo = scratch("harvest_prior_dates");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_parked.md",
+            "2026-05-01",
+            "2026-05-01",
+            "deferred",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive finished and deferred"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "bump updated"],
+            "2026-06-01T12:00:00+00:00",
+        );
+
+        let first = harvest_repository(&repo).expect("first harvest");
+        assert_eq!(take_leave_walk_count(&repo), 2);
+        let prior: Vec<PriorTask> = first
+            .iter()
+            .map(|task| PriorTask {
+                path: task.path.clone(),
+                leave_date: task.leave_date,
+                content_hash: Some(task.content_hash.clone()),
+            })
+            .collect();
+        let second = harvest_repository_with_prior(&repo, &prior).expect("second harvest");
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            0,
+            "matching prior rows skip every leave-day walk"
+        );
+        assert_eq!(first, second, "the cached dates stay identical");
+
+        let done = second
+            .iter()
+            .find(|task| task.path.ends_with("scope_done.md"))
+            .expect("finished");
+        assert_eq!(done.kind, TaskKind::Finished);
+        assert_eq!(
+            done.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_eq!(done.leave_date, done.ship_date);
+        let parked = second
+            .iter()
+            .find(|task| task.path.ends_with("scope_parked.md"))
+            .expect("deferred");
+        assert_eq!(parked.kind, TaskKind::Deferred);
+        assert!(parked.ship_date.is_none());
+        assert_eq!(
+            parked.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -1639,6 +1867,29 @@ mod tests {
             task.ship_date,
             Some(NaiveDate::from_ymd_opt(2026, 10, 16).expect("day"))
         );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_outside_git_launches_no_leave_walk() {
+        // Outside git there is no commit to offer, so the leave-day lookup is
+        // skipped once instead of spawning a failing git process per task, and
+        // the `updated` fallback stands.
+        let repo = scratch("harvest_no_git_no_walk");
+        finished_task(&repo);
+        let tasks = harvest_repository(&repo).expect("harvest");
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            0,
+            "no leave-day git log may launch outside git"
+        );
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 10, 16).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -2384,6 +2635,11 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
         );
         assert_eq!(task.leave_date, task.ship_date);
+        assert_ne!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 1).expect("day")),
+            "the frontmatter updated day must not stand in for the archive commit"
+        );
         let _ = fs::remove_dir_all(&parent);
     }
 
