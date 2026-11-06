@@ -12,6 +12,7 @@ unsafe_code = "forbid"
 [lints.clippy]
 unwrap_used = "deny"
 float_cmp = "deny"
+format_push_string = "deny"
 
 [dependencies]
 anyhow = "1.0"

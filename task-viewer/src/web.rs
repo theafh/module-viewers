@@ -8,6 +8,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::future::ready;
 use std::num::IntErrorKind;
 use std::path::PathBuf;
@@ -59,6 +61,7 @@ pub struct AppState {
     scan_workers: usize,
     picker: Arc<PickerFn>,
     store_hook: Arc<StoreHookFn>,
+    flash: Arc<Mutex<FlashStore>>,
 }
 
 impl AppState {
@@ -71,7 +74,33 @@ impl AppState {
             scan_workers: scan_worker_cap(raw.as_deref()),
             picker: Arc::new(pick_folder),
             store_hook: Arc::new(|| Box::pin(ready(()))),
+            flash: Arc::new(Mutex::new(FlashStore::default())),
         }
+    }
+}
+
+/// The banner one Update run leaves for the dashboard. Each slot is named by a
+/// short incrementing token that the redirect carries, and reading the slot
+/// removes it, so a reload does not repeat the message. The store lives in
+/// this process only: a restart starts it empty.
+#[derive(Default)]
+struct FlashStore {
+    next_token: u64,
+    slots: HashMap<String, (&'static str, String)>,
+}
+
+impl FlashStore {
+    /// Store one banner and return the token that names it.
+    fn insert(&mut self, key: &'static str, message: String) -> String {
+        self.next_token = self.next_token.wrapping_add(1);
+        let token = self.next_token.to_string();
+        self.slots.insert(token.clone(), (key, message));
+        token
+    }
+
+    /// Take the banner `token` names, leaving that slot empty.
+    fn take(&mut self, token: &str) -> Option<(&'static str, String)> {
+        self.slots.remove(token)
     }
 }
 
@@ -193,6 +222,8 @@ struct HomeQuery {
     notice: String,
     #[serde(default)]
     error: String,
+    #[serde(default)]
+    flash: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -241,6 +272,7 @@ async fn repositories_page(
 }
 
 async fn render_home(state: &AppState, query: &HomeQuery) -> anyhow::Result<String> {
+    let (notice, error) = flash_banner(state, query).await;
     let repositories = db::list_repositories(&state.pool).await?;
     let selected = selected_id(&repositories, &query.project);
     let (tasks, mode, label) = match selected {
@@ -275,14 +307,30 @@ async fn render_home(state: &AppState, query: &HomeQuery) -> anyhow::Result<Stri
             Some(id) => id.to_string(),
             None => "all".to_string(),
         },
-        notice: query.notice.clone(),
-        error: query.error.clone(),
+        notice,
+        error,
         scan_label,
         data_json,
         has_projects: !repositories.is_empty(),
     };
     let context = Context::from_serialize(page)?;
     Ok(state.templates.render("dashboard.html", &context)?)
+}
+
+/// The banners for one dashboard request: the flash slot `?flash=` names when
+/// it still exists, otherwise the notice and error the query carries. Taking
+/// the slot consumes it, so a reload shows no banner.
+async fn flash_banner(state: &AppState, query: &HomeQuery) -> (String, String) {
+    let flashed = if query.flash.is_empty() {
+        None
+    } else {
+        state.flash.lock().await.take(&query.flash)
+    };
+    match flashed {
+        Some(("error", message)) => (String::new(), message),
+        Some((_, message)) => (message, String::new()),
+        None => (query.notice.clone(), query.error.clone()),
+    }
 }
 
 async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Result<String> {
@@ -459,7 +507,7 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
         &state.store_hook,
     )
     .await;
-    scan_response(&project, &report)
+    scan_response(&state, &project, &report).await
 }
 
 type HarvestFn =
@@ -631,9 +679,14 @@ fn scan_flash(report: &ScanReport) -> (&'static str, String) {
     )
 }
 
-fn scan_response(project: &str, report: &ScanReport) -> Response {
+async fn scan_response(state: &AppState, project: &str, report: &ScanReport) -> Response {
     let (key, message) = scan_flash(report);
-    redirect(project, key, &message)
+    let token = state.flash.lock().await.insert(key, message);
+    Redirect::to(&format!(
+        "/?project={}&flash={token}",
+        safe_project(project)
+    ))
+    .into_response()
 }
 
 fn pick_folder() -> Result<Option<PathBuf>, &'static str> {
@@ -714,13 +767,24 @@ fn redirect_repositories(key: &str, message: &str) -> Response {
     Redirect::to(&format!("/repositories?{key}={}", encode_query(message))).into_response()
 }
 
+/// Percent-encode a message for a redirect query, writing into one `String`.
+/// A space becomes `%20` and every other byte outside the unreserved set
+/// becomes `%XX` from the uppercase hex table, so no escape allocates.
 fn encode_query(value: &str) -> String {
-    let mut out = String::new();
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => out.push(byte as char),
             b' ' => out.push_str("%20"),
-            _ => out.push_str(&format!("%{byte:02X}")),
+            _ => {
+                let _ = write!(
+                    out,
+                    "%{}{}",
+                    HEX[usize::from(byte >> 4)] as char,
+                    HEX[usize::from(byte & 0x0f)] as char
+                );
+            }
         }
     }
     out
@@ -1001,10 +1065,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            redirect_location(&response),
-            "/?project=all&notice=Charts%20updated."
-        );
+        flash_token(&redirect_location(&response), "all");
         cleanup(&path);
     }
 
@@ -1017,10 +1078,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            redirect_location(&response),
-            "/?project=all&notice=Charts%20updated."
-        );
+        flash_token(&redirect_location(&response), "all");
         cleanup(&path);
     }
 
@@ -1033,10 +1091,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            redirect_location(&response),
-            "/?project=all&notice=Charts%20updated."
-        );
+        flash_token(&redirect_location(&response), "all");
         cleanup(&path);
     }
 
@@ -1049,10 +1104,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            redirect_location(&response),
-            "/?project=all&notice=Charts%20updated."
-        );
+        flash_token(&redirect_location(&response), "all");
         cleanup(&path);
     }
 
@@ -1100,10 +1152,7 @@ mod tests {
         let (state, path) = app_state("origin_absent_accept").await;
         let response = send(state.clone(), form_post("/scan", None, None)).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            redirect_location(&response),
-            "/?project=all&notice=Charts%20updated."
-        );
+        flash_token(&redirect_location(&response), "all");
         cleanup(&path);
     }
 
@@ -1116,10 +1165,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            redirect_location(&response),
-            "/?project=all&notice=Charts%20updated."
-        );
+        flash_token(&redirect_location(&response), "all");
         cleanup(&path);
     }
 
@@ -1258,6 +1304,22 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
+    }
+
+    /// Acceptance: `encode_query` keeps the encoding the query transport had,
+    /// for spaces, parentheses, and non-ASCII text, while writing one `String`.
+    #[test]
+    fn web_encode_query_matches_the_query_transport() {
+        assert_eq!(encode_query("Charts updated."), "Charts%20updated.");
+        assert_eq!(
+            encode_query("Failed: sysadmin (no history)."),
+            "Failed%3A%20sysadmin%20%28no%20history%29."
+        );
+        assert_eq!(
+            encode_query("Grüße — ok"),
+            "Gr%C3%BC%C3%9Fe%20%E2%80%94%20ok"
+        );
+        assert_eq!(encode_query("a-b_c.d~e"), "a-b_c.d%7Ee");
     }
 
     #[test]
@@ -1617,8 +1679,9 @@ mod tests {
         assert_eq!(message, "Charts updated.");
     }
 
-    #[test]
-    fn web_scan_response_redirects_with_the_true_outcome() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_response_redirects_with_the_true_outcome() {
+        let (state, path) = app_state("scan_response_outcome").await;
         let failed = ScanReport {
             attempted: 2,
             failures: vec![ScanFailure {
@@ -1626,37 +1689,144 @@ mod tests {
                 message: "Git could not read the history, so the rows were left as they were.",
             }],
         };
-        let failure_location = scan_response("all", &failed)
-            .headers()
-            .get(header::LOCATION)
-            .expect("failure location")
-            .to_str()
-            .expect("failure location text")
-            .to_string();
+        let failure_location = redirect_location(&scan_response(&state, "all", &failed).await);
+        let failure_token = flash_token(&failure_location, "all");
         assert_eq!(
-            failure_location,
-            format!(
-                "/?project=all&error={}",
-                encode_query(
-                    "Charts updated for 1 of 2 repositories. Failed: sysadmin (Git could not read the history, so the rows were left as they were.)."
-                )
-            )
+            state.flash.lock().await.take(&failure_token),
+            Some((
+                "error",
+                "Charts updated for 1 of 2 repositories. Failed: sysadmin (Git could not read the history, so the rows were left as they were.).".to_string()
+            ))
         );
+
         let clean = ScanReport {
             attempted: 2,
             failures: Vec::new(),
         };
-        let clean_location = scan_response("all", &clean)
-            .headers()
-            .get(header::LOCATION)
-            .expect("clean location")
-            .to_str()
-            .expect("clean location text")
-            .to_string();
+        let clean_location = redirect_location(&scan_response(&state, "all", &clean).await);
+        let clean_token = flash_token(&clean_location, "all");
+        assert_ne!(clean_token, failure_token, "each run names its own slot");
         assert_eq!(
-            clean_location,
-            format!("/?project=all&notice={}", encode_query("Charts updated."))
+            state.flash.lock().await.take(&clean_token),
+            Some(("notice", "Charts updated.".to_string()))
         );
+        cleanup(&path);
+    }
+
+    /// Acceptance: 50 failed repositories cannot push the redirect past a URL
+    /// limit, and the dashboard still reports the run's failure count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_many_failures_keep_the_redirect_short_and_the_banner_complete() {
+        let (state, path) = app_state("flash_many_failures").await;
+        let mut folders = Vec::new();
+        for index in 0..50 {
+            let folder = unique_temp_dir("flash_many_failures_repo");
+            std::fs::create_dir_all(&folder).expect("repository folder");
+            db::insert_repository(
+                &state.pool,
+                &format!("repo{index:02}"),
+                &folder.to_string_lossy(),
+            )
+            .await
+            .expect("insert");
+            folders.push(folder);
+        }
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        let harvest: Arc<HarvestFn> =
+            Arc::new(|_: &Path, _: &[PriorTask]| Err(HarvestError::Git("no history".to_string())));
+        let report = scan_core(
+            &state.pool,
+            &repositories,
+            4,
+            harvest,
+            &immediate_store_hook(),
+        )
+        .await;
+        assert_eq!(report.failures.len(), 50);
+
+        let response = scan_response(&state, "all", &report).await;
+        let location = redirect_location(&response);
+        flash_token(&location, "all");
+        assert!(
+            location.len() < 2_000,
+            "the redirect stays under a URL limit: {} bytes",
+            location.len()
+        );
+        let (_, message) = scan_flash(&report);
+        assert!(
+            encode_query(&message).len() > 2_000,
+            "the query transport would have exceeded the limit"
+        );
+
+        let dashboard =
+            body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
+        assert!(
+            dashboard.contains("Charts updated for 0 of 50 repositories."),
+            "the dashboard still reports the run's failure count"
+        );
+        assert!(
+            dashboard.contains("class=\"banner banner-error\""),
+            "the failure banner renders"
+        );
+
+        for folder in folders {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+        cleanup(&path);
+    }
+
+    /// Acceptance: a flash token is consumed by the first dashboard read, so a
+    /// reload and a reused or missing token show no banner, while the query
+    /// transport the other callers keep still renders.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_flash_token_is_consumed_once() {
+        let (state, path) = app_state("flash_consumed").await;
+        let report = ScanReport {
+            attempted: 1,
+            failures: Vec::new(),
+        };
+        let location = redirect_location(&scan_response(&state, "all", &report).await);
+
+        let first =
+            body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
+        assert!(
+            first.contains("<p class=\"banner\">Charts updated.</p>"),
+            "the first read shows the notice"
+        );
+
+        let second =
+            body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
+        assert!(
+            !second.contains("Charts updated."),
+            "a reused token repeats nothing"
+        );
+
+        let missing = body_text(
+            send(
+                state.clone(),
+                get_page("/?project=all&flash=999999", "127.0.0.1:7880"),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            !missing.contains("Charts updated."),
+            "an unknown token leaves no banner"
+        );
+
+        let carried = body_text(
+            send(
+                state.clone(),
+                get_page("/?project=all&error=Legacy%20message.", "127.0.0.1:7880"),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            carried.contains("Legacy message."),
+            "the query transport still renders"
+        );
+        cleanup(&path);
     }
 
     async fn app_state(name: &str) -> (AppState, PathBuf) {
@@ -1677,6 +1847,25 @@ mod tests {
             .to_str()
             .expect("redirect location text")
             .to_string()
+    }
+
+    /// The flash token a scan redirect carries. The assertion checks the
+    /// `/?project=<p>&flash=` prefix and a non-empty, single-segment token that
+    /// replaced the query-carried message.
+    fn flash_token(location: &str, project: &str) -> String {
+        let prefix = format!("/?project={project}&flash=");
+        let token = location
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("{location} must start with {prefix}"));
+        assert!(
+            !token.is_empty(),
+            "the flash token is not empty: {location}"
+        );
+        assert!(
+            !token.contains('&'),
+            "the flash token is one segment: {location}"
+        );
+        token.to_string()
     }
 
     /// Add must not hold the scan lock while the picker is open, so an
@@ -1709,10 +1898,7 @@ mod tests {
         )
         .await
         .expect("Update acquires the scan lock while the picker is held");
-        assert_eq!(
-            redirect_location(&update),
-            "/?project=all&notice=Charts%20updated."
-        );
+        flash_token(&redirect_location(&update), "all");
 
         release_tx.send(()).expect("release the picker");
         let added = tokio::time::timeout(Duration::from_secs(5), add)

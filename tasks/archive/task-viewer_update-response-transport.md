@@ -2,9 +2,11 @@
 description: "Keep the Update outcome out of a long redirect URL with a compact flash token, and build the redirect query without a String allocation per byte."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T00:03:55
-status: ready
+updated: 2026-11-06T22:34:39
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Keep the Update outcome out of a long redirect URL
@@ -15,7 +17,7 @@ Update reports its outcome without putting the full failure list into the redire
 
 ## Context
 
-`scan_flash` and `redirect` in `task-viewer/src/web.rs` place the full "Charts updated for X of Y ... Failed: ..." message in the `Location` query. `encode_query` allocates a `String` for every escaped byte. The archived [task-viewer_scan-failure-reporting](archive/task-viewer_scan-failure-reporting.md) task kept the query transport and left a session-backed flash store out of scope.
+`scan_flash` and `redirect` in `task-viewer/src/web.rs` place the full "Charts updated for X of Y ... Failed: ..." message in the `Location` query. `encode_query` allocates a `String` for every escaped byte. The archived [task-viewer_scan-failure-reporting](task-viewer_scan-failure-reporting.md) task kept the query transport and left a session-backed flash store out of scope.
 
 ## Approach
 
