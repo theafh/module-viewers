@@ -2,7 +2,7 @@
 description: "Add a versioned migration path, drop the redundant task index, and create or validate the configured database directory."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T22:42:05
+updated: 2026-11-05T23:35:22
 status: ready
 reported-by: "Andreas Hoffmann"
 ---
@@ -19,7 +19,7 @@ A future schema change applies to an existing database, the redundant task index
 
 ## Approach
 
-Add a versioned migration step that reads `PRAGMA user_version` and applies each later schema version in order, starting with the current version 1 as the baseline. `task-viewer/src/schema.sql` stays the version-1 baseline unchanged, and `init` applies `SCHEMA` only to a file whose `PRAGMA user_version` reads 0. Remove the redundant `tasks_repository_id` index in a new schema version, keeping the unique index. Create the parent directory for an explicit database path when it is missing, and fail init with an error naming `TASK_VIEWER_DB` and the configured path when that directory cannot be created; reject an empty `TASK_VIEWER_DB` with a clear error. Route that resolution and directory step through a seam that takes the configured value as an argument, mirroring `scan_worker_cap` in `task-viewer/src/web.rs`: a resolver maps `Option<&str>` to a path, a sibling init entry point takes the same value and runs resolution, directory creation, and connection, and `init` keeps its `#[cfg(test)]` test-database short-circuit, reads `TASK_VIEWER_DB`, and delegates, so a test reaches the explicit-path branch by passing a literal path instead of setting an environment variable.
+Add a versioned migration step that reads `PRAGMA user_version` and applies each later schema version in order, starting with the current version 1 as the baseline. `task-viewer/src/schema.sql` stays the version-1 baseline unchanged, and the path-taking core applies `SCHEMA` only to a file whose `PRAGMA user_version` reads 0, before running the migration. Remove the redundant `tasks_repository_id` index in a new schema version, keeping the unique index. Create the parent directory for an explicit database path when it is missing, and fail init with an error naming `TASK_VIEWER_DB` and the configured path when that directory cannot be created; reject an empty `TASK_VIEWER_DB` with a clear error. Route that resolution and directory step through a seam that takes the configured value as an argument, mirroring `scan_worker_cap` in `task-viewer/src/web.rs`: a resolver maps `Option<&str>` to a path, and one path-taking core function takes a resolved path and runs directory creation, connection, `SCHEMA` application, and the versioned migration, so every caller reaches the schema and migration work. A sibling init entry point takes the configured value and runs resolution then that core, and `init` reads `TASK_VIEWER_DB`, keeps its `#[cfg(test)]` test-database short-circuit by feeding the test path into the same core rather than returning early, and delegates, so a test reaches the explicit-path branch by passing a literal path instead of setting an environment variable.
 
 **Out of scope:** Changing the table contents or the stored date format.
 
