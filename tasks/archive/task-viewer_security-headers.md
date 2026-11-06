@@ -2,9 +2,11 @@
 description: "Send anti-framing, content-sniffing, and referrer-policy headers on normal and host-rejected responses."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T15:50:51
-status: ready
+updated: 2026-11-06T19:45:29
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Send anti-framing and content-sniffing headers

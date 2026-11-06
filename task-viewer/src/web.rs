@@ -95,6 +95,26 @@ pub fn router(state: AppState) -> Router {
             HeaderValue::from_static("no-store"),
         ))
         .layer(middleware::from_fn(require_local_host))
+        // The security headers sit outside the host check, so the 403 that
+        // rejects a foreign Host carries them too. The CSP holds only
+        // `frame-ancestors`, which restricts no script source: the inline theme
+        // bootstrap, the inline handlers, and the static scripts keep running.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors 'none'"),
+        ))
         .with_state(state)
 }
 
@@ -867,6 +887,52 @@ mod tests {
             .expect("router responds")
     }
 
+    /// One GET carrying the `Host` the browser sends, so a test can choose
+    /// between a loopback host and a rejected one.
+    fn get_page(uri: &str, host: &str) -> axum::extract::Request {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .expect("get request")
+    }
+
+    fn header_text(response: &axum::response::Response, name: header::HeaderName) -> String {
+        response
+            .headers()
+            .get(name)
+            .expect("header present")
+            .to_str()
+            .expect("header text")
+            .to_string()
+    }
+
+    async fn body_text(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    /// The anti-framing, content-sniffing, referrer, and framing-only CSP
+    /// headers every response carries, whatever the host check decided.
+    fn assert_security_headers(response: &axum::response::Response) {
+        assert_eq!(header_text(response, header::X_FRAME_OPTIONS), "DENY");
+        assert_eq!(
+            header_text(response, header::X_CONTENT_TYPE_OPTIONS),
+            "nosniff"
+        );
+        assert_eq!(
+            header_text(response, header::REFERRER_POLICY),
+            "no-referrer"
+        );
+        assert_eq!(
+            header_text(response, header::CONTENT_SECURITY_POLICY),
+            "frame-ancestors 'none'"
+        );
+    }
+
     /// A repository whose scan has not run yet, so a rejected POST leaves a
     /// visible `scanned_at` of `None`.
     async fn state_with_repository(name: &str) -> (AppState, PathBuf, PathBuf, i64) {
@@ -1056,6 +1122,82 @@ mod tests {
             .expect("get request");
         let response = send(state.clone(), request).await;
         assert_eq!(response.status(), StatusCode::OK);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_sends_security_headers_on_a_normal_page() {
+        let (state, path) = app_state("security_headers_page").await;
+        let response = send(state.clone(), get_page("/", "127.0.0.1:7880")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(&response);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_sends_security_headers_on_a_rejected_host() {
+        let (state, path) = app_state("security_headers_rejected").await;
+        let response = send(state.clone(), get_page("/", "example.com")).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_security_headers(&response);
+        cleanup(&path);
+    }
+
+    /// The CSP carries `frame-ancestors` alone, so it restricts no script
+    /// source: the theme bootstrap, the Project selector's `onchange`, the
+    /// Remove form's `onsubmit`, and the static scripts all stay in the pages.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_csp_restricts_only_framing_and_pages_keep_their_scripts() {
+        let (state, path, folder, _id) = state_with_repository("security_csp_pages").await;
+
+        let rejected = send(state.clone(), get_page("/", "example.com")).await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            header_text(&rejected, header::CONTENT_SECURITY_POLICY),
+            "frame-ancestors 'none'",
+            "the rejected response carries the framing-only policy"
+        );
+
+        let dashboard = send(state.clone(), get_page("/", "127.0.0.1:7880")).await;
+        assert_eq!(dashboard.status(), StatusCode::OK);
+        assert_eq!(
+            header_text(&dashboard, header::CONTENT_SECURITY_POLICY),
+            "frame-ancestors 'none'",
+            "the dashboard's only CSP directive is frame-ancestors"
+        );
+        let dashboard_body = body_text(dashboard).await;
+        assert!(
+            dashboard_body.contains("localStorage.getItem(\"task-viewer-theme\")"),
+            "the theme bootstrap script still renders"
+        );
+        assert!(
+            dashboard_body.contains("onchange=\"this.form.submit()\""),
+            "the Project selector's onchange still renders"
+        );
+        assert!(
+            dashboard_body.contains("/static/js/dashboard.js"),
+            "the dashboard script still loads"
+        );
+
+        let repositories = send(state.clone(), get_page("/repositories", "127.0.0.1:7880")).await;
+        assert_eq!(repositories.status(), StatusCode::OK);
+        let repositories_body = body_text(repositories).await;
+        assert!(
+            repositories_body.contains("localStorage.getItem(\"task-viewer-theme\")"),
+            "the theme bootstrap script still renders"
+        );
+        assert!(
+            repositories_body.contains(
+                "onsubmit=\"return confirm('Remove this repository from the dashboard?');\""
+            ),
+            "the Remove form's onsubmit still renders"
+        );
+        assert!(
+            repositories_body.contains("/static/js/theme.js"),
+            "the theme script still loads"
+        );
+
+        let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 
