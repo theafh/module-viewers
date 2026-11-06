@@ -10,7 +10,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 
 ## Stack
 
-- Language: Rust (edition 2024), `unsafe_code` forbidden, clippy `unwrap_used` and `float_cmp` denied.
+- Language: Rust (edition 2024), `unsafe_code` forbidden, clippy `unwrap_used`, `float_cmp`, and `format_push_string` denied.
 - Web: axum, Tera templates, static assets under `task-viewer/static/`.
 - Storage: SQLite via sqlx, WAL journal mode, foreign keys on.
 - Runtime: tokio.

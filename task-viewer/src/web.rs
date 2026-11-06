@@ -80,13 +80,22 @@ impl AppState {
 }
 
 /// The banner one Update run leaves for the dashboard. Each slot is named by a
-/// short incrementing token that the redirect carries, and reading the slot
-/// removes it, so a reload does not repeat the message. The store lives in
-/// this process only: a restart starts it empty.
+/// short incrementing token that the redirect carries, and a read claims the
+/// slot under one lock acquisition, so the banner renders once however many
+/// reads name it; a render that fails puts the same slot back. The store lives
+/// in this process only: a restart starts it empty.
 #[derive(Default)]
 struct FlashStore {
     next_token: u64,
     slots: HashMap<String, (&'static str, String)>,
+}
+
+/// One flash slot a dashboard read claimed, kept with its token so a render
+/// that fails can put the very same slot back.
+struct ClaimedBanner {
+    token: String,
+    key: &'static str,
+    message: String,
 }
 
 impl FlashStore {
@@ -101,6 +110,32 @@ impl FlashStore {
     /// Take the banner `token` names, leaving that slot empty.
     fn take(&mut self, token: &str) -> Option<(&'static str, String)> {
         self.slots.remove(token)
+    }
+
+    /// Claim the banner `token` names together with its token, so a render that
+    /// fails can put that same slot back.
+    fn claim(&mut self, token: &str) -> Option<ClaimedBanner> {
+        self.take(token).map(|(key, message)| ClaimedBanner {
+            token: token.to_string(),
+            key,
+            message,
+        })
+    }
+
+    /// Put a claimed banner back under its own token, so the next read shows
+    /// the same message.
+    fn restore(&mut self, claimed: ClaimedBanner) {
+        self.slots
+            .insert(claimed.token, (claimed.key, claimed.message));
+    }
+
+    /// The banner `token` names without taking it, so a test can read the slot
+    /// a render left in place.
+    #[cfg(test)]
+    fn peek(&self, token: &str) -> Option<(&'static str, &str)> {
+        self.slots
+            .get(token)
+            .map(|(key, message)| (*key, message.as_str()))
     }
 }
 
@@ -167,7 +202,35 @@ async fn require_local_host(request: axum::extract::Request, next: Next) -> Resp
         )
             .into_response();
     }
+    // A dashboard read that names a flash token changes server state, because
+    // reading the banner removes it, so it is accepted only from the page
+    // itself. Every method that reaches the dashboard handler counts, `HEAD`
+    // included, because axum answers a `HEAD` from the `GET` route by running
+    // that handler. The query is read through the handler's own decoder, so an
+    // encoded key such as `fl%61sh` names the token as well. A no-`Origin`
+    // subresource load from another loopback port carries `same-site` and is
+    // refused, while a top-level navigation carries `same-origin` or `none`
+    // (or, on an older browser, neither header) and still renders.
+    if matches!(*request.method(), Method::GET | Method::HEAD)
+        && request.uri().path() == "/"
+        && names_flash_token(request.uri())
+        && !is_same_origin_flash_read(request.headers())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "task-viewer accepts a flash banner from its own page only.",
+        )
+            .into_response();
+    }
     next.run(request).await
+}
+
+/// Whether a dashboard request names a non-empty `flash` token, the banner slot
+/// one read consumes. The query goes through the extractor `home` uses, so the
+/// guard and the handler agree on what the request asked for. A query that
+/// extractor rejects never reaches `home`, so it consumes no banner either.
+fn names_flash_token(uri: &axum::http::Uri) -> bool {
+    Query::<HomeQuery>::try_from_uri(uri).is_ok_and(|query| !query.flash.is_empty())
 }
 
 /// The origins a browser page on this machine uses to reach the dashboard,
@@ -180,7 +243,7 @@ fn loopback_origins() -> [String; 3] {
     ]
 }
 
-/// A `POST` is same-origin when its `Origin` names a loopback origin. An opaque
+/// A request is same-origin when its `Origin` names a loopback origin. An opaque
 /// `Origin` of `null` and a request that carries no `Origin` both fall back to
 /// `Sec-Fetch-Site`, whose `cross-site` value is the only one rejected; older
 /// browsers send neither header. A browser sends `Origin: null` for a
@@ -203,6 +266,35 @@ fn is_cross_site_fetch(headers: &HeaderMap) -> bool {
         .get("sec-fetch-site")
         .and_then(|value| value.to_str().ok())
         == Some("cross-site")
+}
+
+/// A dashboard read that names a flash token is accepted only from the page
+/// itself: a loopback `Origin`, or, when `Origin` is absent or the opaque value
+/// `null`, a `Sec-Fetch-Site` that is `same-origin`, `none`, or absent. A
+/// `same-site` or `cross-site` `Sec-Fetch-Site` refuses the read, which covers a
+/// no-`Origin` subresource load from another loopback port that the `POST`
+/// fallback would admit, while an older browser sends neither header and still
+/// renders the navigation the scan redirect leaves.
+fn is_same_origin_flash_read(headers: &HeaderMap) -> bool {
+    match headers.get(header::ORIGIN) {
+        Some(origin) => match origin.to_str() {
+            Ok("null") => !is_sibling_site_fetch(headers),
+            Ok(origin) => loopback_origins().iter().any(|allowed| allowed == origin),
+            Err(_) => false,
+        },
+        None => !is_sibling_site_fetch(headers),
+    }
+}
+
+/// Whether `Sec-Fetch-Site` names an origin that is not this page: a
+/// `cross-site` page, or a `same-site` sibling such as another loopback port.
+fn is_sibling_site_fetch(headers: &HeaderMap) -> bool {
+    matches!(
+        headers
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok()),
+        Some("cross-site" | "same-site")
+    )
 }
 
 fn is_local_host(host: &str) -> bool {
@@ -272,7 +364,56 @@ async fn repositories_page(
 }
 
 async fn render_home(state: &AppState, query: &HomeQuery) -> anyhow::Result<String> {
-    let (notice, error) = flash_banner(state, query).await;
+    let claimed = claim_banner(state, query).await;
+    let (notice, error) = banner_text(claimed.as_ref(), query);
+    match render_dashboard(state, query, notice, error).await {
+        Ok(html) => Ok(html),
+        Err(error) => {
+            // The read claimed the slot before the render, so a render that
+            // fails for any reason puts the exact slot back for the next read.
+            if let Some(claimed) = claimed {
+                state.flash.lock().await.restore(claimed);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The two banner fields the dashboard renders: the claimed flash slot when the
+/// read took one, otherwise the notice and error the query carries.
+fn banner_text(claimed: Option<&ClaimedBanner>, query: &HomeQuery) -> (String, String) {
+    match claimed {
+        Some(ClaimedBanner {
+            key: "error",
+            message,
+            ..
+        }) => (String::new(), message.clone()),
+        Some(ClaimedBanner { message, .. }) => (message.clone(), String::new()),
+        None => (query.notice.clone(), query.error.clone()),
+    }
+}
+
+/// Claim the flash slot `?flash=` names for this request, or `None` when the
+/// query names no slot or names one that is already gone; the notice and error
+/// the query carries then stand in. The claim removes the slot under one lock
+/// acquisition, so however many reads name one token, only the first renders
+/// it, and `render_home` puts the slot back when the render fails. The
+/// middleware rejects a cross-site read that names a slot before this runs, so
+/// a rejected read claims nothing and leaves the banner for the navigation the
+/// person actually made.
+async fn claim_banner(state: &AppState, query: &HomeQuery) -> Option<ClaimedBanner> {
+    if query.flash.is_empty() {
+        return None;
+    }
+    state.flash.lock().await.claim(&query.flash)
+}
+
+async fn render_dashboard(
+    state: &AppState,
+    query: &HomeQuery,
+    notice: String,
+    error: String,
+) -> anyhow::Result<String> {
     let repositories = db::list_repositories(&state.pool).await?;
     let selected = selected_id(&repositories, &query.project);
     let (tasks, mode, label) = match selected {
@@ -315,22 +456,6 @@ async fn render_home(state: &AppState, query: &HomeQuery) -> anyhow::Result<Stri
     };
     let context = Context::from_serialize(page)?;
     Ok(state.templates.render("dashboard.html", &context)?)
-}
-
-/// The banners for one dashboard request: the flash slot `?flash=` names when
-/// it still exists, otherwise the notice and error the query carries. Taking
-/// the slot consumes it, so a reload shows no banner.
-async fn flash_banner(state: &AppState, query: &HomeQuery) -> (String, String) {
-    let flashed = if query.flash.is_empty() {
-        None
-    } else {
-        state.flash.lock().await.take(&query.flash)
-    };
-    match flashed {
-        Some(("error", message)) => (String::new(), message),
-        Some((_, message)) => (message, String::new()),
-        None => (query.notice.clone(), query.error.clone()),
-    }
 }
 
 async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Result<String> {
@@ -793,9 +918,9 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, HarvestFn, PickerFn, ProjectForm, ScanFailure, ScanReport, StoreHookFn,
-        add_repository, encode_query, init_templates, is_local_host, remove_repository, router,
-        scan_all, scan_core, scan_flash, scan_response, scan_worker_cap,
+        AppState, HarvestFn, HomeQuery, PickerFn, ProjectForm, ScanFailure, ScanReport,
+        StoreHookFn, add_repository, claim_banner, encode_query, init_templates, is_local_host,
+        remove_repository, router, scan_all, scan_core, scan_flash, scan_response, scan_worker_cap,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -1206,6 +1331,181 @@ mod tests {
             .expect("get request");
         let response = send(state.clone(), request).await;
         assert_eq!(response.status(), StatusCode::OK);
+        cleanup(&path);
+    }
+
+    /// A dashboard read that names a flash token consumes it, so a cross-site
+    /// GET carrying one is rejected before the banner is taken. The rejected
+    /// read leaves the token in place for the navigation the person made.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rejects_a_cross_site_flash_get() {
+        let (state, path) = app_state("flash_cross_site_reject").await;
+        let report = ScanReport {
+            attempted: 1,
+            failures: Vec::new(),
+        };
+        let location = redirect_location(&scan_response(&state, "all", &report).await);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(&location)
+            .header(header::HOST, "127.0.0.1:7880")
+            .header(header::ORIGIN, "https://example.com")
+            .body(Body::empty())
+            .expect("get request");
+        let response = send(state.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let token = flash_token(&location, "all");
+        assert!(
+            state.flash.lock().await.take(&token).is_some(),
+            "the rejected read must not consume the banner"
+        );
+        cleanup(&path);
+    }
+
+    /// The flash guard covers every method that reaches the dashboard handler
+    /// and decodes the query the way that handler does, so a cross-site `HEAD`,
+    /// a `same-site` read from another loopback port, and a percent-encoded
+    /// `fl%61sh` key are all rejected, and each rejected read leaves the banner
+    /// for the navigation the person made.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rejects_a_foreign_flash_read_of_any_method_or_spelling() {
+        let (state, path) = app_state("flash_cross_site_variants").await;
+        let report = ScanReport {
+            attempted: 1,
+            failures: Vec::new(),
+        };
+        let location = redirect_location(&scan_response(&state, "all", &report).await);
+        let token = flash_token(&location, "all");
+
+        // `fetch(url, {method: "HEAD", mode: "no-cors"})` sends the fetch
+        // metadata and no `Origin`, and axum answers it by running `home`.
+        let head = Request::builder()
+            .method(Method::HEAD)
+            .uri(&location)
+            .header(header::HOST, "127.0.0.1:7880")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .expect("head request");
+        let response = send(state.clone(), head).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a cross-site HEAD naming the token is rejected"
+        );
+
+        // A no-`Origin` subresource load from another loopback port is
+        // `same-site`, not `cross-site`, so the POST fallback alone would admit
+        // it. The banner read refuses that sibling site too.
+        let sibling = Request::builder()
+            .method(Method::GET)
+            .uri(&location)
+            .header(header::HOST, "localhost:7880")
+            .header("sec-fetch-site", "same-site")
+            .body(Body::empty())
+            .expect("same-site request");
+        let response = send(state.clone(), sibling).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a same-site read from another loopback port is rejected"
+        );
+
+        // The handler decodes its query through `form_urlencoded`, so this key
+        // reaches `claim_banner` while a raw `flash=` scan would miss it.
+        let encoded = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/?project=all&fl%61sh={token}"))
+            .header(header::HOST, "127.0.0.1:7880")
+            .header(header::ORIGIN, "https://example.com")
+            .body(Body::empty())
+            .expect("encoded request");
+        let response = send(state.clone(), encoded).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a percent-encoded flash key is rejected as well"
+        );
+
+        assert!(
+            state.flash.lock().await.take(&token).is_some(),
+            "no rejected read consumes the banner"
+        );
+        cleanup(&path);
+    }
+
+    /// The guard leaves the person's own navigation alone: a `same-origin`, a
+    /// `none`, and a loopback-`Origin` read each show and consume their own
+    /// banner, and a `HEAD` that names no token still answers the dashboard.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_accepts_the_persons_own_flash_read() {
+        let (state, path) = app_state("flash_same_origin_accept").await;
+        let report = ScanReport {
+            attempted: 1,
+            failures: Vec::new(),
+        };
+        let location = redirect_location(&scan_response(&state, "all", &report).await);
+
+        let navigation = Request::builder()
+            .method(Method::GET)
+            .uri(&location)
+            .header(header::HOST, "127.0.0.1:7880")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::empty())
+            .expect("navigation request");
+        let response = send(state.clone(), navigation).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            body_text(response).await.contains("Charts updated."),
+            "the person's own navigation still shows the banner"
+        );
+
+        // A navigation typed into the address bar or opened from a bookmark
+        // sends `Sec-Fetch-Site: none` and no `Origin`.
+        let typed_location = redirect_location(&scan_response(&state, "all", &report).await);
+        let typed = Request::builder()
+            .method(Method::GET)
+            .uri(&typed_location)
+            .header(header::HOST, "127.0.0.1:7880")
+            .header("sec-fetch-site", "none")
+            .body(Body::empty())
+            .expect("typed request");
+        let response = send(state.clone(), typed).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            body_text(response).await.contains("Charts updated."),
+            "an address-bar navigation still shows the banner"
+        );
+
+        // A same-origin page that sends its own loopback `Origin` is the
+        // dashboard itself, so the read is admitted on the `Origin` alone.
+        let origin_location = redirect_location(&scan_response(&state, "all", &report).await);
+        let own_origin = Request::builder()
+            .method(Method::GET)
+            .uri(&origin_location)
+            .header(header::HOST, "127.0.0.1:7880")
+            .header(header::ORIGIN, "http://127.0.0.1:7880")
+            .body(Body::empty())
+            .expect("own-origin request");
+        let response = send(state.clone(), own_origin).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            body_text(response).await.contains("Charts updated."),
+            "a loopback Origin still shows the banner"
+        );
+
+        let head = Request::builder()
+            .method(Method::HEAD)
+            .uri("/?project=all")
+            .header(header::HOST, "127.0.0.1:7880")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .expect("head request");
+        let response = send(state.clone(), head).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a HEAD that names no token still answers the dashboard"
+        );
         cleanup(&path);
     }
 
@@ -1825,6 +2125,99 @@ mod tests {
         assert!(
             carried.contains("Legacy message."),
             "the query transport still renders"
+        );
+        cleanup(&path);
+    }
+
+    /// A render that fails after the banner is claimed puts the exact slot back,
+    /// so the next read still shows the Update outcome. The dashboard render
+    /// fails here on a template set without `dashboard.html`, the same failure a
+    /// template error or a database error produces after the banner has been
+    /// claimed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_failed_render_keeps_the_flash_banner() {
+        let (state, path) = app_state("flash_failed_render").await;
+        let report = ScanReport {
+            attempted: 1,
+            failures: Vec::new(),
+        };
+        let location = redirect_location(&scan_response(&state, "all", &report).await);
+        let token = flash_token(&location, "all");
+
+        let broken = AppState {
+            templates: Arc::new(tera::Tera::default()),
+            ..state.clone()
+        };
+        let response = send(broken, get_page(&location, "127.0.0.1:7880")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the broken template set fails the render"
+        );
+        assert_eq!(
+            state.flash.lock().await.peek(&token),
+            Some(("notice", "Charts updated.")),
+            "a failed render must put the exact banner back under its own token"
+        );
+
+        let rendered =
+            body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
+        assert!(
+            rendered.contains("Charts updated."),
+            "the next read still shows the Update outcome"
+        );
+        assert!(
+            state.flash.lock().await.peek(&token).is_none(),
+            "that read consumes the restored banner"
+        );
+        cleanup(&path);
+    }
+
+    /// One token renders once however many reads are in flight: the claim
+    /// removes the slot under a single lock acquisition, so a second read that
+    /// names the same token finds nothing before the first read has rendered,
+    /// and a claim a failed render puts back names the same token, key, and
+    /// message.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_flash_claim_serves_the_banner_once_and_restores_the_exact_slot() {
+        let (state, path) = app_state("flash_claim_once").await;
+        let report = ScanReport {
+            attempted: 1,
+            failures: Vec::new(),
+        };
+        let location = redirect_location(&scan_response(&state, "all", &report).await);
+        let token = flash_token(&location, "all");
+        let query = HomeQuery {
+            flash: token.clone(),
+            ..HomeQuery::default()
+        };
+
+        let first = claim_banner(&state, &query)
+            .await
+            .expect("the first read claims the banner");
+        assert_eq!(first.token, token, "the claim keeps the token it names");
+        assert_eq!(
+            (first.key, first.message.as_str()),
+            ("notice", "Charts updated."),
+            "the claim carries the slot's key and message"
+        );
+        assert!(
+            claim_banner(&state, &query).await.is_none(),
+            "a second read in flight renders nothing"
+        );
+
+        state.flash.lock().await.restore(first);
+        let restored = claim_banner(&state, &query)
+            .await
+            .expect("the restored banner is readable again");
+        assert_eq!(
+            (restored.token, restored.key, restored.message.as_str()),
+            (token.clone(), "notice", "Charts updated."),
+            "the restored slot keeps its token, key, and message"
+        );
+        assert!(
+            claim_banner(&state, &query).await.is_none(),
+            "the restored banner is served once as well"
         );
         cleanup(&path);
     }
