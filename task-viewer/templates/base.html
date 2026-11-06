@@ -7,19 +7,7 @@
     <title>{% block title %}Task viewer{% endblock %}</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="stylesheet" href="/static/style.css?v={{ version }}">
-    <script>
-        (function () {
-            var stored = null;
-            try {
-                stored = localStorage.getItem("task-viewer-theme");
-            } catch (error) {
-                // A restricted browser blocks storage; keep the default theme.
-            }
-            if (stored === "light" || stored === "dark") {
-                document.documentElement.setAttribute("data-theme", stored);
-            }
-        })();
-    </script>
+    <script src="/static/js/theme-boot.js?v={{ version }}"></script>
 </head>
 
 <body>

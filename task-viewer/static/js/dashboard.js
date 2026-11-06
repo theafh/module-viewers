@@ -31,12 +31,23 @@
     }
   }
 
+  var DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+  // Throwing on a value the charts cannot read is deliberate: renderCard
+  // catches it and draws the fallback, so a mistyped payload field shows
+  // "Charts unavailable" instead of a chart drawn from NaN coordinates.
   function parseDay(value) {
-    var parts = value.split("-");
-    return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]), 12, 0, 0);
+    var match = typeof value === "string" ? DAY.exec(value) : null;
+    if (!match) {
+      throw new Error("Unparseable day: " + value);
+    }
+    return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12, 0, 0);
   }
 
   function fmt(value) {
+    if (typeof value !== "number" || !isFinite(value)) {
+      throw new Error("Not a number: " + value);
+    }
     return new Intl.NumberFormat("en-US").format(value);
   }
 

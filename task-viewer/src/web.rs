@@ -97,7 +97,7 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(require_local_host))
         // The security headers sit outside the host check, so the 403 that
         // rejects a foreign Host carries them too. The CSP holds only
-        // `frame-ancestors`, which restricts no script source: the inline theme
+        // `frame-ancestors`, which restricts no script source: the theme
         // bootstrap, the inline handlers, and the static scripts keep running.
         .layer(SetResponseHeaderLayer::overriding(
             header::X_FRAME_OPTIONS,
@@ -151,21 +151,29 @@ fn loopback_origins() -> [String; 3] {
     ]
 }
 
-/// A `POST` is same-origin when its `Origin` names a loopback origin. A request
-/// that carries no `Origin` falls back to `Sec-Fetch-Site`, whose `cross-site`
-/// value is the only one rejected; older browsers send neither header.
+/// A `POST` is same-origin when its `Origin` names a loopback origin. An opaque
+/// `Origin` of `null` and a request that carries no `Origin` both fall back to
+/// `Sec-Fetch-Site`, whose `cross-site` value is the only one rejected; older
+/// browsers send neither header. A browser sends `Origin: null` for a
+/// same-origin form post it cannot attribute to a serialisable origin, so
+/// rejecting that value outright breaks Update on such a browser.
 fn is_same_origin_post(headers: &HeaderMap) -> bool {
     match headers.get(header::ORIGIN) {
-        Some(origin) => origin
-            .to_str()
-            .is_ok_and(|origin| loopback_origins().iter().any(|allowed| allowed == origin)),
-        None => {
-            headers
-                .get("sec-fetch-site")
-                .and_then(|value| value.to_str().ok())
-                != Some("cross-site")
-        }
+        Some(origin) => match origin.to_str() {
+            Ok("null") => !is_cross_site_fetch(headers),
+            Ok(origin) => loopback_origins().iter().any(|allowed| allowed == origin),
+            Err(_) => false,
+        },
+        None => !is_cross_site_fetch(headers),
     }
+}
+
+/// The only `Sec-Fetch-Site` value the origin fallback rejects.
+fn is_cross_site_fetch(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        == Some("cross-site")
 }
 
 fn is_local_host(host: &str) -> bool {
@@ -1100,6 +1108,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn web_accepts_a_null_origin_same_origin_form_post() {
+        let (state, path) = app_state("origin_null_accept").await;
+        let response = send(
+            state.clone(),
+            form_post("/scan", Some("null"), Some("same-origin")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect_location(&response),
+            "/?project=all&notice=Charts%20updated."
+        );
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rejects_a_null_origin_cross_site_form_post() {
+        let (state, path, folder, id) = state_with_repository("origin_null_reject").await;
+        let response = send(
+            state.clone(),
+            form_post("/scan", Some("null"), Some("cross-site")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_not_scanned(&state, id).await;
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn web_rejects_a_cross_site_post_without_an_origin() {
         let (state, path, folder, id) = state_with_repository("fetch_site_reject").await;
         let response = send(state.clone(), form_post("/scan", None, Some("cross-site"))).await;
@@ -1188,7 +1226,7 @@ mod tests {
         );
         let dashboard_body = body_text(dashboard).await;
         assert!(
-            dashboard_body.contains("localStorage.getItem(\"task-viewer-theme\")"),
+            dashboard_body.contains("/static/js/theme-boot.js?v="),
             "the theme bootstrap script still renders"
         );
         assert!(
@@ -1204,7 +1242,7 @@ mod tests {
         assert_eq!(repositories.status(), StatusCode::OK);
         let repositories_body = body_text(repositories).await;
         assert!(
-            repositories_body.contains("localStorage.getItem(\"task-viewer-theme\")"),
+            repositories_body.contains("/static/js/theme-boot.js?v="),
             "the theme bootstrap script still renders"
         );
         assert!(
@@ -2061,13 +2099,14 @@ mod tests {
     }
 
     const BROWSER_GUARDS: &str = include_str!("../testdata/browser_guards.js");
+    const THEME_BOOT_SCRIPT: &str = include_str!("../static/js/theme-boot.js");
     const THEME_SCRIPT: &str = include_str!("../static/js/theme.js");
     const DASHBOARD_SCRIPT: &str = include_str!("../static/js/dashboard.js");
 
     /// Run the real shipped scripts against the stub DOM, then evaluate
     /// `assertion` in the same realm and return its JSON result. Loading a
     /// script that throws fails the test, which is how an uncaught error in
-    /// `theme.js` or `dashboard.js` surfaces.
+    /// `theme-boot.js`, `theme.js` or `dashboard.js` surfaces.
     fn run_browser(config: &serde_json::Value, assertion: &str) -> serde_json::Value {
         let runtime = rquickjs::Runtime::new().expect("quickjs runtime");
         let context = rquickjs::Context::full(&runtime).expect("quickjs context");
@@ -2075,6 +2114,8 @@ mod tests {
             ctx.eval::<(), _>(format!("globalThis.__config = {config};"))
                 .expect("config script");
             ctx.eval::<(), _>(BROWSER_GUARDS).expect("dom harness");
+            ctx.eval::<(), _>(THEME_BOOT_SCRIPT)
+                .expect("theme-boot.js loads");
             ctx.eval::<(), _>(THEME_SCRIPT).expect("theme.js loads");
             ctx.eval::<(), _>(DASHBOARD_SCRIPT)
                 .expect("dashboard.js loads");
@@ -2187,6 +2228,34 @@ mod tests {
         );
     }
 
+    /// The `<head>` bootstrap applies the stored theme before the body paints,
+    /// and a storage that throws keeps the default theme with no uncaught
+    /// error, so a restricted browser still renders the page.
+    #[test]
+    fn browser_theme_boot_applies_the_stored_theme_and_survives_throwing_storage() {
+        let mut stored = browser_config(false, false, None, serde_json::json!("#123456"));
+        stored["storedTheme"] = serde_json::Value::String("light".to_string());
+        let applied = run_browser(
+            &stored,
+            r#"JSON.stringify({ theme: globalThis.__env.html.getAttribute("data-theme") })"#,
+        );
+        assert_eq!(
+            applied["theme"], "light",
+            "the stored theme applies before the body loads"
+        );
+
+        let mut blocked = browser_config(false, true, None, serde_json::json!("#123456"));
+        blocked["storedTheme"] = serde_json::Value::String("light".to_string());
+        let kept = run_browser(
+            &blocked,
+            r#"JSON.stringify({ theme: globalThis.__env.html.getAttribute("data-theme") })"#,
+        );
+        assert_eq!(
+            kept["theme"], "dark",
+            "a storage that throws keeps the default theme"
+        );
+    }
+
     /// Acceptance 2: a 120px SVG with a year of calendar rows draws no
     /// negative-width rect and no negative-radius circle.
     #[test]
@@ -2235,6 +2304,21 @@ mod tests {
         assert_eq!(result["badRadii"], 0);
     }
 
+    /// The `data-chart` values the dashboard template renders, in page order.
+    /// Reading them from the template makes a card the harness does not know
+    /// about fail a test instead of passing unnoticed.
+    fn template_card_names() -> Vec<String> {
+        const DASHBOARD_TEMPLATE: &str = include_str!("../templates/dashboard.html");
+        DASHBOARD_TEMPLATE
+            .match_indices("data-chart=\"")
+            .map(|(index, marker)| {
+                let rest = &DASHBOARD_TEMPLATE[index + marker.len()..];
+                let end = rest.find('"').expect("a closing quote after data-chart");
+                rest[..end].to_string()
+            })
+            .collect()
+    }
+
     /// Acceptance 3: a malformed payload renders "Charts unavailable" on every
     /// chart card, and `dashboard.js` loads without throwing.
     #[test]
@@ -2245,31 +2329,42 @@ mod tests {
             Some("{not json"),
             serde_json::json!("#123456"),
         );
+        let names = template_card_names();
+        assert!(!names.is_empty(), "the template renders chart cards");
+        let names_json = serde_json::to_string(&names).expect("card names json");
         let result = run_browser(
             &config,
-            r#"(function () {
+            &format!(
+                r#"(function () {{
   var env = globalThis.__env;
-  var shown = {};
-  env.cardNames.forEach(function (name) {
+  var names = {names_json};
+  var shown = {{}};
+  var missing = [];
+  names.forEach(function (name) {{
+    if (env.cardNames.indexOf(name) < 0 || !env.cards[name]) {{
+      missing.push(name);
+      return;
+    }}
     var svg = env.cards[name].querySelector("svg");
-    shown[name] = svg.children.some(function (node) {
+    shown[name] = svg.children.some(function (node) {{
       return node.name === "text" && node.textContent === "Charts unavailable";
-    });
-  });
-  return JSON.stringify(shown);
-})()"#,
+    }});
+  }});
+  return JSON.stringify({{ shown: shown, missing: missing }});
+}})()"#
+            ),
         );
-        for name in [
-            "weekly",
-            "cumulative",
-            "shipped-calendar",
-            "created-calendar",
-            "backlog",
-            "age",
-            "radar-shipped",
-            "radar-live",
-        ] {
-            assert_eq!(result[name], true, "{name} shows the fallback");
+        assert_eq!(
+            result["missing"],
+            serde_json::json!([]),
+            "every template card has a harness card to assert against"
+        );
+        for name in &names {
+            assert_eq!(
+                result["shown"][name.as_str()],
+                true,
+                "{name} shows the fallback"
+            );
         }
     }
 

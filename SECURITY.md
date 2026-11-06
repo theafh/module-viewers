@@ -32,7 +32,7 @@ The desktop launcher keeps its PID file and the server log, which records reposi
 
 - The server binds `127.0.0.1:7880`. A `Host` other than loopback (`127.0.0.1`, `localhost`, `[::1]`, with optional `:7880`) is rejected.
 - Every response carries `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Content-Security-Policy: frame-ancestors 'none'`. The layers sit outside the `Host` check, so the 403 that rejects a foreign `Host` carries them too, and they cover static files and the router's own 404.
-- A state-changing `POST` is accepted only when its `Origin` names a loopback origin (`http://127.0.0.1:7880`, `http://localhost:7880`, or `http://[::1]:7880`), or, without an `Origin`, when `Sec-Fetch-Site` is not `cross-site`. Every other `POST` gets 403 before its route runs.
+- A state-changing `POST` is accepted only when its `Origin` names a loopback origin (`http://127.0.0.1:7880`, `http://localhost:7880`, or `http://[::1]:7880`), or, when `Origin` is absent or the opaque value `null`, when `Sec-Fetch-Site` is not `cross-site`. Every other `POST` gets 403 before its route runs.
 - Static files come from `task-viewer/static/`.
 - Remove asks for confirmation in the page and uses its own POST route.
 

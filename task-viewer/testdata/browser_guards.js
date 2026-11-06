@@ -1,7 +1,8 @@
 // Minimal DOM used by the browser_guards tests in src/web.rs. It is loaded
-// before theme.js and dashboard.js so the shipped files run unchanged against
-// a stub document. The test sets globalThis.__config first; this fixture reads
-// it and publishes the built nodes on globalThis.__env for Rust assertions.
+// before theme-boot.js, theme.js and dashboard.js so the shipped files run
+// unchanged against a stub document. The test sets globalThis.__config first;
+// this fixture reads it and publishes the built nodes on globalThis.__env for
+// Rust assertions.
 (function () {
   var config = globalThis.__config || {};
   var narrow = !!config.narrow;
@@ -126,6 +127,9 @@
 
   var themeButton = new Node("button");
   var store = {};
+  if (config.storedTheme !== undefined && config.storedTheme !== null) {
+    store["task-viewer-theme"] = String(config.storedTheme);
+  }
   var localStorage = {
     getItem: function (key) {
       if (storageThrows) throw new Error("storage is blocked");
