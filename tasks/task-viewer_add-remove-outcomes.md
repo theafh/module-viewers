@@ -2,8 +2,8 @@
 description: "Report the initial harvest failure on Add and the rows-affected result on Remove instead of always claiming success."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T12:47:00
-status: open
+updated: 2026-11-06T14:59:13
+status: ready
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -19,12 +19,12 @@ Add reports an initial harvest failure instead of a plain success, and Remove re
 
 ## Approach
 
-Widen `refresh_one` to return `Option<&'static str>`, return that outcome from `store_repository`, and use the existing error redirect when it reports a failure, while keeping the repository inserted and its scan error stored. Have `delete_repository` return the affected row count and have `remove_repository` redirect with an error when it is zero. Keep the existing messages for the success and failure paths.
+Widen `refresh_one` to return `Option<&'static str>`, return that outcome from `store_repository`, and use the existing error redirect when it reports a failure, while keeping the repository inserted and its scan error stored. Have `delete_repository` return the affected row count and have `remove_repository` redirect with the error "The repository was not found." when it is zero. Keep the existing messages for the success path and the database-error path.
 
 **Out of scope:** Changing when a repository is accepted; a folder with `tasks/` is still added even if its first harvest fails.
 
 ## Acceptance
 
 - A test adds a repository whose harvest returns `HarvestError::Git` and asserts the redirect carries the error key and the git failure message while the repository remains listed with that scan error.
-- A test removes a nonexistent id and asserts the redirect carries an error rather than the removed notice.
+- A test removes a nonexistent id and asserts the redirect carries the error key with the message "The repository was not found." rather than the removed notice.
 - A test removes a real repository and still asserts the existing notice.

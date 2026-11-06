@@ -1161,9 +1161,9 @@ mod tests {
         .await;
         assert!(second.failures.is_empty());
         let second_walks = harvest::take_leave_walk_count(&repo);
-        assert!(
-            second_walks < first_walks,
-            "the second pass reuses the stored leave days: {second_walks} walks of {first_walks}"
+        assert_eq!(
+            second_walks, 0,
+            "the second pass reuses every stored leave day: {second_walks} walks of {first_walks}"
         );
 
         let rows = db::load_tasks(&pool, Some(id)).await.expect("rows");
