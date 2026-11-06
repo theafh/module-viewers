@@ -2,9 +2,11 @@
 description: "Escape the frontmatter status before it reaches a git -G regex so unusual statuses cannot fail the whole repository scan."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T23:23:40
-status: ready
+updated: 2026-11-06T04:57:55
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Escape the status before it reaches a git regex

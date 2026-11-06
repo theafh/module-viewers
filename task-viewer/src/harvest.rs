@@ -828,13 +828,33 @@ fn has_archived_status(text: &str, expected: &str) -> bool {
         })
 }
 
+/// Backslash-escape every POSIX extended regex metacharacter so a status value
+/// is matched literally when it reaches `git log -G`.
+fn escape_posix_ere(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '\\' | '.' | '[' | ']' | '(' | ')' | '*' | '+' | '?' | '{' | '}' | '|' | '^' | '$'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 fn first_status_commit_date(
     repo: &Path,
     rel: &str,
     status: &str,
 ) -> Result<Option<NaiveDate>, String> {
     let literal = format!("status: {status}");
-    let regex = format!(r"^status:[[:space:]]*{status}");
+    // A frontmatter status is free text, so an unescaped metacharacter such as
+    // a `[` or `{` would make `-G` exit with `fatal: invalid regex` and abort
+    // the whole repository's harvest.
+    let escaped = escape_posix_ere(status);
+    let regex = format!(r"^status:[[:space:]]*{escaped}");
     for (flag, pattern) in [("-S", literal.as_str()), ("-G", regex.as_str())] {
         if let Some(day) = git_pickaxe(repo, rel, flag, pattern)? {
             return Ok(Some(day));
@@ -952,8 +972,8 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HarvestError, ParsedTask, TaskKind, git_dir_command, git_path, harvest_repository,
-        parse_archive_log, scrub_git_env,
+        HarvestError, ParsedTask, TaskKind, escape_posix_ere, git_dir_command, git_path,
+        harvest_repository, parse_archive_log, scrub_git_env,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -1243,6 +1263,209 @@ mod tests {
         assert_eq!(
             task.leave_date,
             Some(NaiveDate::from_ymd_opt(2026, 6, 15).expect("day"))
+        );
+        assert!(task.ship_date.is_none());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn status_escape_matches_each_metacharacter_literally() {
+        // Every POSIX ERE metacharacter in a status must reach `git log -G`
+        // escaped, so the regex matches the literal frontmatter line.
+        let repo = scratch("harvest_escape_metachars");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        let metacharacters = [
+            '\\', '.', '[', ']', '(', ')', '*', '+', '?', '{', '}', '|', '^', '$',
+        ];
+        let mut probes = Vec::new();
+        for (index, ch) in metacharacters.iter().enumerate() {
+            let status = format!("x{ch}y");
+            let rel = format!("tasks/probe_{index}.md");
+            fs::write(
+                repo.join(&rel),
+                format!(
+                    "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: {status}\n---\n\n# Probe\n"
+                ),
+            )
+            .expect("write probe");
+            probes.push((rel, status));
+        }
+        fs::write(
+            repo.join("tasks/unrelated.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: xy\n---\n\n# Other\n",
+        )
+        .expect("write unrelated");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "probes"],
+            "2026-05-01T12:00:00+00:00",
+        );
+
+        for (rel, status) in &probes {
+            let pattern = format!(r"^status:[[:space:]]*{}", escape_posix_ere(status));
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args([
+                    "log",
+                    "--no-patch",
+                    "--format=%cI",
+                    "-G",
+                    &pattern,
+                    "--all",
+                    "--",
+                    rel,
+                ])
+                .output()
+                .expect("git log");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !output.stdout.is_empty(),
+                "escaped pattern for {status:?} did not match its literal line"
+            );
+        }
+
+        // The escaped `x\.y` must not match the unrelated `xy` line.
+        let pattern = format!(r"^status:[[:space:]]*{}", escape_posix_ere("x.y"));
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "log",
+                "--no-patch",
+                "--format=%cI",
+                "-G",
+                &pattern,
+                "--all",
+                "--",
+                "tasks/unrelated.md",
+            ])
+            .output()
+            .expect("git log");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "escaped pattern matched an unrelated status"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_task_archived_with_a_tight_bracket_status() {
+        // `status:[` carries an unescaped `[` into `-G`; the harvest must
+        // succeed and date the deferral from its archive commit.
+        let repo = scratch("harvest_status_bracket");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::write(
+            repo.join("tasks/archive/scope_bracket.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus:[\n---\n\n# Bracket\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive bracket"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day"))
+        );
+        assert!(task.ship_date.is_none());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_task_archived_with_a_tight_deferred_bracket_status() {
+        // `status:deferred[` keeps the deferred prefix but appends an unescaped
+        // `[`, which must not turn the harvest into a `HarvestError`.
+        let repo = scratch("harvest_status_deferred_bracket");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::write(
+            repo.join("tasks/archive/scope_deferred_bracket.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus:deferred[\n---\n\n# Deferred bracket\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-06-12T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive deferred bracket"],
+            "2026-06-12T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 12).expect("day"))
+        );
+        assert!(task.ship_date.is_none());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_tight_brace_status_from_its_archive_commit() {
+        // The `-S` literal looks for `status: x{1` with a space, so the tight
+        // `status:x{1` line misses it. The escaped `-G` pass finds the archive
+        // commit, so the earlier `updated` day stays out of the leave day.
+        let repo = scratch("harvest_status_brace");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-04-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::write(
+            repo.join("tasks/archive/scope_brace.md"),
+            "---\ncreated: 2026-04-01T10:00:00\nupdated: 2026-04-02T10:00:00\nstatus:x{1\n---\n\n# Brace\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-07-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive brace"],
+            "2026-07-01T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 7, 1).expect("day"))
+        );
+        assert_ne!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 4, 2).expect("day"))
         );
         assert!(task.ship_date.is_none());
         let _ = fs::remove_dir_all(&repo);
