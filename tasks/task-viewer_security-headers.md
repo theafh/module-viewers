@@ -2,8 +2,8 @@
 description: "Send anti-framing, content-sniffing, and referrer-policy headers on normal and host-rejected responses."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T07:00:45
-status: open
+updated: 2026-11-06T15:50:51
+status: ready
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -19,12 +19,12 @@ The app cannot be framed by another page, and responses declare a strict content
 
 ## Approach
 
-Add response headers with `SetResponseHeaderLayer` or a small middleware: `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and a `Content-Security-Policy` with `frame-ancestors 'none'` if the inline theme and form scripts are given hashes or a nonce. Keep the existing `no-store`. Apply the headers outside the host middleware so the 403 response also carries them. Add a test that asserts each header on a normal page and on the host-rejected response.
+Add response headers with `SetResponseHeaderLayer` or a small middleware: `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Content-Security-Policy: frame-ancestors 'none'`. The CSP carries that one directive and no `script-src` or `default-src`, so no script source is restricted: the theme bootstrap `<script>` in `base.html`, the Project selector's `onchange` in `dashboard.html`, the Remove form's `onsubmit` in `repositories.html`, and `/static/js/theme.js` and `/static/js/dashboard.js` keep running as they do today. No hash or nonce is needed, so a later template edit cannot silently break the policy. Keep the existing `no-store`. Apply the headers outside the host middleware so the 403 response also carries them. Add a test that asserts each header on a normal page and on the host-rejected response.
 
-**Out of scope:** Removing the inline scripts; they stay, with a CSP that accommodates them.
+**Out of scope:** Removing or rewriting the inline scripts and handler attributes; they stay, and the CSP this task adds restricts no script source.
 
 ## Acceptance
 
 - A test asserts `GET /` carries `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`.
 - A test asserts the host-rejected 403 carries the same headers.
-- If a CSP is added, a test asserts the dashboard and repositories pages still load their inline theme bootstrap.
+- A test asserts `GET /` and the host-rejected 403 carry a `Content-Security-Policy` whose only directive is `frame-ancestors 'none'`, and that the dashboard and repositories pages still render the theme bootstrap script, the Project selector's `onchange`, and the Remove form's `onsubmit`.

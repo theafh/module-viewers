@@ -202,8 +202,11 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
         let stamp = times.get(&sha).copied().unwrap_or(0);
         candidates.push((archive_rank(&path, 0, stamp), Some(sha), path));
     }
-    for (rel, _) in files_on_disk(repo)? {
-        candidates.push((archive_rank(&rel, 1, i64::MAX), None, rel));
+    // The working-tree walk reads each file's content to rank it, so keep that
+    // content and reuse it for the chosen files instead of reading them again.
+    let worktree = files_on_disk(repo)?;
+    for (rel, _) in &worktree {
+        candidates.push((archive_rank(rel, 1, i64::MAX), None, rel.clone()));
     }
     candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
     let mut seen = std::collections::HashSet::new();
@@ -214,6 +217,7 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
             chosen.push((path, blob));
         }
     }
+    let worktree: std::collections::HashMap<String, String> = worktree.into_iter().collect();
     // Read the committed versions in one `git cat-file` process.
     let blobs: Vec<String> = chosen.iter().filter_map(|(_, blob)| blob.clone()).collect();
     let mut contents = read_blobs(repo, Some(dir), &blobs)?.into_iter();
@@ -221,7 +225,17 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
     for (path, blob) in chosen {
         let text = match blob {
             Some(_) => contents.next().unwrap_or_default(),
-            None => fs::read_to_string(repo.join(&path)).unwrap_or_default(),
+            // A file that disappeared between the walk and here falls back to a
+            // fresh read, matching the walk's empty content for an unreadable
+            // file.
+            None => match worktree.get(&path) {
+                Some(text) => text.clone(),
+                None => {
+                    #[cfg(test)]
+                    worktree_read_count::record(repo);
+                    fs::read_to_string(repo.join(&path)).unwrap_or_default()
+                }
+            },
         };
         files.push((path, text));
     }
@@ -583,6 +597,8 @@ fn files_on_disk(repo: &Path) -> Result<Vec<(String, String)>, HarvestError> {
         if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
+        #[cfg(test)]
+        worktree_read_count::record(repo);
         let Ok(text) = fs::read_to_string(path) else {
             continue;
         };
@@ -739,6 +755,44 @@ pub(crate) fn take_leave_walk_count(repo: &Path) -> usize {
     // Harvest canonicalizes its repository path, so key the lookup the same way.
     let repo = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     walk_count::take(&repo)
+}
+
+/// Test-only tally of working-tree `tasks/` markdown reads, keyed by repository
+/// path so parallel tests and parallel repositories cannot see each other's
+/// counts.
+#[cfg(test)]
+mod worktree_read_count {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn counts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+        static COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+        COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn record(repo: &Path) {
+        if let Ok(mut counts) = counts().lock() {
+            *counts.entry(repo.to_path_buf()).or_insert(0) += 1;
+        }
+    }
+
+    pub(super) fn take(repo: &Path) -> usize {
+        counts()
+            .lock()
+            .ok()
+            .and_then(|mut counts| counts.remove(repo))
+            .unwrap_or(0)
+    }
+}
+
+/// The working-tree `tasks/` markdown reads recorded for `repo` since the last
+/// call, for a test that asserts each chosen file is read once per harvest.
+#[cfg(test)]
+pub(crate) fn take_worktree_read_count(repo: &Path) -> usize {
+    // Harvest canonicalizes its repository path, so key the lookup the same way.
+    let repo = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    worktree_read_count::take(&repo)
 }
 
 type LeaveDays = Vec<(usize, Option<NaiveDate>)>;
@@ -1132,7 +1186,7 @@ mod tests {
     use super::{
         HarvestError, ParsedTask, PriorTask, TaskKind, escape_posix_ere, git_dir_command, git_path,
         harvest_repository, harvest_repository_with_prior, parse_archive_log, scrub_git_env,
-        take_leave_walk_count,
+        take_leave_walk_count, take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -2241,6 +2295,102 @@ mod tests {
         assert_eq!(
             pending.ship_date,
             Some(NaiveDate::from_ymd_opt(2026, 5, 1).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_reads_each_worktree_task_file_once() {
+        // Every chosen worktree file used to be read twice: once to rank it and
+        // once for the content the union returns.
+        let repo = scratch("harvest_worktree_once");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_committed.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "open task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // An uncommitted rewrite, a task only the working tree holds, a task in
+        // a nested folder, and an uncommitted archive.
+        write_task_dated(
+            &repo,
+            "tasks/scope_committed.md",
+            "2026-05-01",
+            "2026-06-05",
+            "open",
+        );
+        write_task(&repo, "tasks/scope_pending.md", "2026-06-01", "open");
+        write_task(&repo, "tasks/deep/scope_nested.md", "2026-06-02", "open");
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_shipped.md",
+            "2026-05-01",
+            "2026-07-01",
+            "finished",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let day = |year, month, day| NaiveDate::from_ymd_opt(year, month, day).expect("day");
+        let rows: Vec<_> = tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.path.clone(),
+                    task.scope.clone(),
+                    task.kind,
+                    task.created,
+                    task.updated,
+                    task.ship_date,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "tasks/archive/scope_shipped.md".to_string(),
+                    "scope".to_string(),
+                    TaskKind::Finished,
+                    day(2026, 5, 1),
+                    day(2026, 7, 1),
+                    Some(day(2026, 7, 1)),
+                ),
+                (
+                    "tasks/deep/scope_nested.md".to_string(),
+                    "scope".to_string(),
+                    TaskKind::Live,
+                    day(2026, 6, 2),
+                    day(2026, 6, 2),
+                    None,
+                ),
+                (
+                    "tasks/scope_committed.md".to_string(),
+                    "scope".to_string(),
+                    TaskKind::Live,
+                    day(2026, 5, 1),
+                    day(2026, 6, 5),
+                    None,
+                ),
+                (
+                    "tasks/scope_pending.md".to_string(),
+                    "scope".to_string(),
+                    TaskKind::Live,
+                    day(2026, 6, 1),
+                    day(2026, 6, 1),
+                    None,
+                ),
+            ]
+        );
+        assert_eq!(
+            take_worktree_read_count(&repo),
+            4,
+            "one read per working-tree task file, against two per file before the walk's content was kept"
         );
         let _ = fs::remove_dir_all(&repo);
     }
