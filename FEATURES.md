@@ -16,7 +16,7 @@ What `task-viewer` does, from the person's side. Structure is `ARCHITECTURE.md`,
 - On Dashboard, the bar also carries the project filter and Update.
 - On Repositories, the bar carries Add repository.
 - All projects is the default filter.
-- Light and Dark switch the page. The browser remembers the choice.
+- Light and Dark switch the page. The browser remembers the choice, except where a restricted browser blocks storage: the switch still applies for the session and recolors the charts, it just is not remembered for the next visit.
 
 ## 3. Repositories
 
@@ -39,3 +39,5 @@ The dashboard shows eight charts from the stored rows, for all configured reposi
 - Live radar.
 
 Hovering a mark shows the count for that week, day, or spoke. With all projects selected, each radar spoke is one repository. With one project selected, each spoke is one task scope, the filename prefix before the first underscore.
+
+A card whose chart cannot be drawn shows Charts unavailable in place of the chart, and the other cards still render.

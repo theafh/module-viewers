@@ -12,7 +12,7 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 ## Test Organization
 
 - Tests live in `#[cfg(test)]` modules in the source file they exercise.
-- Shared helpers live in `#[cfg(test)]` `src/test_support.rs` (`unique_temp_dir`). The `[dev-dependencies]` block in `task-viewer/Cargo.toml` adds `tower` with its `util` feature for `tower::ServiceExt::oneshot` tests through `router(state)`.
+- Shared helpers live in `#[cfg(test)]` `src/test_support.rs` (`unique_temp_dir`). The `[dev-dependencies]` block in `task-viewer/Cargo.toml` adds `tower` with its `util` feature for `tower::ServiceExt::oneshot` tests through `router(state)`, and `rquickjs` for tests that execute the shipped JavaScript. A JavaScript fixture shared by those tests sits in `task-viewer/testdata/`, such as `testdata/browser_guards.js` with its stub DOM: it is the JavaScript counterpart of the `src/test_support.rs` helpers, kept outside `src/` so it adds no Rust module.
 - Database tests set a thread-local database path under a unique temp dir and use the current-thread runtime so that path stays on the test thread.
 - Git tests build a unique temporary repository with `user.email` and `user.name` passed on the command, and with author and committer dates in the environment.
 
