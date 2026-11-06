@@ -100,18 +100,22 @@ pub fn harvest_repository_with_prior(
         return Err(HarvestError::MissingTasks);
     }
 
-    // A repository with a `.git` is charted from every version of its `tasks/`
-    // tree that the working tree or any ref holds, so a task stays visible
-    // whichever branch is checked out. A folder outside git is charted from its
-    // files.
+    // A configured folder that a git repository holds is charted from every
+    // version of its `tasks/` tree that the working tree or any ref holds, so a
+    // task stays visible whichever branch is checked out. The repository that
+    // holds it is the folder's own `.git` or an enclosing one. A folder outside
+    // git is charted from its files.
     let git = GitContext::resolve(&repo);
-    let files = match &git.dir {
-        Some(dir) => {
+    let files = match git.repository() {
+        Some((root, dir)) => {
             // A `.git` that git cannot open fails the scan; charting frontmatter
             // dates instead would pile every task onto its last bulk `updated`
-            // day.
-            git_read(&repo, dir, &["rev-parse", "--git-dir"]).map_err(HarvestError::Git)?;
-            union_files(&repo, dir)?
+            // day. An enclosing repository that git cannot read never resolves
+            // to a context, so only the folder's own `.git` needs the probe.
+            if git.dir.is_some() {
+                git_read(&repo, dir, &["rev-parse", "--git-dir"]).map_err(HarvestError::Git)?;
+            }
+            union_files(&repo, root, dir, &git.prefix)?
         }
         None => files_on_disk(&repo)?,
     };
@@ -119,35 +123,56 @@ pub fn harvest_repository_with_prior(
 }
 
 /// The git context resolved once per harvest: the folder's own `.git`, its
-/// place inside an enclosing repository, and whether a repository holds it.
+/// place inside an enclosing repository, and the repository that holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitContext {
+    /// The folder's own `.git`, when it has one.
     dir: Option<PathBuf>,
+    /// The folder's path inside the repository that holds it, ending in `/`.
     prefix: String,
     inside_repository: bool,
+    /// The worktree root of the repository that holds the folder: the folder
+    /// itself when it has its own `.git`, otherwise the enclosing repository's
+    /// top level.
+    root: Option<PathBuf>,
+    /// The git dir of that repository, which is `dir` when the folder has its
+    /// own `.git` and the enclosing repository's dir otherwise.
+    repository_dir: Option<PathBuf>,
 }
 
 impl GitContext {
     fn resolve(repo: &Path) -> Self {
         if let Some(dir) = git_dir(repo) {
             return Self {
-                dir: Some(dir),
+                dir: Some(dir.clone()),
                 prefix: String::new(),
                 inside_repository: true,
+                root: Some(repo.to_path_buf()),
+                repository_dir: Some(dir),
             };
         }
-        match enclosing_prefix(repo) {
-            Some(prefix) => Self {
+        match enclosing_repository(repo) {
+            Some((prefix, root, dir)) => Self {
                 dir: None,
                 prefix,
                 inside_repository: true,
+                root: Some(root),
+                repository_dir: Some(dir),
             },
             None => Self {
                 dir: None,
                 prefix: String::new(),
                 inside_repository: false,
+                root: None,
+                repository_dir: None,
             },
         }
+    }
+
+    /// The worktree root and git dir that chart the folder from git, or `None`
+    /// when no repository holds it.
+    fn repository(&self) -> Option<(&Path, &Path)> {
+        Some((self.root.as_deref()?, self.repository_dir.as_deref()?))
     }
 }
 
@@ -161,9 +186,23 @@ impl GitContext {
 /// commit, and its path.
 type Candidate = ((u8, u8, i64), Option<String>, String);
 
-fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, HarvestError> {
+/// Chart `folder` from the refs of the repository that holds it.
+///
+/// `root` is that repository's worktree root and `dir` its git dir, so a nested
+/// folder lists the enclosing repository's refs. `prefix` is the folder's place
+/// inside it, ending in `/` and empty when the folder is the repository root.
+/// The listing is limited to `<prefix>tasks` and the prefix is stripped from
+/// every path, so the enclosing root's own `tasks/` never enters it and a stored
+/// path stays relative to the configured folder.
+fn union_files(
+    folder: &Path,
+    root: &Path,
+    dir: &Path,
+    prefix: &str,
+) -> Result<Vec<(String, String)>, HarvestError> {
+    let pathspec = format!("{prefix}tasks");
     let listing = git_read(
-        repo,
+        root,
         dir,
         &[
             "for-each-ref",
@@ -183,16 +222,16 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
     let mut all_blobs: Vec<String> = Vec::new();
     for reference in &refs {
         let tree = git_read(
-            repo,
+            root,
             dir,
-            &["ls-tree", "-r", "-z", reference, "--", "tasks"],
+            &["ls-tree", "-r", "-z", reference, "--", &pathspec],
         )
         .map_err(HarvestError::Git)?;
-        let (paths, blobs) = markdown_blobs(&tree);
+        let (paths, blobs) = markdown_blobs(&tree, prefix);
         all_blobs.extend(blobs.iter().cloned());
         found.extend(paths.into_iter().zip(blobs));
     }
-    let times = blob_days(repo, dir, &all_blobs)?;
+    let times = blob_days(root, dir, &all_blobs, &pathspec)?;
     // Rank a version by how much it should be trusted: the working tree first,
     // then an archived copy over a live one, then the newest commit. A task
     // archived on one branch is shipped even when another branch still carries
@@ -204,7 +243,8 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
     }
     // The working-tree walk reads each file's content to rank it, so keep that
     // content and reuse it for the chosen files instead of reading them again.
-    let worktree = files_on_disk(repo)?;
+    // It reads the configured folder, whose paths are already relative to it.
+    let worktree = files_on_disk(folder)?;
     for (rel, _) in &worktree {
         candidates.push((archive_rank(rel, 1, i64::MAX), None, rel.clone()));
     }
@@ -220,7 +260,7 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
     let mut worktree: std::collections::HashMap<String, String> = worktree.into_iter().collect();
     // Read the committed versions in one `git cat-file` process.
     let blobs: Vec<String> = chosen.iter().filter_map(|(_, blob)| blob.clone()).collect();
-    let mut contents = read_blobs(repo, Some(dir), &blobs)?.into_iter();
+    let mut contents = read_blobs(root, Some(dir), &blobs)?.into_iter();
     let mut files = Vec::new();
     for (path, blob) in chosen {
         let text = match blob {
@@ -232,8 +272,8 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
                 Some(text) => text,
                 None => {
                     #[cfg(test)]
-                    worktree_read_count::record(repo);
-                    fs::read_to_string(repo.join(&path)).unwrap_or_default()
+                    worktree_read_count::record(folder);
+                    fs::read_to_string(folder.join(&path)).unwrap_or_default()
                 }
             },
         };
@@ -253,11 +293,12 @@ fn archive_rank(path: &str, from_worktree: u8, stamp: i64) -> (u8, u8, i64) {
 /// The committer day of the newest commit that touched each blob, keyed by
 /// blob id, in one `git log` process.
 fn blob_days(
-    repo: &Path,
+    root: &Path,
     dir: &Path,
     blobs: &[String],
+    pathspec: &str,
 ) -> Result<std::collections::HashMap<String, i64>, HarvestError> {
-    let mut command = git_dir_command(repo, dir);
+    let mut command = git_dir_command(root, dir);
     scrub_git_env(&mut command);
     command.args([
         "log",
@@ -267,7 +308,7 @@ fn blob_days(
         "--no-renames",
         "--no-abbrev",
         "--",
-        "tasks",
+        pathspec,
     ]);
     let output = command
         .output()
@@ -403,8 +444,9 @@ fn harvest_files(
 /// name holding a non-ASCII character or a double quote reaches us unquoted
 /// instead of C-quoted and dropped. `git_read` decodes the output lossily, as
 /// the archive walk does, so a path that is not valid UTF-8 keeps its place in
-/// the listing.
-fn markdown_blobs(listing: &str) -> (Vec<String>, Vec<String>) {
+/// the listing. Each path loses `prefix`, the configured folder's place in the
+/// repository, so a stored path stays relative to that folder.
+fn markdown_blobs(listing: &str, prefix: &str) -> (Vec<String>, Vec<String>) {
     let mut paths = Vec::new();
     let mut blobs = Vec::new();
     for record in listing.split('\0') {
@@ -422,6 +464,9 @@ fn markdown_blobs(listing: &str) -> (Vec<String>, Vec<String>) {
         if kind != "blob" {
             continue;
         }
+        let Some(path) = path.strip_prefix(prefix) else {
+            continue;
+        };
         paths.push(path.to_string());
         blobs.push(sha.to_string());
     }
@@ -985,21 +1030,32 @@ fn parse_archive_log(output: &[u8]) -> Vec<(NaiveDate, String, String)> {
     records
 }
 
-/// The folder's path inside the repository that holds it, ending in `/`, or
+/// The repository that holds a folder without its own `.git`: the folder's path
+/// inside it (ending in `/`), that repository's worktree root, and its git dir.
 /// `None` when no enclosing repository holds the folder.
-fn enclosing_prefix(repo: &Path) -> Option<String> {
+fn enclosing_repository(repo: &Path) -> Option<(String, PathBuf, PathBuf)> {
     let mut command = Command::new(git_bin());
     command.arg("-C").arg(repo);
     scrub_git_env(&mut command);
-    let output = command.args(["rev-parse", "--show-prefix"]).output().ok()?;
+    // One `rev-parse` supplies the prefix, root, and git dir in argument order.
+    let output = command
+        .args([
+            "rev-parse",
+            "--show-prefix",
+            "--show-toplevel",
+            "--absolute-git-dir",
+        ])
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
-    Some(
-        String::from_utf8_lossy(&output.stdout)
-            .trim_end_matches(['\r', '\n'])
-            .to_string(),
-    )
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let prefix = lines.next()?.to_string();
+    let root = PathBuf::from(lines.next()?);
+    let dir = PathBuf::from(lines.next()?);
+    Some((prefix, root, dir))
 }
 
 /// A stable 64-bit FNV-1a hash of the bytes a task row was parsed from. Only
@@ -2894,6 +2950,98 @@ mod tests {
             task.ship_date,
             Some(NaiveDate::from_ymd_opt(2026, 5, 1).expect("day")),
             "the frontmatter updated day must not stand in for the archive commit"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_charts_a_branch_only_task_in_a_nested_folder() {
+        // The configured folder has no `.git`, so the chart comes from the
+        // enclosing repository's refs. A task only the feature branch holds must
+        // still appear, with a path relative to the configured folder.
+        let parent = scratch("harvest_nested_union");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&parent, "nested/tasks/scope_live.md", "2026-05-01", "open");
+        git(&parent, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "live task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &parent,
+            &["checkout", "-b", "feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task(
+            &parent,
+            "nested/tasks/scope_branch.md",
+            "2026-06-01",
+            "open",
+        );
+        git(&parent, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "branch-only task"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        // Back on main, which does not carry the branch-only task. `nested/tasks`
+        // stays present, so harvest does not return `MissingTasks`.
+        git(&parent, &["checkout", "main"], "2026-06-02T12:00:00+00:00");
+
+        let tasks = harvest_repository(&parent.join("nested")).expect("harvest");
+        let branch_only = tasks
+            .iter()
+            .find(|task| task.path == "tasks/scope_branch.md")
+            .expect("the feature branch's task must be charted");
+        assert_eq!(branch_only.kind, TaskKind::Live);
+        assert!(
+            tasks.iter().any(|task| task.path == "tasks/scope_live.md"),
+            "the checked-out branch's task stays charted"
+        );
+        assert!(
+            tasks.iter().all(|task| task.path.starts_with("tasks/")),
+            "every stored path stays relative to the configured folder"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_excludes_the_enclosing_root_tasks_from_a_nested_folder() {
+        // The nested folder's listing is limited to its own `tasks/` tree, so the
+        // enclosing repository's root tasks never chart for it.
+        let parent = scratch("harvest_nested_root_tasks");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&parent, "tasks/scope_parent.md", "2026-05-01", "open");
+        write_task(
+            &parent,
+            "nested/tasks/scope_nested.md",
+            "2026-05-01",
+            "open",
+        );
+        git(&parent, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "root and nested tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&parent.join("nested")).expect("harvest");
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tasks/scope_nested.md"],
+            "the enclosing root's own tasks must not chart"
         );
         let _ = fs::remove_dir_all(&parent);
     }

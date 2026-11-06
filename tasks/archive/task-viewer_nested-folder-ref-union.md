@@ -2,9 +2,11 @@
 description: "Chart a configured folder inside a parent git repository from the enclosing repository's refs."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T09:49:47
-status: ready
+updated: 2026-11-07T00:01:38
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Chart nested configured folders from the enclosing repository's refs
@@ -17,7 +19,7 @@ A configured folder that lives inside a parent git repository but has no `.git` 
 
 `harvest_repository_with_prior` in `task-viewer/src/harvest.rs` is the production entry point that calls `union_files` only when `git_dir(repo)` returns `Some`, and `git_dir` only checks `repo/.git`. A nested folder therefore uses `files_on_disk` only. Its leave-day lookup already reaches the enclosing repository through `git_pickaxe` and `enclosing_prefix`, so the two paths disagree. `CHARTER.md` says a configured repository with a git history is charted from every version of its `tasks/` tree; `ARCHITECTURE.md` only distinguishes "has `.git`" from "outside git", so this task also records the chosen reading.
 
-Two hard prerequisites own the symbols this task consumes. [task-viewer_leave-day-lookup-cost](archive/task-viewer_leave-day-lookup-cost.md) resolves the once-per-harvest git context — its dir, prefix, and whether an enclosing repository exists — and this task consumes that context instead of resolving a second one. [task-viewer_worktree-double-read](archive/task-viewer_worktree-double-read.md) turns the `union_files` worktree read into a path-to-content map, and this task's prefix strip keys that map. Every other live task whose body names `task-viewer/src/harvest.rs`'s git helpers touches a different aspect of the same code.
+Two hard prerequisites own the symbols this task consumes. [task-viewer_leave-day-lookup-cost](task-viewer_leave-day-lookup-cost.md) resolves the once-per-harvest git context — its dir, prefix, and whether an enclosing repository exists — and this task consumes that context instead of resolving a second one. [task-viewer_worktree-double-read](task-viewer_worktree-double-read.md) turns the `union_files` worktree read into a path-to-content map, and this task's prefix strip keys that map. Every other live task whose body names `task-viewer/src/harvest.rs`'s git helpers touches a different aspect of the same code.
 
 ## Approach
 
