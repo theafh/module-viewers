@@ -26,8 +26,8 @@ module-viewers ships small local tools that read repositories a person already h
 - The source of a chart is the parsed rows in `~/.task-viewer` for the repositories that person configured.
 - A configured repository that has a git history is charted from every version of its `tasks/` tree that its working tree or any of its refs holds, so a task stays on the charts whichever branch happens to be checked out.
 - Update replaces those rows from the current files and git history. It is the only refresh path.
-- A shipped task is an archived task whose status is `finished`. Its ship day is the commit that first archived it as `finished`, or as `implemented` when `implemented` was the archived spelling that a later commit renamed, or the frontmatter `updated` day when git has no such commit.
-- A deferred archived task counts as created and never as shipped. Its leave day is the commit that first introduced its archived status, or the frontmatter `updated` day when git has no such commit. Mean age includes it from `created` until that leave day.
+- A shipped task is an archived task whose status is `finished`. Its ship day is the commit that first archived it as `finished`, or as `implemented` when `implemented` was the archived spelling that a later commit renamed, or the frontmatter `updated` day when git has no such commit or when the task's path cannot be named in a git command.
+- A deferred archived task counts as created and never as shipped. Its leave day is the commit that first introduced its archived status, or the frontmatter `updated` day when git has no such commit or when the task's path cannot be named in a git command. Mean age includes it from `created` until that leave day.
 - All projects is the default filter. Its radar charts count tasks per configured repository. A single-project filter counts tasks per filename scope.
 
 ## Intentional Constraints

@@ -217,7 +217,7 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
             chosen.push((path, blob));
         }
     }
-    let worktree: std::collections::HashMap<String, String> = worktree.into_iter().collect();
+    let mut worktree: std::collections::HashMap<String, String> = worktree.into_iter().collect();
     // Read the committed versions in one `git cat-file` process.
     let blobs: Vec<String> = chosen.iter().filter_map(|(_, blob)| blob.clone()).collect();
     let mut contents = read_blobs(repo, Some(dir), &blobs)?.into_iter();
@@ -228,8 +228,8 @@ fn union_files(repo: &Path, dir: &Path) -> Result<Vec<(String, String)>, Harvest
             // A file that disappeared between the walk and here falls back to a
             // fresh read, matching the walk's empty content for an unreadable
             // file.
-            None => match worktree.get(&path) {
-                Some(text) => text.clone(),
+            None => match worktree.remove(&path) {
+                Some(text) => text,
                 None => {
                     #[cfg(test)]
                     worktree_read_count::record(repo);
