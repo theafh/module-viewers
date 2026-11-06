@@ -230,7 +230,7 @@ pub async fn replace_tasks(
         .bind(crate::dates::format_date(task.updated))
         .bind(task.ship_date.map(crate::dates::format_date))
         .bind(task.leave_date.map(crate::dates::format_date))
-        .bind(&task.content_hash)
+        .bind(task.content_hash.as_deref())
         .execute(&mut *tx)
         .await?;
     }
@@ -410,7 +410,7 @@ mod tests {
             updated: date(2026, 8, 1),
             ship_date: Some(date(2026, 7, 17)),
             leave_date: Some(date(2026, 7, 17)),
-            content_hash: "0123456789abcdef".to_string(),
+            content_hash: Some("0123456789abcdef".to_string()),
         }
     }
 
@@ -690,6 +690,35 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    /// A leave day that only the frontmatter `updated` fallback supplies carries
+    /// no content hash, so the next Update walks that path again. The store must
+    /// round trip that `None` instead of inventing a hash, while the path and the
+    /// leave day it was stored with still load.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_keeps_an_uncached_row_uncached() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        let mut uncached = task();
+        uncached.content_hash = None;
+        replace_tasks(&pool, id, &[uncached], immediate_hook().as_ref())
+            .await
+            .expect("replace");
+        let prior = load_prior_tasks(&pool, id).await.expect("prior");
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0].path, "tasks/archive/scope_one.md");
+        assert_eq!(prior[0].leave_date, Some(date(2026, 7, 17)));
+        assert_eq!(
+            prior[0].content_hash, None,
+            "a fallback day stays uncached across the store"
+        );
+        pool.close().await;
+        remove_scratch(&path);
     }
 
     /// The store hook runs inside the open write transaction, after the delete

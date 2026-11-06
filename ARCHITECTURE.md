@@ -35,7 +35,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
   tasks           # parsed rows for one repository, replaced on update
 ```
 
-`tasks` stores the relative path, the scope (filename prefix before the first underscore), the kind (`finished`, `deferred`, or `live`), `created`, `updated`, `ship_date`, `leave_date`, and `content_hash`, the hash of the file bytes the row was parsed from. Update reuses a row's stored leave day while its path and `content_hash` still match the file, and walks git again when the bytes change. Chart series are computed from these rows when the dashboard renders. Update deletes and reinserts the rows of each repository that still has a `tasks/` directory. A missing directory keeps the previous rows and records `last_error`.
+`tasks` stores the relative path, the scope (filename prefix before the first underscore), the kind (`finished`, `deferred`, or `live`), `created`, `updated`, `ship_date`, `leave_date`, and `content_hash`, the hash of the file bytes the row was parsed from. Update reuses a row's stored leave day only while its path and `content_hash` still match the file and that stored day came from a commit, and walks git again when the bytes change, or when the stored day is the frontmatter `updated` fallback because no commit carries the archived status — an uncommitted archive, or a history git cannot see. Chart series are computed from these rows when the dashboard renders. Update deletes and reinserts the rows of each repository that still has a `tasks/` directory. A missing directory keeps the previous rows and records `last_error`.
 
 ## Extraction Rules
 

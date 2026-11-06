@@ -727,7 +727,7 @@ mod tests {
             updated: chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("date"),
             ship_date: None,
             leave_date: None,
-            content_hash: "0123456789abcdef".to_string(),
+            content_hash: Some("0123456789abcdef".to_string()),
         }
     }
 

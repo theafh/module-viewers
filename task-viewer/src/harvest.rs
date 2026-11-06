@@ -42,8 +42,10 @@ pub struct ParsedTask {
     pub ship_date: Option<NaiveDate>,
     pub leave_date: Option<NaiveDate>,
     /// A hash of the file bytes this row was parsed from, so the next harvest
-    /// can reuse the stored leave day while the file is unchanged.
-    pub content_hash: String,
+    /// can reuse the stored leave day while the file is unchanged. It stays
+    /// `None` when the stored leave day is only the `updated` fallback, because
+    /// that day has no commit behind it to reuse.
+    pub content_hash: Option<String>,
 }
 
 /// The leave day and content hash the database stored for one task path before
@@ -338,20 +340,28 @@ fn harvest_files(
             updated,
             ship_date,
             leave_date,
-            content_hash,
+            content_hash: Some(content_hash),
         });
     }
 
     let mut from_git = 0usize;
     for (index, leave_day) in leave_dates(repo, git, &pending, prior).map_err(HarvestError::Git)? {
-        if let Some(task) = tasks.get_mut(index)
-            && let Some(day) = leave_day
-        {
-            from_git += 1;
-            task.leave_date = Some(day);
-            if task.kind == TaskKind::Finished {
-                task.ship_date = Some(day);
+        let Some(task) = tasks.get_mut(index) else {
+            continue;
+        };
+        match leave_day {
+            Some(day) => {
+                from_git += 1;
+                task.leave_date = Some(day);
+                if task.kind == TaskKind::Finished {
+                    task.ship_date = Some(day);
+                }
             }
+            // No commit carries this archived status yet, so the day stays the
+            // `updated` fallback `dates_for` seeded. Leave the hash unset so the
+            // next Update re-walks this path and records the archive commit day
+            // once it lands, instead of reusing the fallback forever.
+            None => task.content_hash = None,
         }
     }
     let finished = tasks
@@ -1368,7 +1378,7 @@ mod tests {
             .map(|task| PriorTask {
                 path: task.path.clone(),
                 leave_date: task.leave_date,
-                content_hash: Some(task.content_hash.clone()),
+                content_hash: task.content_hash.clone(),
             })
             .collect();
         let second = harvest_repository_with_prior(&repo, &prior).expect("second harvest");
@@ -2227,6 +2237,97 @@ mod tests {
         assert_eq!(
             pending.ship_date,
             Some(NaiveDate::from_ymd_opt(2026, 5, 1).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_rewalks_a_fallback_leave_day_after_the_archive_commit_lands() {
+        // A leave day seeded from `updated` while the archive move is only
+        // staged must not be cached. Otherwise the next Update reuses it and
+        // never records the archive commit day once the move is committed.
+        let repo = scratch("harvest_archive_after_fallback");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_pending.md"),
+            task_with_body("2026-05-01", "open"),
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "open task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // Staged, not committed: no commit carries the finished status yet.
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::rename(
+            repo.join("tasks/scope_pending.md"),
+            repo.join("tasks/archive/scope_pending.md"),
+        )
+        .expect("rename");
+        fs::write(
+            repo.join("tasks/archive/scope_pending.md"),
+            task_with_body("2026-05-01", "finished"),
+        )
+        .expect("finish");
+        git(&repo, &["add", "-A"], "2026-07-01T12:00:00+00:00");
+
+        let first = harvest_repository(&repo).expect("first harvest");
+        let pending = first
+            .iter()
+            .find(|task| task.path.ends_with("scope_pending.md"))
+            .expect("pending");
+        assert_eq!(pending.kind, TaskKind::Finished);
+        assert_eq!(
+            pending.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 1).expect("day")),
+            "the uncommitted archive falls back to `updated`"
+        );
+        assert_eq!(
+            pending.content_hash, None,
+            "a fallback day is not cached against the unchanged file"
+        );
+        let prior: Vec<PriorTask> = first
+            .iter()
+            .map(|task| PriorTask {
+                path: task.path.clone(),
+                leave_date: task.leave_date,
+                content_hash: task.content_hash.clone(),
+            })
+            .collect();
+        let _ = take_leave_walk_count(&repo);
+
+        git(
+            &repo,
+            &["commit", "-m", "archive task"],
+            "2026-07-01T12:00:00+00:00",
+        );
+
+        let second = harvest_repository_with_prior(&repo, &prior).expect("second harvest");
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            1,
+            "the uncached path is walked again"
+        );
+        let pending = second
+            .iter()
+            .find(|task| task.path.ends_with("scope_pending.md"))
+            .expect("pending");
+        assert_eq!(
+            pending.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 7, 1).expect("day")),
+            "the archive commit day replaces the fallback"
+        );
+        assert_eq!(pending.ship_date, pending.leave_date);
+        assert!(
+            pending.content_hash.is_some(),
+            "a day from a commit is cached for the next Update"
         );
         let _ = fs::remove_dir_all(&repo);
     }

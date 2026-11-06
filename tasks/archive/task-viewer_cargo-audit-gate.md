@@ -2,9 +2,11 @@
 description: "Make make audit pass with a documented ignore for the unbuilt optional rsa dependency and the evidence that it is not in the build graph."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-05T23:13:06
-status: ready
+updated: 2026-11-06T14:51:33
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Make the documented audit gate pass

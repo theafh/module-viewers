@@ -39,6 +39,8 @@ The desktop launcher keeps its PID file and the server log, which records reposi
 
 Dependencies stay pinned in `Cargo.lock`. Run `make audit` when they change.
 
+`Cargo.lock` also pins `rsa` 0.9.10 through `sqlx-mysql`, an optional `sqlx` backend that this workspace never builds. `cargo audit` reports RUSTSEC-2023-0071 against that crate, and the advisory has no fixed upgrade. `.cargo/audit.toml` records it in `[advisories] ignore`, and `cargo tree -i rsa` rechecks reachability: it prints nothing while `rsa` stays outside the build graph. A dependency change that pulls `rsa` into a built target removes the ignore and fixes the advisory instead.
+
 ## Per-Change Checklist
 
 - [ ] No outbound network client introduced.
