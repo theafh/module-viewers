@@ -25,6 +25,7 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 - Database: versioned migrations upgrade a version-one and a version-two database without losing rows; a configured path creates its parent directory, a parent that is a file is reported, and an empty configured path is rejected; insert, replace rows, keep rows when a scan error is recorded, and delete a repository with its rows.
 - Scan: the worker cap parses unset, in-range, zero, non-numeric, and above-maximum values; Update harvests up to the cap at once, stores every repository's rows, and keeps an earlier store with the missing-tasks error when a folder has no `tasks/` directory.
 - Host check: loopback names are accepted with or without port 7880; a POST from another origin, or one without an `Origin` whose `Sec-Fetch-Site` is `cross-site`, is rejected with 403 and leaves no side effect.
+- Security headers: a page, a host-rejected 403, a `/static` file response, and the router's own 404 carry `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Content-Security-Policy: frame-ancestors 'none'`, and the CSP leaves the pages' inline and static scripts running.
 
 ## Running the Suite
 

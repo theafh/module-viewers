@@ -1143,6 +1143,27 @@ mod tests {
         cleanup(&path);
     }
 
+    /// The header layers wrap the whole router, so the nested `ServeDir` that
+    /// answers `/static` and the router's own 404 carry them as well.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_sends_security_headers_on_a_static_file_and_the_404() {
+        let (state, path) = app_state("security_headers_static_404").await;
+
+        let static_file = send(
+            state.clone(),
+            get_page("/static/style.css", "127.0.0.1:7880"),
+        )
+        .await;
+        assert_eq!(static_file.status(), StatusCode::OK);
+        assert_security_headers(&static_file);
+
+        let missing = send(state.clone(), get_page("/no-such-page", "127.0.0.1:7880")).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_security_headers(&missing);
+
+        cleanup(&path);
+    }
+
     /// The CSP carries `frame-ancestors` alone, so it restricts no script
     /// source: the theme bootstrap, the Project selector's `onchange`, the
     /// Remove form's `onsubmit`, and the static scripts all stay in the pages.
