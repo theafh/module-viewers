@@ -2,9 +2,11 @@
 description: "Report the initial harvest failure on Add and the rows-affected result on Remove instead of always claiming success."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T14:59:13
-status: ready
+updated: 2026-11-06T15:16:20
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Report Add and Remove outcomes truthfully

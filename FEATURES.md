@@ -21,8 +21,8 @@ What `task-viewer` does, from the person's side. Structure is `ARCHITECTURE.md`,
 ## 3. Repositories
 
 - The Repositories tab lists each repository's name, path, last scan time, and any scan error.
-- Add repository opens a folder picker. A folder is accepted when it contains `tasks/`. After add or remove, the person stays on Repositories.
-- Remove drops that repository and its parsed rows from `~/.task-viewer` after confirmation.
+- Add repository opens a folder picker. A folder is accepted when it contains `tasks/`. After add or remove, the person stays on Repositories. Add reports a failed first harvest as a scan error on the new repository instead of as a success.
+- Remove drops that repository and its parsed rows from `~/.task-viewer` after confirmation. A remove whose id no longer exists reports that the repository was not found instead of claiming a removal.
 - Update scans every configured repository, up to `TASK_VIEWER_SCAN_WORKERS` at once (default 4), and replaces the parsed rows that still read cleanly. A repository whose git history cannot be read keeps its rows and shows a scan error. The dashboard reports the run truthfully: it shows the success notice only when every repository harvested, and otherwise names each failed repository and its reason. A repository with a git history is read from its working tree and every branch, so a task counts whether or not its branch is checked out.
 
 ## 4. Charts

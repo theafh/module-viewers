@@ -367,7 +367,9 @@ async fn add_repository(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Store one already-chosen folder as a repository and refresh its rows.
+/// Store one already-chosen folder as a repository and refresh its rows. A
+/// failed first harvest keeps the repository and its scan error and returns
+/// that error's message, so Add can report the failure instead of a success.
 /// The caller holds the scan lock across this call.
 async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<(), &'static str> {
     let path_text = path.to_string_lossy().into_owned();
@@ -388,17 +390,25 @@ async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<()
     let id = db::insert_repository(&state.pool, &name, &path_text)
         .await
         .map_err(|_| "The repository could not be saved.")?;
-    refresh_one(&state.pool, &state.store_hook, id, path).await;
-    Ok(())
+    match refresh_one(&state.pool, &state.store_hook, id, path).await {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
 }
 
 async fn remove_repository(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     // Serialize Remove with Update so a scan cannot store rows for a repository
     // this delete removes, and a delete never waits out the write-lock timeout.
     let _guard = state.scan.lock().await;
-    if let Err(error) = db::delete_repository(&state.pool, id).await {
-        tracing::error!(%error, "delete failed");
-        return redirect_repositories("error", "The repository could not be removed.");
+    let deleted = match db::delete_repository(&state.pool, id).await {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            tracing::error!(%error, "delete failed");
+            return redirect_repositories("error", "The repository could not be removed.");
+        }
+    };
+    if deleted == 0 {
+        return redirect_repositories("error", "The repository was not found.");
     }
     redirect_repositories("notice", "Repository removed.")
 }
@@ -556,7 +566,7 @@ async fn refresh_one(
     store_hook: &Arc<StoreHookFn>,
     repository_id: i64,
     path: &std::path::Path,
-) {
+) -> Option<&'static str> {
     let owned = path.to_path_buf();
     let prior = match db::load_prior_tasks(pool, repository_id).await {
         Ok(prior) => prior,
@@ -568,7 +578,7 @@ async fn refresh_one(
     let outcome =
         tokio::task::spawn_blocking(move || harvest::harvest_repository_with_prior(&owned, &prior))
             .await;
-    let _ = store_outcome(pool, repository_id, outcome, store_hook).await;
+    store_outcome(pool, repository_id, outcome, store_hook).await
 }
 
 /// The dashboard banner a scan run deserves: the success notice only when every
@@ -1537,6 +1547,42 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Add reports a failed first harvest instead of a plain success, and the
+    /// repository stays listed with the scan error that failure stored.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_reports_a_failed_first_harvest() {
+        let (mut state, path) = app_state("add_git_failure").await;
+        let folder = live_repository("add_git_failure_repo");
+        std::fs::write(
+            folder.join(".git"),
+            format!("gitdir: {}\n", folder.join("missing.git").display()),
+        )
+        .expect("gitfile");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            format!(
+                "/repositories?error={}",
+                encode_query("Git could not read the history, so the rows were left as they were.")
+            )
+        );
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(
+            repositories[0].last_error.as_deref(),
+            Some("Git could not read the history, so the rows were left as they were.")
+        );
+        let rows = db::load_tasks(&state.pool, Some(repositories[0].repository_id))
+            .await
+            .expect("rows");
+        assert!(rows.is_empty(), "a failed first harvest stores no rows");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn web_add_cancelled_picker_redirects_without_a_message() {
         let (mut state, path) = app_state("add_cancelled").await;
@@ -1797,6 +1843,26 @@ mod tests {
             "the repository is gone"
         );
         let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Remove reports a stale id instead of claiming it removed a repository.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_remove_reports_a_missing_repository() {
+        let (state, path) = app_state("remove_missing").await;
+
+        let response = remove_repository(State(state.clone()), UrlPath(9_999)).await;
+        assert_eq!(
+            redirect_location(&response),
+            format!(
+                "/repositories?error={}",
+                encode_query("The repository was not found.")
+            )
+        );
+        assert_ne!(
+            redirect_location(&response),
+            "/repositories?notice=Repository%20removed."
+        );
         cleanup(&path);
     }
 

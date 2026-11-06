@@ -194,12 +194,12 @@ pub async fn insert_repository(pool: &Pool<Sqlite>, name: &str, path: &str) -> R
     Ok(result.last_insert_rowid())
 }
 
-pub async fn delete_repository(pool: &Pool<Sqlite>, repository_id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM repositories WHERE repository_id = ?")
+pub async fn delete_repository(pool: &Pool<Sqlite>, repository_id: i64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM repositories WHERE repository_id = ?")
         .bind(repository_id)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(result.rows_affected())
 }
 
 pub async fn replace_tasks(
@@ -684,7 +684,11 @@ mod tests {
             Some("The tasks directory is missing.")
         );
 
-        delete_repository(&pool, id).await.expect("delete");
+        assert_eq!(
+            delete_repository(&pool, id).await.expect("delete"),
+            1,
+            "the delete reports the row it removed"
+        );
         let after = load_tasks(&pool, None).await.expect("after");
         assert!(after.is_empty());
         if let Some(parent) = path.parent() {
