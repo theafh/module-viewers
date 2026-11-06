@@ -115,10 +115,15 @@ async fn migrate(pool: &Pool<Sqlite>) -> Result<()> {
         let Some(statement) = migration(next) else {
             anyhow::bail!("No migration from database schema version {version}");
         };
-        sqlx::query(statement).execute(pool).await?;
+        // The step's schema statement and its version stamp commit together, so
+        // a failure between them cannot leave a statement applied under an older
+        // `user_version` that the next init would re-run and fail on.
+        let mut tx = pool.begin().await?;
+        sqlx::query(statement).execute(&mut *tx).await?;
         sqlx::query(&format!("PRAGMA user_version = {next}"))
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         version = next;
     }
     Ok(())
