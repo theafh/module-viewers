@@ -558,8 +558,12 @@ fn parse_batch(output: &[u8], expected: usize) -> Result<Vec<String>, HarvestErr
         let body = rest.get(start..end).ok_or_else(|| {
             HarvestError::Git("git printed less content than it announced.".to_string())
         })?;
-        let text = String::from_utf8(body.to_vec())
-            .map_err(|_| HarvestError::Git("git printed a task that is not UTF-8.".to_string()))?;
+        // A blob whose bytes are not valid UTF-8 parses to no task, the same
+        // way `files_on_disk` skips a worktree file it cannot read. Push an
+        // empty string rather than failing the scan, so the caller still
+        // consumes one entry per chosen blob and every later blob keeps its
+        // position.
+        let text = String::from_utf8(body.to_vec()).unwrap_or_default();
         contents.push(text);
         rest = rest.get(end..).unwrap_or_default();
         rest = rest.strip_prefix(b"\n").unwrap_or(rest);
@@ -3062,5 +3066,160 @@ mod tests {
                 "tasks/archive/scope_valid.md".to_string()
             ))
         );
+    }
+
+    /// A task file whose frontmatter is valid ASCII and whose body carries a
+    /// byte that is not valid UTF-8, so its committed blob cannot decode as a
+    /// task.
+    fn write_non_utf8_task(repo: &Path, rel: &str, created: &str, updated: &str, status: &str) {
+        let path = repo.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("parent");
+        }
+        let mut bytes = format!(
+            "---\ncreated: {created}T10:00:00\nupdated: {updated}T10:00:00\nstatus: {status}\n---\n\n# Task\n\n"
+        )
+        .into_bytes();
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"\n");
+        fs::write(path, bytes).expect("write non-UTF-8 task");
+    }
+
+    #[test]
+    fn harvest_skips_a_committed_archived_task_that_is_not_utf8() {
+        // The archived blob is committed, so it reaches harvest through the
+        // batch reader. One bad blob must not fail the whole scan; it parses to
+        // no task while the valid task still charts.
+        let repo = scratch("harvest_non_utf8_archived");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_valid.md", "2026-05-01", "open");
+        write_non_utf8_task(
+            &repo,
+            "tasks/archive/scope_bad.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "add a non-UTF-8 archived task"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("a non-UTF-8 blob must not fail the harvest");
+        assert!(
+            tasks
+                .iter()
+                .all(|task| !task.path.ends_with("scope_bad.md")),
+            "the non-UTF-8 task must produce no row: {tasks:?}"
+        );
+        let valid = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_valid.md"))
+            .expect("the valid task charts");
+        assert_eq!(valid.kind, TaskKind::Live);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_keeps_a_valid_archived_task_beside_a_non_utf8_blob() {
+        // Both archived files live only on `feature`, so the working tree never
+        // supplies them and the batch reader returns them in path order: the
+        // bad blob first, then the valid one. The valid task must keep its own
+        // leave day, which proves the batch keeps positional alignment.
+        let repo = scratch("harvest_non_utf8_beside_valid");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_main.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "main task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "feature"],
+            "2026-05-02T12:00:00+00:00",
+        );
+        write_non_utf8_task(
+            &repo,
+            "tasks/archive/scope_bad.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_good.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive a bad and a good task"],
+            "2026-06-10T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-06-11T12:00:00+00:00");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let good = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_good.md"))
+            .expect("the valid archived task charts");
+        assert_eq!(good.kind, TaskKind::Finished);
+        assert_eq!(
+            good.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day")),
+            "the valid task keeps its own leave day beside the bad blob"
+        );
+        assert!(
+            tasks
+                .iter()
+                .all(|task| !task.path.ends_with("scope_bad.md")),
+            "the non-UTF-8 task must produce no row: {tasks:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_skips_a_committed_live_task_that_is_not_utf8() {
+        // A live task file whose committed content is not valid UTF-8 is
+        // skipped like an unreadable worktree file, and the other tasks chart.
+        let repo = scratch("harvest_non_utf8_live");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_valid.md", "2026-05-01", "open");
+        write_non_utf8_task(
+            &repo,
+            "tasks/scope_bad.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "add a non-UTF-8 live task"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        assert_eq!(tasks.len(), 1, "only the valid task charts: {tasks:?}");
+        assert_eq!(tasks[0].path, "tasks/scope_valid.md");
+        let _ = fs::remove_dir_all(&repo);
     }
 }

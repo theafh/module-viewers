@@ -2,9 +2,11 @@
 description: "Skip a non-UTF-8 task file instead of failing the whole repository scan on one bad blob."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T15:02:12
-status: ready
+updated: 2026-11-06T15:37:40
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Skip non-UTF-8 task content instead of failing the scan
