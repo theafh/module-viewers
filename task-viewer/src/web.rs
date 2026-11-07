@@ -10,13 +10,14 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::future::ready;
+use std::future::{Future, ready};
 use std::num::IntErrorKind;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Command;
 use std::sync::Arc;
 use tera::{Context, Tera};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -53,6 +54,10 @@ pub fn scan_worker_cap(raw: Option<&str>) -> usize {
 
 type PickerFn = dyn Fn() -> Result<Option<PathBuf>, &'static str> + Send + Sync;
 
+/// The stage that runs immediately before one repository's harvest is spawned.
+/// Production passes a no-op; a test counts prior reads from a counter it owns.
+type PriorReadHookFn = dyn Fn(i64) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
+
 #[derive(Clone)]
 pub struct AppState {
     pool: sqlx::SqlitePool,
@@ -61,6 +66,7 @@ pub struct AppState {
     scan_workers: usize,
     picker: Arc<PickerFn>,
     store_hook: Arc<StoreHookFn>,
+    prior_read_hook: Arc<PriorReadHookFn>,
     harvest: Arc<HarvestFn>,
     flash: Arc<Mutex<FlashStore>>,
 }
@@ -75,6 +81,7 @@ impl AppState {
             scan_workers: scan_worker_cap(raw.as_deref()),
             picker: Arc::new(pick_folder),
             store_hook: Arc::new(|| Box::pin(ready(()))),
+            prior_read_hook: Arc::new(|_| Box::pin(ready(()))),
             harvest: Arc::new(harvest::harvest_repository_with_prior),
             flash: Arc::new(Mutex::new(FlashStore::default())),
         }
@@ -688,6 +695,7 @@ async fn run_scan(state: AppState) -> Result<ScanReport, &'static str> {
         state.scan_workers,
         Arc::clone(&state.harvest),
         &state.store_hook,
+        &state.prior_read_hook,
     )
     .await)
 }
@@ -708,58 +716,83 @@ struct ScanReport {
     failures: Vec<ScanFailure>,
 }
 
-/// Harvest the repositories up to `cap` at once, then store each finished
-/// result one repository at a time so no two writes overlap on SQLite.
+/// One harvest result as it leaves its join, before the store turns it into a
+/// scan error or a set of stored rows.
+type HarvestOutcome = Result<Result<Vec<ParsedTask>, HarvestError>, tokio::task::JoinError>;
+
+/// Harvest the repositories up to `cap` at once, draining each result as soon
+/// as it finishes so a completed harvest never holds its parsed rows in the set
+/// while the rest of the repositories are still being spawned. Each result is
+/// stored one repository at a time, so no two writes overlap on SQLite.
 async fn scan_core(
     pool: &sqlx::SqlitePool,
     repositories: &[Repository],
     cap: usize,
     harvest: Arc<HarvestFn>,
     store_hook: &Arc<StoreHookFn>,
+    prior_read_hook: &Arc<PriorReadHookFn>,
 ) -> ScanReport {
-    let permits = Arc::new(Semaphore::new(cap.max(1)));
+    let cap = cap.max(1);
     let mut harvests = JoinSet::new();
-    for repository in repositories {
-        let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
-            continue;
-        };
-        let harvest = Arc::clone(&harvest);
-        let repository_id = repository.repository_id;
-        let path = PathBuf::from(&repository.path);
-        // Load the rows the last Update stored before this harvest runs, so an
-        // unchanged archived file can reuse its leave day.
-        let prior = match db::load_prior_tasks(pool, repository_id).await {
-            Ok(prior) => prior,
-            Err(error) => {
-                tracing::error!(%error, repository_id, "prior rows could not be read");
-                Vec::new()
-            }
-        };
-        harvests.spawn(async move {
-            let _permit = permit;
-            let outcome = tokio::task::spawn_blocking(move || harvest(&path, &prior)).await;
-            (repository_id, outcome)
-        });
+    let mut pending = repositories.iter();
+    // Prime the set with the cap, then keep it full by spawning one more
+    // repository as each finished result is stored and dropped.
+    for repository in pending.by_ref().take(cap) {
+        spawn_harvest(&mut harvests, pool, repository, &harvest, prior_read_hook).await;
     }
     let mut failures = Vec::new();
     while let Some(finished) = harvests.join_next().await {
-        // The spawned wrapper carries every stop inside its tuple, so this
-        // branch is unreachable and its `continue` changes no outcome.
-        let Ok((repository_id, outcome)) = finished else {
-            tracing::error!("a scan worker stopped");
-            continue;
-        };
-        if let Some(message) = store_outcome(pool, repository_id, outcome, store_hook).await {
-            failures.push(ScanFailure {
-                repository: repository_name(repositories, repository_id),
-                message,
-            });
+        match finished {
+            Ok((repository_id, outcome)) => {
+                if let Some(message) = store_outcome(pool, repository_id, outcome, store_hook).await
+                {
+                    failures.push(ScanFailure {
+                        repository: repository_name(repositories, repository_id),
+                        message,
+                    });
+                }
+            }
+            // The spawned wrapper carries every stop inside its tuple, so this
+            // branch is unreachable and changes no outcome.
+            Err(_) => tracing::error!("a scan worker stopped"),
+        }
+        if let Some(repository) = pending.next() {
+            spawn_harvest(&mut harvests, pool, repository, &harvest, prior_read_hook).await;
         }
     }
     ScanReport {
         attempted: repositories.len(),
         failures,
     }
+}
+
+/// Read one repository's prior rows and spawn its harvest into `harvests`. The
+/// prior read is its own stage immediately before the spawn, so a run never
+/// holds every repository's prior rows at once.
+async fn spawn_harvest(
+    harvests: &mut JoinSet<(i64, HarvestOutcome)>,
+    pool: &sqlx::SqlitePool,
+    repository: &Repository,
+    harvest: &Arc<HarvestFn>,
+    prior_read_hook: &Arc<PriorReadHookFn>,
+) {
+    let repository_id = repository.repository_id;
+    let path = PathBuf::from(&repository.path);
+    prior_read_hook(repository_id).await;
+    // Load the rows the last Update stored before this harvest runs, so an
+    // unchanged archived file can reuse its leave day.
+    let prior = match db::load_prior_tasks(pool, repository_id).await {
+        Ok(prior) => prior,
+        Err(error) => {
+            tracing::error!(%error, repository_id, "prior rows could not be read");
+            Vec::new()
+        }
+    };
+    let harvest = Arc::clone(harvest);
+    harvests.spawn(async move {
+        let outcome = tokio::task::spawn_blocking(move || harvest(&path, &prior)).await;
+        (repository_id, outcome)
+    });
 }
 
 fn repository_name(repositories: &[Repository], repository_id: i64) -> String {
@@ -782,7 +815,7 @@ const STOPPED_ERROR: &str = "The scan stopped before it finished.";
 async fn store_outcome(
     pool: &sqlx::SqlitePool,
     repository_id: i64,
-    outcome: Result<Result<Vec<ParsedTask>, HarvestError>, tokio::task::JoinError>,
+    outcome: HarvestOutcome,
     store_hook: &Arc<StoreHookFn>,
 ) -> Option<&'static str> {
     match outcome {
@@ -975,10 +1008,10 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, HarvestFn, HomeQuery, PickerFn, ProjectForm, ScanFailure, ScanReport,
-        StoreHookFn, add_repository, claim_banner, encode_query, init_templates, is_local_host,
-        remove_repository, render_blocking_thread, render_home, router, scan_all, scan_core,
-        scan_flash, scan_response, scan_worker_cap,
+        AppState, HarvestFn, HomeQuery, PickerFn, PriorReadHookFn, ProjectForm, ScanFailure,
+        ScanReport, StoreHookFn, add_repository, claim_banner, encode_query, init_templates,
+        is_local_host, remove_repository, render_blocking_thread, render_home, router, scan_all,
+        scan_core, scan_flash, scan_response, scan_worker_cap,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -1000,6 +1033,12 @@ mod tests {
     /// pausing inside the write transaction.
     fn immediate_store_hook() -> Arc<StoreHookFn> {
         Arc::new(|| Box::pin(ready(())))
+    }
+
+    /// The production prior-read hook: it resolves at once and counts nothing,
+    /// so a scan that has no counter to keep does no extra work.
+    fn immediate_prior_read_hook() -> Arc<PriorReadHookFn> {
+        Arc::new(|_| Box::pin(ready(())))
     }
 
     /// One parsed row, so a store actually inserts and can trip the foreign key
@@ -1835,7 +1874,15 @@ mod tests {
                 Ok(Vec::new())
             })
         };
-        scan_core(&pool, &repositories, 2, harvest, &immediate_store_hook()).await;
+        scan_core(
+            &pool,
+            &repositories,
+            2,
+            harvest,
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         cleanup(&path);
     }
@@ -1860,6 +1907,7 @@ mod tests {
             2,
             Arc::new(harvest::harvest_repository_with_prior),
             &immediate_store_hook(),
+            &immediate_prior_read_hook(),
         )
         .await;
         let after = db::list_repositories(&pool).await.expect("after");
@@ -1871,6 +1919,189 @@ mod tests {
                 .expect("rows");
             assert_eq!(rows.len(), 1);
         }
+        for folder in folders {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+        cleanup(&path);
+    }
+
+    /// Acceptance: a finished harvest is stored and dropped as soon as it
+    /// joins, so the number of completed but unstored results never exceeds the
+    /// cap plus one however many repositories the run holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_drains_results_as_harvests_finish() {
+        let path = temp_database("scan_drain_buffer");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let mut folders = Vec::new();
+        for index in 0..12 {
+            let repo = live_repository(&format!("scan_drain_buffer_{index}"));
+            db::insert_repository(&pool, &format!("repo{index:02}"), &repo.to_string_lossy())
+                .await
+                .expect("insert");
+            folders.push(repo);
+        }
+        let repositories = db::list_repositories(&pool).await.expect("list");
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let stored = Arc::new(AtomicUsize::new(0));
+        let peak_buffered = Arc::new(AtomicUsize::new(0));
+        let harvest: Arc<HarvestFn> = {
+            let completed = Arc::clone(&completed);
+            Arc::new(move |_: &Path, _: &[PriorTask]| {
+                std::thread::sleep(Duration::from_millis(10));
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![parsed_task()])
+            })
+        };
+        // The store hook runs inside each write, so it sees how many harvests
+        // have completed but not yet been stored at that moment.
+        let store_hook: Arc<StoreHookFn> = {
+            let completed = Arc::clone(&completed);
+            let stored = Arc::clone(&stored);
+            let peak_buffered = Arc::clone(&peak_buffered);
+            Arc::new(move || {
+                let completed = Arc::clone(&completed);
+                let stored = Arc::clone(&stored);
+                let peak_buffered = Arc::clone(&peak_buffered);
+                Box::pin(async move {
+                    let buffered = completed.load(Ordering::SeqCst) - stored.load(Ordering::SeqCst);
+                    peak_buffered.fetch_max(buffered, Ordering::SeqCst);
+                    stored.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+        };
+
+        let report = scan_core(
+            &pool,
+            &repositories,
+            2,
+            harvest,
+            &store_hook,
+            &immediate_prior_read_hook(),
+        )
+        .await;
+        assert_eq!(report.attempted, 12);
+        assert!(report.failures.is_empty());
+        assert!(
+            peak_buffered.load(Ordering::SeqCst) <= 3,
+            "at most the cap plus one result may wait to be stored, saw {}",
+            peak_buffered.load(Ordering::SeqCst)
+        );
+        for folder in folders {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+        cleanup(&path);
+    }
+
+    /// Acceptance: draining while spawning still stores every repository's
+    /// rows and leaves the run report unchanged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_drains_and_stores_every_repository() {
+        let path = temp_database("scan_drain_store");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let mut folders = Vec::new();
+        for index in 0..12 {
+            let repo = live_repository(&format!("scan_drain_store_{index}"));
+            db::insert_repository(&pool, &format!("repo{index:02}"), &repo.to_string_lossy())
+                .await
+                .expect("insert");
+            folders.push(repo);
+        }
+        let repositories = db::list_repositories(&pool).await.expect("list");
+
+        let report = scan_core(
+            &pool,
+            &repositories,
+            2,
+            Arc::new(harvest::harvest_repository_with_prior),
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+        assert_eq!(report.attempted, 12);
+        assert!(report.failures.is_empty());
+        let after = db::list_repositories(&pool).await.expect("after");
+        assert_eq!(after.len(), 12);
+        for repository in &after {
+            assert!(repository.last_error.is_none());
+            assert!(repository.scanned_at.is_some());
+            let rows = db::load_tasks(&pool, Some(repository.repository_id))
+                .await
+                .expect("rows");
+            assert_eq!(rows.len(), 1);
+        }
+        for folder in folders {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+        cleanup(&path);
+    }
+
+    /// Acceptance: each repository's prior rows are read in their own stage just
+    /// before that repository's harvest is spawned, so at any harvest start the
+    /// prior reads counted so far never exceed the harvests started plus one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_reads_prior_rows_just_before_each_harvest() {
+        let path = temp_database("scan_prior_stage");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let mut folders = Vec::new();
+        for index in 0..12 {
+            let repo = live_repository(&format!("scan_prior_stage_{index}"));
+            let id =
+                db::insert_repository(&pool, &format!("repo{index:02}"), &repo.to_string_lossy())
+                    .await
+                    .expect("insert");
+            db::replace_tasks(&pool, id, &[parsed_task()], immediate_store_hook().as_ref())
+                .await
+                .expect("prior rows");
+            folders.push(repo);
+        }
+        let repositories = db::list_repositories(&pool).await.expect("list");
+
+        let prior_reads = Arc::new(AtomicUsize::new(0));
+        let harvests_started = Arc::new(AtomicUsize::new(0));
+        let over_read = Arc::new(AtomicUsize::new(0));
+        let prior_read_hook: Arc<PriorReadHookFn> = {
+            let prior_reads = Arc::clone(&prior_reads);
+            Arc::new(move |_: i64| {
+                let prior_reads = Arc::clone(&prior_reads);
+                Box::pin(async move {
+                    prior_reads.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+        };
+        let harvest: Arc<HarvestFn> = {
+            let prior_reads = Arc::clone(&prior_reads);
+            let harvests_started = Arc::clone(&harvests_started);
+            let over_read = Arc::clone(&over_read);
+            Arc::new(move |_: &Path, _: &[PriorTask]| {
+                let started = harvests_started.fetch_add(1, Ordering::SeqCst) + 1;
+                if prior_reads.load(Ordering::SeqCst) > started + 1 {
+                    over_read.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(vec![parsed_task()])
+            })
+        };
+
+        let report = scan_core(
+            &pool,
+            &repositories,
+            2,
+            harvest,
+            &immediate_store_hook(),
+            &prior_read_hook,
+        )
+        .await;
+        assert_eq!(report.attempted, 12);
+        assert!(report.failures.is_empty());
+        assert_eq!(
+            over_read.load(Ordering::SeqCst),
+            0,
+            "a run must not pre-load every repository's prior rows"
+        );
+        assert_eq!(prior_reads.load(Ordering::SeqCst), 12);
         for folder in folders {
             let _ = std::fs::remove_dir_all(folder);
         }
@@ -2189,6 +2420,7 @@ mod tests {
             1,
             Arc::new(harvest::harvest_repository_with_prior),
             &immediate_store_hook(),
+            &immediate_prior_read_hook(),
         )
         .await;
         assert!(first.failures.is_empty());
@@ -2203,6 +2435,7 @@ mod tests {
             1,
             Arc::new(harvest::harvest_repository_with_prior),
             &immediate_store_hook(),
+            &immediate_prior_read_hook(),
         )
         .await;
         assert!(second.failures.is_empty());
@@ -2240,6 +2473,7 @@ mod tests {
             1,
             Arc::new(harvest::harvest_repository_with_prior),
             &immediate_store_hook(),
+            &immediate_prior_read_hook(),
         )
         .await;
         assert_eq!(harvest::take_leave_walk_count(&repo), 3);
@@ -2255,6 +2489,7 @@ mod tests {
             1,
             Arc::new(harvest::harvest_repository_with_prior),
             &immediate_store_hook(),
+            &immediate_prior_read_hook(),
         )
         .await;
         assert_eq!(
@@ -2320,6 +2555,7 @@ mod tests {
             2,
             Arc::new(harvest::harvest_repository_with_prior),
             &immediate_store_hook(),
+            &immediate_prior_read_hook(),
         )
         .await;
         let after = db::list_repositories(&pool).await.expect("after");
@@ -2375,7 +2611,15 @@ mod tests {
                 Ok(Vec::new())
             }
         });
-        let report = scan_core(&pool, &repositories, 2, harvest, &immediate_store_hook()).await;
+        let report = scan_core(
+            &pool,
+            &repositories,
+            2,
+            harvest,
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
         assert_eq!(report.attempted, 2);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].repository, "broken");
@@ -2400,7 +2644,15 @@ mod tests {
         let repositories = db::list_repositories(&pool).await.expect("list");
         let harvest: Arc<HarvestFn> =
             Arc::new(|_: &Path, _: &[PriorTask]| panic!("harvest stopped"));
-        let report = scan_core(&pool, &repositories, 1, harvest, &immediate_store_hook()).await;
+        let report = scan_core(
+            &pool,
+            &repositories,
+            1,
+            harvest,
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
         assert_eq!(report.attempted, 1);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].repository, "stopped");
@@ -2513,6 +2765,7 @@ mod tests {
             4,
             harvest,
             &immediate_store_hook(),
+            &immediate_prior_read_hook(),
         )
         .await;
         assert_eq!(report.failures.len(), 50);
@@ -2974,6 +3227,7 @@ mod tests {
                 1,
                 harvest,
                 &scan_state.store_hook,
+                &scan_state.prior_read_hook,
             )
             .await
         });
@@ -3056,6 +3310,7 @@ mod tests {
                 1,
                 Arc::new(harvest::harvest_repository_with_prior),
                 &scan_state.store_hook,
+                &scan_state.prior_read_hook,
             )
             .await
         });

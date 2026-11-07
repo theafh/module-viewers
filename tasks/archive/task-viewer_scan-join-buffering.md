@@ -2,8 +2,10 @@
 description: "Drain harvest results as they finish so Update's peak memory is one repository's rows plus the in-flight harvests, not every repository's rows."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T17:01:17
-status: ready
+updated: 2026-11-07T21:06:27
+status: finished
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 reported-by: "Andreas Hoffmann"
 ---
 
