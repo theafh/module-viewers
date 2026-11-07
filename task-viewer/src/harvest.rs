@@ -768,9 +768,11 @@ fn scrub_git_env(command: &mut Command) {
         // An inherited external diff driver would change what the archive walk
         // reads, so keep git on its built-in diff.
         .env_remove("GIT_EXTERNAL_DIFF")
-        // These three redirections would point git at a different config file
-        // or ref namespace than the user's own. Removing them leaves the default
-        // global and system config in place, so `safe.directory` keeps working.
+        // `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` would point git at a
+        // different config file than the user's own, while
+        // `GIT_CONFIG_NOSYSTEM` would suppress the system config entirely.
+        // Removing all three leaves the default global and system config in
+        // place, so `safe.directory` keeps working.
         .env_remove("GIT_CONFIG_GLOBAL")
         .env_remove("GIT_CONFIG_SYSTEM")
         .env_remove("GIT_CONFIG_NOSYSTEM")
@@ -778,11 +780,23 @@ fn scrub_git_env(command: &mut Command) {
         // pins, so it must not reach the listing under test.
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_PARAMETERS")
-        // A ceiling or cross-filesystem discovery would make git refuse to find
-        // the enclosing repository the folder actually lives in.
+        // An inherited ceiling can stop the upward walk before it reaches the
+        // enclosing repository the folder actually lives in, so removing it
+        // restores git's default discovery.
         .env_remove("GIT_CEILING_DIRECTORIES")
+        // Git stops discovery at a filesystem boundary by default, so removing
+        // an inherited `1` restores that default instead of widening the walk.
         .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
-        .env_remove("GIT_NAMESPACE");
+        // An inherited namespace would confine every ref git resolves to that
+        // namespace instead of the repository's own, so removing it restores
+        // the repository's refs.
+        .env_remove("GIT_NAMESPACE")
+        // These three redirect the history git reports: replace refs, the
+        // shallow boundary, and grafts. Removing them leaves every log walk
+        // reading the repository's own history.
+        .env_remove("GIT_REPLACE_REF_BASE")
+        .env_remove("GIT_SHALLOW_FILE")
+        .env_remove("GIT_GRAFT_FILE");
 }
 
 /// The arguments for every `git log` harvest runs: the output options that a
@@ -1496,6 +1510,9 @@ mod tests {
         command.env("GIT_CEILING_DIRECTORIES", "/tmp/ceiling");
         command.env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1");
         command.env("GIT_NAMESPACE", "poisoned");
+        command.env("GIT_REPLACE_REF_BASE", "refs/poisoned/");
+        command.env("GIT_SHALLOW_FILE", "/tmp/poisoned-shallow");
+        command.env("GIT_GRAFT_FILE", "/tmp/poisoned-grafts");
         scrub_git_env(&mut command);
         for key in [
             "GIT_DIR",
@@ -1510,6 +1527,9 @@ mod tests {
             "GIT_CEILING_DIRECTORIES",
             "GIT_DISCOVERY_ACROSS_FILESYSTEM",
             "GIT_NAMESPACE",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_SHALLOW_FILE",
+            "GIT_GRAFT_FILE",
         ] {
             let cleared = command
                 .get_envs()
