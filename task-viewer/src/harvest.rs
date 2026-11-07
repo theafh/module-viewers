@@ -47,6 +47,10 @@ pub struct ParsedTask {
     /// `None` when the stored leave day is only the `updated` fallback, because
     /// that day has no commit behind it to reuse.
     pub content_hash: Option<String>,
+    /// Whether `path` was decoded from bytes that are not valid UTF-8, so the
+    /// stored path names no git object. Recorded where the path is decoded, not
+    /// guessed from a replacement character in the decoded path.
+    pub path_is_lossy: bool,
 }
 
 /// The leave day and content hash the database stored for one task path before
@@ -210,8 +214,8 @@ impl GitContext {
 /// version wins: the working tree first, then the version whose commit is most
 /// recent.
 /// One version of a task file: its rank, its blob id when it came from a
-/// commit, and its path.
-type Candidate = ((u8, u8, i64), Option<String>, String);
+/// commit, its path, and whether that path decoded lossily.
+type Candidate = ((u8, u8, i64), Option<String>, String, bool);
 
 /// Chart `folder` from the refs of the repository that holds it.
 ///
@@ -226,7 +230,7 @@ fn union_files(
     root: &Path,
     dir: &Path,
     prefix: &str,
-) -> Result<Vec<(String, String)>, HarvestError> {
+) -> Result<Vec<(String, String, bool)>, HarvestError> {
     let pathspec = format!("{prefix}tasks");
     let listing = git_read(
         root,
@@ -244,19 +248,25 @@ fn union_files(
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect();
-    // Every (ref, path, blob) pair, then the newest touch of each blob once.
-    let mut found: Vec<(String, String)> = Vec::new();
+    // Every (ref, path, blob, lossy) pair, then the newest touch of each blob once.
+    let mut found: Vec<(String, String, bool)> = Vec::new();
     let mut all_blobs: Vec<String> = Vec::new();
     for reference in &refs {
-        let tree = git_read(
+        let tree = git_read_bytes(
             root,
             dir,
             &["ls-tree", "-r", "-z", reference, "--", &pathspec],
         )
         .map_err(HarvestError::Git)?;
-        let (paths, blobs) = markdown_blobs(&tree, prefix);
+        let (paths, blobs, lossy) = markdown_blobs(&tree, prefix);
         all_blobs.extend(blobs.iter().cloned());
-        found.extend(paths.into_iter().zip(blobs));
+        found.extend(
+            paths
+                .into_iter()
+                .zip(blobs)
+                .zip(lossy)
+                .map(|((path, blob), path_is_lossy)| (path, blob, path_is_lossy)),
+        );
     }
     let times = blob_days(root, dir, &all_blobs, &pathspec)?;
     // Rank a version by how much it should be trusted: the working tree first,
@@ -264,39 +274,55 @@ fn union_files(
     // archived on one branch is shipped even when another branch still carries
     // an older live copy, so the archived version wins.
     let mut candidates: Vec<Candidate> = Vec::new();
-    for (path, sha) in found {
+    for (path, sha, path_is_lossy) in found {
         let stamp = times.get(&sha).copied().unwrap_or(0);
-        candidates.push((archive_rank(&path, 0, stamp), Some(sha), path));
+        candidates.push((
+            archive_rank(&path, 0, stamp),
+            Some(sha),
+            path,
+            path_is_lossy,
+        ));
     }
     // The working-tree walk reads each file's content to rank it, so keep that
     // content and reuse it for the chosen files instead of reading them again.
     // It reads the configured folder, whose paths are already relative to it.
     let worktree = files_on_disk(folder)?;
-    for (rel, _) in &worktree {
-        candidates.push((archive_rank(rel, 1, i64::MAX), None, rel.clone()));
+    for (rel, _, path_is_lossy) in &worktree {
+        candidates.push((
+            archive_rank(rel, 1, i64::MAX),
+            None,
+            rel.clone(),
+            *path_is_lossy,
+        ));
     }
     candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
     let mut seen = std::collections::HashSet::new();
-    let mut chosen: Vec<(String, Option<String>)> = Vec::new();
-    for (_, blob, path) in candidates {
+    let mut chosen: Vec<(String, Option<String>, bool)> = Vec::new();
+    for (_, blob, path, path_is_lossy) in candidates {
         let name = path.rsplit('/').next().unwrap_or_default().to_string();
         if seen.insert(name) {
-            chosen.push((path, blob));
+            chosen.push((path, blob, path_is_lossy));
         }
     }
-    let mut worktree: std::collections::HashMap<String, String> = worktree.into_iter().collect();
+    let mut worktree: std::collections::HashMap<String, (String, bool)> = worktree
+        .into_iter()
+        .map(|(path, text, path_is_lossy)| (path, (text, path_is_lossy)))
+        .collect();
     // Read the committed versions in one `git cat-file` process.
-    let blobs: Vec<String> = chosen.iter().filter_map(|(_, blob)| blob.clone()).collect();
+    let blobs: Vec<String> = chosen
+        .iter()
+        .filter_map(|(_, blob, _)| blob.clone())
+        .collect();
     let mut contents = read_blobs(root, Some(dir), &blobs)?.into_iter();
     let mut files = Vec::new();
-    for (path, blob) in chosen {
+    for (path, blob, path_is_lossy) in chosen {
         let text = match blob {
             Some(_) => contents.next().unwrap_or_default(),
             // A file that disappeared between the walk and here falls back to a
             // fresh read, matching the walk's empty content for an unreadable
             // file.
             None => match worktree.remove(&path) {
-                Some(text) => text,
+                Some((text, _)) => text,
                 None => {
                     #[cfg(test)]
                     worktree_read_count::record(folder);
@@ -304,7 +330,7 @@ fn union_files(
                 }
             },
         };
-        files.push((path, text));
+        files.push((path, text, path_is_lossy));
     }
     files.sort();
     Ok(files)
@@ -360,13 +386,13 @@ fn blob_days(
 fn harvest_files(
     repo: &Path,
     git: &GitContext,
-    files: Vec<(String, String)>,
+    files: Vec<(String, String, bool)>,
     prior: &[PriorTask],
 ) -> Result<Vec<ParsedTask>, HarvestError> {
     let mut pending = Vec::new();
     let mut tasks = Vec::new();
 
-    for (rel, text) in files {
+    for (rel, text, path_is_lossy) in files {
         let Some(fields) = frontmatter(&text) else {
             continue;
         };
@@ -408,6 +434,7 @@ fn harvest_files(
             ship_date,
             leave_date,
             content_hash: Some(content_hash),
+            path_is_lossy,
         });
     }
 
@@ -436,7 +463,7 @@ fn harvest_files(
                 // lossy path names no git object, so its leave-day walk can
                 // never hit. Chart the row anyway and name the lossy path and
                 // the fallback day it keeps, so the gap is visible.
-                if task.path.contains('\u{FFFD}') {
+                if task.path_is_lossy {
                     tracing::warn!(
                         path = %task.path,
                         fallback_day = %task.updated,
@@ -465,24 +492,32 @@ fn harvest_files(
     Ok(tasks)
 }
 
-/// Split an `ls-tree -r -z` listing into task paths and their blob ids.
+/// Split an `ls-tree -r -z` listing into task paths, their blob ids, and
+/// whether each path decoded lossily.
 ///
 /// Under `-z` git separates records with NUL and prints each path raw, so a
 /// name holding a non-ASCII character or a double quote reaches us unquoted
-/// instead of C-quoted and dropped. `git_read` decodes the output lossily, as
-/// the archive walk does, so a path that is not valid UTF-8 keeps its place in
-/// the listing. Each path loses `prefix`, the configured folder's place in the
-/// repository, so a stored path stays relative to that folder.
-fn markdown_blobs(listing: &str, prefix: &str) -> (Vec<String>, Vec<String>) {
+/// instead of C-quoted and dropped. The listing arrives as raw bytes, so a path
+/// that is not valid UTF-8 keeps its place in the listing and is flagged as
+/// lossy, which is what a later leave-day walk cannot name. Each path loses
+/// `prefix`, the configured folder's place in the repository, so a stored path
+/// stays relative to that folder.
+fn markdown_blobs(listing: &[u8], prefix: &str) -> (Vec<String>, Vec<String>, Vec<bool>) {
     let mut paths = Vec::new();
     let mut blobs = Vec::new();
-    for record in listing.split('\0') {
-        let Some((meta, path)) = record.split_once('\t') else {
+    let mut lossy = Vec::new();
+    for record in listing.split(|byte| *byte == b'\0') {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
             continue;
         };
+        let (meta, raw_path) = record.split_at(tab);
+        let raw_path = raw_path.get(1..).unwrap_or_default();
+        let path_is_lossy = std::str::from_utf8(raw_path).is_err();
+        let path = String::from_utf8_lossy(raw_path);
         if !path.ends_with(".md") {
             continue;
         }
+        let meta = String::from_utf8_lossy(meta);
         let mut fields = meta.split_whitespace();
         let (Some(_mode), Some(kind), Some(sha)) = (fields.next(), fields.next(), fields.next())
         else {
@@ -496,8 +531,9 @@ fn markdown_blobs(listing: &str, prefix: &str) -> (Vec<String>, Vec<String>) {
         };
         paths.push(path.to_string());
         blobs.push(sha.to_string());
+        lossy.push(path_is_lossy);
     }
-    (paths, blobs)
+    (paths, blobs, lossy)
 }
 
 /// Read many blobs in one `git cat-file` process, in the order they are given.
@@ -613,7 +649,7 @@ fn parse_batch(output: &[u8], expected: usize) -> Result<Vec<String>, GitFailure
 
 /// The markdown files of `tasks/` as the folder holds them, for a folder
 /// outside git.
-fn files_on_disk(repo: &Path) -> Result<Vec<(String, String)>, HarvestError> {
+fn files_on_disk(repo: &Path) -> Result<Vec<(String, String, bool)>, HarvestError> {
     let mut files = Vec::new();
     for entry in WalkDir::new(repo.join("tasks"))
         .into_iter()
@@ -628,29 +664,41 @@ fn files_on_disk(repo: &Path) -> Result<Vec<(String, String)>, HarvestError> {
         let Ok(text) = fs::read_to_string(path) else {
             continue;
         };
-        files.push((relative_path(path, repo), text));
+        let (rel, path_is_lossy) = relative_path(path, repo);
+        files.push((rel, text, path_is_lossy));
     }
     files.sort();
     Ok(files)
 }
 
-/// The path of `path` below `base`, with `/` separators.
+/// The path of `path` below `base`, with `/` separators, and whether any
+/// component decoded lossily.
 ///
 /// The stored path is built from the path's components, not from one
 /// `to_string_lossy` of the whole path, so a literal backslash in a file name
 /// stays a backslash instead of turning into a separator. A component that is
 /// not valid UTF-8 decodes lossily, which is the same lossy path the committed
-/// listing yields, so the two candidates for one file dedupe to one row.
-fn relative_path(path: &Path, base: &Path) -> String {
-    path.strip_prefix(base)
+/// listing yields, so the two candidates for one file dedupe to one row. The
+/// flag records that lossy decode at this site instead of leaving a later
+/// reader to guess from a replacement character in the path.
+fn relative_path(path: &Path, base: &Path) -> (String, bool) {
+    let mut path_is_lossy = false;
+    let joined = path
+        .strip_prefix(base)
         .unwrap_or(path)
         .components()
         .filter_map(|component| match component {
-            std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+            std::path::Component::Normal(name) => {
+                if name.to_str().is_none() {
+                    path_is_lossy = true;
+                }
+                Some(name.to_string_lossy())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join("/")
+        .join("/");
+    (joined, path_is_lossy)
 }
 
 fn classify(in_archive: bool, status: &str) -> TaskKind {
@@ -1530,8 +1578,8 @@ fn git_pickaxe(
     }
 }
 
-/// Run a read-only git command against this folder and return its stdout.
-fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
+/// Run a read-only git command against this folder and return its stdout bytes.
+fn git_read_bytes(repo: &Path, dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let mut command = git_dir_command(repo, dir);
     scrub_git_env(&mut command);
     command.args(args);
@@ -1540,7 +1588,12 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
     if !output.status.success() {
         return Err(git_exit_message(&output));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
+}
+
+/// Run a read-only git command against this folder and return its stdout.
+fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
+    Ok(String::from_utf8_lossy(&git_read_bytes(repo, dir, args)?).into_owned())
 }
 
 #[cfg(test)]
@@ -4616,6 +4669,66 @@ mod tests {
         assert_eq!(
             valid.updated,
             NaiveDate::from_ymd_opt(2026, 5, 2).expect("day")
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_valid_utf8_name_holding_a_replacement_character_without_warning() {
+        // A valid UTF-8 name may itself contain U+FFFD, so a name holding one
+        // is not a lossy decode. An uncommitted archived task with such a name
+        // keeps the frontmatter `updated` fallback day, but the harvest stays
+        // quiet: nothing decoded lossily, so nothing needs the warning.
+        let repo = scratch("harvest_replacement_character_name");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/scope_valid.md",
+            "2026-05-02",
+            "2026-05-02",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "valid task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // Left uncommitted, so no commit carries its archived status and the
+        // leave day keeps the frontmatter fallback.
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_replaced\u{FFFD}name.md",
+            "2026-05-01",
+            "2026-05-20",
+            "finished",
+        );
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("a valid UTF-8 task name must not fail the harvest");
+
+        let path = "tasks/archive/scope_replaced\u{FFFD}name.md";
+        let charted = tasks
+            .iter()
+            .find(|task| task.path == path)
+            .unwrap_or_else(|| panic!("the real path must chart: {tasks:?}"));
+        assert_eq!(charted.kind, TaskKind::Finished);
+        assert_eq!(
+            charted.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 20).expect("day")),
+            "the frontmatter updated day stands in for the uncommitted archive"
+        );
+        assert_eq!(charted.ship_date, charted.leave_date);
+
+        let warnings = captured.take();
+        assert!(
+            warnings.is_empty(),
+            "a valid UTF-8 name must not warn: {warnings:?}"
         );
         let _ = fs::remove_dir_all(&repo);
     }

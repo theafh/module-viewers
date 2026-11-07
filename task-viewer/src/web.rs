@@ -1014,6 +1014,7 @@ mod tests {
             ship_date: None,
             leave_date: None,
             content_hash: Some("0123456789abcdef".to_string()),
+            path_is_lossy: false,
         }
     }
 
@@ -1454,6 +1455,7 @@ mod tests {
                 ship_date: None,
                 leave_date: None,
                 content_hash: None,
+                path_is_lossy: false,
             },
             ParsedTask {
                 path: "tasks/archive/two_finished.md".to_string(),
@@ -1464,6 +1466,7 @@ mod tests {
                 ship_date: Some(shipped),
                 leave_date: Some(shipped),
                 content_hash: None,
+                path_is_lossy: false,
             },
         ];
         db::replace_tasks(

@@ -411,6 +411,7 @@ mod tests {
             ship_date: Some(date(2026, 7, 17)),
             leave_date: Some(date(2026, 7, 17)),
             content_hash: Some("0123456789abcdef".to_string()),
+            path_is_lossy: false,
         }
     }
 
