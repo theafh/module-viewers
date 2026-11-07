@@ -1302,14 +1302,14 @@ enum LogLookup {
 }
 
 fn run_git_log(
-    _repo: &Path,
+    repo: &Path,
     mut command: Command,
     flag: &str,
     pattern: &str,
     rel: &str,
 ) -> LogLookup {
     #[cfg(test)]
-    walk_count::record(_repo);
+    walk_count::record(repo);
     scrub_git_env(&mut command);
     let mut args = vec![
         "log",
@@ -1323,7 +1323,7 @@ fn run_git_log(
     ];
     args.extend([flag, pattern, "--", rel]);
     command.args(&args);
-    let output = match run_git_command(command, None, git_deadline(_repo)) {
+    let output = match run_git_command(command, None, git_deadline(repo)) {
         Ok(output) => output,
         Err(failure) => return LogLookup::Failed(failure),
     };
