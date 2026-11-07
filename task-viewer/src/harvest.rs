@@ -1,7 +1,10 @@
 use chrono::NaiveDate;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
@@ -137,7 +140,7 @@ pub fn harvest_repository_with_prior(
     // git is charted from its files.
     let git =
         GitContext::resolve(&repo).map_err(|failure| HarvestError::Git(failure.to_string()))?;
-    let files = match git.repository() {
+    match git.repository() {
         Some((root, dir)) => {
             // A `.git` that git cannot open fails the scan; charting frontmatter
             // dates instead would pile every task onto its last bulk `updated`
@@ -146,11 +149,11 @@ pub fn harvest_repository_with_prior(
             if git.dir.is_some() {
                 git_read(&repo, dir, &["rev-parse", "--git-dir"]).map_err(HarvestError::Git)?;
             }
-            union_files(&repo, root, dir, &git.prefix)?
+            let (chosen, worktree) = union_files(&repo, root, dir, &git.prefix)?;
+            harvest_chosen(&repo, &git, root, dir, chosen, worktree, prior)
         }
-        None => files_on_disk(&repo)?,
-    };
-    harvest_files(&repo, &git, files, prior)
+        None => harvest_files(&repo, &git, files_on_disk(&repo)?, prior),
+    }
 }
 
 /// The git context resolved once per harvest: the folder's own `.git`, its
@@ -217,6 +220,15 @@ impl GitContext {
 /// commit, its path, and whether that path decoded lossily.
 type Candidate = ((u8, u8, i64), Option<String>, String, bool);
 
+/// One chosen version of a task file: its path, its blob id when it came from
+/// a commit, and whether that path decoded lossily.
+type ChosenFile = (String, Option<String>, bool);
+
+/// The working-tree task files keyed by path, each with its content and whether
+/// its path decoded lossily. The walk reads them to rank them, so the chosen
+/// rows reuse that content instead of reading each file again.
+type WorktreeFiles = std::collections::HashMap<String, (String, bool)>;
+
 /// Chart `folder` from the refs of the repository that holds it.
 ///
 /// `root` is that repository's worktree root and `dir` its git dir, so a nested
@@ -225,12 +237,16 @@ type Candidate = ((u8, u8, i64), Option<String>, String, bool);
 /// The listing is limited to `<prefix>tasks` and the prefix is stripped from
 /// every path, so the enclosing root's own `tasks/` never enters it and a stored
 /// path stays relative to the configured folder.
+///
+/// The chosen rows carry no file contents: the committed contents stream from
+/// `read_blobs` in row order, and the working-tree contents come from the walk
+/// that already read them.
 fn union_files(
     folder: &Path,
     root: &Path,
     dir: &Path,
     prefix: &str,
-) -> Result<Vec<(String, String, bool)>, HarvestError> {
+) -> Result<(Vec<ChosenFile>, WorktreeFiles), HarvestError> {
     let pathspec = format!("{prefix}tasks");
     let listing = git_read(
         root,
@@ -297,43 +313,73 @@ fn union_files(
     }
     candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
     let mut seen = std::collections::HashSet::new();
-    let mut chosen: Vec<(String, Option<String>, bool)> = Vec::new();
+    let mut chosen: Vec<ChosenFile> = Vec::new();
     for (_, blob, path, path_is_lossy) in candidates {
         let name = path.rsplit('/').next().unwrap_or_default().to_string();
         if seen.insert(name) {
             chosen.push((path, blob, path_is_lossy));
         }
     }
-    let mut worktree: std::collections::HashMap<String, (String, bool)> = worktree
+    let worktree: WorktreeFiles = worktree
         .into_iter()
         .map(|(path, text, path_is_lossy)| (path, (text, path_is_lossy)))
         .collect();
-    // Read the committed versions in one `git cat-file` process.
+    Ok((chosen, worktree))
+}
+
+/// Harvest the chosen rows as a consumer chain: walk them in order, take the
+/// next committed content from the streaming `read_blobs` consumer for a row
+/// that names a blob, and read a working-tree row's cached content, handing
+/// each `(path, text)` to `harvest_file` as it arrives. The chosen set's
+/// contents are therefore never all resident.
+fn harvest_chosen(
+    repo: &Path,
+    git: &GitContext,
+    root: &Path,
+    dir: &Path,
+    chosen: Vec<ChosenFile>,
+    mut worktree: WorktreeFiles,
+    prior: &[PriorTask],
+) -> Result<Vec<ParsedTask>, HarvestError> {
     let blobs: Vec<String> = chosen
         .iter()
         .filter_map(|(_, blob, _)| blob.clone())
         .collect();
-    let mut contents = read_blobs(root, Some(dir), &blobs)?.into_iter();
-    let mut files = Vec::new();
-    for (path, blob, path_is_lossy) in chosen {
-        let text = match blob {
-            Some(_) => contents.next().unwrap_or_default(),
-            // A file that disappeared between the walk and here falls back to a
-            // fresh read, matching the walk's empty content for an unreadable
-            // file.
-            None => match worktree.remove(&path) {
-                Some((text, _)) => text,
-                None => {
-                    #[cfg(test)]
-                    worktree_read_count::record(folder);
-                    fs::read_to_string(folder.join(&path)).unwrap_or_default()
-                }
-            },
-        };
-        files.push((path, text, path_is_lossy));
+    let mut state = HarvestState::default();
+    let mut rows = chosen.into_iter();
+    read_blobs(root, Some(dir), &blobs, |text| {
+        // Advance to the next row that names a blob, harvesting the
+        // working-tree rows that sit ahead of it.
+        for (path, blob, path_is_lossy) in rows.by_ref() {
+            if blob.is_some() {
+                state.harvest_file(&path, &text, path_is_lossy);
+                break;
+            }
+            let text = worktree_content(repo, &mut worktree, &path);
+            state.harvest_file(&path, &text, path_is_lossy);
+        }
+    })?;
+    // Every committed row has taken its content, so the rows left are
+    // working-tree ones.
+    for (path, _, path_is_lossy) in rows {
+        let text = worktree_content(repo, &mut worktree, &path);
+        state.harvest_file(&path, &text, path_is_lossy);
     }
-    files.sort();
-    Ok(files)
+    state.finish(repo, git, prior)
+}
+
+/// One chosen working-tree row's content: the text the ranking walk already
+/// read, or a fresh read when the file disappeared since then, matching the
+/// walk's empty content for an unreadable file.
+fn worktree_content(repo: &Path, worktree: &mut WorktreeFiles, path: &str) -> String {
+    match worktree.remove(path) {
+        Some((text, _)) => text,
+        None => {
+            #[cfg(test)]
+            worktree_read_count::record(repo);
+            fs::read_to_string(repo.join(path)).unwrap_or_default()
+        }
+    }
 }
 
 /// Rank a version of a task: working tree before a commit, then an archived
@@ -354,17 +400,37 @@ fn blob_days(
     let mut command = git_dir_command(root, dir);
     scrub_git_env(&mut command);
     command.args(blob_days_log_args(pathspec));
-    let output = run_git_command(command, None, git_deadline(root))
-        .map_err(|failure| HarvestError::Git(failure.to_string()))?;
-    if !output.status.success() {
-        return Err(HarvestError::Git(git_exit_message(&output)));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
     let wanted: std::collections::HashSet<&str> = blobs.iter().map(String::as_str).collect();
     let mut days: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    run_git_streaming(command, None, git_deadline(root), |reader| {
+        stream_blob_days(reader, &wanted, |sha, stamp| {
+            // Log order is newest first, so the first hit is the newest touch.
+            days.entry(sha.to_string()).or_insert(stamp);
+        })
+    })
+    .map_err(|failure| HarvestError::Git(failure.to_string()))?;
+    Ok(days)
+}
+
+/// Report each `(blob, day)` entry of a `git log --raw --numstat` stream as it
+/// parses, so the caller folds them into its blob-to-day map without the whole
+/// log ever being resident.
+fn stream_blob_days<R: BufRead>(
+    mut reader: R,
+    wanted: &std::collections::HashSet<&str>,
+    mut on_entry: impl FnMut(&str, i64),
+) -> Result<(), GitFailure> {
+    let mut line = Vec::new();
     let mut stamp = 0_i64;
-    for line in text.lines() {
-        if let Some(raw) = line.strip_prefix(':') {
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(read_failure)?;
+        if read == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end_matches(['\n', '\r']);
+        if let Some(raw) = text.strip_prefix(':') {
             // `:old new oldmode newmode status\tsha\tpath`, oldest refs first.
             let Some(meta) = raw.split('\t').next() else {
                 continue;
@@ -374,36 +440,42 @@ fn blob_days(
             if !wanted.contains(sha) {
                 continue;
             }
-            // Log order is newest first, so the first hit is the newest touch.
-            days.entry(sha.to_string()).or_insert(stamp);
-        } else if let Ok(value) = line.trim().parse::<i64>() {
+            on_entry(sha, stamp);
+        } else if let Ok(value) = text.trim().parse::<i64>() {
             stamp = value;
         }
     }
-    Ok(days)
+    Ok(())
 }
 
-fn harvest_files(
-    repo: &Path,
-    git: &GitContext,
-    files: Vec<(String, String, bool)>,
-    prior: &[PriorTask],
-) -> Result<Vec<ParsedTask>, HarvestError> {
-    let mut pending = Vec::new();
-    let mut tasks = Vec::new();
+/// Turn a read failure on a git stream into the scan's git error.
+fn read_failure(error: std::io::Error) -> GitFailure {
+    GitFailure::Other(format!("git output could not be read: {error}"))
+}
 
-    for (rel, text, path_is_lossy) in files {
-        let Some(fields) = frontmatter(&text) else {
-            continue;
+/// The harvest accumulators. `harvest_file` folds one `(path, text)` in as it
+/// arrives, so the chosen set's contents never all sit in memory, and `finish`
+/// runs the leave-day pass once after the last file.
+#[derive(Default)]
+struct HarvestState {
+    pending: Vec<LeaveJob>,
+    tasks: Vec<ParsedTask>,
+}
+
+impl HarvestState {
+    /// Fold one task file's text into the pending and task accumulators.
+    fn harvest_file(&mut self, rel: &str, text: &str, path_is_lossy: bool) {
+        let Some(fields) = frontmatter(text) else {
+            return;
         };
         let Some(created) = fields
             .get("created")
             .and_then(|value| parse_iso_date(value))
         else {
-            continue;
+            return;
         };
         let Some(status) = fields.get("status").map(|value| value.trim().to_string()) else {
-            continue;
+            return;
         };
         let updated = fields
             .get("updated")
@@ -416,17 +488,18 @@ fn harvest_files(
             .split_once('_')
             .map(|(prefix, _)| prefix.to_string())
             .unwrap_or_else(|| name.to_string());
-        let content_hash = content_hash(&text);
-        let index = tasks.len();
+        let content_hash = content_hash(text);
+        let index = self.tasks.len();
         // Always pickaxe against this folder with a path relative to it.
         // Never ask `rev-parse` first: an inherited GIT_DIR can point that at
         // another checkout and every leave/ship lookup misses.
         if matches!(kind, TaskKind::Finished | TaskKind::Deferred) {
-            pending.push((index, rel.clone(), status, content_hash.clone()));
+            self.pending
+                .push((index, rel.to_string(), status, content_hash.clone()));
         }
         let (ship_date, leave_date) = dates_for(kind, updated);
-        tasks.push(ParsedTask {
-            path: rel,
+        self.tasks.push(ParsedTask {
+            path: rel.to_string(),
             scope,
             kind,
             created,
@@ -438,58 +511,87 @@ fn harvest_files(
         });
     }
 
-    let mut from_git = 0usize;
-    for (index, leave_day) in leave_dates(repo, git, &pending, prior)
-        .map_err(|failure| HarvestError::Git(failure.to_string()))?
-    {
-        let Some(task) = tasks.get_mut(index) else {
-            continue;
-        };
-        match leave_day {
-            Some(day) => {
-                from_git += 1;
-                task.leave_date = Some(day);
-                if task.kind == TaskKind::Finished {
-                    task.ship_date = Some(day);
+    /// Resolve every archived task's leave day once the stream has ended, then
+    /// return the rows in path order.
+    fn finish(
+        mut self,
+        repo: &Path,
+        git: &GitContext,
+        prior: &[PriorTask],
+    ) -> Result<Vec<ParsedTask>, HarvestError> {
+        let pending_len = self.pending.len();
+        let mut from_git = 0usize;
+        for (index, leave_day) in leave_dates(repo, git, &self.pending, prior)
+            .map_err(|failure| HarvestError::Git(failure.to_string()))?
+        {
+            let Some(task) = self.tasks.get_mut(index) else {
+                continue;
+            };
+            match leave_day {
+                Some(day) => {
+                    from_git += 1;
+                    task.leave_date = Some(day);
+                    if task.kind == TaskKind::Finished {
+                        task.ship_date = Some(day);
+                    }
                 }
-            }
-            // No commit carries this archived status yet, so the day stays the
-            // `updated` fallback `dates_for` seeded. Leave the hash unset so the
-            // next Update re-walks this path and records the archive commit day
-            // once it lands, instead of reusing the fallback forever.
-            None => {
-                task.content_hash = None;
-                // A name that is not valid UTF-8 decodes lossily, and that
-                // lossy path names no git object, so its leave-day walk can
-                // never hit. Chart the row anyway and name the lossy path and
-                // the fallback day it keeps, so the gap is visible.
-                if task.path_is_lossy {
-                    tracing::warn!(
-                        path = %task.path,
-                        fallback_day = %task.updated,
-                        "archived task name is not valid UTF-8; keeping the frontmatter updated day"
-                    );
+                // No commit carries this archived status yet, so the day stays
+                // the `updated` fallback `dates_for` seeded. Leave the hash
+                // unset so the next Update re-walks this path and records the
+                // archive commit day once it lands, instead of reusing the
+                // fallback forever.
+                None => {
+                    task.content_hash = None;
+                    // A name that is not valid UTF-8 decodes lossily, and that
+                    // lossy path names no git object, so its leave-day walk can
+                    // never hit. Chart the row anyway and name the lossy path
+                    // and the fallback day it keeps, so the gap is visible.
+                    if task.path_is_lossy {
+                        tracing::warn!(
+                            path = %task.path,
+                            fallback_day = %task.updated,
+                            "archived task name is not valid UTF-8; keeping the frontmatter updated day"
+                        );
+                    }
                 }
             }
         }
+        // The chosen rows arrive in rank order, so restore the path order the
+        // harvest has always returned.
+        self.tasks.sort_by(|left, right| left.path.cmp(&right.path));
+        let finished = self
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Finished)
+            .count();
+        let shipped = self
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Finished && task.ship_date.is_some())
+            .count();
+        tracing::info!(
+            repo = %repo.display(),
+            pending = pending_len,
+            from_git,
+            finished,
+            shipped,
+            "harvest complete"
+        );
+        Ok(self.tasks)
     }
-    let finished = tasks
-        .iter()
-        .filter(|task| task.kind == TaskKind::Finished)
-        .count();
-    let shipped = tasks
-        .iter()
-        .filter(|task| task.kind == TaskKind::Finished && task.ship_date.is_some())
-        .count();
-    tracing::info!(
-        repo = %repo.display(),
-        pending = pending.len(),
-        from_git,
-        finished,
-        shipped,
-        "harvest complete"
-    );
-    Ok(tasks)
+}
+
+fn harvest_files(
+    repo: &Path,
+    git: &GitContext,
+    files: Vec<(String, String, bool)>,
+    prior: &[PriorTask],
+) -> Result<Vec<ParsedTask>, HarvestError> {
+    let mut state = HarvestState::default();
+    for (rel, text, path_is_lossy) in files {
+        state.harvest_file(&rel, &text, path_is_lossy);
+    }
+    state.finish(repo, git, prior)
 }
 
 /// Split an `ls-tree -r -z` listing into task paths, their blob ids, and
@@ -536,14 +638,16 @@ fn markdown_blobs(listing: &[u8], prefix: &str) -> (Vec<String>, Vec<String>, Ve
     (paths, blobs, lossy)
 }
 
-/// Read many blobs in one `git cat-file` process, in the order they are given.
+/// Read many blobs in one `git cat-file` process, in the order they are given,
+/// handing each decoded content to `on_content` as it arrives.
 fn read_blobs(
     repo: &Path,
     dir: Option<&Path>,
     blobs: &[String],
-) -> Result<Vec<String>, GitFailure> {
+    mut on_content: impl FnMut(String),
+) -> Result<(), GitFailure> {
     if blobs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let mut command = cat_file_command(repo, dir);
     command.args(["cat-file", "--batch"]);
@@ -552,13 +656,15 @@ fn read_blobs(
         input.push_str(sha);
         input.push('\n');
     }
+    let expected = blobs.len();
     // Feed stdin from its own thread: a full stdout pipe would otherwise stop
     // the child from draining stdin and deadlock the write.
-    let output = run_git_command(command, Some(input.into_bytes()), git_deadline(repo))?;
-    if !output.status.success() {
-        return Err(GitFailure::Other(git_exit_message(&output)));
-    }
-    parse_batch(&output.stdout, blobs.len())
+    run_git_streaming(
+        command,
+        Some(input.into_bytes()),
+        git_deadline(repo),
+        |reader| parse_batch(reader, expected, &mut on_content),
+    )
 }
 
 /// The indexes of expressions that name an object present in the repository.
@@ -573,23 +679,13 @@ fn existing_object_indices(
     let mut command = cat_file_command(repo, dir);
     command.args(["cat-file", "--batch-check"]);
     let input = format!("{}\n", exprs.join("\n"));
-    let output = run_git_command(command, Some(input.into_bytes()), git_deadline(repo))?;
-    if !output.status.success() {
-        return Err(GitFailure::Other(git_exit_message(&output)));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut indices = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        if index >= exprs.len() {
-            break;
-        }
-        // A missing object prints `<expr> missing`; a present one prints its
-        // type and size. Skip the missing ones before feeding the batch.
-        if !line.ends_with(" missing") {
-            indices.push(index);
-        }
-    }
-    Ok(indices)
+    let expected = exprs.len();
+    run_git_streaming(
+        command,
+        Some(input.into_bytes()),
+        git_deadline(repo),
+        |reader| parse_batch_check(reader, expected),
+    )
 }
 
 /// Build a `git cat-file` command routed the same way as the other lookups.
@@ -612,39 +708,80 @@ fn cat_file_command(repo: &Path, dir: Option<&Path>) -> Command {
     command
 }
 
-fn parse_batch(output: &[u8], expected: usize) -> Result<Vec<String>, GitFailure> {
-    let mut contents = Vec::with_capacity(expected);
-    let mut rest = output;
+/// Parse the length-prefixed records of a `git cat-file --batch` stream,
+/// handing each decoded content to `on_content` as it arrives.
+fn parse_batch<R: BufRead>(
+    mut reader: R,
+    expected: usize,
+    mut on_content: impl FnMut(String),
+) -> Result<(), GitFailure> {
+    let mut header = Vec::new();
     for _ in 0..expected {
-        let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
+        header.clear();
+        let read = reader
+            .read_until(b'\n', &mut header)
+            .map_err(read_failure)?;
+        let Some(newline) = header.iter().position(|byte| *byte == b'\n') else {
             return Err(GitFailure::Other(
                 "git printed a truncated object header.".to_string(),
             ));
         };
-        let header = String::from_utf8_lossy(&rest[..newline]).into_owned();
-        let size = header
+        if read == 0 {
+            return Err(GitFailure::Other(
+                "git printed a truncated object header.".to_string(),
+            ));
+        }
+        let header_text = String::from_utf8_lossy(&header[..newline]).into_owned();
+        let size = header_text
             .split_whitespace()
             .nth(2)
             .and_then(|field| field.parse::<usize>().ok())
             .ok_or_else(|| {
-                GitFailure::Other(format!("git printed an unreadable object header: {header}"))
+                GitFailure::Other(format!(
+                    "git printed an unreadable object header: {header_text}"
+                ))
             })?;
-        let start = newline + 1;
-        let end = start.saturating_add(size);
-        let body = rest.get(start..end).ok_or_else(|| {
+        let mut body = vec![0_u8; size];
+        reader.read_exact(&mut body).map_err(|_| {
             GitFailure::Other("git printed less content than it announced.".to_string())
         })?;
+        // A newline follows each body; the last record may end at EOF.
+        let mut trailing = [0_u8; 1];
+        let _ = reader.read(&mut trailing).map_err(read_failure)?;
         // A blob whose bytes are not valid UTF-8 parses to no task, the same
-        // way `files_on_disk` skips a worktree file it cannot read. Push an
+        // way `files_on_disk` skips a worktree file it cannot read. Hand an
         // empty string rather than failing the scan, so the caller still
-        // consumes one entry per chosen blob and every later blob keeps its
+        // consumes one content per chosen blob and every later blob keeps its
         // position.
-        let text = String::from_utf8(body.to_vec()).unwrap_or_default();
-        contents.push(text);
-        rest = rest.get(end..).unwrap_or_default();
-        rest = rest.strip_prefix(b"\n").unwrap_or(rest);
+        let text = String::from_utf8(body).unwrap_or_default();
+        on_content(text);
     }
-    Ok(contents)
+    Ok(())
+}
+
+/// Read a `git cat-file --batch-check` stream one line per expression and
+/// return the index of every present one.
+///
+/// A missing object prints `<expr> missing`; a present one prints its type and
+/// size. The missing ones are skipped before the batch read.
+fn parse_batch_check<R: BufRead>(mut reader: R, expected: usize) -> Result<Vec<usize>, GitFailure> {
+    let mut indices = Vec::new();
+    let mut line = Vec::new();
+    let mut index = 0usize;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(read_failure)?;
+        if read == 0 || index >= expected {
+            break;
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end_matches(['\n', '\r']);
+        if !text.ends_with(" missing") {
+            indices.push(index);
+        }
+        index += 1;
+    }
+    Ok(indices)
 }
 
 /// The markdown files of `tasks/` as the folder holds them, for a folder
@@ -1058,6 +1195,118 @@ fn run_git_command(
     })
 }
 
+/// Run one read-only git command and hand its live stdout to a streaming
+/// parser.
+///
+/// The child's stderr is drained on its own thread and an optional stdin
+/// payload is written from another, while a watcher thread owns the child and
+/// enforces the deadline. The parser runs on the calling thread over a
+/// `BufReader` on the child's `ChildStdout`, so it can hand each record to a
+/// consumer as it arrives and borrow the caller's accumulators. A parser that
+/// stops early signals the watcher to kill the child, so a broken stream never
+/// waits out the deadline.
+fn run_git_streaming<T, F>(
+    mut command: Command,
+    input: Option<Vec<u8>>,
+    deadline: Duration,
+    parse: F,
+) -> Result<T, GitFailure>
+where
+    F: FnOnce(&mut dyn BufRead) -> Result<T, GitFailure>,
+{
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| GitFailure::Other(format!("git did not start: {error}")))?;
+    let Some(stdout) = child.stdout.take() else {
+        return Err(GitFailure::Other(
+            "git did not open a stdout pipe".to_string(),
+        ));
+    };
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer);
+            buffer
+        })
+    });
+    let writer = input.and_then(|input| {
+        child.stdin.take().map(|mut stdin| {
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            })
+        })
+    });
+    let abort = Arc::new(AtomicBool::new(false));
+    let abort_watcher = Arc::clone(&abort);
+    let watcher = std::thread::spawn(move || -> Result<std::process::ExitStatus, GitFailure> {
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {
+                    if started.elapsed() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(GitFailure::Timeout(format!(
+                            "git did not finish within {} ms",
+                            deadline.as_millis()
+                        )));
+                    }
+                    if abort_watcher.load(Ordering::Relaxed) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(GitFailure::Other(String::new()));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(GitFailure::Other(format!("git did not finish: {error}")));
+                }
+            }
+        }
+    });
+    let mut reader = BufReader::new(stdout);
+    let parsed = parse(&mut reader);
+    drop(reader);
+    if parsed.is_err() {
+        abort.store(true, Ordering::Relaxed);
+    }
+    let status = watcher
+        .join()
+        .unwrap_or_else(|_| Err(GitFailure::Other("git watcher stopped".to_string())));
+    let stderr = stderr
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    // A timed-out child is final even when the parser already saw EOF on the
+    // pipe the kill closed.
+    if let Err(GitFailure::Timeout(reason)) = &status {
+        return Err(GitFailure::Timeout(reason.clone()));
+    }
+    let value = parsed?;
+    let status = status?;
+    if !status.success() {
+        return Err(GitFailure::Other(git_exit_message(&Output {
+            status,
+            stdout: Vec::new(),
+            stderr,
+        })));
+    }
+    Ok(value)
+}
+
 /// The message a failed git process contributes, matching what the readers
 /// reported before the timeout helper existed.
 fn git_exit_message(output: &Output) -> String {
@@ -1305,47 +1554,49 @@ fn archived_leave_lookup(
     };
     scrub_git_env(&mut command);
     command.args(archive_log_args(rel));
-    let output = run_git_command(command, None, git_deadline(repo))?;
-    if !output.status.success() {
-        return Err(GitFailure::Other(git_exit_message(&output)));
-    }
-    let records = parse_archive_log(&output.stdout);
     let mut exprs = Vec::new();
     let mut days = Vec::new();
-    for (day, commit, path) in records {
-        // Both `cat-file` passes read one expression per line, so a path that
-        // holds a newline would split its expression and shift every later
-        // answer onto the wrong record.
-        if path.contains('\n') {
-            continue;
-        }
-        // `--name-only` names paths from the repository root. A path outside
-        // this folder belongs to no archive of it.
-        if !path.strip_prefix(prefix).is_some_and(is_archived_path) {
-            continue;
-        }
-        exprs.push(format!("{commit}:{path}"));
-        days.push(day);
-    }
+    run_git_streaming(command, None, git_deadline(repo), |reader| {
+        parse_archive_log(reader, |day, commit, path| {
+            // Both `cat-file` passes read one expression per line, so a path
+            // that holds a newline would split its expression and shift every
+            // later answer onto the wrong record.
+            if path.contains('\n') {
+                return;
+            }
+            // `--name-only` names paths from the repository root. A path
+            // outside this folder belongs to no archive of it.
+            if !path.strip_prefix(prefix).is_some_and(is_archived_path) {
+                return;
+            }
+            exprs.push(format!("{commit}:{path}"));
+            days.push(day);
+        })
+    })?;
     let indices = existing_object_indices(repo, dir, &exprs)?;
     let blobs: Vec<String> = indices.iter().map(|&index| exprs[index].clone()).collect();
-    let contents = read_blobs(repo, dir, &blobs)?;
+    // Consume one content at a time as the batch stream delivers it, folding
+    // each archived status into the earliest day instead of holding the set.
+    let mut next = indices.iter();
     let mut earliest: Option<NaiveDate> = None;
-    for (index, text) in indices.iter().zip(contents) {
+    read_blobs(repo, dir, &blobs, |text| {
+        let Some(&index) = next.next() else {
+            return;
+        };
         if !has_archived_status(&text, expected) {
-            continue;
+            return;
         }
-        let day = days[*index];
+        let day = days[index];
         earliest = Some(match earliest {
             Some(current) => current.min(day),
             None => day,
         });
-    }
+    })?;
     Ok(earliest)
 }
 
-/// Split a `git log -z --format=%cI %H --name-only` walk into date, commit,
-/// and path.
+/// Report each record of a `git log -z --format=%cI %H --name-only` walk as it
+/// parses, so the caller consumes each record instead of collecting the walk.
 ///
 /// Under `-z` git ends each `<date> <id>` header with a NUL and a newline and
 /// each raw path with a NUL, so the walk reads
@@ -1354,17 +1605,26 @@ fn archived_leave_lookup(
 /// any other field is a path of the current one. A path that is not valid
 /// UTF-8 thus names no object, so the batch-check pass drops its record and
 /// the records after it still count.
-fn parse_archive_log(output: &[u8]) -> Vec<(NaiveDate, String, String)> {
-    let mut records = Vec::new();
+fn parse_archive_log<R: BufRead>(
+    mut reader: R,
+    mut on_record: impl FnMut(NaiveDate, &str, &str),
+) -> Result<(), GitFailure> {
+    let mut field = Vec::new();
     let mut current: Option<(NaiveDate, String)> = None;
-    for field in output.split(|byte| *byte == 0) {
-        let field = field.strip_prefix(b"\n").unwrap_or(field);
-        if field.is_empty() {
+    loop {
+        field.clear();
+        let read = reader.read_until(b'\0', &mut field).map_err(read_failure)?;
+        if read == 0 {
+            break;
+        }
+        let raw = field.strip_suffix(b"\0").unwrap_or(&field);
+        let raw = raw.strip_prefix(b"\n").unwrap_or(raw);
+        if raw.is_empty() {
             continue;
         }
-        let field = String::from_utf8_lossy(field);
+        let text = String::from_utf8_lossy(raw);
         // A commit id is 40 hex digits under SHA-1 and 64 under SHA-256.
-        if let Some((raw_date, hash)) = field.split_once(' ')
+        if let Some((raw_date, hash)) = text.split_once(' ')
             && let Some(day) = parse_iso_date(raw_date)
             && matches!(hash.len(), 40 | 64)
             && hash.chars().all(|ch| ch.is_ascii_hexdigit())
@@ -1373,10 +1633,10 @@ fn parse_archive_log(output: &[u8]) -> Vec<(NaiveDate, String, String)> {
             continue;
         }
         if let Some((day, hash)) = &current {
-            records.push((*day, hash.clone(), field.into_owned()));
+            on_record(*day, hash, &text);
         }
     }
-    records
+    Ok(())
 }
 
 /// The repository that holds a folder without its own `.git`: the folder's path
@@ -1508,23 +1768,44 @@ fn run_git_log(
     walk_count::record(repo);
     scrub_git_env(&mut command);
     command.args(pickaxe_log_args(flag, pattern, rel));
-    let output = match run_git_command(command, None, git_deadline(repo)) {
-        Ok(output) => output,
-        Err(failure) => return LogLookup::Failed(failure),
-    };
-    if !output.status.success() {
-        return LogLookup::Failed(GitFailure::Other(git_exit_message(&output)));
-    }
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        return LogLookup::Failed(GitFailure::Other(
-            "git printed output that is not UTF-8".to_string(),
-        ));
-    };
     // Earliest hit. Do not use `--reverse` with `--follow` (drops renames).
-    match text.lines().filter_map(parse_iso_date).min() {
-        Some(day) => LogLookup::Found(day),
-        None => LogLookup::Miss,
+    let mut earliest: Option<NaiveDate> = None;
+    let result = run_git_streaming(command, None, git_deadline(repo), |reader| {
+        scan_log_dates(reader, |day| {
+            earliest = Some(match earliest {
+                Some(current) => current.min(day),
+                None => day,
+            });
+        })
+    });
+    match result {
+        Err(failure) => LogLookup::Failed(failure),
+        Ok(()) => match earliest {
+            Some(day) => LogLookup::Found(day),
+            None => LogLookup::Miss,
+        },
     }
+}
+
+/// Report each `%cI` date of a pickaxe log stream as its line parses.
+fn scan_log_dates<R: BufRead>(
+    mut reader: R,
+    mut on_date: impl FnMut(NaiveDate),
+) -> Result<(), GitFailure> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(read_failure)?;
+        if read == 0 {
+            break;
+        }
+        let text = std::str::from_utf8(&line)
+            .map_err(|_| GitFailure::Other("git printed output that is not UTF-8".to_string()))?;
+        if let Some(day) = parse_iso_date(text.trim_end_matches(['\n', '\r'])) {
+            on_date(day);
+        }
+    }
+    Ok(())
 }
 
 fn git_dir_command(repo: &Path, dir: &Path) -> Command {
@@ -1599,21 +1880,26 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GIT_COMMAND_TIMEOUT, GitContext, GitFailure, HarvestError, LogLookup, ParsedTask,
-        PriorTask, TaskKind, archive_log_args, archived_leave_lookup, blob_days,
+        GIT_COMMAND_TIMEOUT, GitContext, GitFailure, HarvestError, HarvestState, LogLookup,
+        ParsedTask, PriorTask, TaskKind, archive_log_args, archived_leave_lookup, blob_days,
         blob_days_log_args, enclosing_prefix, escape_posix_ere, existing_object_indices,
         first_status_commit_date, git_bin, git_deadline, git_dir_command, git_log_args,
         git_override, git_path, git_read, harvest_repository, harvest_repository_with_prior,
-        parse_archive_log, pickaxe_log_args, read_blobs, run_git_command, run_git_log,
-        scrub_git_env, take_leave_walk_count, take_worktree_read_count,
+        parse_archive_log, parse_batch, parse_batch_check, pickaxe_log_args, read_blobs,
+        run_git_command, run_git_log, scan_log_dates, scrub_git_env, stream_blob_days,
+        take_leave_walk_count, take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
+    use std::cell::Cell;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
+    use std::io::{self, BufRead, Read};
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::rc::Rc;
     use std::time::Duration;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -1621,6 +1907,397 @@ mod tests {
         let path = unique_temp_dir(name);
         fs::create_dir_all(&path).expect("scratch");
         path
+    }
+
+    /// Collect a streaming archive-log walk into the record list the whole
+    /// buffer parser used to return.
+    fn collect_archive_log(bytes: &[u8]) -> Vec<(NaiveDate, String, String)> {
+        let mut records = Vec::new();
+        parse_archive_log(bytes, |day, commit, path| {
+            records.push((day, commit.to_string(), path.to_string()));
+        })
+        .expect("parse archive log");
+        records
+    }
+
+    /// A `BufRead` that yields one bounded chunk per `fill_buf` and records
+    /// when the parser asks past the last chunk. A whole-buffer `read_to_end`
+    /// consumes every chunk before it can hand out the first record, so it
+    /// flips the flag before any callback runs.
+    struct ChunkedReader {
+        chunks: std::vec::IntoIter<Vec<u8>>,
+        current: Vec<u8>,
+        offset: usize,
+        exhausted: Rc<Cell<bool>>,
+    }
+
+    impl ChunkedReader {
+        fn new(chunks: Vec<Vec<u8>>) -> (Self, Rc<Cell<bool>>) {
+            let exhausted = Rc::new(Cell::new(false));
+            (
+                Self {
+                    chunks: chunks.into_iter(),
+                    current: Vec::new(),
+                    offset: 0,
+                    exhausted: Rc::clone(&exhausted),
+                },
+                exhausted,
+            )
+        }
+    }
+
+    impl BufRead for ChunkedReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            while self.offset >= self.current.len() {
+                match self.chunks.next() {
+                    Some(chunk) => {
+                        self.current = chunk;
+                        self.offset = 0;
+                    }
+                    None => {
+                        self.exhausted.set(true);
+                        return Ok(&[]);
+                    }
+                }
+            }
+            Ok(&self.current[self.offset..])
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.offset += amount;
+        }
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            let count = available.len().min(buf.len());
+            buf[..count].copy_from_slice(&available[..count]);
+            self.consume(count);
+            Ok(count)
+        }
+    }
+
+    /// Split `bytes` into bounded chunks so a parser cannot see the whole
+    /// stream at its first read.
+    fn bounded_chunks(bytes: &[u8], size: usize) -> Vec<Vec<u8>> {
+        bytes.chunks(size).map(<[u8]>::to_vec).collect()
+    }
+
+    fn hex_id(seed: u8) -> String {
+        std::iter::repeat_n(format!("{seed:02x}"), 20).collect()
+    }
+
+    /// A synthetic `git log --raw --format=%ct` stream: one stamp line, then
+    /// one raw line per changed path. A large history produces many of both.
+    fn synthetic_blob_log(commits: usize, paths_per_commit: usize) -> (Vec<u8>, Vec<String>) {
+        use std::fmt::Write as _;
+
+        let mut log = String::new();
+        let mut ids = Vec::new();
+        for commit in 0..commits {
+            let _ = writeln!(log, "{}", 1_700_000_000 + commit as i64);
+            for path in 0..paths_per_commit {
+                let old = hex_id(((commit * paths_per_commit + path) % 250) as u8);
+                let new = hex_id(((commit * paths_per_commit + path + 1) % 250) as u8);
+                ids.push(new.clone());
+                let _ = writeln!(
+                    log,
+                    ":100644 100644 {old} {new} M\t{new}\ttasks/scope_{commit}_{path}.md"
+                );
+            }
+        }
+        (log.into_bytes(), ids)
+    }
+
+    #[test]
+    fn stream_blob_days_matches_the_whole_buffer_parser() {
+        let (log, ids) = synthetic_blob_log(80, 12);
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let expected = whole_buffer_blob_days(&log, &wanted);
+        assert!(expected.len() > 100, "the synthetic log must be large");
+
+        let (reader, _exhausted) = ChunkedReader::new(bounded_chunks(&log, 97));
+        let mut streamed = HashMap::new();
+        stream_blob_days(reader, &wanted, |sha, stamp| {
+            streamed.entry(sha.to_string()).or_insert(stamp);
+        })
+        .expect("stream blob days");
+
+        assert_eq!(streamed, expected);
+    }
+
+    /// The whole-buffer parser the streaming one replaces, kept in the test so
+    /// the two maps are compared against the same rules.
+    fn whole_buffer_blob_days(bytes: &[u8], wanted: &HashSet<&str>) -> HashMap<String, i64> {
+        let text = String::from_utf8_lossy(bytes);
+        let mut days = HashMap::new();
+        let mut stamp = 0_i64;
+        for line in text.lines() {
+            if let Some(raw) = line.strip_prefix(':') {
+                let Some(meta) = raw.split('\t').next() else {
+                    continue;
+                };
+                let fields: Vec<&str> = meta.split_whitespace().collect();
+                let Some(sha) = fields.get(3) else { continue };
+                if !wanted.contains(sha) {
+                    continue;
+                }
+                days.entry(sha.to_string()).or_insert(stamp);
+            } else if let Ok(value) = line.trim().parse::<i64>() {
+                stamp = value;
+            }
+        }
+        days
+    }
+
+    #[test]
+    fn stream_blob_days_reports_entries_before_the_reader_is_exhausted() {
+        let (log, ids) = synthetic_blob_log(20, 6);
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let (reader, exhausted) = ChunkedReader::new(bounded_chunks(&log, 53));
+        let mut entries = Vec::new();
+        stream_blob_days(reader, &wanted, |sha, stamp| {
+            entries.push((sha.to_string(), stamp, exhausted.get()));
+        })
+        .expect("stream blob days");
+
+        assert!(!entries.is_empty(), "the callback must receive entries");
+        assert!(
+            !entries[0].2,
+            "the first entry must arrive before the reader is exhausted"
+        );
+        assert!(
+            entries.iter().all(|(_, _, seen_exhausted)| !seen_exhausted),
+            "no entry may wait for the whole stream"
+        );
+    }
+
+    #[test]
+    fn parse_batch_matches_the_whole_buffer_parser() {
+        let contents = ["alpha".to_string(), String::new(), "gamma".to_string()];
+        let stream = batch_stream(&contents);
+        let mut streamed = Vec::new();
+        parse_batch(&stream[..], contents.len(), |text| streamed.push(text)).expect("stream batch");
+        assert_eq!(streamed, contents);
+
+        // The same records split into bounded chunks.
+        let (reader, _exhausted) = ChunkedReader::new(bounded_chunks(&stream, 7));
+        let mut chunked = Vec::new();
+        parse_batch(reader, contents.len(), |text| chunked.push(text)).expect("chunked batch");
+        assert_eq!(chunked, contents);
+    }
+
+    fn batch_stream(contents: &[String]) -> Vec<u8> {
+        let mut stream = Vec::new();
+        for (index, text) in contents.iter().enumerate() {
+            stream
+                .extend_from_slice(format!("{:040x} blob {}\n", index + 1, text.len()).as_bytes());
+            stream.extend_from_slice(text.as_bytes());
+            stream.push(b'\n');
+        }
+        stream
+    }
+
+    #[test]
+    fn parse_batch_keeps_the_truncated_header_error() {
+        let error = parse_batch(&b"blob 12"[..], 1, |_| {}).expect_err("truncated header");
+        assert_eq!(
+            error,
+            GitFailure::Other("git printed a truncated object header.".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_batch_hands_content_to_harvest_file_before_the_reader_is_exhausted() {
+        let first = task_text("2026-05-01", "2026-05-01", "open");
+        let second = task_text("2026-06-01", "2026-06-01", "open");
+        let stream = batch_stream(&[first.clone(), second.clone()]);
+        let (reader, exhausted) = ChunkedReader::new(bounded_chunks(&stream, 9));
+        let mut state = HarvestState::default();
+        let mut first_arrival: Option<(String, bool, bool)> = None;
+        parse_batch(reader, 2, |text| {
+            let path = format!("tasks/scope_{}.md", state.tasks.len());
+            state.harvest_file(&path, &text, false);
+            if first_arrival.is_none() {
+                first_arrival = Some((path, !state.tasks.is_empty(), exhausted.get()));
+            }
+        })
+        .expect("stream batch into harvest_file");
+
+        let (path, task_present, seen_exhausted) = first_arrival.expect("first content");
+        assert_eq!(path, "tasks/scope_0.md");
+        assert!(
+            task_present,
+            "the first parsed task must exist at the callback"
+        );
+        assert!(
+            !seen_exhausted,
+            "the first content must reach harvest_file before the reader is exhausted"
+        );
+        assert_eq!(state.tasks.len(), 2);
+        assert_eq!(state.tasks[0].path, "tasks/scope_0.md");
+    }
+
+    fn task_text(created: &str, updated: &str, status: &str) -> String {
+        format!(
+            "---\ncreated: {created}T10:00:00\nupdated: {updated}T10:00:00\nstatus: {status}\n---\n\n# Task\n"
+        )
+    }
+
+    #[test]
+    fn streamed_batch_returns_the_same_task_contents_including_a_working_tree_only_file() {
+        let repo = scratch("harvest_streamed_batch");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_committed.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "committed task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // Only the working tree holds this one: it has no blob id.
+        write_task(&repo, "tasks/scope_worktree.md", "2026-06-02", "open");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["tasks/scope_committed.md", "tasks/scope_worktree.md"]
+        );
+        assert!(
+            tasks.iter().all(|task| task.kind == TaskKind::Live),
+            "{tasks:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn batch_check_reader_returns_present_indices_and_skips_missing() {
+        let stream = b"abc blob 12\ndef blob 3\ngone missing\nghi blob 3\n".to_vec();
+        let (reader, _exhausted) = ChunkedReader::new(bounded_chunks(&stream, 5));
+        let indices = parse_batch_check(reader, 4).expect("batch check");
+        assert_eq!(indices, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn parse_archive_log_reports_the_first_record_before_the_reader_is_exhausted() {
+        let first = hex_id(0x11);
+        let second = hex_id(0x22);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(format!("2026-05-10T12:00:00+00:00 {first}\0\n").as_bytes());
+        stream.extend_from_slice(b"tasks/archive/scope_a.md\0");
+        stream.extend_from_slice(format!("2026-06-10T12:00:00+00:00 {second}\0\n").as_bytes());
+        stream.extend_from_slice(b"tasks/archive/scope_b.md\0");
+
+        let (reader, exhausted) = ChunkedReader::new(bounded_chunks(&stream, 11));
+        let mut records = Vec::new();
+        parse_archive_log(reader, |day, commit, path| {
+            records.push((day, commit.to_string(), path.to_string(), exhausted.get()));
+        })
+        .expect("stream archive log");
+
+        assert_eq!(records.len(), 2);
+        assert!(
+            !records[0].3,
+            "the first record must arrive before the reader is exhausted"
+        );
+        assert_eq!(records[0].2, "tasks/archive/scope_a.md");
+    }
+
+    #[test]
+    fn scan_log_dates_reports_the_first_date_before_the_reader_is_exhausted() {
+        let stream = b"2026-05-10T12:00:00+00:00\n2026-06-10T12:00:00+00:00\n".to_vec();
+        let (reader, exhausted) = ChunkedReader::new(bounded_chunks(&stream, 13));
+        let mut dates = Vec::new();
+        scan_log_dates(reader, |day| dates.push((day, exhausted.get()))).expect("scan log dates");
+        assert_eq!(dates.len(), 2);
+        assert!(
+            !dates[0].1,
+            "the first date must arrive before the reader is exhausted"
+        );
+        assert_eq!(
+            dates[0].0,
+            NaiveDate::from_ymd_opt(2026, 5, 10).expect("day")
+        );
+    }
+
+    #[test]
+    fn every_log_and_cat_file_command_streams_child_stdout() {
+        let source = include_str!("harvest.rs");
+        let (production, tests) = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module opening");
+        assert!(!tests.is_empty(), "the test module must follow its opening");
+        // Above the test module, no command may buffer its stdout with a
+        // `.output()` or `wait_with_output()` call.
+        assert!(
+            !production.contains(".output()"),
+            "production harvest code must not call .output()"
+        );
+        assert!(
+            !production.contains("wait_with_output()"),
+            "production harvest code must not call wait_with_output()"
+        );
+        assert!(
+            production.contains("BufReader::new(stdout)"),
+            "the streaming runner hands a BufReader over ChildStdout to its parser"
+        );
+
+        for name in [
+            "blob_days",
+            "read_blobs",
+            "existing_object_indices",
+            "archived_leave_lookup",
+            "run_git_log",
+        ] {
+            let body = function_body(production, name);
+            for forbidden in [
+                ".output()",
+                "wait_with_output()",
+                "read_to_end()",
+                "read_to_string()",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{name} must not call {forbidden}"
+                );
+            }
+            assert!(
+                body.contains("run_git_streaming"),
+                "{name} must hand the child's stdout to its streaming parser"
+            );
+        }
+    }
+
+    /// The body of a top-level `fn name(...)` in `source`, braces included.
+    fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let needle = format!("\nfn {name}(");
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{name} exists"));
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("{name} has a body"));
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{name} has a closing brace")
     }
 
     #[test]
@@ -3508,7 +4185,7 @@ mod tests {
             .output()
             .expect("git log");
         assert!(walk.status.success(), "git log --follow must run");
-        let records = parse_archive_log(&walk.stdout);
+        let records = collect_archive_log(&walk.stdout);
         assert!(
             records.iter().any(|(day, _, path)| {
                 path == "tasks/scope_live.md"
@@ -4125,7 +4802,7 @@ mod tests {
         output.extend_from_slice(format!("2026-06-10T12:00:00+00:00 {second}\0\n").as_bytes());
         output.extend_from_slice(b"tasks/archive/scope_valid.md\0");
 
-        let records = parse_archive_log(&output);
+        let records = collect_archive_log(&output);
         // The invalid byte decodes lossily, so that path names no object.
         assert_eq!(
             records.first().map(|(_, _, path)| path.as_str()),
@@ -4888,7 +5565,7 @@ mod tests {
         assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
 
         let blobs = vec!["abc".to_string()];
-        let error = read_blobs(&repo, Some(&dir), &blobs).expect_err("read_blobs");
+        let error = read_blobs(&repo, Some(&dir), &blobs, |_| {}).expect_err("read_blobs");
         assert!(matches!(error, GitFailure::Timeout(_)), "{error:?}");
 
         let exprs = vec!["abc".to_string()];

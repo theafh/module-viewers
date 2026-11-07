@@ -2,9 +2,11 @@
 description: "Stream large git log and cat-file output instead of buffering the whole command result in memory."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T16:18:46
-status: ready
+updated: 2026-11-07T22:49:26
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Stream large git output instead of buffering it whole
