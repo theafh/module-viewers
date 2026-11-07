@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::{Future, ready};
 use std::num::IntErrorKind;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::Arc;
@@ -21,13 +21,13 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
+use walkdir::WalkDir;
 
 use crate::db::{self, Repository, StoreHookFn};
 use crate::harvest::{self, HarvestError, ParsedTask, PriorTask};
 use crate::series::{self, RadarMode};
 
 pub const PORT: u16 = 7880;
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_SCAN_WORKERS: usize = 4;
 pub const MAX_SCAN_WORKERS: usize = 32;
 
@@ -69,12 +69,14 @@ pub struct AppState {
     prior_read_hook: Arc<PriorReadHookFn>,
     harvest: Arc<HarvestFn>,
     flash: Arc<Mutex<FlashStore>>,
+    static_version: String,
 }
 
 impl AppState {
-    pub fn new(pool: sqlx::SqlitePool, templates: Tera) -> Self {
+    pub fn new(pool: sqlx::SqlitePool, templates: Tera) -> anyhow::Result<Self> {
         let raw = std::env::var("TASK_VIEWER_SCAN_WORKERS").ok();
-        Self {
+        let static_version = static_version(&static_dir())?;
+        Ok(Self {
             pool,
             templates: Arc::new(templates),
             scan: Arc::new(Mutex::new(())),
@@ -84,7 +86,8 @@ impl AppState {
             prior_read_hook: Arc::new(|_| Box::pin(ready(()))),
             harvest: Arc::new(harvest::harvest_repository_with_prior),
             flash: Arc::new(Mutex::new(FlashStore::default())),
-        }
+            static_version,
+        })
     }
 }
 
@@ -155,18 +158,80 @@ pub fn init_templates() -> anyhow::Result<Tera> {
     Ok(tera)
 }
 
+/// The crate's `static/` directory, recorded at compile time so `make run`
+/// resolves it from the workspace root. `router` serves it and the startup
+/// version hashes it, so both always name the same files.
+fn static_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static")
+}
+
+/// A content-derived version for every asset under `static_dir`. The files are
+/// walked recursively, sorted by their `/`-separated relative path, and each
+/// path and its bytes feed one stable 64-bit FNV-1a hash, so a change to any
+/// file's bytes, a rename, or an added or removed file changes the version.
+/// The templates append it as `?v=` to every `/static/...` URL, which turns a
+/// changed asset into a new URL while the server marks `/static` immutable.
+pub fn static_version(static_dir: &FsPath) -> anyhow::Result<String> {
+    let mut entries = Vec::new();
+    for entry in WalkDir::new(static_dir).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(static_dir)?
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        entries.push((relative, std::fs::read(entry.path())?));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (relative, bytes) in &entries {
+        hash_bytes(&mut hash, relative.as_bytes());
+        // A zero byte separates the path from the content, so no path suffix
+        // can be read as the first content byte of the next entry.
+        hash_bytes(&mut hash, &[0]);
+        hash_bytes(&mut hash, bytes);
+    }
+    Ok(format!("{hash:016x}"))
+}
+
+/// Fold `bytes` into a running FNV-1a hash, the same stable function
+/// `harvest::content_hash` uses for task bytes.
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
 pub fn router(state: AppState) -> Router {
-    let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
-    Router::new()
+    // The page routes own the uncached HTML: `no-store` sits on this router
+    // alone, so it never wraps the static service below.
+    let pages: Router<AppState> = Router::new()
         .route("/", get(home))
         .route("/repositories", get(repositories_page).post(add_repository))
         .route("/repositories/{id}/delete", post(remove_repository))
         .route("/scan", post(scan_all))
-        .nest_service("/static", ServeDir::new(static_dir))
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
-        ))
+        ));
+    // Every `/static` URL the templates emit carries the content-derived
+    // version, so one asset URL never names different bytes and the browser
+    // may keep it for a year.
+    let static_files: Router<AppState> = Router::new()
+        .nest_service("/static", ServeDir::new(static_dir()))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        ));
+    Router::new()
+        .merge(pages)
+        .merge(static_files)
         .layer(middleware::from_fn(require_local_host))
         // The security headers sit outside the host check, so the 403 that
         // rejects a foreign Host carries them too. The CSP holds only
@@ -474,6 +539,7 @@ async fn render_dashboard(
     };
     let has_projects = !repositories.is_empty();
     let templates = Arc::clone(&state.templates);
+    let version = state.static_version.clone();
     // The chart computation, the JSON payload, the page assembly, and the
     // template render are CPU work over every stored row and every chart day,
     // so they run on a blocking thread instead of a tokio worker. Only the
@@ -485,7 +551,7 @@ async fn render_dashboard(
         let mut data_json = serde_json::to_string(&board)?;
         data_json = data_json.replace('<', "\\u003c");
         let page = DashboardPage {
-            version: VERSION,
+            version,
             page: "dashboard",
             projects,
             selected,
@@ -508,7 +574,7 @@ async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Re
     let repositories = db::list_repositories(&state.pool).await?;
     let projects = repositories.iter().map(project_view).collect::<Vec<_>>();
     let page = RepositoriesPage {
-        version: VERSION,
+        version: state.static_version.clone(),
         page: "repositories",
         projects,
         notice: query.notice.clone(),
@@ -559,7 +625,7 @@ fn scan_label(repositories: &[Repository], selected: Option<i64>) -> String {
 
 #[derive(Serialize)]
 struct DashboardPage {
-    version: &'static str,
+    version: String,
     page: &'static str,
     projects: Vec<ProjectView>,
     selected: String,
@@ -572,7 +638,7 @@ struct DashboardPage {
 
 #[derive(Serialize)]
 struct RepositoriesPage {
-    version: &'static str,
+    version: String,
     page: &'static str,
     projects: Vec<ProjectView>,
     notice: String,
@@ -1011,7 +1077,7 @@ mod tests {
         AppState, HarvestFn, HomeQuery, PickerFn, PriorReadHookFn, ProjectForm, ScanFailure,
         ScanReport, StoreHookFn, add_repository, claim_banner, encode_query, init_templates,
         is_local_host, remove_repository, render_blocking_thread, render_home, router, scan_all,
-        scan_core, scan_flash, scan_response, scan_worker_cap,
+        scan_core, scan_flash, scan_response, scan_worker_cap, static_version,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -1246,6 +1312,22 @@ mod tests {
             .await
             .expect("body");
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    /// Every `/static/...` URL an HTML body emits, cut at the quote,
+    /// whitespace, or tag end that closes the attribute value.
+    fn static_urls(html: &str) -> Vec<String> {
+        let mut urls = Vec::new();
+        let mut rest = html;
+        while let Some(index) = rest.find("/static/") {
+            rest = &rest[index..];
+            let end = rest
+                .find(|ch: char| ch == '"' || ch == '\'' || ch == '>' || ch.is_whitespace())
+                .unwrap_or(rest.len());
+            urls.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+        urls
     }
 
     /// The anti-framing, content-sniffing, referrer, and framing-only CSP
@@ -1762,6 +1844,111 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert_security_headers(&missing);
 
+        cleanup(&path);
+    }
+
+    /// Acceptance: both rendered pages carry the version the server computed
+    /// from its own `static/` directory, not the package version.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_pages_reference_the_servers_static_version() {
+        let (state, path) = app_state("static_version_pages").await;
+        let version = state.static_version.clone();
+        assert_ne!(
+            version,
+            env!("CARGO_PKG_VERSION"),
+            "the cache buster is the asset content hash, not the package version"
+        );
+        for uri in ["/", "/repositories"] {
+            let body = body_text(send(state.clone(), get_page(uri, "127.0.0.1:7880")).await).await;
+            assert!(
+                body.contains(&format!("/static/style.css?v={version}")),
+                "{uri} must reference the server's static version {version}"
+            );
+        }
+        cleanup(&path);
+    }
+
+    /// Acceptance: the version function hashes every file under the directory
+    /// it is given, so changing a root asset or a nested one changes it.
+    #[test]
+    fn web_static_version_changes_with_either_file() {
+        let dir = unique_temp_dir("static_version_hash");
+        std::fs::create_dir_all(dir.join("js")).expect("static dirs");
+        std::fs::write(dir.join("style.css"), "body { color: red; }\n").expect("root asset");
+        std::fs::write(dir.join("js/theme.js"), "console.log('a');\n").expect("nested asset");
+
+        let first = static_version(&dir).expect("version");
+        assert_eq!(
+            static_version(&dir).expect("version again"),
+            first,
+            "an unchanged tree keeps its version"
+        );
+
+        std::fs::write(dir.join("style.css"), "body { color: blue; }\n")
+            .expect("changed root asset");
+        let second = static_version(&dir).expect("version");
+        assert_ne!(second, first, "changing the root asset changes the version");
+
+        std::fs::write(dir.join("js/theme.js"), "console.log('b');\n")
+            .expect("changed nested asset");
+        let third = static_version(&dir).expect("version");
+        assert_ne!(
+            third, second,
+            "changing the nested asset changes the version"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Acceptance: `no-store` covers the page routes alone, while `/static`
+    /// owns the immutable cache directive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scopes_cache_control_to_pages_and_static() {
+        let (state, path) = app_state("cache_control_scope").await;
+
+        let page = send(state.clone(), get_page("/", "127.0.0.1:7880")).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(header_text(&page, header::CACHE_CONTROL), "no-store");
+
+        let asset = send(
+            state.clone(),
+            get_page("/static/style.css", "127.0.0.1:7880"),
+        )
+        .await;
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert_eq!(
+            header_text(&asset, header::CACHE_CONTROL),
+            "public, max-age=31536000, immutable"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Acceptance: every `/static/...` URL the templates emit carries the
+    /// content-derived version, so a reference without it fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_every_static_url_carries_the_content_version() {
+        let (state, path) = app_state("static_version_urls").await;
+        let version = state.static_version.clone();
+        for uri in ["/", "/repositories"] {
+            let body = body_text(send(state.clone(), get_page(uri, "127.0.0.1:7880")).await).await;
+            let urls = static_urls(&body);
+            assert!(
+                !urls.is_empty(),
+                "{uri} references at least one static asset"
+            );
+            assert!(
+                urls.iter()
+                    .any(|url| url.starts_with("/static/favicon.svg?v=")),
+                "{uri} versions the favicon too"
+            );
+            for url in urls {
+                assert!(
+                    url.ends_with(&format!("?v={version}")),
+                    "{uri} emits {url} without the content version {version}"
+                );
+            }
+        }
         cleanup(&path);
     }
 
@@ -2952,10 +3139,8 @@ mod tests {
         let path = temp_database(name);
         db::test_db::set(path.clone());
         let pool = db::init().await.expect("init");
-        (
-            AppState::new(pool, init_templates().expect("templates")),
-            path,
-        )
+        let state = AppState::new(pool, init_templates().expect("templates")).expect("state");
+        (state, path)
     }
 
     fn redirect_location(response: &axum::response::Response) -> String {

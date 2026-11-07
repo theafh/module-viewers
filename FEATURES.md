@@ -8,6 +8,7 @@ What `task-viewer` does, from the person's side. Structure is `ARCHITECTURE.md`,
 - Serves on `127.0.0.1:7880`.
 - Reads repositories the person selects. Those repositories stay where they are.
 - Stores the repository list and the parsed task rows in `~/.task-viewer`.
+- The browser caches the styles, scripts, and icon between visits. Every `/static` URL carries a version derived from the asset bytes, so a changed asset gets a new URL and the browser never serves a stale one, while the HTML pages themselves are never cached.
 - `make install` installs a macOS Dock or Linux application-menu icon that toggles the server (start if stopped, stop if running). Each start, and each icon click, first builds the release binary at `target/release/task-viewer` from the checkout (a no-op when nothing changed), so the server always runs the checked-out code. When the build produced a binary newer than the running server, start and the icon click restart the server on it. When the build fails, start reports it and runs nothing, and an icon click on a running server stops it. `make start` / `make stop` / `make status` drive the same launcher.
 
 ## 2. Navigation

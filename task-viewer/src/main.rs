@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     }));
 
     let pool = db::init().await?;
-    let state = web::AppState::new(pool, web::init_templates()?);
+    let state = web::AppState::new(pool, web::init_templates()?)?;
     let app = web::router(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], web::PORT));
     tracing::info!("task-viewer listening on http://{addr}");
