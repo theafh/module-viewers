@@ -3,6 +3,8 @@
 mod dates;
 mod db;
 mod harvest;
+#[cfg(test)]
+mod launcher_tests;
 mod series;
 #[cfg(test)]
 mod test_support;

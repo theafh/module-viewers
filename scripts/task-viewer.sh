@@ -72,7 +72,9 @@ is_ours() {
     local candidate="$1"
     [ -n "$candidate" ] || return 1
     local args
-    args=$(ps -p "$candidate" -o args= 2>/dev/null | sed 's/[[:space:]]*$//')
+    # -ww keeps procps from truncating a long command line to the terminal
+    # width, so Linux reads the same full path macOS prints.
+    args=$(ps -ww -p "$candidate" -o args= 2>/dev/null | sed 's/[[:space:]]*$//')
     [ "$args" = "$BINARY" ]
 }
 
@@ -326,19 +328,23 @@ do_toggle() {
     fi
 }
 
-case "${1:-toggle}" in
-    start)   do_start ;;
-    stop)    do_stop ;;
-    status)  do_status ;;
-    restart) do_stop && do_start ;;
-    toggle)  do_toggle ;;
-    *)
-        echo "Usage: $0 {start|stop|status|restart|toggle}"
-        echo "  start   - Start task-viewer"
-        echo "  stop    - Stop task-viewer"
-        echo "  status  - Check if task-viewer is running"
-        echo "  restart - Restart task-viewer"
-        echo "  toggle  - Start if stopped, stop if running (default)"
-        exit 1
-        ;;
-esac
+# Dispatch only when executed, so a test can source this file to reach the
+# helpers without starting or stopping a server.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    case "${1:-toggle}" in
+        start)   do_start ;;
+        stop)    do_stop ;;
+        status)  do_status ;;
+        restart) do_stop && do_start ;;
+        toggle)  do_toggle ;;
+        *)
+            echo "Usage: $0 {start|stop|status|restart|toggle}"
+            echo "  start   - Start task-viewer"
+            echo "  stop    - Stop task-viewer"
+            echo "  status  - Check if task-viewer is running"
+            echo "  restart - Restart task-viewer"
+            echo "  toggle  - Start if stopped, stop if running (default)"
+            exit 1
+            ;;
+    esac
+fi

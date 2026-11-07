@@ -2,9 +2,11 @@
 description: "Make launcher process identification robust when ps would truncate a long command line on Linux."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-07T17:31:48
-status: ready
+updated: 2026-11-07T23:40:21
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Make launcher process identification robust on Linux
