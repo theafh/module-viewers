@@ -33,20 +33,19 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).expect("chmod script");
 }
 
-/// Stand in for procps: a long command line comes back empty unless `-ww`
-/// asks for the full width, which is the truncation the launcher must avoid.
-const FAKE_PS: &str = r#"#!/bin/sh
-case " $* " in
-    *" -ww "*) printf '%s\n' "$FAKE_PS_ARGS" ;;
-esac
-"#;
-
 /// Source the launcher without dispatching, then exercise `is_ours` against
 /// the fake `ps`. The positional probe matches no dispatcher arm, so a missing
 /// main guard would print usage and exit before the assertions run.
 const DRIVER: &str = r#"#!/bin/bash
 set -u
 set -- source-guard-probe
+# A function beats every PATH entry the launcher prepends, so a real procps in
+# /usr/local/bin or /opt/homebrew/bin cannot answer in place of the fake.
+ps() {
+    case " $* " in
+        *" -ww "*) printf '%s\n' "$FAKE_PS_ARGS" ;;
+    esac
+}
 # shellcheck source=/dev/null
 . "$SCRIPT_PATH"
 BINARY="$LONG_BINARY"
@@ -65,9 +64,7 @@ printf 'long-ok\nforeign-rejected\n'
 #[test]
 fn launcher_is_ours_reads_the_full_command_line() {
     let dir = unique_temp_dir("launcher_ps");
-    let bin = dir.join("bin");
-    fs::create_dir_all(&bin).expect("fake bin dir");
-    write_executable(&bin.join("ps"), FAKE_PS);
+    fs::create_dir_all(&dir).expect("temp dir");
     let driver = dir.join("driver.sh");
     write_executable(&driver, DRIVER);
 
@@ -87,24 +84,23 @@ fn launcher_is_ours_reads_the_full_command_line() {
         .to_string_lossy()
         .into_owned();
 
-    let launcher = repo_launcher();
+    let launcher = dir.join("scripts").join("task-viewer.sh");
+    fs::create_dir_all(launcher.parent().expect("launcher parent")).expect("launcher scripts dir");
+    // Source a copy under the temp dir: the launcher derives PROJECT_DIR from
+    // its own path, so its legacy cleanup stays inside the test's root instead
+    // of deleting and moving files at the checkout root.
+    fs::copy(repo_launcher(), &launcher).expect("copy launcher into temp dir");
     assert!(
         launcher.is_file(),
-        "launcher missing at {}",
+        "launcher copy missing at {}",
         launcher.display()
     );
 
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
     let mut command = Command::new("bash");
     command
         .arg("--noprofile")
         .arg("--norc")
         .arg(&driver)
-        .env("PATH", path)
         // Keep the launcher's state and log files out of the live directories.
         .env("HOME", dir.join("home"))
         .env("XDG_STATE_HOME", dir.join("state"))
