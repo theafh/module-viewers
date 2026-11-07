@@ -23,7 +23,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 **`task-viewer/src/web.rs`** owns the routes. The dashboard is `GET /`. The repository list is `GET /repositories`. Add repository is `POST /repositories` and opens the operating-system folder picker on this machine. Remove is `POST /repositories/{id}/delete`. Update is `POST /scan`; it harvests up to the configured cap at once and stores each result one repository at a time. Routes name a repository by its integer id. The folder path is taken from the picker, not from the browser body.
 
 **`task-viewer/src/harvest.rs`** reads `tasks/**/*.md`, reads frontmatter, and asks git for the leave day of each finished or deferred task. It returns parsed rows and does not write them.
-**`task-viewer/src/db.rs`** creates `~/.task-viewer` and reads and writes the two tables.
+**`task-viewer/src/db.rs`** creates the database directory — the default `~/.task-viewer` path or the parent of a configured `TASK_VIEWER_DB` path — opens the database, and brings its schema to the current version one step at a time. It reads and writes the two tables.
 
 **`task-viewer/src/series.rs`** turns the stored rows into the eight chart series for the current filter.
 
