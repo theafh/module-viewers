@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use sqlx::{
     Pool, QueryBuilder, Sqlite,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions},
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -285,7 +285,11 @@ pub async fn load_tasks(
     pool: &Pool<Sqlite>,
     repository_id: Option<i64>,
 ) -> Result<Vec<crate::series::TaskRecord>> {
-    let projects = load_project_handles(pool, repository_id).await?;
+    // One read transaction covers both statements, so the names and the rows come
+    // from the same snapshot: a repository committed between them can no longer
+    // leave its task rows without a name handle and drop them from this render.
+    let mut tx = pool.begin().await?;
+    let projects = load_project_handles(&mut tx, repository_id).await?;
     let rows = match repository_id {
         Some(id) => {
             sqlx::query_as::<_, TaskRow>(
@@ -296,7 +300,7 @@ pub async fn load_tasks(
                  ORDER BY t.path",
             )
             .bind(id)
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await?
         }
         None => {
@@ -306,10 +310,11 @@ pub async fn load_tasks(
                  INNER JOIN repositories r ON r.repository_id = t.repository_id
                  ORDER BY r.name COLLATE NOCASE, t.path",
             )
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await?
         }
     };
+    tx.commit().await?;
 
     let mut tasks = Vec::new();
     for row in rows {
@@ -323,9 +328,10 @@ pub async fn load_tasks(
 /// Load each repository's name once and share it as one `Arc<str>` across every
 /// task row of that repository, so the dashboard read allocates no copy of the
 /// name per task. The join in `load_tasks` keeps the ordering; this map supplies
-/// the handle each row carries.
+/// the handle each row carries. It reads on the caller's connection so the names
+/// and the rows come from one snapshot.
 async fn load_project_handles(
-    pool: &Pool<Sqlite>,
+    conn: &mut SqliteConnection,
     repository_id: Option<i64>,
 ) -> Result<HashMap<i64, Arc<str>>> {
     let rows = match repository_id {
@@ -334,12 +340,12 @@ async fn load_project_handles(
                 "SELECT repository_id, name FROM repositories WHERE repository_id = ?",
             )
             .bind(id)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?
         }
         None => {
             sqlx::query_as::<_, (i64, String)>("SELECT repository_id, name FROM repositories")
-                .fetch_all(pool)
+                .fetch_all(&mut *conn)
                 .await?
         }
     };
@@ -522,10 +528,14 @@ mod tests {
             let layer = StatementCapture {
                 statements: captured_statements(),
             };
-            let _ = tracing::subscriber::set_global_default(
+            tracing::subscriber::set_global_default(
                 tracing_subscriber::registry()
                     .with(tracing_subscriber::filter::LevelFilter::DEBUG)
                     .with(layer),
+            )
+            .expect(
+                "the statement capture needs the process-wide subscriber: sqlx logs on the \
+                 connection's worker thread, so a thread-scoped subscriber cannot see it",
             );
         });
     }
