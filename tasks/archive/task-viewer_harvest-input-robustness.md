@@ -2,9 +2,11 @@
 description: "Accept a UTF-8 BOM, leading blank lines, quoted status values, and space-separated timestamps in task frontmatter."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-07T09:49:51
-status: ready
+updated: 2026-11-07T19:43:11
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Accept common frontmatter variations

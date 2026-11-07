@@ -646,7 +646,32 @@ fn dates_for(kind: TaskKind, updated: NaiveDate) -> (Option<NaiveDate>, Option<N
     }
 }
 
+/// Strip one matching pair of single or double quotes around a frontmatter
+/// value, so a quoted `status` or date reads like its bare spelling. A value
+/// that merely holds quotes inside it keeps them.
+fn unquote_frontmatter_value(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if first == last && (first == b'"' || first == b'\'') {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
 fn frontmatter(text: &str) -> Option<std::collections::HashMap<String, String>> {
+    // A UTF-8 BOM and blank lines ahead of the opening delimiter are common
+    // editor artifacts. Dropping them keeps a file with either variation
+    // charted instead of silently skipped.
+    let mut text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    while let Some(rest) = text
+        .strip_prefix("\r\n")
+        .or_else(|| text.strip_prefix('\n'))
+    {
+        text = rest;
+    }
     let rest = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))?;
@@ -659,7 +684,10 @@ fn frontmatter(text: &str) -> Option<std::collections::HashMap<String, String>> 
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        fields.insert(key.trim().to_string(), value.trim().to_string());
+        fields.insert(
+            key.trim().to_string(),
+            unquote_frontmatter_value(value.trim()).to_string(),
+        );
     }
     Some(fields)
 }
@@ -1356,14 +1384,26 @@ fn first_status_commit_date(
     if !git.inside_repository {
         return Ok(None);
     }
-    let literal = format!("status: {status}");
     // A frontmatter status is free text, so an unescaped metacharacter such as
     // a `[` or `{` would make `-G` exit with `fatal: invalid regex` and abort
     // the whole repository's harvest.
     let escaped = escape_posix_ere(status);
-    let regex = format!(r"^status:[[:space:]]*{escaped}");
-    for (flag, pattern) in [("-S", literal.as_str()), ("-G", regex.as_str())] {
-        if let Some(day) = git_pickaxe(repo, git, rel, flag, pattern)? {
+    // A quoted frontmatter value is common, so the unquoted status must match
+    // the commit that introduced either spelling. The bare alternative keeps
+    // the old prefix match, which is what dates a tight `status:deferred[`
+    // line; each quoted alternative requires the closing quote, so a lookup
+    // for `open` never answers `status: "openx"`.
+    let patterns = [
+        ("-S", format!("status: {status}")),
+        ("-S", format!("status: \"{status}\"")),
+        ("-S", format!("status: '{status}'")),
+        (
+            "-G",
+            format!(r#"^status:[[:space:]]*("{escaped}"|'{escaped}'|{escaped})"#),
+        ),
+    ];
+    for (flag, pattern) in patterns {
+        if let Some(day) = git_pickaxe(repo, git, rel, flag, &pattern)? {
             return Ok(Some(day));
         }
     }
@@ -1473,13 +1513,13 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GIT_COMMAND_TIMEOUT, GitFailure, HarvestError, LogLookup, ParsedTask, PriorTask, TaskKind,
-        archive_log_args, archived_leave_lookup, blob_days, blob_days_log_args, enclosing_prefix,
-        escape_posix_ere, existing_object_indices, git_bin, git_deadline, git_dir_command,
-        git_log_args, git_override, git_path, git_read, harvest_repository,
-        harvest_repository_with_prior, parse_archive_log, pickaxe_log_args, read_blobs,
-        run_git_command, run_git_log, scrub_git_env, take_leave_walk_count,
-        take_worktree_read_count,
+        GIT_COMMAND_TIMEOUT, GitContext, GitFailure, HarvestError, LogLookup, ParsedTask,
+        PriorTask, TaskKind, archive_log_args, archived_leave_lookup, blob_days,
+        blob_days_log_args, enclosing_prefix, escape_posix_ere, existing_object_indices,
+        first_status_commit_date, git_bin, git_deadline, git_dir_command, git_log_args,
+        git_override, git_path, git_read, harvest_repository, harvest_repository_with_prior,
+        parse_archive_log, pickaxe_log_args, read_blobs, run_git_command, run_git_log,
+        scrub_git_env, take_leave_walk_count, take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -2993,6 +3033,302 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
         );
         assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_tight_finished_status_from_its_archive_commit() {
+        // The tight `status:finished` spelling carries no space after the
+        // colon, so its ship day must still come from the archive commit
+        // rather than the later frontmatter `updated` day.
+        let repo = scratch("harvest_tight_finished_single_commit");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::write(
+            repo.join("tasks/archive/scope_tight.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-06-01T10:00:00\nstatus:finished\n---\n\n# Task\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive tight finished"],
+            "2026-05-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        assert_ne!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_task_behind_a_bom_and_leading_blank_lines() {
+        // Editors can leave a UTF-8 BOM and blank lines ahead of the opening
+        // delimiter. The frontmatter dates must still chart the task.
+        let repo = scratch("harvest_bom_blank_lines");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_bom.md"),
+            "\u{feff}\r\n\r\n---\r\ncreated: 2026-05-01T10:00:00\r\nupdated: 2026-05-02T10:00:00\r\nstatus: open\r\n---\r\n\r\n# Task\r\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "create"],
+            "2026-05-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Live);
+        assert_eq!(
+            task.created,
+            NaiveDate::from_ymd_opt(2026, 5, 1).expect("day")
+        );
+        assert_eq!(
+            task.updated,
+            NaiveDate::from_ymd_opt(2026, 5, 2).expect("day")
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_double_quoted_finished_status_as_finished() {
+        let repo = scratch("harvest_double_quoted_finished");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_quoted.md",
+            "2026-05-01",
+            "2026-05-01",
+            "\"finished\"",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive quoted finished"],
+            "2026-05-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_single_quoted_finished_status_as_finished() {
+        let repo = scratch("harvest_single_quoted_finished");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_quoted.md",
+            "2026-05-01",
+            "2026-05-01",
+            "'finished'",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive quoted finished"],
+            "2026-05-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_double_quoted_finished_status_from_its_archive_commit() {
+        let repo = scratch("harvest_double_quoted_ship");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_quoted.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive open"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_quoted.md",
+            "2026-05-01",
+            "2026-06-01",
+            "\"finished\"",
+        );
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "finish quoted"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day"))
+        );
+        assert_ne!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_single_quoted_finished_status_from_its_archive_commit() {
+        let repo = scratch("harvest_single_quoted_ship");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_quoted.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive open"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_quoted.md",
+            "2026-05-01",
+            "2026-06-01",
+            "'finished'",
+        );
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "finish quoted"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day"))
+        );
+        assert_ne!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_first_status_commit_matches_a_double_quoted_status() {
+        // `first_status_commit_date` reads raw commit text, so an unquoted
+        // status must still date the commit that introduced its quoted form.
+        let repo = scratch("harvest_first_status_double_quoted");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-06-15T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::write(
+            repo.join("tasks/archive/scope_quoted.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: \"open\"\n---\n\n# Task\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-06-15T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive quoted open"],
+            "2026-06-15T12:00:00+00:00",
+        );
+
+        let git = GitContext::resolve(&repo).expect("git context");
+        let day = first_status_commit_date(&repo, &git, "tasks/archive/scope_quoted.md", "open")
+            .expect("lookup");
+        assert_eq!(
+            day,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 15).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_first_status_commit_matches_a_single_quoted_status() {
+        let repo = scratch("harvest_first_status_single_quoted");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-06-15T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::write(
+            repo.join("tasks/archive/scope_quoted.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: 'open'\n---\n\n# Task\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"], "2026-06-15T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive quoted open"],
+            "2026-06-15T12:00:00+00:00",
+        );
+
+        let git = GitContext::resolve(&repo).expect("git context");
+        let day = first_status_commit_date(&repo, &git, "tasks/archive/scope_quoted.md", "open")
+            .expect("lookup");
+        assert_eq!(
+            day,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 15).expect("day"))
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 
