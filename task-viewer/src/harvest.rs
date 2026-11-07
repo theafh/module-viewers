@@ -430,7 +430,20 @@ fn harvest_files(
             // `updated` fallback `dates_for` seeded. Leave the hash unset so the
             // next Update re-walks this path and records the archive commit day
             // once it lands, instead of reusing the fallback forever.
-            None => task.content_hash = None,
+            None => {
+                task.content_hash = None;
+                // A name that is not valid UTF-8 decodes lossily, and that
+                // lossy path names no git object, so its leave-day walk can
+                // never hit. Chart the row anyway and name the lossy path and
+                // the fallback day it keeps, so the gap is visible.
+                if task.path.contains('\u{FFFD}') {
+                    tracing::warn!(
+                        path = %task.path,
+                        fallback_day = %task.updated,
+                        "archived task name is not valid UTF-8; keeping the frontmatter updated day"
+                    );
+                }
+            }
         }
     }
     let finished = tasks
@@ -615,15 +628,29 @@ fn files_on_disk(repo: &Path) -> Result<Vec<(String, String)>, HarvestError> {
         let Ok(text) = fs::read_to_string(path) else {
             continue;
         };
-        let rel = path
-            .strip_prefix(repo)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        files.push((rel, text));
+        files.push((relative_path(path, repo), text));
     }
     files.sort();
     Ok(files)
+}
+
+/// The path of `path` below `base`, with `/` separators.
+///
+/// The stored path is built from the path's components, not from one
+/// `to_string_lossy` of the whole path, so a literal backslash in a file name
+/// stays a backslash instead of turning into a separator. A component that is
+/// not valid UTF-8 decodes lossily, which is the same lossy path the committed
+/// listing yields, so the two candidates for one file dedupe to one row.
+fn relative_path(path: &Path, base: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn classify(in_archive: bool, status: &str) -> TaskKind {
@@ -859,6 +886,12 @@ fn blob_days_log_args(pathspec: &str) -> Vec<String> {
     ])
 }
 
+/// A pathspec that names `rel` literally, so a file name holding `*`, `?`,
+/// `[`, or a backslash matches only that path instead of a glob or an escape.
+fn literal_pathspec(rel: &str) -> String {
+    format!(":(literal){rel}")
+}
+
 /// The `git log` arguments for the archive walk in `archived_leave_lookup`.
 fn archive_log_args(rel: &str) -> Vec<String> {
     // `-z` prints every path raw. Without it git C-quotes a path holding a
@@ -872,7 +905,7 @@ fn archive_log_args(rel: &str) -> Vec<String> {
         "--format=%cI %H",
         "--all",
         "--",
-        rel,
+        &literal_pathspec(rel),
     ])
 }
 
@@ -889,7 +922,7 @@ fn pickaxe_log_args(flag: &str, pattern: &str, rel: &str) -> Vec<String> {
         flag,
         pattern,
         "--",
-        rel,
+        &literal_pathspec(rel),
     ])
 }
 
@@ -1524,10 +1557,12 @@ mod tests {
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
     use std::fs;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::Duration;
+    use tracing_subscriber::layer::SubscriberExt;
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let path = unique_temp_dir(name);
@@ -1686,6 +1721,11 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str], date: &str) {
+        let _ = git_stdout(dir, args, date);
+    }
+
+    /// Run git in `dir` at `date` and return its trimmed stdout.
+    fn git_stdout(dir: &Path, args: &[&str], date: &str) -> String {
         let output = Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -1712,6 +1752,10 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8(output.stdout)
+            .expect("git printed output that is not UTF-8")
+            .trim()
+            .to_string()
     }
 
     #[test]
@@ -4196,6 +4240,383 @@ mod tests {
         let tasks = harvest_repository(&repo).expect("harvest");
         assert_eq!(tasks.len(), 1, "only the valid task charts: {tasks:?}");
         assert_eq!(tasks[0].path, "tasks/scope_valid.md");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_backslash_task_name_once_with_its_literal_path() {
+        // A backslash is a literal byte in a file name, not a separator. The
+        // working-tree walk and the committed listing must agree on it so the
+        // file charts as one row instead of splitting into a second path.
+        let repo = scratch("harvest_backslash_name");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/scope_a\\b.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/scope_other.md",
+            "2026-05-02",
+            "2026-05-02",
+            "open",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-03",
+            "2026-05-03",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "tasks"],
+            "2026-05-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let backslash: Vec<_> = tasks
+            .iter()
+            .filter(|task| task.path.contains('\\'))
+            .collect();
+        assert_eq!(backslash.len(), 1, "one file must chart once: {tasks:?}");
+        assert_eq!(backslash[0].path, "tasks/scope_a\\b.md");
+        assert_eq!(backslash[0].scope, "scope");
+        assert!(
+            tasks.iter().all(|task| task.path != "tasks/scope_a/b.md"),
+            "the backslash must not become a separator: {tasks:?}"
+        );
+        let other = tasks
+            .iter()
+            .find(|task| task.path == "tasks/scope_other.md")
+            .expect("the neighboring live task keeps its path");
+        assert_eq!(
+            other.created,
+            NaiveDate::from_ymd_opt(2026, 5, 2).expect("day")
+        );
+        assert_eq!(
+            other.updated,
+            NaiveDate::from_ymd_opt(2026, 5, 2).expect("day")
+        );
+        let done = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/scope_done.md")
+            .expect("the archived task keeps its path");
+        assert_eq!(done.kind, TaskKind::Finished);
+        assert_eq!(
+            done.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_matches_glob_named_tasks_only_by_their_literal_path() {
+        // Each glob-named task sits beside a file its glob would match. A
+        // pathspec that is not literal lets the archive walk or the pickaxe
+        // date the glob task from the unrelated file's commit.
+        let repo = scratch("harvest_glob_names");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-03-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_a_open.md",
+            "2026-03-01",
+            "2026-03-01",
+            "open",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_f_in.md",
+            "2026-03-02",
+            "2026-03-02",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-04-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "unrelated archived tasks"],
+            "2026-04-01T12:00:00+00:00",
+        );
+
+        write_task_dated(
+            &repo,
+            "tasks/scope_live*.md",
+            "2026-05-05",
+            "2026-05-09",
+            "open",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_a*open.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "glob-named live and archived open"],
+            "2026-06-01T12:00:00+00:00",
+        );
+
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_f*in.md",
+            "2026-05-02",
+            "2026-05-02",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-07-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "glob-named finished"],
+            "2026-07-01T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let day = |year, month, day| NaiveDate::from_ymd_opt(year, month, day).expect("day");
+        let live = tasks
+            .iter()
+            .find(|task| task.path == "tasks/scope_live*.md")
+            .expect("the glob-named live task charts");
+        assert_eq!(live.kind, TaskKind::Live);
+        assert_eq!(live.created, day(2026, 5, 5));
+        assert_eq!(live.updated, day(2026, 5, 9));
+
+        let archived_open = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/scope_a*open.md")
+            .expect("the glob-named archived open task charts");
+        assert_eq!(archived_open.kind, TaskKind::Deferred);
+        assert_eq!(
+            archived_open.leave_date,
+            Some(day(2026, 6, 1)),
+            "the pickaxe must not date the task from the unrelated file"
+        );
+
+        let finished = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/scope_f*in.md")
+            .expect("the glob-named finished task charts");
+        assert_eq!(finished.kind, TaskKind::Finished);
+        assert_eq!(
+            finished.leave_date,
+            Some(day(2026, 7, 1)),
+            "the archive walk must not date the task from the unrelated file"
+        );
+        assert_eq!(finished.ship_date, finished.leave_date);
+
+        // The unrelated files keep their own paths and dates.
+        let unrelated_open = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/scope_a_open.md")
+            .expect("the unrelated open task keeps its path");
+        assert_eq!(unrelated_open.leave_date, Some(day(2026, 4, 1)));
+        let unrelated_finished = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/scope_f_in.md")
+            .expect("the unrelated finished task keeps its path");
+        assert_eq!(unrelated_finished.leave_date, Some(day(2026, 4, 1)));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Commit a task whose file name holds bytes that are not valid UTF-8.
+    ///
+    /// macOS rejects such a name at the filesystem, so the path is written
+    /// straight into a tree through the index, which is how a checkout on
+    /// another platform could carry it. The file then exists only in history.
+    fn commit_non_utf8_named_task(
+        repo: &Path,
+        dir: &str,
+        name: &[u8],
+        created: &str,
+        updated: &str,
+        date: &str,
+    ) {
+        let content_path = repo.join("non-utf8-name-content.md");
+        fs::write(
+            &content_path,
+            format!(
+                "---\ncreated: {created}T10:00:00\nupdated: {updated}T10:00:00\nstatus: finished\n---\n\n# Task\n"
+            ),
+        )
+        .expect("write content");
+        let content_arg = content_path.to_str().expect("temp path").to_string();
+        let sha = git_stdout(repo, &["hash-object", "-w", &content_arg], date);
+        let _ = fs::remove_file(&content_path);
+
+        let mut cacheinfo = format!("100644,{sha},").into_bytes();
+        cacheinfo.extend_from_slice(dir.as_bytes());
+        cacheinfo.push(b'/');
+        cacheinfo.extend_from_slice(name);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["update-index", "--add", "--cacheinfo"])
+            .arg(std::ffi::OsString::from_vec(cacheinfo))
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("git update-index");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let tree = git_stdout(repo, &["write-tree"], date);
+        let parent = git_stdout(repo, &["rev-parse", "HEAD"], date);
+        let commit = git_stdout(
+            repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &parent,
+                "-m",
+                "add a non-UTF-8 named task",
+            ],
+            date,
+        );
+        git(repo, &["update-ref", "refs/heads/main", &commit], date);
+    }
+
+    /// A warning message's fields, rendered as ` name=value` pairs.
+    struct WarningFields(String);
+
+    impl tracing::field::Visit for WarningFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, " {}={:?}", field.name(), value);
+        }
+    }
+
+    /// A layer that records every `WARN` event's fields, so a test can assert
+    /// the fallback-day warning without a process-wide subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedWarnings {
+        fn take(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .map(|mut warnings| std::mem::take(&mut *warnings))
+                .unwrap_or_default()
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CapturedWarnings
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut fields = WarningFields(String::new());
+            event.record(&mut fields);
+            if let Ok(mut warnings) = self.0.lock() {
+                warnings.push(fields.0);
+            }
+        }
+    }
+
+    #[test]
+    fn harvest_charts_a_non_utf8_named_task_and_warns_about_the_fallback_day() {
+        // The name decodes lossily, so the committed listing yields one lossy
+        // path. That path names no git object, so the leave day is the
+        // frontmatter `updated` day and the harvest warns about the gap instead
+        // of silently charting it.
+        let repo = scratch("harvest_non_utf8_name");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/scope_valid.md",
+            "2026-05-02",
+            "2026-05-02",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "valid task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        commit_non_utf8_named_task(
+            &repo,
+            "tasks/archive",
+            b"scope_bad\xff.md",
+            "2026-05-01",
+            "2026-05-20",
+            "2026-06-10T12:00:00+00:00",
+        );
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("a non-UTF-8 task name must not fail the harvest");
+
+        let lossy = "tasks/archive/scope_bad\u{FFFD}.md";
+        let matching: Vec<_> = tasks
+            .iter()
+            .filter(|task| task.path.contains('\u{FFFD}'))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "the lossy name must chart as one row: {tasks:?}"
+        );
+        assert_eq!(matching[0].path, lossy);
+        assert_eq!(matching[0].kind, TaskKind::Finished);
+        assert_eq!(
+            matching[0].leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 20).expect("day")),
+            "the frontmatter updated day stands in for the unreachable commit"
+        );
+        assert_eq!(matching[0].ship_date, matching[0].leave_date);
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains(lossy),
+            "the warning must name the lossy path: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("2026-05-20"),
+            "the warning must name the fallback day: {warnings:?}"
+        );
+
+        let valid = tasks
+            .iter()
+            .find(|task| task.path == "tasks/scope_valid.md")
+            .expect("the neighboring task keeps its path");
+        assert_eq!(
+            valid.created,
+            NaiveDate::from_ymd_opt(2026, 5, 2).expect("day")
+        );
+        assert_eq!(
+            valid.updated,
+            NaiveDate::from_ymd_opt(2026, 5, 2).expect("day")
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 

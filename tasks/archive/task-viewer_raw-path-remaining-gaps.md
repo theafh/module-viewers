@@ -2,9 +2,11 @@
 description: "Close the remaining raw-path gaps for task names holding a backslash, a glob character, or a non-UTF-8 byte."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T19:36:53
-status: ready
+updated: 2026-11-07T20:04:51
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Close the remaining raw-path gaps
@@ -15,7 +17,7 @@ A task file whose name holds a backslash, a glob character, or a non-UTF-8 byte 
 
 ## Context
 
-The archived [task-viewer_raw-paths-in-archive-walk](archive/task-viewer_raw-paths-in-archive-walk.md) task fixed quoted paths in the archive walk but left the backslash, glob, and non-UTF-8 name cases out of scope. `files_on_disk` rewrites each backslash to `/`, so a file `tasks/scope_a\b.md` reaches harvest as `tasks/scope_a/b.md` and parses with `scope: b.md`; when that file is committed, its `ls-tree` path and the rewritten working-tree path survive the `path.rsplit('/').next()` dedupe as two rows for one file. `git log -- <rel>` treats `*`, `?`, and `[` as pathspec globs. A non-UTF-8 path decodes lossily and names no object. These remain real gaps for task names outside the ASCII-safe set.
+The archived [task-viewer_raw-paths-in-archive-walk](task-viewer_raw-paths-in-archive-walk.md) task fixed quoted paths in the archive walk but left the backslash, glob, and non-UTF-8 name cases out of scope. `files_on_disk` rewrites each backslash to `/`, so a file `tasks/scope_a\b.md` reaches harvest as `tasks/scope_a/b.md` and parses with `scope: b.md`; when that file is committed, its `ls-tree` path and the rewritten working-tree path survive the `path.rsplit('/').next()` dedupe as two rows for one file. `git log -- <rel>` treats `*`, `?`, and `[` as pathspec globs. A non-UTF-8 path decodes lossily and names no object. These remain real gaps for task names outside the ASCII-safe set.
 
 ## Approach
 
