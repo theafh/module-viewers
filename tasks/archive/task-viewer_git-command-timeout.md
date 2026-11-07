@@ -2,9 +2,11 @@
 description: "Bound every read-only git subprocess with a timeout so a hung repository cannot hold the scan lock or a blocking thread forever."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T16:19:55
-status: ready
+updated: 2026-11-07T10:09:15
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Bound every git subprocess with a timeout

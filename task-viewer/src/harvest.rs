@@ -1,7 +1,8 @@
 use chrono::NaiveDate;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 use crate::dates::parse_iso_date;
@@ -82,6 +83,31 @@ impl From<std::io::Error> for HarvestError {
     }
 }
 
+impl From<GitFailure> for HarvestError {
+    fn from(value: GitFailure) -> Self {
+        Self::Git(value.to_string())
+    }
+}
+
+/// Why a git command did not produce a usable result.
+///
+/// `Timeout` is final: a hung command must reach `store_outcome` as a scan
+/// error instead of being retried or flattened into a frontmatter fallback.
+/// `Other` keeps the pre-existing fallbacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitFailure {
+    Timeout(String),
+    Other(String),
+}
+
+impl std::fmt::Display for GitFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout(reason) | Self::Other(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> {
     harvest_repository_with_prior(repo, &[])
@@ -105,7 +131,8 @@ pub fn harvest_repository_with_prior(
     // task stays visible whichever branch is checked out. The repository that
     // holds it is the folder's own `.git` or an enclosing one. A folder outside
     // git is charted from its files.
-    let git = GitContext::resolve(&repo);
+    let git =
+        GitContext::resolve(&repo).map_err(|failure| HarvestError::Git(failure.to_string()))?;
     let files = match git.repository() {
         Some((root, dir)) => {
             // A `.git` that git cannot open fails the scan; charting frontmatter
@@ -141,31 +168,31 @@ struct GitContext {
 }
 
 impl GitContext {
-    fn resolve(repo: &Path) -> Self {
+    fn resolve(repo: &Path) -> Result<Self, GitFailure> {
         if let Some(dir) = git_dir(repo) {
-            return Self {
+            return Ok(Self {
                 dir: Some(dir.clone()),
                 prefix: String::new(),
                 inside_repository: true,
                 root: Some(repo.to_path_buf()),
                 repository_dir: Some(dir),
-            };
+            });
         }
-        match enclosing_repository(repo) {
-            Some((prefix, root, dir)) => Self {
+        match enclosing_prefix(repo)? {
+            Some((prefix, root, dir)) => Ok(Self {
                 dir: None,
                 prefix,
                 inside_repository: true,
                 root: Some(root),
                 repository_dir: Some(dir),
-            },
-            None => Self {
+            }),
+            None => Ok(Self {
                 dir: None,
                 prefix: String::new(),
                 inside_repository: false,
                 root: None,
                 repository_dir: None,
-            },
+            }),
         }
     }
 
@@ -310,16 +337,10 @@ fn blob_days(
         "--",
         pathspec,
     ]);
-    let output = command
-        .output()
-        .map_err(|error| HarvestError::Git(format!("git did not start: {error}")))?;
+    let output = run_git_command(command, None, git_deadline(root))
+        .map_err(|failure| HarvestError::Git(failure.to_string()))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().find(|line| !line.trim().is_empty());
-        return Err(HarvestError::Git(match first {
-            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
-            None => format!("git exited with {}", output.status),
-        }));
+        return Err(HarvestError::Git(git_exit_message(&output)));
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let wanted: std::collections::HashSet<&str> = blobs.iter().map(String::as_str).collect();
@@ -400,7 +421,9 @@ fn harvest_files(
     }
 
     let mut from_git = 0usize;
-    for (index, leave_day) in leave_dates(repo, git, &pending, prior).map_err(HarvestError::Git)? {
+    for (index, leave_day) in leave_dates(repo, git, &pending, prior)
+        .map_err(|failure| HarvestError::Git(failure.to_string()))?
+    {
         let Some(task) = tasks.get_mut(index) else {
             continue;
         };
@@ -478,45 +501,22 @@ fn read_blobs(
     repo: &Path,
     dir: Option<&Path>,
     blobs: &[String],
-) -> Result<Vec<String>, HarvestError> {
+) -> Result<Vec<String>, GitFailure> {
     if blobs.is_empty() {
         return Ok(Vec::new());
     }
     let mut command = cat_file_command(repo, dir);
-    command
-        .args(["cat-file", "--batch"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| HarvestError::Git(format!("git did not start: {error}")))?;
+    command.args(["cat-file", "--batch"]);
     let mut input = String::new();
     for sha in blobs {
         input.push_str(sha);
         input.push('\n');
     }
     // Feed stdin from its own thread: a full stdout pipe would otherwise stop
-    // the child from draining stdin and deadlock the write below.
-    let writer = child.stdin.take().map(|mut stdin| {
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let _ = stdin.write_all(input.as_bytes());
-        })
-    });
-    let output = child
-        .wait_with_output()
-        .map_err(|error| HarvestError::Git(format!("git did not finish: {error}")))?;
-    if let Some(writer) = writer {
-        let _ = writer.join();
-    }
+    // the child from draining stdin and deadlock the write.
+    let output = run_git_command(command, Some(input.into_bytes()), git_deadline(repo))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().find(|line| !line.trim().is_empty());
-        return Err(HarvestError::Git(match first {
-            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
-            None => format!("git exited with {}", output.status),
-        }));
+        return Err(GitFailure::Other(git_exit_message(&output)));
     }
     parse_batch(&output.stdout, blobs.len())
 }
@@ -526,39 +526,16 @@ fn existing_object_indices(
     repo: &Path,
     dir: Option<&Path>,
     exprs: &[String],
-) -> Result<Vec<usize>, HarvestError> {
+) -> Result<Vec<usize>, GitFailure> {
     if exprs.is_empty() {
         return Ok(Vec::new());
     }
     let mut command = cat_file_command(repo, dir);
-    command
-        .args(["cat-file", "--batch-check"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| HarvestError::Git(format!("git did not start: {error}")))?;
+    command.args(["cat-file", "--batch-check"]);
     let input = format!("{}\n", exprs.join("\n"));
-    let writer = child.stdin.take().map(|mut stdin| {
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let _ = stdin.write_all(input.as_bytes());
-        })
-    });
-    let output = child
-        .wait_with_output()
-        .map_err(|error| HarvestError::Git(format!("git did not finish: {error}")))?;
-    if let Some(writer) = writer {
-        let _ = writer.join();
-    }
+    let output = run_git_command(command, Some(input.into_bytes()), git_deadline(repo))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().find(|line| !line.trim().is_empty());
-        return Err(HarvestError::Git(match first {
-            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
-            None => format!("git exited with {}", output.status),
-        }));
+        return Err(GitFailure::Other(git_exit_message(&output)));
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut indices = Vec::new();
@@ -577,7 +554,7 @@ fn existing_object_indices(
 
 /// Build a `git cat-file` command routed the same way as the other lookups.
 fn cat_file_command(repo: &Path, dir: Option<&Path>) -> Command {
-    let mut command = Command::new(git_bin());
+    let mut command = Command::new(git_program(repo));
     match dir {
         Some(dir) => {
             command
@@ -595,12 +572,12 @@ fn cat_file_command(repo: &Path, dir: Option<&Path>) -> Command {
     command
 }
 
-fn parse_batch(output: &[u8], expected: usize) -> Result<Vec<String>, HarvestError> {
+fn parse_batch(output: &[u8], expected: usize) -> Result<Vec<String>, GitFailure> {
     let mut contents = Vec::with_capacity(expected);
     let mut rest = output;
     for _ in 0..expected {
         let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
-            return Err(HarvestError::Git(
+            return Err(GitFailure::Other(
                 "git printed a truncated object header.".to_string(),
             ));
         };
@@ -610,12 +587,12 @@ fn parse_batch(output: &[u8], expected: usize) -> Result<Vec<String>, HarvestErr
             .nth(2)
             .and_then(|field| field.parse::<usize>().ok())
             .ok_or_else(|| {
-                HarvestError::Git(format!("git printed an unreadable object header: {header}"))
+                GitFailure::Other(format!("git printed an unreadable object header: {header}"))
             })?;
         let start = newline + 1;
         let end = start.saturating_add(size);
         let body = rest.get(start..end).ok_or_else(|| {
-            HarvestError::Git("git printed less content than it announced.".to_string())
+            GitFailure::Other("git printed less content than it announced.".to_string())
         })?;
         // A blob whose bytes are not valid UTF-8 parses to no task, the same
         // way `files_on_disk` skips a worktree file it cannot read. Push an
@@ -720,6 +697,41 @@ const GIT_SEARCH_DIRS: [&str; 6] = [
     "/sbin",
 ];
 
+/// How long a read-only git command may run before harvest kills it and records
+/// a scan error for that repository. A hung command must not hold the scan lock
+/// or a blocking thread forever.
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The git program to run for a repository. Production always uses `git_bin`;
+/// tests may route a fixture repository to a stand-in script through the
+/// repository-keyed override, without touching the process environment.
+fn git_program(repo: &Path) -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(program) = git_override::program(repo) {
+            return program;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = repo;
+    PathBuf::from(git_bin())
+}
+
+/// The deadline for a git command in `repo`. Production always returns
+/// `GIT_COMMAND_TIMEOUT`; a test may register a short deadline for its fixture
+/// repository.
+fn git_deadline(repo: &Path) -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(deadline) = git_override::deadline(repo) {
+            return deadline;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = repo;
+    GIT_COMMAND_TIMEOUT
+}
+
 fn git_path() -> std::ffi::OsString {
     // Standard locations first for Dock launches with a minimal PATH, then the
     // inherited PATH so a git outside them (Nix, a custom prefix) still runs.
@@ -763,6 +775,164 @@ fn scrub_git_env(command: &mut Command) {
         // pins, so it must not reach the listing under test.
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_PARAMETERS");
+}
+
+/// Run one read-only git command with a deadline.
+///
+/// The child's stdout and stderr are drained on their own threads while it
+/// runs, and an optional stdin payload is written from its own thread, so a
+/// child that fills a pipe cannot deadlock the wait. When the deadline passes
+/// the child is killed and reaped, and `GitFailure::Timeout` is returned.
+fn run_git_command(
+    mut command: Command,
+    input: Option<Vec<u8>>,
+    deadline: Duration,
+) -> Result<Output, GitFailure> {
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| GitFailure::Other(format!("git did not start: {error}")))?;
+    let stdout = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer);
+            buffer
+        })
+    });
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer);
+            buffer
+        })
+    });
+    let writer = input.and_then(|input| {
+        child.stdin.take().map(|mut stdin| {
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = stdin.write_all(&input);
+            })
+        })
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(GitFailure::Timeout(format!(
+                        "git did not finish within {} ms",
+                        deadline.as_millis()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(GitFailure::Other(format!("git did not finish: {error}")));
+            }
+        }
+    };
+    let stdout = stdout
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = stderr
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// The message a failed git process contributes, matching what the readers
+/// reported before the timeout helper existed.
+fn git_exit_message(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let first = stderr.lines().find(|line| !line.trim().is_empty());
+    match first {
+        Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
+        None => format!("git exited with {}", output.status),
+    }
+}
+
+/// Test-only per-repository git routing, keyed by canonical repository path in
+/// the shape of `walk_count`. An entry may carry a stand-in git script and a
+/// short deadline, so a harvest-level hang test drives the production sites
+/// without changing their signatures or the process environment.
+#[cfg(test)]
+mod git_override {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    #[derive(Clone, Default)]
+    struct Entry {
+        program: Option<PathBuf>,
+        deadline: Option<Duration>,
+    }
+
+    fn entries() -> &'static Mutex<HashMap<PathBuf, Entry>> {
+        static ENTRIES: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
+        ENTRIES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn canonical(repo: &Path) -> PathBuf {
+        std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf())
+    }
+
+    /// Look up the exact repository path or its nearest registered ancestor, so
+    /// a fixture may register the enclosing repository root while harvest works
+    /// in a nested folder that has no `.git` of its own.
+    fn find(repo: &Path) -> Option<Entry> {
+        let key = canonical(repo);
+        let entries = entries().lock().ok()?;
+        let mut candidate = Some(key.as_path());
+        while let Some(path) = candidate {
+            if let Some(entry) = entries.get(path) {
+                return Some(entry.clone());
+            }
+            candidate = path.parent();
+        }
+        None
+    }
+
+    pub(super) fn program(repo: &Path) -> Option<PathBuf> {
+        find(repo).and_then(|entry| entry.program)
+    }
+
+    pub(super) fn deadline(repo: &Path) -> Option<Duration> {
+        find(repo).and_then(|entry| entry.deadline)
+    }
+
+    pub(super) fn register(repo: &Path, program: Option<PathBuf>, deadline: Option<Duration>) {
+        if let Ok(mut entries) = entries().lock() {
+            entries.insert(canonical(repo), Entry { program, deadline });
+        }
+    }
+
+    pub(super) fn clear(repo: &Path) {
+        if let Ok(mut entries) = entries().lock() {
+            entries.remove(&canonical(repo));
+        }
+    }
 }
 
 /// Test-only tally of leave-day `git log` launches, keyed by repository path so
@@ -851,7 +1021,7 @@ fn leave_dates(
     git: &GitContext,
     jobs: &[LeaveJob],
     prior: &[PriorTask],
-) -> Result<LeaveDays, String> {
+) -> Result<LeaveDays, GitFailure> {
     // A folder outside git has no commit to offer. Return once instead of
     // spawning a failing git process for every archived task; the `updated`
     // fallback that `dates_for` seeded stays in place.
@@ -897,7 +1067,7 @@ fn first_archived_commit_date(
     git: &GitContext,
     rel: &str,
     expected: &str,
-) -> Result<Option<NaiveDate>, String> {
+) -> Result<Option<NaiveDate>, GitFailure> {
     if !git.inside_repository {
         return Ok(None);
     }
@@ -906,12 +1076,14 @@ fn first_archived_commit_date(
         match archived_leave_lookup(repo, rel, Some(dir), &git.prefix, expected) {
             Ok(Some(day)) => return Ok(Some(day)),
             Ok(None) => return Ok(None),
+            Err(GitFailure::Timeout(reason)) => return Err(GitFailure::Timeout(reason)),
             Err(reason) => first_failure = Some(reason),
         }
     }
     match archived_leave_lookup(repo, rel, None, &git.prefix, expected) {
         Ok(Some(day)) => Ok(Some(day)),
         Ok(None) => Ok(None),
+        Err(GitFailure::Timeout(reason)) => Err(GitFailure::Timeout(reason)),
         Err(reason) if git.dir.is_some() => Err(first_failure.unwrap_or(reason)),
         Err(_) => Ok(None),
     }
@@ -923,13 +1095,13 @@ fn archived_leave_lookup(
     dir: Option<&Path>,
     prefix: &str,
     expected: &str,
-) -> Result<Option<NaiveDate>, String> {
+) -> Result<Option<NaiveDate>, GitFailure> {
     #[cfg(test)]
     walk_count::record(repo);
     let mut command = match dir {
         Some(dir) => git_dir_command(repo, dir),
         None => {
-            let mut command = Command::new(git_bin());
+            let mut command = Command::new(git_program(repo));
             command.arg("-C").arg(repo);
             command
         }
@@ -938,27 +1110,20 @@ fn archived_leave_lookup(
     // `-z` prints every path raw. Without it git C-quotes a path holding a
     // non-ASCII byte or a double quote, and the quoted form matches neither the
     // raw folder prefix nor any object.
-    let output = command
-        .args([
-            "log",
-            "-z",
-            "--follow",
-            "--diff-merges=first-parent",
-            "--name-only",
-            "--format=%cI %H",
-            "--all",
-            "--",
-            rel,
-        ])
-        .output()
-        .map_err(|error| format!("git did not start: {error}"))?;
+    command.args([
+        "log",
+        "-z",
+        "--follow",
+        "--diff-merges=first-parent",
+        "--name-only",
+        "--format=%cI %H",
+        "--all",
+        "--",
+        rel,
+    ]);
+    let output = run_git_command(command, None, git_deadline(repo))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().find(|line| !line.trim().is_empty());
-        return Err(match first {
-            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
-            None => format!("git exited with {}", output.status),
-        });
+        return Err(GitFailure::Other(git_exit_message(&output)));
     }
     let records = parse_archive_log(&output.stdout);
     let mut exprs = Vec::new();
@@ -978,9 +1143,9 @@ fn archived_leave_lookup(
         exprs.push(format!("{commit}:{path}"));
         days.push(day);
     }
-    let indices = existing_object_indices(repo, dir, &exprs).map_err(|error| error.to_string())?;
+    let indices = existing_object_indices(repo, dir, &exprs)?;
     let blobs: Vec<String> = indices.iter().map(|&index| exprs[index].clone()).collect();
-    let contents = read_blobs(repo, dir, &blobs).map_err(|error| error.to_string())?;
+    let contents = read_blobs(repo, dir, &blobs)?;
     let mut earliest: Option<NaiveDate> = None;
     for (index, text) in indices.iter().zip(contents) {
         if !has_archived_status(&text, expected) {
@@ -1032,30 +1197,38 @@ fn parse_archive_log(output: &[u8]) -> Vec<(NaiveDate, String, String)> {
 
 /// The repository that holds a folder without its own `.git`: the folder's path
 /// inside it (ending in `/`), that repository's worktree root, and its git dir.
-/// `None` when no enclosing repository holds the folder.
-fn enclosing_repository(repo: &Path) -> Option<(String, PathBuf, PathBuf)> {
-    let mut command = Command::new(git_bin());
+/// `Ok(None)` when no enclosing repository holds the folder; a timed-out
+/// `rev-parse` is final and returns `Err(GitFailure::Timeout)`.
+fn enclosing_prefix(repo: &Path) -> Result<Option<(String, PathBuf, PathBuf)>, GitFailure> {
+    let mut command = Command::new(git_program(repo));
     command.arg("-C").arg(repo);
     scrub_git_env(&mut command);
     // One `rev-parse` supplies the prefix, root, and git dir in argument order.
-    let output = command
-        .args([
-            "rev-parse",
-            "--show-prefix",
-            "--show-toplevel",
-            "--absolute-git-dir",
-        ])
-        .output()
-        .ok()?;
+    command.args([
+        "rev-parse",
+        "--show-prefix",
+        "--show-toplevel",
+        "--absolute-git-dir",
+    ]);
+    let output = match run_git_command(command, None, git_deadline(repo)) {
+        Ok(output) => output,
+        Err(GitFailure::Timeout(reason)) => return Err(GitFailure::Timeout(reason)),
+        // An ordinary failure means git cannot name an enclosing repository.
+        Err(GitFailure::Other(_)) => return Ok(None),
+    };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = text.lines();
-    let prefix = lines.next()?.to_string();
-    let root = PathBuf::from(lines.next()?);
-    let dir = PathBuf::from(lines.next()?);
-    Some((prefix, root, dir))
+    let (Some(prefix), Some(root), Some(dir)) = (lines.next(), lines.next(), lines.next()) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        prefix.to_string(),
+        PathBuf::from(root),
+        PathBuf::from(dir),
+    )))
 }
 
 /// A stable 64-bit FNV-1a hash of the bytes a task row was parsed from. Only
@@ -1104,7 +1277,7 @@ fn first_status_commit_date(
     git: &GitContext,
     rel: &str,
     status: &str,
-) -> Result<Option<NaiveDate>, String> {
+) -> Result<Option<NaiveDate>, GitFailure> {
     if !git.inside_repository {
         return Ok(None);
     }
@@ -1125,7 +1298,7 @@ fn first_status_commit_date(
 enum LogLookup {
     Found(NaiveDate),
     Miss,
-    Failed(String),
+    Failed(GitFailure),
 }
 
 fn run_git_log(
@@ -1149,20 +1322,18 @@ fn run_git_log(
         "--all",
     ];
     args.extend([flag, pattern, "--", rel]);
-    let output = match command.args(&args).output() {
+    command.args(&args);
+    let output = match run_git_command(command, None, git_deadline(_repo)) {
         Ok(output) => output,
-        Err(error) => return LogLookup::Failed(format!("git did not start: {error}")),
+        Err(failure) => return LogLookup::Failed(failure),
     };
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().find(|line| !line.trim().is_empty());
-        return LogLookup::Failed(match first {
-            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
-            None => format!("git exited with {}", output.status),
-        });
+        return LogLookup::Failed(GitFailure::Other(git_exit_message(&output)));
     }
     let Ok(text) = String::from_utf8(output.stdout) else {
-        return LogLookup::Failed("git printed output that is not UTF-8".to_string());
+        return LogLookup::Failed(GitFailure::Other(
+            "git printed output that is not UTF-8".to_string(),
+        ));
     };
     // Earliest hit. Do not use `--reverse` with `--follow` (drops renames).
     match text.lines().filter_map(parse_iso_date).min() {
@@ -1175,7 +1346,7 @@ fn git_dir_command(repo: &Path, dir: &Path) -> Command {
     // With an explicit --work-tree, git reads a relative pathspec from its
     // working directory when that lies inside the work tree. Run from the
     // repository root so `rel` resolves the same wherever the server started.
-    let mut command = Command::new(git_bin());
+    let mut command = Command::new(git_program(repo));
     command
         .current_dir(repo)
         .arg("--git-dir")
@@ -1191,7 +1362,7 @@ fn git_pickaxe(
     rel: &str,
     flag: &str,
     pattern: &str,
-) -> Result<Option<NaiveDate>, String> {
+) -> Result<Option<NaiveDate>, GitFailure> {
     // 1) Explicit --git-dir beats an inherited GIT_DIR (Cursor sets one).
     // Fall back to -C only when the folder has no own `.git` or that call fails
     // to run.
@@ -1200,15 +1371,19 @@ fn git_pickaxe(
         match run_git_log(repo, git_dir_command(repo, dir), flag, pattern, rel) {
             LogLookup::Found(day) => return Ok(Some(day)),
             LogLookup::Miss => return Ok(None),
+            LogLookup::Failed(GitFailure::Timeout(reason)) => {
+                return Err(GitFailure::Timeout(reason));
+            }
             LogLookup::Failed(reason) => first_failure = Some(reason),
         }
     }
     // 2) Plain -C with scrubbed env.
-    let mut command = Command::new(git_bin());
+    let mut command = Command::new(git_program(repo));
     command.arg("-C").arg(repo);
     match run_git_log(repo, command, flag, pattern, rel) {
         LogLookup::Found(day) => Ok(Some(day)),
         LogLookup::Miss => Ok(None),
+        LogLookup::Failed(GitFailure::Timeout(reason)) => Err(GitFailure::Timeout(reason)),
         // A folder with its own `.git` that git cannot read means git cannot
         // run here (a sandbox, a broken install). Stop the scan rather than
         // chart frontmatter dates as ship days.
@@ -1222,17 +1397,11 @@ fn git_pickaxe(
 fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = git_dir_command(repo, dir);
     scrub_git_env(&mut command);
-    let output = command
-        .args(args)
-        .output()
-        .map_err(|error| format!("git did not start: {error}"))?;
+    command.args(args);
+    let output = run_git_command(command, None, git_deadline(repo))
+        .map_err(|failure| failure.to_string())?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().find(|line| !line.trim().is_empty());
-        return Err(match first {
-            Some(line) => format!("git exited with {}: {}", output.status, line.trim()),
-            None => format!("git exited with {}", output.status),
-        });
+        return Err(git_exit_message(&output));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -1240,15 +1409,20 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HarvestError, ParsedTask, PriorTask, TaskKind, escape_posix_ere, git_dir_command, git_path,
-        harvest_repository, harvest_repository_with_prior, parse_archive_log, scrub_git_env,
-        take_leave_walk_count, take_worktree_read_count,
+        GIT_COMMAND_TIMEOUT, GitFailure, HarvestError, LogLookup, ParsedTask, PriorTask, TaskKind,
+        archived_leave_lookup, blob_days, enclosing_prefix, escape_posix_ere,
+        existing_object_indices, git_bin, git_deadline, git_dir_command, git_override, git_path,
+        git_read, harvest_repository, harvest_repository_with_prior, parse_archive_log, read_blobs,
+        run_git_command, run_git_log, scrub_git_env, take_leave_walk_count,
+        take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
     use std::fs;
-    use std::path::Path;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::Duration;
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let path = unique_temp_dir(name);
@@ -3519,5 +3693,470 @@ mod tests {
         assert_eq!(tasks.len(), 1, "only the valid task charts: {tasks:?}");
         assert_eq!(tasks[0].path, "tasks/scope_valid.md");
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    fn fake_git_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake git");
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod fake git");
+        path
+    }
+
+    fn register_fake_git_with_deadline(repo: &Path, script: &Path, deadline: Duration) {
+        // Start the stand-in once at a generous deadline so the production-site
+        // deadline measures the hang, not the first process start under load.
+        let _ = run_git_command(Command::new(script), None, Duration::from_secs(1));
+        git_override::register(repo, Some(script.to_path_buf()), Some(deadline));
+    }
+
+    fn register_fake_git(repo: &Path, script: &Path) {
+        register_fake_git_with_deadline(repo, script, Duration::from_millis(100));
+    }
+
+    fn clear_fake_git(repo: &Path) {
+        git_override::clear(repo);
+    }
+
+    /// A wrapper that answers every call with the real git except the command
+    /// form the given `case` arm matches, which hangs past the 100 ms deadline.
+    fn dispatch_script(hang_pattern: &str) -> String {
+        format!(
+            "case \"$*\" in\n  {hang_pattern}) exec sleep 10 ;;\n  *) exec {} \"$@\" ;;\nesac",
+            git_bin()
+        )
+    }
+
+    #[test]
+    fn git_deadline_defaults_to_the_production_timeout() {
+        let repo = scratch("harvest_deadline_default");
+        assert_eq!(git_deadline(&repo), GIT_COMMAND_TIMEOUT);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// The pid a stand-in recorded, when its write completed.
+    fn recorded_pid(pid_file: &Path) -> Option<String> {
+        fs::read_to_string(pid_file)
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|pid| !pid.is_empty())
+    }
+
+    #[test]
+    fn run_git_command_times_out_and_kills_the_child() {
+        let dir = scratch("harvest_helper_timeout");
+        let pid_file = dir.join("pid");
+        let script = fake_git_script(
+            &dir,
+            "hang.sh",
+            &format!("echo $$ > {}\nexec sleep 10", pid_file.display()),
+        );
+        // The deadline must outlast the stand-in's first line so the pid write
+        // completes, but no fixed value survives an arbitrarily loaded machine
+        // under a parallel test run. Retry with a longer deadline until the
+        // stand-in has demonstrably recorded its pid, so the assertion never
+        // depends on process-start latency. The stand-in sleeps far past every
+        // deadline, so each started attempt times out.
+        let mut deadline = Duration::from_millis(250);
+        let (result, pid) = loop {
+            let _ = fs::remove_file(&pid_file);
+            let result = run_git_command(Command::new(&script), None, deadline);
+            if let Some(pid) = recorded_pid(&pid_file) {
+                break (result, pid);
+            }
+            assert!(
+                deadline < Duration::from_secs(8),
+                "the stand-in never started within {deadline:?}"
+            );
+            deadline *= 2;
+        };
+        assert!(
+            matches!(result, Err(GitFailure::Timeout(_))),
+            "a hung command must time out: {result:?}"
+        );
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("kill -0")
+            .success();
+        assert!(!alive, "the timed-out child {pid} must be gone");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_git_command_drains_output_larger_than_a_pipe_buffer() {
+        // 256 KiB on both pipes is more than a pipe buffer, so a helper that
+        // waited before draining would deadlock until the deadline.
+        let dir = scratch("harvest_helper_large_output");
+        let script = fake_git_script(
+            &dir,
+            "big.sh",
+            "head -c 262144 /dev/zero | tr '\\000' 'o'\nhead -c 262144 /dev/zero | tr '\\000' 'e' >&2",
+        );
+        let output = run_git_command(Command::new(&script), None, Duration::from_secs(5))
+            .expect("large output must not time out");
+        assert_eq!(output.stdout.len(), 262144);
+        assert!(output.stdout.iter().all(|byte| *byte == b'o'));
+        assert_eq!(output.stderr.len(), 262144);
+        assert!(output.stderr.iter().all(|byte| *byte == b'e'));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn harvest_hanging_git_returns_a_scan_error() {
+        let repo = scratch("harvest_hanging_git");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "live task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let bin = scratch("harvest_hanging_git_bin");
+        let script = fake_git_script(&bin, "git", "exec sleep 10");
+        register_fake_git(&repo, &script);
+
+        let error = harvest_repository(&repo).expect_err("a hanging git must fail the scan");
+        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_every_git_site_returns_at_the_deadline() {
+        let repo = scratch("harvest_sites_timeout");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let dir = repo.join(".git");
+        let bin = scratch("harvest_sites_timeout_bin");
+        let script = fake_git_script(&bin, "git", "exec sleep 10");
+        register_fake_git(&repo, &script);
+
+        let error = git_read(&repo, &dir, &["rev-parse", "--git-dir"]).expect_err("git_read");
+        assert!(error.contains("did not finish"), "{error}");
+
+        let error = blob_days(&repo, &dir, &[], "tasks").expect_err("blob_days");
+        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+
+        let blobs = vec!["abc".to_string()];
+        let error = read_blobs(&repo, Some(&dir), &blobs).expect_err("read_blobs");
+        assert!(matches!(error, GitFailure::Timeout(_)), "{error:?}");
+
+        let exprs = vec!["abc".to_string()];
+        let error = existing_object_indices(&repo, Some(&dir), &exprs).expect_err("batch-check");
+        assert!(matches!(error, GitFailure::Timeout(_)), "{error:?}");
+
+        let lookup = run_git_log(
+            &repo,
+            git_dir_command(&repo, &dir),
+            "-S",
+            "status: open",
+            "tasks/scope_live.md",
+        );
+        assert!(
+            matches!(lookup, LogLookup::Failed(GitFailure::Timeout(_))),
+            "run_git_log must time out"
+        );
+
+        let error = archived_leave_lookup(&repo, "tasks/x.md", Some(&dir), "", "finished")
+            .expect_err("archived_leave_lookup");
+        assert!(matches!(error, GitFailure::Timeout(_)), "{error:?}");
+
+        let error = enclosing_prefix(&repo).expect_err("enclosing_prefix");
+        assert!(matches!(error, GitFailure::Timeout(_)), "{error:?}");
+
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    fn nested_enclosing_fixture(name: &str) -> PathBuf {
+        let parent = scratch(name);
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&parent, "nested/tasks/scope_live.md", "2026-05-01", "open");
+        write_task_dated(
+            &parent,
+            "nested/tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&parent, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "live and archived nested tasks"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        parent
+    }
+
+    #[test]
+    fn harvest_nested_archive_log_timeout_records_a_scan_error() {
+        // The enclosing repository resolves, but the leave-day `git log
+        // --follow` hangs, so the archived task must not fall back to its
+        // `updated` day.
+        let parent = nested_enclosing_fixture("harvest_nested_archive_timeout");
+        let bin = scratch("harvest_nested_archive_timeout_bin");
+        let script = fake_git_script(&bin, "git", &dispatch_script("*--follow*"));
+        register_fake_git(&parent, &script);
+
+        let error = harvest_repository(&parent.join("nested"))
+            .expect_err("the leave-day log must time out");
+        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        clear_fake_git(&parent);
+        let _ = fs::remove_dir_all(&parent);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_nested_pickaxe_timeout_records_a_scan_error() {
+        // An archived task whose status is not finished/deferred routes through
+        // `git_pickaxe`; a hung pickaxe must not be flattened to a miss.
+        let parent = scratch("harvest_nested_pickaxe_timeout");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&parent, "nested/tasks/scope_live.md", "2026-05-01", "open");
+        write_task(
+            &parent,
+            "nested/tasks/archive/scope_open.md",
+            "2026-05-01",
+            "open",
+        );
+        git(&parent, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "archived open nested task"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        let bin = scratch("harvest_nested_pickaxe_timeout_bin");
+        let script = fake_git_script(&bin, "git", &dispatch_script("*--follow*"));
+        register_fake_git(&parent, &script);
+
+        let error =
+            harvest_repository(&parent.join("nested")).expect_err("the pickaxe log must time out");
+        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        clear_fake_git(&parent);
+        let _ = fs::remove_dir_all(&parent);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_nested_batch_check_timeout_records_a_scan_error() {
+        // The archive log answers, so the hang happens in the nested batch
+        // reader and must reach the scan error instead of becoming a miss.
+        let parent = nested_enclosing_fixture("harvest_nested_batch_check_timeout");
+        let bin = scratch("harvest_nested_batch_check_timeout_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &dispatch_script("*\"cat-file --batch-check\"*"),
+        );
+        register_fake_git(&parent, &script);
+
+        let error =
+            harvest_repository(&parent.join("nested")).expect_err("the batch-check must time out");
+        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        clear_fake_git(&parent);
+        let _ = fs::remove_dir_all(&parent);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_nested_hanging_rev_parse_records_a_scan_error() {
+        let parent = nested_enclosing_fixture("harvest_nested_rev_parse_timeout");
+        let bin = scratch("harvest_nested_rev_parse_timeout_bin");
+        let script = fake_git_script(&bin, "git", &dispatch_script("*rev-parse*"));
+        register_fake_git(&parent, &script);
+
+        let error = harvest_repository(&parent.join("nested"))
+            .expect_err("a hung rev-parse must not look like a folder outside git");
+        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        clear_fake_git(&parent);
+        let _ = fs::remove_dir_all(&parent);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_timeout_does_not_retry_the_git_dir_fallback() {
+        let repo = scratch("harvest_no_retry");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
+        write_task(&repo, "tasks/archive/scope_open.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archived open task"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        let bin = scratch("harvest_no_retry_bin");
+        let calls = bin.join("calls");
+        // Answer the commands before the pickaxe from the wrapper itself, so
+        // the only process work under the 100 ms deadline is the hang. The
+        // pickaxe's `--follow` call is the sole invocation the test counts.
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "case \"$*\" in\n  *--follow*) echo \"$*\" >> {}; exec sleep 10 ;;\n  *rev-parse*) echo .git ;;\n  *for-each-ref*) ;;\n  *ls-tree*) ;;\n  *\"log --all\"*) ;;\n  *) exec {} \"$@\" ;;\nesac",
+                calls.display(),
+                git_bin()
+            ),
+        );
+        register_fake_git(&repo, &script);
+
+        // The wrapper records its invocation from inside the stand-in, so a
+        // loaded machine can expire the 100 ms deadline before the wrapper
+        // reaches its first line. Retry the scan until the stand-in has
+        // demonstrably run once, then count within that single scan, so the
+        // count never depends on process-start latency while the deadline and
+        // the exactly-one assertion stay unchanged.
+        let mut recorded = String::new();
+        let mut outcome = None;
+        for _ in 0..6 {
+            let _ = fs::remove_file(&calls);
+            let attempt = harvest_repository(&repo);
+            recorded = fs::read_to_string(&calls).unwrap_or_default();
+            let started = !recorded.trim().is_empty();
+            outcome = Some(attempt);
+            if started {
+                break;
+            }
+        }
+        let error = outcome
+            .expect("the scan ran")
+            .expect_err("the pickaxe log must time out");
+        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        let follow_calls = recorded
+            .lines()
+            .filter(|line| line.contains("--follow"))
+            .count();
+        assert_eq!(
+            follow_calls, 1,
+            "a timed-out command must not be retried: {recorded}"
+        );
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_hanging_batch_read_records_a_scan_error() {
+        let repo = scratch("harvest_batch_timeout");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archived task"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        let bin = scratch("harvest_batch_timeout_bin");
+        // The dispatch pattern also matches `--batch-check`, so answer that
+        // form with the real git before the batch arm can see it.
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "case \"$*\" in\n  *\"cat-file --batch-check\"*) exec {} \"$@\" ;;\n  *\"cat-file --batch\"*) exec sleep 10 ;;\n  *) exec {} \"$@\" ;;\nesac",
+                git_bin(),
+                git_bin()
+            ),
+        );
+        register_fake_git(&repo, &script);
+
+        let error = harvest_repository(&repo).expect_err("the batch read must time out");
+        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_ordinary_git_dir_failure_keeps_the_fallback() {
+        let repo = scratch("harvest_git_dir_fallback");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
+        write_task(&repo, "tasks/archive/scope_open.md", "2026-05-01", "open");
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive tasks"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        let bin = scratch("harvest_git_dir_fallback_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "case \"$*\" in\n  *--git-dir*--follow*) echo 'fatal: simulated --git-dir failure' >&2; exit 128 ;;\n  *) exec {} \"$@\" ;;\nesac",
+                git_bin()
+            ),
+        );
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(2));
+
+        let tasks = harvest_repository(&repo).expect("an ordinary failure keeps the -C fallback");
+        let done = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_done.md"))
+            .expect("finished task");
+        assert_eq!(
+            done.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        assert_eq!(done.leave_date, done.ship_date);
+        let archived_open = tasks
+            .iter()
+            .find(|task| task.path.ends_with("archive/scope_open.md"))
+            .expect("archived open task");
+        assert_eq!(
+            archived_open.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
     }
 }
