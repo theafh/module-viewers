@@ -2,9 +2,11 @@
 description: "Keep Update bounded and result-storing when the HTTP client disconnects, so a dropped request cannot release the scan lock while blocking harvests still run."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T16:04:18
-status: ready
+updated: 2026-11-07T08:31:15
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Keep Update bounded when the client disconnects

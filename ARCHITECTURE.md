@@ -57,6 +57,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 - Parsed rows are the chart base, so a dashboard view does not re-walk repositories until Update or a newly added repository.
 - The binary reads repository files and git history. It does not write into those repositories.
 - Update runs harvests in parallel but stores their results one repository at a time, because overlapping writes would queue on SQLite's write lock, and a write that waits past the five-second busy timeout would leave its repository with old rows and a scan error.
+- Update owns the scan lock inside a detached task that spans listing the repositories, harvesting, and storing, so a disconnected request leaves the run to finish and store rather than releasing the lock while blocking harvests still run.
 - Static assets and templates resolve from the crate directory recorded at compile time, so `make run` works from this workspace root.
 
 ## Direction

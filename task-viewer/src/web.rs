@@ -61,6 +61,7 @@ pub struct AppState {
     scan_workers: usize,
     picker: Arc<PickerFn>,
     store_hook: Arc<StoreHookFn>,
+    harvest: Arc<HarvestFn>,
     flash: Arc<Mutex<FlashStore>>,
 }
 
@@ -74,6 +75,7 @@ impl AppState {
             scan_workers: scan_worker_cap(raw.as_deref()),
             picker: Arc::new(pick_folder),
             store_hook: Arc::new(|| Box::pin(ready(()))),
+            harvest: Arc::new(harvest::harvest_repository_with_prior),
             flash: Arc::new(Mutex::new(FlashStore::default())),
         }
     }
@@ -616,23 +618,41 @@ async fn remove_repository(State(state): State<AppState>, Path(id): Path<i64>) -
 
 async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) -> Response {
     let project = safe_project(&form.project);
+    // The run owns `state.scan` and the store loop inside its own task, so a
+    // client that disconnects drops only the handler. The detached run keeps
+    // the lock and finishes storing every harvested result, which leaves the
+    // next Update and Remove waiting for it instead of racing its harvests.
+    let handle = tokio::spawn(run_scan(state.clone()));
+    match handle.await {
+        Ok(Ok(report)) => scan_response(&state, &project, &report).await,
+        Ok(Err(message)) => redirect(&project, "error", message),
+        Err(error) => {
+            tracing::error!(%error, "the scan task stopped");
+            redirect(&project, "error", STOPPED_ERROR)
+        }
+    }
+}
+
+/// List the repositories, harvest them, and store each result while holding the
+/// scan lock. Only this task acquires the lock; `scan_core` never does, so the
+/// whole list-then-harvest-then-store sequence stays under one owner.
+async fn run_scan(state: AppState) -> Result<ScanReport, &'static str> {
     let _guard = state.scan.lock().await;
     let repositories = match db::list_repositories(&state.pool).await {
         Ok(repositories) => repositories,
         Err(error) => {
             tracing::error!(%error, "list failed");
-            return redirect(&project, "error", "The repository list could not be read.");
+            return Err("The repository list could not be read.");
         }
     };
-    let report = scan_core(
+    Ok(scan_core(
         &state.pool,
         &repositories,
         state.scan_workers,
-        Arc::new(harvest::harvest_repository_with_prior),
+        Arc::clone(&state.harvest),
         &state.store_hook,
     )
-    .await;
-    scan_response(&state, &project, &report).await
+    .await)
 }
 
 type HarvestFn =
@@ -1082,6 +1102,43 @@ mod tests {
             .oneshot(request)
             .await
             .expect("router responds")
+    }
+
+    /// Drive one Update through the router in its own task, so a test can drop
+    /// the request future the way a disconnected client does.
+    fn start_update(state: AppState) -> tokio::task::JoinHandle<axum::response::Response> {
+        let request = form_post("/scan", None, None);
+        tokio::spawn(async move {
+            router(state)
+                .oneshot(request)
+                .await
+                .expect("router responds")
+        })
+    }
+
+    /// Drop one in-flight request future and wait for the abort to land, which
+    /// leaves the handler's detached scan task running on its own.
+    async fn drop_request(handle: tokio::task::JoinHandle<axum::response::Response>) {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// Wait until the detached scan has stored rows for `repository_id`, so a
+    /// test observes the store that happens after its request was dropped.
+    async fn wait_for_rows(
+        pool: &sqlx::SqlitePool,
+        repository_id: i64,
+    ) -> Vec<crate::series::TaskRecord> {
+        for _ in 0..100 {
+            let rows = db::load_tasks(pool, Some(repository_id))
+                .await
+                .expect("rows");
+            if !rows.is_empty() {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the detached scan never stored its rows");
     }
 
     /// One GET carrying the `Host` the browser sends, so a test can choose
@@ -1696,6 +1753,306 @@ mod tests {
         for folder in folders {
             let _ = std::fs::remove_dir_all(folder);
         }
+        cleanup(&path);
+    }
+
+    /// Acceptance: dropping the Update request leaves the scan task holding the
+    /// scan lock until its stores finish, so a second Update's harvest never
+    /// enters while the first blocking harvest is held, and the peak number of
+    /// concurrent blocking harvests across both runs stays within the cap.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_keeps_the_lock_when_the_request_is_dropped() {
+        let (mut state, path) = app_state("scan_drop_lock").await;
+        state.scan_workers = 2;
+        let folder = live_repository("scan_drop_lock_repo");
+        db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+
+        let entries = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let harvest: Arc<HarvestFn> = {
+            let entries = Arc::clone(&entries);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            Arc::new(move |_: &Path, _: &[PriorTask]| {
+                let index = entries.fetch_add(1, Ordering::SeqCst);
+                let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(running, Ordering::SeqCst);
+                let _ = entered_tx.blocking_send(());
+                if index == 0
+                    && let Ok(release) = release_rx.lock()
+                {
+                    let _ = release.recv();
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec![parsed_task()])
+            })
+        };
+        state.harvest = harvest;
+
+        let first = start_update(state.clone());
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the first harvest is entered")
+            .expect("the harvest signalled");
+        drop_request(first).await;
+
+        let second = start_update(state.clone());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), entered_rx.recv())
+                .await
+                .is_err(),
+            "the second run must not harvest while the dropped run still holds the lock"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "one blocking harvest runs at a time"
+        );
+
+        release_tx.send(()).expect("release the held harvest");
+        let response = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the second Update finishes")
+            .expect("the second request joins");
+        flash_token(&redirect_location(&response), "all");
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the second run harvests after the release")
+            .expect("the second harvest signalled");
+        assert!(
+            peak.load(Ordering::SeqCst) <= state.scan_workers,
+            "the peak concurrent harvests stay within the cap"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Acceptance: the detached scan still stores the rows it harvested after
+    /// the request future is dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_stores_rows_after_the_request_is_dropped() {
+        let (mut state, path) = app_state("scan_drop_store").await;
+        let folder = live_repository("scan_drop_store_repo");
+        let repository_id = db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let harvest: Arc<HarvestFn> = {
+            let entries = Arc::new(AtomicUsize::new(0));
+            Arc::new(move |_: &Path, _: &[PriorTask]| {
+                let index = entries.fetch_add(1, Ordering::SeqCst);
+                let _ = entered_tx.blocking_send(());
+                if index == 0
+                    && let Ok(release) = release_rx.lock()
+                {
+                    let _ = release.recv();
+                }
+                Ok(vec![parsed_task()])
+            })
+        };
+        state.harvest = harvest;
+
+        let first = start_update(state.clone());
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the first harvest is entered")
+            .expect("the harvest signalled");
+        drop_request(first).await;
+        release_tx.send(()).expect("release the held harvest");
+
+        let rows = wait_for_rows(&state.pool, repository_id).await;
+        assert_eq!(rows.len(), 1, "the detached scan stored its harvested row");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Acceptance: a normal Update request still returns the same scan report,
+    /// so the detached run changes only what a disconnect does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_request_still_reports_a_clean_run() {
+        let (mut state, path) = app_state("scan_normal_report").await;
+        let folder = live_repository("scan_normal_report_repo");
+        let repository_id = db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        state.harvest = Arc::new(|_: &Path, _: &[PriorTask]| Ok(vec![parsed_task()]));
+
+        let response = send(state.clone(), form_post("/scan", None, None)).await;
+        let location = redirect_location(&response);
+        let token = flash_token(&location, "all");
+        assert_eq!(
+            state.flash.lock().await.take(&token),
+            Some(("notice", "Charts updated.".to_string())),
+            "the run reports the same clean banner"
+        );
+        let rows = db::load_tasks(&state.pool, Some(repository_id))
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Acceptance: Remove waits for the detached scan, then runs once that scan
+    /// has stored its rows, so a dropped request cannot let a delete overtake a
+    /// still-running harvest.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_remove_waits_for_the_detached_scan() {
+        let (mut state, path) = app_state("scan_drop_remove").await;
+        state.scan_workers = 1;
+        let scanned = live_repository("scan_drop_remove_scanned");
+        let scanned_id = db::insert_repository(&state.pool, "scanned", &scanned.to_string_lossy())
+            .await
+            .expect("insert");
+        let removed = live_repository("scan_drop_remove_removed");
+        let removed_id = db::insert_repository(&state.pool, "removed", &removed.to_string_lossy())
+            .await
+            .expect("insert");
+
+        let entries = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let harvest: Arc<HarvestFn> = {
+            let entries = Arc::clone(&entries);
+            Arc::new(move |_: &Path, _: &[PriorTask]| {
+                let index = entries.fetch_add(1, Ordering::SeqCst);
+                let _ = entered_tx.blocking_send(());
+                if index == 0
+                    && let Ok(release) = release_rx.lock()
+                {
+                    let _ = release.recv();
+                }
+                Ok(vec![parsed_task()])
+            })
+        };
+        state.harvest = harvest;
+
+        let first = start_update(state.clone());
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the first harvest is entered")
+            .expect("the harvest signalled");
+        drop_request(first).await;
+
+        let remove = tokio::spawn(remove_repository(State(state.clone()), UrlPath(removed_id)));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !remove.is_finished(),
+            "Remove waits for the detached scan's lock"
+        );
+
+        release_tx.send(()).expect("release the held harvest");
+        let response = tokio::time::timeout(Duration::from_secs(10), remove)
+            .await
+            .expect("Remove finishes after the detached scan")
+            .expect("Remove task joins");
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=Repository%20removed."
+        );
+        let rows = db::load_tasks(&state.pool, Some(scanned_id))
+            .await
+            .expect("rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the detached scan stored its rows before Remove ran"
+        );
+        let after = db::list_repositories(&state.pool).await.expect("after");
+        assert!(
+            !after
+                .iter()
+                .any(|repository| repository.repository_id == removed_id),
+            "the repository is gone"
+        );
+        let _ = std::fs::remove_dir_all(scanned);
+        let _ = std::fs::remove_dir_all(removed);
+        cleanup(&path);
+    }
+
+    /// Acceptance: a second Update's store entry and response both wait for a
+    /// held store from the first, detached run, and the peak concurrent store
+    /// entries stays at one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_second_update_waits_for_the_detached_store() {
+        let (mut state, path) = app_state("scan_drop_store_lock").await;
+        let folder = live_repository("scan_drop_store_lock_repo");
+        db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        state.harvest = Arc::new(|_: &Path, _: &[PriorTask]| Ok(vec![parsed_task()]));
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let store_hook: Arc<StoreHookFn> = {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            Arc::new(move || {
+                let entered_tx = entered_tx.clone();
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let release_rx = Arc::clone(&release_rx);
+                Box::pin(async move {
+                    let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(running, Ordering::SeqCst);
+                    let _ = entered_tx.send(()).await;
+                    let release = release_rx.lock().await.take();
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+        };
+        state.store_hook = store_hook;
+
+        let first = start_update(state.clone());
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the first store is entered")
+            .expect("the store signalled");
+        drop_request(first).await;
+
+        let second = start_update(state.clone());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), entered_rx.recv())
+                .await
+                .is_err(),
+            "the second store does not start while the first is held"
+        );
+        assert!(
+            !second.is_finished(),
+            "the second request waits for the held store"
+        );
+
+        release_tx.send(()).expect("release the held store");
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the second store is entered after the release")
+            .expect("the second store signalled");
+        let response = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the second Update finishes")
+            .expect("the second request joins");
+        flash_token(&redirect_location(&response), "all");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "one store entry runs at a time"
+        );
+        let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 
