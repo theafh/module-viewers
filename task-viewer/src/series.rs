@@ -1,12 +1,13 @@
 use chrono::{Datelike, Days, NaiveDate};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::harvest::TaskKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
-    pub project: String,
+    pub project: Arc<str>,
     pub scope: String,
     pub kind: TaskKind,
     pub created: NaiveDate,
@@ -358,23 +359,49 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
 }
 
 fn radar(tasks: &[TaskRecord], mode: RadarMode) -> (Vec<LabeledCount>, Vec<LabeledCount>) {
-    let mut shipped: BTreeMap<String, i64> = BTreeMap::new();
-    let mut live: BTreeMap<String, i64> = BTreeMap::new();
-    for task in tasks {
-        let label = match mode {
-            RadarMode::Project => task.project.clone(),
-            RadarMode::Scope => task.scope.clone(),
-        };
-        match task.kind {
-            TaskKind::Finished => *shipped.entry(label).or_insert(0) += 1,
-            TaskKind::Live => *live.entry(label).or_insert(0) += 1,
-            TaskKind::Deferred => {}
+    match mode {
+        // The project radar keys on the shared handle, so counting a task costs a
+        // refcount bump instead of a `String` allocation per task.
+        RadarMode::Project => {
+            let mut shipped: BTreeMap<Arc<str>, i64> = BTreeMap::new();
+            let mut live: BTreeMap<Arc<str>, i64> = BTreeMap::new();
+            for task in tasks {
+                let counts = match task.kind {
+                    TaskKind::Finished => &mut shipped,
+                    TaskKind::Live => &mut live,
+                    TaskKind::Deferred => continue,
+                };
+                *counts.entry(Arc::clone(&task.project)).or_insert(0) += 1;
+            }
+            radar_rows(&shipped, &live, |project| project.to_string())
+        }
+        RadarMode::Scope => {
+            let mut shipped: BTreeMap<&str, i64> = BTreeMap::new();
+            let mut live: BTreeMap<&str, i64> = BTreeMap::new();
+            for task in tasks {
+                let counts = match task.kind {
+                    TaskKind::Finished => &mut shipped,
+                    TaskKind::Live => &mut live,
+                    TaskKind::Deferred => continue,
+                };
+                *counts.entry(task.scope.as_str()).or_insert(0) += 1;
+            }
+            radar_rows(&shipped, &live, |scope| (*scope).to_string())
         }
     }
-    let mut labels: Vec<String> = shipped
+}
+
+/// Materialize the shared label set once per distinct key, sorted by shipped
+/// plus live and then by label, and turn each distinct key into a label string
+/// once per chart rather than once per task.
+fn radar_rows<K: Ord>(
+    shipped: &BTreeMap<K, i64>,
+    live: &BTreeMap<K, i64>,
+    label: impl Fn(&K) -> String,
+) -> (Vec<LabeledCount>, Vec<LabeledCount>) {
+    let mut labels: Vec<&K> = shipped
         .keys()
         .chain(live.keys())
-        .cloned()
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -385,18 +412,19 @@ fn radar(tasks: &[TaskRecord], mode: RadarMode) -> (Vec<LabeledCount>, Vec<Label
             shipped.get(right).copied().unwrap_or(0) + live.get(right).copied().unwrap_or(0);
         right_total.cmp(&left_total).then_with(|| left.cmp(right))
     });
+    let label = &label;
     let shipped_rows = labels
         .iter()
-        .map(|label| LabeledCount {
-            label: label.clone(),
-            count: shipped.get(label).copied().unwrap_or(0),
+        .map(|key| LabeledCount {
+            label: label(key),
+            count: shipped.get(*key).copied().unwrap_or(0),
         })
         .collect();
     let live_rows = labels
         .iter()
-        .map(|label| LabeledCount {
-            label: label.clone(),
-            count: live.get(label).copied().unwrap_or(0),
+        .map(|key| LabeledCount {
+            label: label(key),
+            count: live.get(*key).copied().unwrap_or(0),
         })
         .collect();
     (shipped_rows, live_rows)
@@ -447,6 +475,7 @@ mod tests {
     };
     use crate::harvest::TaskKind;
     use chrono::{Days, NaiveDate};
+    use std::sync::Arc;
 
     fn day(year: i32, month: u32, date: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, date).expect("valid date")
@@ -461,7 +490,7 @@ mod tests {
         leave: Option<NaiveDate>,
     ) -> TaskRecord {
         TaskRecord {
-            project: project.to_string(),
+            project: Arc::from(project),
             scope: scope.to_string(),
             kind,
             created,
@@ -826,7 +855,7 @@ mod tests {
         let one = dashboard(
             &tasks
                 .into_iter()
-                .filter(|task| task.project == "alpha")
+                .filter(|task| &*task.project == "alpha")
                 .collect::<Vec<_>>(),
             today,
             RadarMode::Scope,

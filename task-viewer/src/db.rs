@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use sqlx::{
-    Pool, Sqlite,
+    Pool, QueryBuilder, Sqlite,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::harvest::{ParsedTask, PriorTask};
@@ -46,13 +48,18 @@ pub struct Repository {
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct TaskRow {
-    name: String,
+    repository_id: i64,
     scope: String,
     kind: String,
     created: String,
     ship_date: Option<String>,
     leave_date: Option<String>,
 }
+
+/// The rows one multi-row `INSERT` carries. Nine binds per row keeps a chunk at
+/// 4,500 bind variables, well under SQLite's 32,766 limit, while a large
+/// repository still stores in a handful of statements instead of one per task.
+const INSERT_CHUNK_ROWS: usize = 500;
 
 /// Turn the configured `TASK_VIEWER_DB` value into a database path. An unset
 /// value falls back to `~/.task-viewer`; an empty value is rejected.
@@ -216,23 +223,23 @@ pub async fn replace_tasks(
     // The delete has taken SQLite's write lock; the hook runs here so a test can
     // hold that lock while it drives a concurrent Remove.
     store_hook().await;
-    for task in tasks {
-        sqlx::query(
+    for chunk in tasks.chunks(INSERT_CHUNK_ROWS) {
+        let mut insert = QueryBuilder::<Sqlite>::new(
             "INSERT INTO tasks
-                (repository_id, path, scope, kind, created, updated, ship_date, leave_date, content_hash)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(repository_id)
-        .bind(&task.path)
-        .bind(&task.scope)
-        .bind(task.kind.as_str())
-        .bind(crate::dates::format_date(task.created))
-        .bind(crate::dates::format_date(task.updated))
-        .bind(task.ship_date.map(crate::dates::format_date))
-        .bind(task.leave_date.map(crate::dates::format_date))
-        .bind(task.content_hash.as_deref())
-        .execute(&mut *tx)
-        .await?;
+                (repository_id, path, scope, kind, created, updated, ship_date, leave_date, content_hash) ",
+        );
+        insert.push_values(chunk, |mut row, task| {
+            row.push_bind(repository_id)
+                .push_bind(&task.path)
+                .push_bind(&task.scope)
+                .push_bind(task.kind.as_str())
+                .push_bind(crate::dates::format_date(task.created))
+                .push_bind(crate::dates::format_date(task.updated))
+                .push_bind(task.ship_date.map(crate::dates::format_date))
+                .push_bind(task.leave_date.map(crate::dates::format_date))
+                .push_bind(task.content_hash.as_deref());
+        });
+        insert.build().execute(&mut *tx).await?;
     }
     sqlx::query(
         "UPDATE repositories SET scanned_at = ?, last_error = NULL WHERE repository_id = ?",
@@ -278,10 +285,11 @@ pub async fn load_tasks(
     pool: &Pool<Sqlite>,
     repository_id: Option<i64>,
 ) -> Result<Vec<crate::series::TaskRecord>> {
+    let projects = load_project_handles(pool, repository_id).await?;
     let rows = match repository_id {
         Some(id) => {
             sqlx::query_as::<_, TaskRow>(
-                "SELECT r.name, t.scope, t.kind, t.created, t.ship_date, t.leave_date
+                "SELECT t.repository_id, t.scope, t.kind, t.created, t.ship_date, t.leave_date
                  FROM tasks t
                  INNER JOIN repositories r ON r.repository_id = t.repository_id
                  WHERE r.repository_id = ?
@@ -293,7 +301,7 @@ pub async fn load_tasks(
         }
         None => {
             sqlx::query_as::<_, TaskRow>(
-                "SELECT r.name, t.scope, t.kind, t.created, t.ship_date, t.leave_date
+                "SELECT t.repository_id, t.scope, t.kind, t.created, t.ship_date, t.leave_date
                  FROM tasks t
                  INNER JOIN repositories r ON r.repository_id = t.repository_id
                  ORDER BY r.name COLLATE NOCASE, t.path",
@@ -305,18 +313,51 @@ pub async fn load_tasks(
 
     let mut tasks = Vec::new();
     for row in rows {
-        if let Some(task) = row_to_record(row) {
+        if let Some(task) = row_to_record(row, &projects) {
             tasks.push(task);
         }
     }
     Ok(tasks)
 }
 
-fn row_to_record(row: TaskRow) -> Option<crate::series::TaskRecord> {
+/// Load each repository's name once and share it as one `Arc<str>` across every
+/// task row of that repository, so the dashboard read allocates no copy of the
+/// name per task. The join in `load_tasks` keeps the ordering; this map supplies
+/// the handle each row carries.
+async fn load_project_handles(
+    pool: &Pool<Sqlite>,
+    repository_id: Option<i64>,
+) -> Result<HashMap<i64, Arc<str>>> {
+    let rows = match repository_id {
+        Some(id) => {
+            sqlx::query_as::<_, (i64, String)>(
+                "SELECT repository_id, name FROM repositories WHERE repository_id = ?",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as::<_, (i64, String)>("SELECT repository_id, name FROM repositories")
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|(id, name)| (id, Arc::<str>::from(name)))
+        .collect())
+}
+
+fn row_to_record(
+    row: TaskRow,
+    projects: &HashMap<i64, Arc<str>>,
+) -> Option<crate::series::TaskRecord> {
+    let project = Arc::clone(projects.get(&row.repository_id)?);
     let kind = crate::harvest::TaskKind::parse(&row.kind)?;
     let created = crate::dates::parse_iso_date(&row.created)?;
     Some(crate::series::TaskRecord {
-        project: row.name,
+        project,
         scope: row.scope,
         kind,
         created,
@@ -390,6 +431,7 @@ mod tests {
     use std::future::ready;
     use std::sync::Arc;
     use std::time::Duration;
+    use tracing_subscriber::layer::SubscriberExt;
 
     fn temp_database() -> std::path::PathBuf {
         let dir = unique_temp_dir("db_stores");
@@ -417,6 +459,143 @@ mod tests {
 
     fn immediate_hook() -> Arc<StoreHookFn> {
         Arc::new(|| Box::pin(ready(())))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parsed(
+        path: &str,
+        scope: &str,
+        kind: TaskKind,
+        created: NaiveDate,
+        updated: NaiveDate,
+        ship: Option<NaiveDate>,
+        leave: Option<NaiveDate>,
+        content_hash: Option<&str>,
+    ) -> ParsedTask {
+        ParsedTask {
+            path: path.to_string(),
+            scope: scope.to_string(),
+            kind,
+            created,
+            updated,
+            ship_date: ship,
+            leave_date: leave,
+            content_hash: content_hash.map(str::to_string),
+            path_is_lossy: false,
+        }
+    }
+
+    fn with_path(path: &str) -> ParsedTask {
+        let mut task = task();
+        task.path = path.to_string();
+        task
+    }
+
+    /// The name prefix this test gives its sqlx worker threads. The subscriber
+    /// below captures only statements from those threads, because sqlx logs a
+    /// statement on the connection's worker thread rather than the caller's.
+    const CAPTURE_THREAD_PREFIX: &str = "task-viewer-statement-capture";
+
+    static CAPTURED_STATEMENTS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<String>>>> =
+        std::sync::OnceLock::new();
+
+    fn captured_statements() -> Arc<std::sync::Mutex<Vec<String>>> {
+        Arc::clone(CAPTURED_STATEMENTS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new()))))
+    }
+
+    fn captured_insert_count() -> usize {
+        captured_statements()
+            .lock()
+            .expect("statement log")
+            .iter()
+            .filter(|statement| statement.contains("INSERT INTO tasks"))
+            .count()
+    }
+
+    /// Installs one process-wide subscriber that records the statements sqlx
+    /// logs for a pool whose worker threads carry `CAPTURE_THREAD_PREFIX`. sqlx
+    /// logs on the connection's worker thread, so the capture layer checks that
+    /// thread's name as the event arrives.
+    fn install_statement_capture() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let layer = StatementCapture {
+                statements: captured_statements(),
+            };
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry()
+                    .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+                    .with(layer),
+            );
+        });
+    }
+
+    #[derive(Clone)]
+    struct StatementCapture {
+        statements: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for StatementCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "sqlx::query"
+                || !std::thread::current()
+                    .name()
+                    .is_some_and(|name| name.starts_with(CAPTURE_THREAD_PREFIX))
+            {
+                return;
+            }
+            let mut fields = StatementFields::default();
+            event.record(&mut fields);
+            if let Some(statement) = fields.statement.or(fields.message) {
+                self.statements
+                    .lock()
+                    .expect("statement log")
+                    .push(statement);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct StatementFields {
+        message: Option<String>,
+        statement: Option<String>,
+    }
+
+    impl tracing::field::Visit for StatementFields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "message" => self.message = Some(value.to_string()),
+                "db.statement" => self.statement = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    /// A pool whose worker threads carry the capture prefix, so the subscriber
+    /// above sees the statements this pool runs.
+    async fn capture_pool(path: &std::path::Path) -> sqlx::SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .foreign_keys(true)
+                    .busy_timeout(Duration::from_secs(5))
+                    .thread_name(|id| format!("{CAPTURE_THREAD_PREFIX}-{id}")),
+            )
+            .await
+            .expect("capture pool")
     }
 
     async fn index_names(pool: &sqlx::SqlitePool) -> Vec<String> {
@@ -670,7 +849,7 @@ mod tests {
         assert_eq!(prior[0].content_hash.as_deref(), Some("0123456789abcdef"));
         let loaded = load_tasks(&pool, None).await.expect("load");
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].project, "ai-modules");
+        assert_eq!(&*loaded[0].project, "ai-modules");
         assert_eq!(loaded[0].kind, TaskKind::Finished);
         assert_eq!(loaded[0].ship_date, Some(date(2026, 7, 17)));
 
@@ -792,5 +971,240 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    /// Acceptance: a large repository stores in a handful of multi-row INSERT
+    /// statements instead of one per task, and every row of that repository
+    /// loads with the same project name through one shared handle.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_stores_a_large_repository_in_chunks_and_shares_one_project_handle() {
+        install_statement_capture();
+        let path = temp_database();
+        test_db::set(path.clone());
+        let schema = init().await.expect("init");
+        schema.close().await;
+        let pool = capture_pool(&path).await;
+        let id = super::insert_repository(&pool, "big", "/tmp/big")
+            .await
+            .expect("insert");
+        let tasks: Vec<ParsedTask> = (0..1_200)
+            .map(|index| with_path(&format!("tasks/task_{index:04}.md")))
+            .collect();
+
+        captured_statements().lock().expect("statement log").clear();
+        replace_tasks(&pool, id, &tasks, immediate_hook().as_ref())
+            .await
+            .expect("replace");
+        let loaded = load_tasks(&pool, Some(id)).await.expect("load");
+        // Closing waits for the worker threads, so every statement's log event
+        // has run before the count is read.
+        pool.close().await;
+
+        let inserted = captured_insert_count();
+        assert!(
+            inserted < tasks.len(),
+            "the store issued {inserted} INSERT INTO tasks statements for {} tasks",
+            tasks.len()
+        );
+        assert_eq!(
+            inserted, 3,
+            "1,200 rows in chunks of at most 500 take three statements"
+        );
+
+        assert_eq!(loaded.len(), tasks.len());
+        assert!(
+            loaded.iter().all(|task| &*task.project == "big"),
+            "every row carries its repository name"
+        );
+        let handle = &loaded[0].project;
+        assert!(
+            loaded.iter().all(|task| Arc::ptr_eq(handle, &task.project)),
+            "every row shares one project handle"
+        );
+        assert_eq!(
+            Arc::strong_count(handle),
+            loaded.len(),
+            "one handle per loaded row and nothing else"
+        );
+
+        remove_scratch(&path);
+    }
+
+    /// Acceptance: a failed insert rolls the transaction back, so the rows the
+    /// delete removed come back and none of the earlier inserted chunk stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_failed_insert_rolls_back_and_keeps_the_earlier_rows() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        let original = vec![
+            with_path("tasks/keep_one.md"),
+            with_path("tasks/keep_two.md"),
+            with_path("tasks/keep_three.md"),
+        ];
+        replace_tasks(&pool, id, &original, immediate_hook().as_ref())
+            .await
+            .expect("seed");
+
+        // The first chunk of 500 inserts, then the second chunk repeats a path
+        // from it, so `UNIQUE (repository_id, path)` fails after earlier rows
+        // already landed inside the transaction.
+        let mut replacement: Vec<ParsedTask> = (0..super::INSERT_CHUNK_ROWS)
+            .map(|index| with_path(&format!("tasks/bulk_{index:04}.md")))
+            .collect();
+        replacement.push(with_path("tasks/bulk_0000.md"));
+        let error = replace_tasks(&pool, id, &replacement, immediate_hook().as_ref())
+            .await
+            .expect_err("a repeated path fails the insert");
+        assert!(
+            format!("{error:#}").contains("UNIQUE"),
+            "the failure is the unique constraint: {error:#}"
+        );
+
+        let stored = load_prior_tasks(&pool, id).await.expect("stored rows");
+        let mut paths: Vec<&str> = stored.iter().map(|task| task.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec![
+                "tasks/keep_one.md",
+                "tasks/keep_three.md",
+                "tasks/keep_two.md"
+            ],
+            "the rollback restores the rows the delete removed"
+        );
+        assert!(
+            stored
+                .iter()
+                .all(|task| !task.path.starts_with("tasks/bulk_")),
+            "no chunk inserted before the failure survives"
+        );
+
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Acceptance: two repositories load in `r.name COLLATE NOCASE, t.path`
+    /// order, each row carries its own repository's name through one handle per
+    /// repository with no handle shared across them, and the multi-repository
+    /// dashboard output stays the baseline held in `testdata/`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_loads_repositories_in_name_then_path_order_and_keeps_the_dashboard_baseline() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        // zeta is inserted first and Alpha second, so name order (NOCASE) differs
+        // from insertion order. zeta's task paths arrive out of order too.
+        let zeta = super::insert_repository(&pool, "zeta", "/tmp/zeta")
+            .await
+            .expect("zeta");
+        let alpha = super::insert_repository(&pool, "Alpha", "/tmp/alpha")
+            .await
+            .expect("alpha");
+        let zeta_tasks = vec![
+            parsed(
+                "tasks/zeta_three.md",
+                "zeta",
+                TaskKind::Finished,
+                date(2026, 10, 20),
+                date(2026, 10, 25),
+                Some(date(2026, 10, 25)),
+                Some(date(2026, 10, 25)),
+                Some("z3"),
+            ),
+            parsed(
+                "tasks/alpha_one.md",
+                "alpha",
+                TaskKind::Live,
+                date(2026, 10, 22),
+                date(2026, 10, 22),
+                None,
+                None,
+                Some("a1"),
+            ),
+            parsed(
+                "tasks/mid_two.md",
+                "mid",
+                TaskKind::Deferred,
+                date(2026, 10, 21),
+                date(2026, 10, 24),
+                None,
+                Some(date(2026, 10, 24)),
+                None,
+            ),
+        ];
+        let alpha_tasks = vec![
+            parsed(
+                "tasks/beta_live.md",
+                "beta",
+                TaskKind::Live,
+                date(2026, 10, 23),
+                date(2026, 10, 23),
+                None,
+                None,
+                Some("b1"),
+            ),
+            parsed(
+                "tasks/beta_done.md",
+                "beta",
+                TaskKind::Finished,
+                date(2026, 10, 19),
+                date(2026, 10, 24),
+                Some(date(2026, 10, 24)),
+                Some(date(2026, 10, 24)),
+                Some("b2"),
+            ),
+        ];
+        replace_tasks(&pool, zeta, &zeta_tasks, immediate_hook().as_ref())
+            .await
+            .expect("zeta rows");
+        replace_tasks(&pool, alpha, &alpha_tasks, immediate_hook().as_ref())
+            .await
+            .expect("alpha rows");
+
+        let loaded = load_tasks(&pool, None).await.expect("load");
+        let observed: Vec<(&str, &str, TaskKind)> = loaded
+            .iter()
+            .map(|task| (&*task.project, task.scope.as_str(), task.kind))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("Alpha", "beta", TaskKind::Finished),
+                ("Alpha", "beta", TaskKind::Live),
+                ("zeta", "alpha", TaskKind::Live),
+                ("zeta", "mid", TaskKind::Deferred),
+                ("zeta", "zeta", TaskKind::Finished),
+            ],
+            "rows load in name-then-path order with their own repository name"
+        );
+
+        let alpha_handle = &loaded[0].project;
+        let zeta_handle = &loaded[2].project;
+        assert!(Arc::ptr_eq(alpha_handle, &loaded[1].project));
+        assert!(Arc::ptr_eq(zeta_handle, &loaded[3].project));
+        assert!(Arc::ptr_eq(zeta_handle, &loaded[4].project));
+        assert!(
+            !Arc::ptr_eq(alpha_handle, zeta_handle),
+            "repositories never share a project handle"
+        );
+
+        let board = crate::series::dashboard(
+            &loaded,
+            date(2026, 11, 7),
+            crate::series::RadarMode::Project,
+            "All projects",
+        );
+        let actual = serde_json::to_value(&board).expect("serialize the dashboard");
+        let baseline: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/dashboard_baseline.json"))
+                .expect("dashboard baseline");
+        assert_eq!(actual, baseline, "the dashboard output stays unchanged");
+
+        pool.close().await;
+        remove_scratch(&path);
     }
 }

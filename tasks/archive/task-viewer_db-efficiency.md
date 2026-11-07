@@ -2,8 +2,10 @@
 description: "Batch task inserts and stop copying the repository name per row when loading the dashboard rows."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T16:06:03
-status: ready
+updated: 2026-11-07T21:43:32
+status: finished
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 reported-by: "Andreas Hoffmann"
 ---
 
