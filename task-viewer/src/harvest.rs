@@ -327,16 +327,7 @@ fn blob_days(
 ) -> Result<std::collections::HashMap<String, i64>, HarvestError> {
     let mut command = git_dir_command(root, dir);
     scrub_git_env(&mut command);
-    command.args([
-        "log",
-        "--all",
-        "--format=%ct",
-        "--raw",
-        "--no-renames",
-        "--no-abbrev",
-        "--",
-        pathspec,
-    ]);
+    command.args(blob_days_log_args(pathspec));
     let output = run_git_command(command, None, git_deadline(root))
         .map_err(|failure| HarvestError::Git(failure.to_string()))?;
     if !output.status.success() {
@@ -765,16 +756,99 @@ fn scrub_git_env(command: &mut Command) {
     command
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("PATH", git_path())
+        // The viewed repository is read-only input, so git must not take an
+        // optional lock while it refreshes an index or writes a reflog.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        // An inherited external diff driver would change what the archive walk
+        // reads, so keep git on its built-in diff.
+        .env_remove("GIT_EXTERNAL_DIFF")
+        // These three redirections would point git at a different config file
+        // or ref namespace than the user's own. Removing them leaves the default
+        // global and system config in place, so `safe.directory` keeps working.
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_NOSYSTEM")
         // An inherited config override outranks the repository config a fixture
         // pins, so it must not reach the listing under test.
         .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS");
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        // A ceiling or cross-filesystem discovery would make git refuse to find
+        // the enclosing repository the folder actually lives in.
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
+        .env_remove("GIT_NAMESPACE");
+}
+
+/// The arguments for every `git log` harvest runs: the output options that a
+/// user config could otherwise change are overridden with `-c` ahead of the
+/// `log` subcommand, then the caller's flags follow.
+///
+/// A user `log.showSignature=true` would add signature lines to the walk and a
+/// `log.decorate` setting would add ref names, so both are pinned off before
+/// any flag the caller supplies.
+fn git_log_args(flags: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "-c".to_string(),
+        "log.showSignature=false".to_string(),
+        "-c".to_string(),
+        "log.decorate=false".to_string(),
+        "log".to_string(),
+    ];
+    args.extend(flags.iter().map(|flag| (*flag).to_string()));
+    args
+}
+
+/// The `git log` arguments that date each blob in `blob_days`.
+fn blob_days_log_args(pathspec: &str) -> Vec<String> {
+    git_log_args(&[
+        "--all",
+        "--format=%ct",
+        "--raw",
+        "--no-renames",
+        "--no-abbrev",
+        "--",
+        pathspec,
+    ])
+}
+
+/// The `git log` arguments for the archive walk in `archived_leave_lookup`.
+fn archive_log_args(rel: &str) -> Vec<String> {
+    // `-z` prints every path raw. Without it git C-quotes a path holding a
+    // non-ASCII byte or a double quote, and the quoted form matches neither the
+    // raw folder prefix nor any object.
+    git_log_args(&[
+        "-z",
+        "--follow",
+        "--diff-merges=first-parent",
+        "--name-only",
+        "--format=%cI %H",
+        "--all",
+        "--",
+        rel,
+    ])
+}
+
+/// The `git log` arguments for the pickaxe lookup in `run_git_log`.
+fn pickaxe_log_args(flag: &str, pattern: &str, rel: &str) -> Vec<String> {
+    git_log_args(&[
+        "--follow",
+        "--diff-merges=first-parent",
+        "--no-patch",
+        "--format=%cI",
+        // Every ref counts, so a task archived on a branch that is not checked
+        // out keeps its ship day.
+        "--all",
+        flag,
+        pattern,
+        "--",
+        rel,
+    ])
 }
 
 /// Run one read-only git command with a deadline.
@@ -1107,20 +1181,7 @@ fn archived_leave_lookup(
         }
     };
     scrub_git_env(&mut command);
-    // `-z` prints every path raw. Without it git C-quotes a path holding a
-    // non-ASCII byte or a double quote, and the quoted form matches neither the
-    // raw folder prefix nor any object.
-    command.args([
-        "log",
-        "-z",
-        "--follow",
-        "--diff-merges=first-parent",
-        "--name-only",
-        "--format=%cI %H",
-        "--all",
-        "--",
-        rel,
-    ]);
+    command.args(archive_log_args(rel));
     let output = run_git_command(command, None, git_deadline(repo))?;
     if !output.status.success() {
         return Err(GitFailure::Other(git_exit_message(&output)));
@@ -1311,18 +1372,7 @@ fn run_git_log(
     #[cfg(test)]
     walk_count::record(repo);
     scrub_git_env(&mut command);
-    let mut args = vec![
-        "log",
-        "--follow",
-        "--diff-merges=first-parent",
-        "--no-patch",
-        "--format=%cI",
-        // Every ref counts, so a task archived on a branch that is not checked
-        // out keeps its ship day.
-        "--all",
-    ];
-    args.extend([flag, pattern, "--", rel]);
-    command.args(&args);
+    command.args(pickaxe_log_args(flag, pattern, rel));
     let output = match run_git_command(command, None, git_deadline(repo)) {
         Ok(output) => output,
         Err(failure) => return LogLookup::Failed(failure),
@@ -1410,9 +1460,10 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 mod tests {
     use super::{
         GIT_COMMAND_TIMEOUT, GitFailure, HarvestError, LogLookup, ParsedTask, PriorTask, TaskKind,
-        archived_leave_lookup, blob_days, enclosing_prefix, escape_posix_ere,
-        existing_object_indices, git_bin, git_deadline, git_dir_command, git_override, git_path,
-        git_read, harvest_repository, harvest_repository_with_prior, parse_archive_log, read_blobs,
+        archive_log_args, archived_leave_lookup, blob_days, blob_days_log_args, enclosing_prefix,
+        escape_posix_ere, existing_object_indices, git_bin, git_deadline, git_dir_command,
+        git_log_args, git_override, git_path, git_read, harvest_repository,
+        harvest_repository_with_prior, parse_archive_log, pickaxe_log_args, read_blobs,
         run_git_command, run_git_log, scrub_git_env, take_leave_walk_count,
         take_worktree_read_count,
     };
@@ -1438,6 +1489,13 @@ mod tests {
         command.env("GIT_INDEX_FILE", "/tmp/poisoned-index");
         command.env("GIT_CONFIG_COUNT", "1");
         command.env("GIT_CONFIG_PARAMETERS", "'core.quotePath'='false'");
+        command.env("GIT_EXTERNAL_DIFF", "/tmp/poisoned-diff");
+        command.env("GIT_CONFIG_GLOBAL", "/tmp/poisoned-global");
+        command.env("GIT_CONFIG_SYSTEM", "/tmp/poisoned-system");
+        command.env("GIT_CONFIG_NOSYSTEM", "1");
+        command.env("GIT_CEILING_DIRECTORIES", "/tmp/ceiling");
+        command.env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1");
+        command.env("GIT_NAMESPACE", "poisoned");
         scrub_git_env(&mut command);
         for key in [
             "GIT_DIR",
@@ -1445,11 +1503,101 @@ mod tests {
             "GIT_INDEX_FILE",
             "GIT_CONFIG_COUNT",
             "GIT_CONFIG_PARAMETERS",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_NAMESPACE",
         ] {
             let cleared = command
                 .get_envs()
                 .any(|(name, value)| name == key && value.is_none());
             assert!(cleared, "{key} must be removed");
+        }
+        let optional_locks = command
+            .get_envs()
+            .find_map(|(name, value)| (name == "GIT_OPTIONAL_LOCKS").then_some(value))
+            .flatten();
+        assert_eq!(
+            optional_locks,
+            Some(std::ffi::OsStr::new("0")),
+            "GIT_OPTIONAL_LOCKS must be 0"
+        );
+    }
+
+    /// The index of the `-c <setting>` pair, selected by value rather than by
+    /// position, so an extra flag cannot make the assertion pass or fail.
+    fn config_pair_index(args: &[String], setting: &str) -> Option<usize> {
+        args.windows(2)
+            .position(|window| window[0] == "-c" && window[1] == setting)
+    }
+
+    fn assert_log_args_pin_output(args: &[String]) {
+        let log_index = args
+            .iter()
+            .position(|arg| arg == "log")
+            .expect("a log subcommand");
+        for setting in ["log.showSignature=false", "log.decorate=false"] {
+            let pair = config_pair_index(args, setting)
+                .unwrap_or_else(|| panic!("{setting} must be configured with -c"));
+            assert!(
+                pair < log_index,
+                "{setting} must precede the log subcommand"
+            );
+        }
+    }
+
+    #[test]
+    fn harvest_git_log_args_pin_output_options_ahead_of_log() {
+        // Every flag list the three production `git log` call sites supply.
+        let sites: [&[&str]; 3] = [
+            &[
+                "--all",
+                "--format=%ct",
+                "--raw",
+                "--no-renames",
+                "--no-abbrev",
+                "--",
+                "tasks",
+            ],
+            &[
+                "-z",
+                "--follow",
+                "--diff-merges=first-parent",
+                "--name-only",
+                "--format=%cI %H",
+                "--all",
+                "--",
+                "tasks/archive/scope_one.md",
+            ],
+            &[
+                "--follow",
+                "--diff-merges=first-parent",
+                "--no-patch",
+                "--format=%cI",
+                "--all",
+                "-S",
+                "status: finished",
+                "--",
+                "tasks/scope_one.md",
+            ],
+        ];
+        for flags in sites {
+            assert_log_args_pin_output(&git_log_args(flags));
+        }
+    }
+
+    #[test]
+    fn harvest_log_call_sites_pin_output_options_ahead_of_log() {
+        let assembled = [
+            blob_days_log_args("tasks"),
+            archive_log_args("tasks/archive/scope_one.md"),
+            pickaxe_log_args("-S", "status: finished", "tasks/scope_one.md"),
+        ];
+        for args in assembled {
+            assert_log_args_pin_output(&args);
         }
     }
 
