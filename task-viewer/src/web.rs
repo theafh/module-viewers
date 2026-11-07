@@ -410,6 +410,28 @@ async fn claim_banner(state: &AppState, query: &HomeQuery) -> Option<ClaimedBann
     state.flash.lock().await.claim(&query.flash)
 }
 
+/// The thread the dashboard's blocking render closure last ran on, recorded for
+/// the test that asserts the render path left the async worker. It exists only
+/// in test builds, so production pays nothing for it.
+#[cfg(test)]
+static RENDER_BLOCKING_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
+    std::sync::Mutex::new(None);
+
+/// Record the thread the blocking render closure runs on.
+#[cfg(test)]
+fn record_render_blocking_thread() {
+    if let Ok(mut slot) = RENDER_BLOCKING_THREAD.lock() {
+        *slot = Some(std::thread::current().id());
+    }
+}
+
+/// The thread the blocking render closure last ran on, or `None` before any
+/// dashboard render. A test compares it with its runtime thread.
+#[cfg(test)]
+fn render_blocking_thread() -> Option<std::thread::ThreadId> {
+    RENDER_BLOCKING_THREAD.lock().ok().and_then(|slot| *slot)
+}
+
 async fn render_dashboard(
     state: &AppState,
     query: &HomeQuery,
@@ -437,27 +459,42 @@ async fn render_dashboard(
             "All projects".to_string(),
         ),
     };
-    let board = series::dashboard(&tasks, crate::dates::today(), mode, &label);
-    let mut data_json = serde_json::to_string(&board)?;
-    data_json = data_json.replace('<', "\\u003c");
     let projects = repositories.iter().map(project_view).collect::<Vec<_>>();
     let scan_label = scan_label(&repositories, selected);
-    let page = DashboardPage {
-        version: VERSION,
-        page: "dashboard",
-        projects,
-        selected: match selected {
-            Some(id) => id.to_string(),
-            None => "all".to_string(),
-        },
-        notice,
-        error,
-        scan_label,
-        data_json,
-        has_projects: !repositories.is_empty(),
+    let selected = match selected {
+        Some(id) => id.to_string(),
+        None => "all".to_string(),
     };
-    let context = Context::from_serialize(page)?;
-    Ok(state.templates.render("dashboard.html", &context)?)
+    let has_projects = !repositories.is_empty();
+    let templates = Arc::clone(&state.templates);
+    // The chart computation, the JSON payload, the page assembly, and the
+    // template render are CPU work over every stored row and every chart day,
+    // so they run on a blocking thread instead of a tokio worker. Only the
+    // sqlx loads and the cheap repository lookups above stay on the worker.
+    let html = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        #[cfg(test)]
+        record_render_blocking_thread();
+        let board = series::dashboard(&tasks, crate::dates::today(), mode, &label);
+        let mut data_json = serde_json::to_string(&board)?;
+        data_json = data_json.replace('<', "\\u003c");
+        let page = DashboardPage {
+            version: VERSION,
+            page: "dashboard",
+            projects,
+            selected,
+            notice,
+            error,
+            scan_label,
+            data_json,
+            has_projects,
+        };
+        let context = Context::from_serialize(page)?;
+        templates
+            .render("dashboard.html", &context)
+            .map_err(anyhow::Error::from)
+    })
+    .await??;
+    Ok(html)
 }
 
 async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Result<String> {
@@ -940,10 +977,12 @@ mod tests {
     use super::{
         AppState, HarvestFn, HomeQuery, PickerFn, ProjectForm, ScanFailure, ScanReport,
         StoreHookFn, add_repository, claim_banner, encode_query, init_templates, is_local_host,
-        remove_repository, router, scan_all, scan_core, scan_flash, scan_response, scan_worker_cap,
+        remove_repository, render_blocking_thread, render_home, router, scan_all, scan_core,
+        scan_flash, scan_response, scan_worker_cap,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
+    use crate::series::{self, RadarMode};
     use crate::test_support::unique_temp_dir;
     use axum::Form;
     use axum::body::Body;
@@ -1388,6 +1427,85 @@ mod tests {
             .expect("get request");
         let response = send(state.clone(), request).await;
         assert_eq!(response.status(), StatusCode::OK);
+        cleanup(&path);
+    }
+
+    /// Acceptance: a dashboard render moves the chart computation off the tokio
+    /// worker, and the page still carries the payload `series::dashboard` builds
+    /// for the stored rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_dashboard_render_leaves_the_async_worker() {
+        let (state, path) = app_state("render_blocking").await;
+        let folder = unique_temp_dir("render_blocking_repo");
+        std::fs::create_dir_all(&folder).expect("repository folder");
+        let repository_id =
+            db::insert_repository(&state.pool, "alpha<&", &folder.to_string_lossy())
+                .await
+                .expect("insert");
+        let created = chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("date");
+        let shipped = chrono::NaiveDate::from_ymd_opt(2026, 5, 20).expect("date");
+        let rows = vec![
+            ParsedTask {
+                path: "tasks/one_live.md".to_string(),
+                scope: "one".to_string(),
+                kind: TaskKind::Live,
+                created,
+                updated: created,
+                ship_date: None,
+                leave_date: None,
+                content_hash: None,
+            },
+            ParsedTask {
+                path: "tasks/archive/two_finished.md".to_string(),
+                scope: "two".to_string(),
+                kind: TaskKind::Finished,
+                created,
+                updated: shipped,
+                ship_date: Some(shipped),
+                leave_date: Some(shipped),
+                content_hash: None,
+            },
+        ];
+        db::replace_tasks(
+            &state.pool,
+            repository_id,
+            &rows,
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("store rows");
+
+        let runtime_thread = std::thread::current().id();
+        let html = render_home(&state, &HomeQuery::default())
+            .await
+            .expect("render");
+        let blocking_thread =
+            render_blocking_thread().expect("the blocking closure records its thread");
+        assert_ne!(
+            blocking_thread, runtime_thread,
+            "the dashboard render must leave the async worker"
+        );
+
+        let tasks = db::load_tasks(&state.pool, None).await.expect("tasks");
+        let board = series::dashboard(
+            &tasks,
+            crate::dates::today(),
+            RadarMode::Project,
+            "All projects",
+        );
+        let payload = serde_json::to_string(&board)
+            .expect("payload")
+            .replace('<', "\\u003c");
+        assert!(
+            payload.contains("\\u003c"),
+            "the fixture's project name carries a `<` the payload escapes"
+        );
+        assert!(
+            html.contains(&payload),
+            "the page carries the chart payload series::dashboard builds for the fixture"
+        );
+
+        let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 

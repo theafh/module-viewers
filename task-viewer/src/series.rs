@@ -279,33 +279,64 @@ fn live_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<LivePoint> {
 }
 
 fn age_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<AgePoint> {
+    age_points_counted(tasks, today).0
+}
+
+/// The mean-age sweep. One work step is one day row plus one task add or one
+/// task remove, so the work grows with `days + 2 * tasks` rather than
+/// `days * tasks`. The returned count lets a test hold the sweep to that bound.
+///
+/// A task is active from its `created` day until its leave day, and it drops out
+/// on that leave day. A leave day before `created` counts from `created`, the
+/// way `live_points` clamps it, so a record whose dates are out of order is
+/// added and removed on the same day and counts on no day. The running total is
+/// `count * day - sum_created`, which equals the sum of `day - created` over the
+/// active tasks without touching each task on each day.
+fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>, usize) {
     if tasks.is_empty() {
-        return Vec::new();
+        return (Vec::new(), 0);
+    }
+    // Per-day (task count, sum of created days) for the adds and the removes,
+    // both keyed by day. A created day is stored as its day number so the
+    // running total stays one integer subtraction.
+    let mut adds: BTreeMap<NaiveDate, (i64, i64)> = BTreeMap::new();
+    let mut removes: BTreeMap<NaiveDate, (i64, i64)> = BTreeMap::new();
+    for task in tasks {
+        let created = i64::from(task.created.num_days_from_ce());
+        let add = adds.entry(task.created).or_insert((0, 0));
+        add.0 += 1;
+        add.1 += created;
+        if let Some(leave) = task.leave_date {
+            let remove = removes.entry(leave.max(task.created)).or_insert((0, 0));
+            remove.0 += 1;
+            remove.1 += created;
+        }
     }
     let start = tasks.iter().map(|task| task.created).min().unwrap_or(today);
     let mut rows = Vec::new();
+    let mut steps = 0_usize;
+    let mut count = 0_i64;
+    let mut sum_created = 0_i64;
     let mut cur = start;
     while cur <= today {
-        let mut total = 0_i64;
-        let mut count = 0_usize;
-        for task in tasks {
-            if task.created > cur {
-                continue;
-            }
-            if let Some(leave) = task.leave_date
-                && leave <= cur
-            {
-                continue;
-            }
-            total += (cur - task.created).num_days();
-            count += 1;
+        steps += 1;
+        if let Some((added, added_sum)) = adds.get(&cur) {
+            count += added;
+            sum_created += added_sum;
+            steps += *added as usize;
+        }
+        if let Some((removed, removed_sum)) = removes.get(&cur) {
+            count -= removed;
+            sum_created -= removed_sum;
+            steps += *removed as usize;
         }
         let avg = if count == 0 {
             0.0
         } else {
+            let total = count * i64::from(cur.num_days_from_ce()) - sum_created;
             total as f64 / count as f64
         };
-        rows.push((cur, avg, count));
+        rows.push((cur, avg, count as usize));
         match cur.checked_add_days(Days::new(1)) {
             Some(next) => cur = next,
             None => break,
@@ -313,7 +344,8 @@ fn age_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<AgePoint> {
     }
     let values: Vec<f64> = rows.iter().map(|(_, avg, _)| *avg).collect();
     let trend = linreg(&values);
-    rows.into_iter()
+    let points = rows
+        .into_iter()
         .zip(trend)
         .map(|((date, avg, n), trend)| AgePoint {
             date: crate::dates::format_date(date),
@@ -321,7 +353,8 @@ fn age_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<AgePoint> {
             trend: round_to(trend, 2),
             n,
         })
-        .collect()
+        .collect();
+    (points, steps)
 }
 
 fn radar(tasks: &[TaskRecord], mode: RadarMode) -> (Vec<LabeledCount>, Vec<LabeledCount>) {
@@ -409,9 +442,11 @@ fn round_to(value: f64, places: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{RadarMode, TaskRecord, dashboard, monday};
+    use super::{
+        AgePoint, RadarMode, TaskRecord, age_points, age_points_counted, dashboard, monday,
+    };
     use crate::harvest::TaskKind;
-    use chrono::NaiveDate;
+    use chrono::{Days, NaiveDate};
 
     fn day(year: i32, month: u32, date: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, date).expect("valid date")
@@ -433,6 +468,179 @@ mod tests {
             ship_date: ship,
             leave_date: leave,
         }
+    }
+
+    /// The pre-change `age_points`: a day loop with an inner task loop, kept
+    /// beside the sweep so the equivalence test compares against the exact
+    /// shape the sweep replaced. It is test-only and never runs in production.
+    fn age_points_by_day_and_task(tasks: &[TaskRecord], today: NaiveDate) -> Vec<AgePoint> {
+        if tasks.is_empty() {
+            return Vec::new();
+        }
+        let start = tasks.iter().map(|task| task.created).min().unwrap_or(today);
+        let mut rows = Vec::new();
+        let mut cur = start;
+        while cur <= today {
+            let mut total = 0_i64;
+            let mut count = 0_usize;
+            for task in tasks {
+                if task.created > cur {
+                    continue;
+                }
+                if let Some(leave) = task.leave_date
+                    && leave <= cur
+                {
+                    continue;
+                }
+                total += (cur - task.created).num_days();
+                count += 1;
+            }
+            let avg = if count == 0 {
+                0.0
+            } else {
+                total as f64 / count as f64
+            };
+            rows.push((cur, avg, count));
+            match cur.checked_add_days(Days::new(1)) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        let values: Vec<f64> = rows.iter().map(|(_, avg, _)| *avg).collect();
+        let trend = super::linreg(&values);
+        rows.into_iter()
+            .zip(trend)
+            .map(|((date, avg, n), trend)| AgePoint {
+                date: crate::dates::format_date(date),
+                avg_age: super::round_to(avg, 2),
+                trend: super::round_to(trend, 2),
+                n,
+            })
+            .collect()
+    }
+
+    /// Compare the sweep against the pre-change loop field by field. Both
+    /// produce the same integer total and the same rounded output, so the
+    /// floats compare bit for bit and no float equality lint applies.
+    fn assert_same_age_points(actual: &[AgePoint], expected: &[AgePoint]) {
+        assert_eq!(actual.len(), expected.len(), "the day range differs");
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.date, expected.date);
+            assert_eq!(actual.n, expected.n, "n differs at {}", actual.date);
+            assert_eq!(
+                actual.avg_age.to_bits(),
+                expected.avg_age.to_bits(),
+                "avg_age differs at {}",
+                actual.date
+            );
+            assert_eq!(
+                actual.trend.to_bits(),
+                expected.trend.to_bits(),
+                "trend differs at {}",
+                actual.date
+            );
+        }
+    }
+
+    /// Acceptance: the sweep matches the pre-change loop on `avg_age`, `n`, and
+    /// `trend`, including a record whose leave day precedes `created` and one
+    /// created and left on the same day.
+    #[test]
+    fn series_age_sweep_matches_the_day_times_task_loop() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Live,
+                day(2026, 6, 1),
+                None,
+                None,
+            ),
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Finished,
+                day(2026, 6, 2),
+                Some(day(2026, 6, 5)),
+                Some(day(2026, 6, 5)),
+            ),
+            task(
+                "alpha",
+                "other",
+                TaskKind::Deferred,
+                day(2026, 6, 3),
+                None,
+                Some(day(2026, 6, 8)),
+            ),
+            // A leave day before `created`: the record counts on no day.
+            task(
+                "alpha",
+                "other",
+                TaskKind::Finished,
+                day(2026, 6, 6),
+                Some(day(2026, 6, 1)),
+                Some(day(2026, 6, 1)),
+            ),
+            // Created and left on the same day: also counts on no day.
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Finished,
+                day(2026, 6, 4),
+                Some(day(2026, 6, 4)),
+                Some(day(2026, 6, 4)),
+            ),
+        ];
+        let sweep = age_points(&tasks, today);
+        let legacy = age_points_by_day_and_task(&tasks, today);
+        assert_same_age_points(&sweep, &legacy);
+        let out_of_order = sweep
+            .iter()
+            .find(|point| point.date == "2026-06-06")
+            .expect("the out-of-order record's created day");
+        assert_eq!(
+            out_of_order.n, 2,
+            "the leave-before-created record must not inflate the count"
+        );
+    }
+
+    /// Acceptance: the fixed 500-task set starting 1900-01-01 stays within the
+    /// linear work-step bound for `today` 2026-11-06. The pre-change
+    /// day-times-task loop would report about 23,000,000 steps here.
+    #[test]
+    fn series_age_sweep_stays_linear_for_an_old_task_set() {
+        let today = day(2026, 11, 6);
+        let start = day(1900, 1, 1);
+        let tasks = (0..500_u64)
+            .map(|index| {
+                let created = start + Days::new(index * 90);
+                let leave = created + Days::new(30);
+                task(
+                    "alpha",
+                    "scope",
+                    TaskKind::Finished,
+                    created,
+                    Some(leave),
+                    Some(leave),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (points, steps) = age_points_counted(&tasks, today);
+        let days = (today - start).num_days() + 1;
+        assert_eq!(days, 46_331, "the fixture spans the declared day count");
+        let bound = days as usize + 2 * tasks.len();
+        assert_eq!(bound, 47_331, "the bound is days + 2 * tasks");
+        assert!(
+            steps <= bound,
+            "the sweep reported {steps} work steps for {days} days and {} tasks, above the linear bound of {bound}",
+            tasks.len()
+        );
+        assert_eq!(
+            points.len() as i64,
+            days,
+            "the sweep still emits one point per day"
+        );
     }
 
     #[test]

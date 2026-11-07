@@ -2,9 +2,11 @@
 description: "Move chart computation off the async worker and make mean-age computation linear in days plus tasks instead of their product."
 scope: task-viewer
 created: 2026-11-05T07:00:45
-updated: 2026-11-06T16:59:34
-status: ready
+updated: 2026-11-07T09:18:13
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Move chart computation off the async worker and make mean age linear
