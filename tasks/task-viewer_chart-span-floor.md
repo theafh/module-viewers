@@ -2,8 +2,8 @@
 description: "Start the cumulative, backlog, and mean-age series at 1970-01-01 and the weekly series at that week's Monday, keeping every row, so a mistyped early year cannot stretch the charts."
 scope: task-viewer
 created: 2026-11-08T14:13:24
-updated: 2026-11-08T14:51:13
-status: open
+updated: 2026-11-08T18:10:59
+status: ready
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -30,7 +30,7 @@ A single task created on 0026-03-01 makes each daily series about 730,000 points
 
 1. Add one constant for the floor, 1970-01-01, beside `parse_iso_date` in `task-viewer/src/dates.rs`.
 2. Start each of the four walks at the later of its current first day and the floor, using the floor's Monday for `weekly_points`.
-3. Fold earlier events into the first charted day. `cumulative_points` starts its level at the number of ships on or before the first charted day, so the line still ends at `counts.shipped_events`. `live_points` starts with every task created on or before the first charted day that has not left by then. `age_points_counted` keeps its formula, so a task created before the floor counts its real age. Weeks before the floor's Monday are not drawn, while the `counts` summary keeps every event.
+3. Fold earlier events into the first charted day. `cumulative_points` seeds its level with the ships dated strictly before the first charted day and adds that day's own ships in the first row, so the line still ends at `counts.shipped_events`. `live_points` seeds its stock with every task created strictly before the first charted day that has not left before that day, then adds and removes that day's own tasks in the first row. `age_points_counted` keeps its formula and seeds its running count and its running created-day sum from the tasks created strictly before the first charted day that have not left by then, taking each such task's created day number into the sum, so the first row adds and removes that day's own tasks, a task created before the floor counts its real age, and a task that leaves after the floor counts out. Weeks before the floor's Monday are not drawn, while the `counts` summary keeps every event.
 4. Rewrite the `series-cpu-offload` test so its fixture starts on or after the floor, keeping the step bound it asserts derived from that fixture.
 5. Rewrite the **Extraction Rules** sentence of `ARCHITECTURE.md` that begins "The cumulative, backlog, and mean-age charts include every calendar day" so the three charts include every calendar day from the later of their first day and 1970-01-01 through today, with earlier events counted on that first day, and say the same for the weekly chart's first Monday. Rewrite the **Series** bullet of `TESTING.md` so its early-ship cases hold for days on or after the floor and it names the floor case below.
 
@@ -39,7 +39,8 @@ A single task created on 0026-03-01 makes each daily series about 730,000 points
 ## Acceptance
 
 - A series test builds one task created 0026-03-01 and one created and shipped in the current year, calls `series::dashboard`, and finds every daily series at most `today - 1970-01-01` days plus one long and the weekly series at most that span divided by seven plus two.
-- In the same test the backlog's first point counts the 0026 task, and the live radar and `counts.created_events` still count it.
-- A series test with a ship day of 0026-03-01 counts that ship in the first cumulative point, and the cumulative series ends at `counts.shipped_events`.
+- A series test with one task created 0026-03-01 and one created on 1970-01-01, both still open, finds the backlog's first point dated 1970-01-01 with `live` 2, a count that separates a single fold from a double count, and the live radar and `counts.created_events` still count the 0026 task.
+- A series test with ship days of 0026-03-01 and 1970-01-01 finds the cumulative first point dated 1970-01-01 with `shipped` 1 and `cumulative` 2, a count that separates a single fold from a double count, the cumulative series at most `today - 1970-01-01` days plus one long, and the last point equal to `counts.shipped_events`.
+- A series test with one task created 0026-03-01 that ships in the current year finds the mean-age first point dated 1970-01-01 with `n` 1 and `avg_age` the day count from 0026-03-01 to 1970-01-01, and the point dated its ship day with `n` 0.
 - The rewritten `series-cpu-offload` test passes with its fixture on or after the floor.
 - `ARCHITECTURE.md` and `TESTING.md` each state the floor once, and the sentence "include every calendar day from their first day through today" is gone.

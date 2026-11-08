@@ -2,8 +2,8 @@
 description: "Date merge-produced task blobs in the ref union so the newest commit decides, and list each distinct ref commit and blob id once."
 scope: task-viewer
 created: 2026-11-08T14:13:24
-updated: 2026-11-08T14:13:24
-status: open
+updated: 2026-11-08T18:40:13
+status: ready
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -30,7 +30,7 @@ The listing pathspec `{prefix}tasks` reaches `ls-tree` and `git log` raw, while 
 1. Add `--diff-merges=first-parent` to `blob_days_log_args`, beside `--raw`. A merge commit then reports every blob its first-parent diff introduces, so a merged result gets the merge's committer time, and a side-branch blob that the merge brought onto the first-parent line takes the merge time as its newest touch. Both follow the stamp's existing meaning, "the newest touch", which `blob_days` records with `or_insert` over a newest-first stream. Update the `blob_days_log_args` entry in the `sites` array of `harvest_log_call_sites_pin_output_options_ahead_of_log` to the new argument list.
 2. Change the ref listing format to `%(objectname) %(refname)` and skip a ref whose commit id was already listed before running its `ls-tree`. Two refs at one commit list identical `(path, blob, lossy)` triples, so dropping the repeat leaves the candidate set unchanged.
 3. Collect the blob ids into a `HashSet<String>` while listing and pass that set to `blob_days`, so the vector of per-ref duplicates is never built.
-4. Read the blob id in `stream_blob_days` with `meta.split_whitespace().nth(3)`.
+4. Read the blob id in `stream_blob_days` with `meta.split_whitespace().nth(3)`, and make the same change in the test-only `whole_buffer_blob_days` helper that `stream_blob_days_matches_the_whole_buffer_parser` compares against, so the file-wide `fields.get(3)` grep returns nothing.
 5. Put one comment on the `pathspec` binding in `union_files` stating that the raw prefix is matched literally by `ls-tree` and `git log`, so it needs no `:(literal)` magic, unlike the per-file lookups.
 6. Rewrite the first **Extraction Rules** bullet in `ARCHITECTURE.md` so its tie-break sentence says the newest commit is read with merges diffed against their first parent, which dates a merged task version from its merge commit. Rewrite the **Harvest ref** bullet in `TESTING.md` so it names the merge case below.
 

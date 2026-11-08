@@ -2,8 +2,8 @@
 description: "Read each archived task's walk with one cat-file --batch that reports missing objects inline, dropping the --batch-check pass, and drain oversized blobs without allocating them."
 scope: task-viewer
 created: 2026-11-08T14:13:24
-updated: 2026-11-08T14:42:52
-status: open
+updated: 2026-11-08T15:36:36
+status: ready
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -38,6 +38,8 @@ The leave-day walk of an archived task starts two git processes instead of three
 - A harvest test routes a fixture repository through a logging stand-in git registered with the test-only git override and finds one `cat-file --batch` invocation and no `cat-file --batch-check` invocation for the leave-day walk of one archived task.
 - The existing harvest tests for an archived task deleted and restored, including a deletion on a branch reached through `--all`, still date from the first archived day and return no `HarvestError`.
 - A unit test feeds `parse_batch` a header announcing `MAX_TASK_FILE_BYTES + 1` bytes followed by that many bytes and a second small blob, and receives `Some("")` and then the second blob's content.
+- A unit test feeds `parse_batch` a header built from `usize::MAX` with no body behind it, and the call returns without a capacity overflow, delivering at most one content to its callback.
 - A harvest test with a working-tree task file larger than the cap and a normal neighbour charts the neighbour and no row for the large file.
+- A harvest test with a working-tree task file several times the cap records the bytes read for each working-tree task file, beside the existing `take_worktree_read_count` tally, and finds the file over the cap read with at most `MAX_TASK_FILE_BYTES + 1` bytes.
 - A harvest test routes the ref union's `cat-file --batch` through a stand-in git that answers one listed blob with `<sha> missing`, and gets a `HarvestError::Git` whose message names that blob's path, while the repository's earlier rows stay stored.
-- `rg -n 'existing_object_indices|parse_batch_check' task-viewer/src` returns nothing, and `ARCHITECTURE.md` no longer mentions `--batch-check`.
+- `rg -n 'existing_object_indices|parse_batch_check' task-viewer/src` returns nothing; `rg -n -- '--batch-check' ARCHITECTURE.md` returns nothing, that file's leave-day bullet says one `git cat-file --batch` answers an expression that names no object with `missing` and that expression counts as no qualifying commit, and its newline sentence names `cat-file` once; and `rg -n '4 MiB' FEATURES.md TESTING.md` finds a match in each, on the **3. Repositories** sentence that names the non-UTF-8 skip and on the matching Harvest bullet in `TESTING.md`.

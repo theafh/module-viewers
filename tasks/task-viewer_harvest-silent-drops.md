@@ -2,8 +2,8 @@
 description: "Strip trailing # comments from frontmatter values, close frontmatter only on a bare --- line, log every task file dropped for bad frontmatter, and fail the scan on an unreadable tasks directory."
 scope: task-viewer
 created: 2026-11-08T14:13:24
-updated: 2026-11-08T14:51:13
-status: open
+updated: 2026-11-08T18:49:13
+status: ready
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -30,16 +30,18 @@ The archived `task-viewer_harvest-input-robustness` task settled that the flat k
 
 1. Before `unquote_frontmatter_value`, strip a trailing comment from each value. A value that opens with `"` or `'` keeps everything up to its matching closing quote, and a `#` after that quote that follows whitespace starts a comment. An unquoted value ends at the first `#` that follows a space or a tab. Trim the result.
 2. End the frontmatter block at the first line, after the opening delimiter, whose content without a trailing `\r` and trailing whitespace is exactly `---`.
-3. In `harvest_file`, log `tracing::debug!` naming the path when a file has no frontmatter, which is how a stray `README.md` under `tasks/` reads, and `tracing::warn!` naming the path and the missing or unparseable field when `status` is missing, or `created` is missing or does not parse. The returned rows stay unchanged.
+3. In `harvest_file`, log `tracing::warn!` naming the path and the missing or unparseable field when `status` is missing, or `created` is missing or does not parse. When a file has no frontmatter, log `tracing::warn!` naming the path and the absent frontmatter if its file name carries the task naming shape — a `.md` name with an `_` in it, the shape `harvest_file` already splits for `scope` — and `tracing::debug!` naming the path otherwise, which is how a stray `README.md` under `tasks/` reads. The returned rows stay unchanged.
 4. In `files_on_disk`, return `HarvestError::Io` built from the first walk error, so the repository's scan fails, its rows stay, and the error names the unreadable path. A file that opens but cannot be read as text keeps today's skip.
-5. Extend the **3. Repositories** sentence in `FEATURES.md` that lists a BOM, leading blank lines, quoted values, and a space-separated timestamp with a trailing `#` comment, and extend its scan-error sentence with an unreadable directory under `tasks/`. Extend the `ARCHITECTURE.md` **Data Layout** sentence about a missing directory to cover an unreadable one, and add the comment and walk-error cases to the Harvest bullet of `TESTING.md`.
+5. Version the content hash so no stored row survives this reader change: keep the FNV-1a digest in its own helper and return it from `content_hash` behind a revision constant, such as `format!("r2:{digest}")`, which the next frontmatter change bumps again. Every archived row the database holds then mismatches once, re-walks its leave-day history on the next Update, and stores a hash that matches again. Refresh the `content_hash` doc comment to say the digest covers the reader revision as well as the bytes.
+6. Extend the **3. Repositories** sentence in `FEATURES.md` that lists a BOM, leading blank lines, quoted values, and a space-separated timestamp with a trailing `#` comment, and extend its scan-error sentence with an unreadable directory under `tasks/`. Extend the `ARCHITECTURE.md` **Data Layout** sentence about a missing directory to cover an unreadable one, and add the comment and walk-error cases to the Harvest bullet of `TESTING.md`.
 
 ## Acceptance
 
 - A harvest test archives a task with `status: finished  # shipped early` and charts it as finished with its archive commit's ship day.
+- A harvest test harvests a repository whose archived task carries `status: finished  # shipped early` through `harvest_repository_with_prior` with a prior row for that path whose `content_hash` is the bare FNV digest of those same bytes and whose leave day is an earlier commit's day, and finds the returned ship day is that task's archive commit day.
 - A harvest test charts a live task whose `created: 2026-01-01\t# note` value carries a tab-separated comment with created day 2026-01-01.
-- A unit test of `frontmatter` reads `status: "fin#ished" # note` as `fin#ished`, and reads a block whose value line is `title: ---draft` followed by `status: open` with both keys present.
-- A harvest test under a thread-scoped `tracing` subscriber, like the existing lossy-path warning test, finds one warning naming a task file whose `created` is `not-a-date`, and no warning for a `README.md` without frontmatter in the same `tasks/` tree.
+- A unit test of `frontmatter` reads `status: "fin#ished" # note` as `fin#ished`, and reads a block carrying `title: draft`, an unindented `---draft` line, then `status: open`, and finds `title` and `status` both present.
+- A harvest test under a thread-scoped `tracing` subscriber, like the existing lossy-path warning test, finds one warning naming a task file whose `created` is `not-a-date`, one warning naming a task-named file with no frontmatter, and no warning for a `README.md` without frontmatter in the same `tasks/` tree.
 - A harvest test under the same subscriber finds one warning naming a task file whose frontmatter has no `status` key, and one naming a file with no `created` key.
 - A harvest test on a folder outside git whose `tasks/archive/` directory has its read permission removed returns `HarvestError::Io` naming that directory, and a scan test finds the repository's earlier rows intact with the error recorded. The test restores the permission before its temp directory is removed, and returns early when the directory stays readable after the mode change, as it does for root.
-- The **3. Repositories** section of `FEATURES.md` names the trailing comment and the unreadable directory, the **Data Layout** section of `ARCHITECTURE.md` covers an unreadable directory, and each rule appears once with no superseded wording beside it.
+- The **3. Repositories** section of `FEATURES.md` names the trailing comment and the unreadable directory, the **Data Layout** section of `ARCHITECTURE.md` covers an unreadable directory, the **Harvest** bullet of `TESTING.md` names the trailing-comment and walk-error cases, and each rule appears once with no superseded wording beside it.

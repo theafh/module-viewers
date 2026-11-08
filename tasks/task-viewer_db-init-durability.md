@@ -2,8 +2,8 @@
 description: "Propagate a failed schema-version read, refuse a database newer than the binary, and run SQLite at synchronous=NORMAL under WAL."
 scope: task-viewer
 created: 2026-11-08T14:13:24
-updated: 2026-11-08T14:13:24
-status: open
+updated: 2026-11-08T15:38:03
+status: ready
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -31,7 +31,9 @@ After the version-0 branch, `migrate` loops `while version < SCHEMA_VERSION`, so
 ## Acceptance
 
 - A `db` test closes a pool and calls `migrate` on it, and the returned error's chain contains the schema-version context.
+- A `db` test creates a database through `init_at`, closes the pool, turns on a `#[cfg(test)]` seam beside `test_db` that makes the next `PRAGMA user_version` read in `migrate` fail while the file still accepts writes, calls `init_at` on the same path, and gets an error whose chain contains the schema-version context; a fresh connection to that file then reads `PRAGMA user_version` as `SCHEMA_VERSION`.
 - A `db` test creates a database through `init_at`, sets `PRAGMA user_version` to `SCHEMA_VERSION + 1`, calls `init_at` again, and gets an error naming both versions, after which the file still reads `SCHEMA_VERSION + 1`.
 - A `db` test reads `PRAGMA synchronous` on a connection from the pool `init_at` returns and gets `1`, SQLite's value for `NORMAL`.
 - The existing migration tests that upgrade a version-one and a version-two database keep their rows.
-- The **Stack** line in `ARCHITECTURE.md` names `synchronous=NORMAL`, and no other passage still describes the storage settings without it.
+- `rg -n 'journal mode|journal_mode|synchronous|foreign key|foreign_keys' ARCHITECTURE.md FEATURES.md README.md SECURITY.md TESTING.md` returns the rewritten **Stack** line as its only hit, and that line names `synchronous=NORMAL`.
+- The `- Database:` bullet under **What Must Be Covered** in `TESTING.md` names both failure paths: a schema version that cannot be read, and a database stamped above `SCHEMA_VERSION`.
