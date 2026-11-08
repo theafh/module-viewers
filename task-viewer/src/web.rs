@@ -3922,6 +3922,85 @@ mod tests {
         assert_eq!(result["radarMarks"], true);
     }
 
+    /// A payload whose shipped calendar and radar carry a non-numeric count,
+    /// so both draws throw and `renderCard` paints "Charts unavailable".
+    fn payload_with_non_numeric_counts() -> serde_json::Value {
+        let mut payload = year_of_calendar_rows();
+        payload["shipped_calendar"] = serde_json::json!([{"date": "2026-01-05", "count": "many"}]);
+        payload["radar_shipped"] = serde_json::json!([{"label": "alpha", "count": "many"}]);
+        payload
+    }
+
+    /// Acceptance 3: the fallback centres on the frame, not on the chart's
+    /// own seeded size. At a 1000px frame the calendar's seeded 884px width
+    /// would centre at 442 and the radar's 212.8px at 106.4, so 500 is the
+    /// value the frame-forcing line in `message()` alone produces.
+    #[test]
+    fn browser_fallback_centres_on_the_frame_width() {
+        let payload = payload_with_non_numeric_counts();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function svgOf(name) {
+    return env.cards[name].querySelector("svg");
+  }
+  function fallbackX(name) {
+    var found = svgOf(name).children.filter(function (node) {
+      return node.name === "text" && node.textContent === "Charts unavailable";
+    });
+    return found.length ? Number(found[0].attrs.x) : null;
+  }
+  var calendar = svgOf("shipped-calendar");
+  var radar = svgOf("radar-shipped");
+  calendar.setAttribute("width", "884");
+  radar.setAttribute("width", "212.8");
+  var seeded = {
+    calendar: calendar.getAttribute("width"),
+    radar: radar.getAttribute("width")
+  };
+  env.window.dispatchEvent(new env.Event("task-viewer-theme"));
+  return JSON.stringify({
+    seeded: seeded,
+    x: { calendar: fallbackX("shipped-calendar"), radar: fallbackX("radar-shipped") },
+    frameWidth: env.cards["shipped-calendar"].querySelector(".chart-frame").clientWidth,
+    clientWidths: { calendar: calendar.clientWidth, radar: radar.clientWidth },
+    viewBoxBaseWidths: {
+      calendar: calendar.viewBox.baseVal.width,
+      radar: radar.viewBox.baseVal.width
+    }
+  });
+})()"#,
+        );
+        assert_eq!(result["seeded"]["calendar"], "884");
+        assert_eq!(result["seeded"]["radar"], "212.8");
+        assert_eq!(result["frameWidth"].as_f64(), Some(1000.0));
+        assert_eq!(result["x"]["calendar"].as_f64(), Some(500.0));
+        assert_eq!(result["x"]["radar"].as_f64(), Some(500.0));
+        assert_eq!(
+            result["clientWidths"]["calendar"].as_f64(),
+            Some(1000.0),
+            "the fallback measures the frame, not the seeded 884px width"
+        );
+        assert_eq!(
+            result["clientWidths"]["radar"].as_f64(),
+            Some(1000.0),
+            "the fallback measures the frame, not the seeded 212.8px width"
+        );
+        assert_eq!(
+            result["viewBoxBaseWidths"]["calendar"].as_f64(),
+            Some(1000.0)
+        );
+        assert_eq!(result["viewBoxBaseWidths"]["radar"].as_f64(), Some(1000.0));
+    }
+
     /// Four radar spokes whose 17- and 18-character labels reach the ring's
     /// horizontal and vertical bounds, so a frame-sized viewBox at a narrow
     /// width would clip the left, right, top, and bottom labels.
@@ -4247,8 +4326,8 @@ mod tests {
     }
 
     /// Acceptance 5: at a 1000px frame the radar's ring fits, so the element
-    /// carries no inline size, the viewBox is the frame size, and the frame's
-    /// client size divides the viewBox to 1 in both axes.
+    /// carries no inline size, the viewBox is the frame size, and the
+    /// element's own client size divides the viewBox to 1 in both axes.
     #[test]
     fn browser_wide_radar_renders_at_one_to_one() {
         let payload = payload_with_long_radar_labels();
@@ -4268,6 +4347,8 @@ mod tests {
   var box = { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
   return JSON.stringify({
     box: box,
+    clientWidth: svg.clientWidth,
+    clientHeight: svg.clientHeight,
     styleWidth: String(svg.style.width || ""),
     styleHeight: String(svg.style.height || ""),
     widthScale: svg.clientWidth / box.width,
@@ -4276,16 +4357,52 @@ mod tests {
 })()"#,
         );
         assert_eq!(result["box"]["width"].as_f64(), Some(1000.0));
-        assert_eq!(result["box"]["height"].as_f64(), Some(190.0));
+        assert_eq!(result["box"]["height"].as_f64(), Some(360.0));
+        assert_eq!(result["clientWidth"].as_f64(), Some(1000.0));
+        assert_eq!(result["clientHeight"].as_f64(), Some(360.0));
         assert_eq!(result["styleWidth"], "");
         assert_eq!(result["styleHeight"], "");
         assert!((result["widthScale"].as_f64().expect("width scale") - 1.0).abs() < 1e-9);
         assert!((result["heightScale"].as_f64().expect("height scale") - 1.0).abs() < 1e-9);
     }
 
+    /// Acceptance 2: at a 1000px frame the radar element takes the
+    /// stylesheet's 360px height, so its radius and viewBox follow the
+    /// geometry the page produces.
+    #[test]
+    fn browser_wide_radar_uses_the_stylesheet_height() {
+        let payload = payload_with_long_radar_labels();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["radar-shipped"].querySelector("svg");
+  var radius = 0;
+  svg.children.forEach(function (node) {
+    if (node.name === "circle") radius = Math.max(radius, Number(node.attrs.r));
+  });
+  return JSON.stringify({
+    clientHeight: svg.clientHeight,
+    radius: radius,
+    viewBox: String(svg.getAttribute("viewBox"))
+  });
+})()"#,
+        );
+        assert_eq!(result["clientHeight"].as_f64(), Some(360.0));
+        assert_eq!(result["radius"].as_f64(), Some(116.0));
+        assert_eq!(result["viewBox"], "0 0 1000 360");
+    }
+
     /// Acceptance 6: at a 1000px frame the calendar cell size is 14 and the
-    /// radar radius equals the shipped formula, so the normal-width layout is
-    /// unchanged.
+    /// radar radius and viewBox follow the 360px stylesheet height, so the
+    /// normal-width layout is unchanged.
     #[test]
     fn browser_wide_layout_matches_the_shipped_formula() {
         let payload = payload_with_long_radar_labels();
@@ -4316,19 +4433,20 @@ mod tests {
   });
 })()"#,
         );
-        let shipped = f64::max(1.0, f64::min(1000.0, 190.0) / 2.0 - 64.0);
+        let shipped = f64::max(1.0, f64::min(1000.0, 360.0) / 2.0 - 64.0);
         assert_eq!(result["cells"].as_u64(), Some(365));
         let widths = result["cellWidths"].as_array().expect("cell widths");
         let heights = result["cellHeights"].as_array().expect("cell heights");
         assert!(widths.iter().all(|width| width.as_f64() == Some(14.0)));
         assert!(heights.iter().all(|height| height.as_f64() == Some(14.0)));
         assert_eq!(result["radius"].as_f64(), Some(shipped));
-        assert_eq!(result["viewBox"], "0 0 1000 190");
+        assert_eq!(result["viewBox"], "0 0 1000 360");
     }
 
     /// Acceptance 7: an 800px frame, below the 884px threshold, still renders
     /// the calendar at its natural width and scrolls it, through the stub's
-    /// numeric `config.width`.
+    /// numeric `config.width`. The element's client width is its own 884px
+    /// natural width, not the narrower frame it sits in.
     #[test]
     fn browser_mid_width_calendar_scrolls_full_size_cells() {
         let payload = year_of_calendar_rows();
@@ -4344,18 +4462,56 @@ mod tests {
             &config,
             r#"(function () {
   var env = globalThis.__env;
-  var svg = env.cards["shipped-calendar"].querySelector("svg");
+  var card = env.cards["shipped-calendar"];
+  var svg = card.querySelector("svg");
   var parts = String(svg.getAttribute("viewBox")).trim().split(/\s+/).map(Number);
   return JSON.stringify({
     clientWidth: svg.clientWidth,
+    frameClientWidth: card.querySelector(".chart-frame").clientWidth,
     viewBoxWidth: parts[2],
     width: Number(svg.getAttribute("width"))
   });
 })()"#,
         );
-        assert_eq!(result["clientWidth"].as_f64(), Some(800.0));
+        assert_eq!(result["clientWidth"].as_f64(), Some(884.0));
+        assert_eq!(result["frameClientWidth"].as_f64(), Some(800.0));
         assert_eq!(result["viewBoxWidth"].as_f64(), Some(884.0));
         assert_eq!(result["width"].as_f64(), Some(884.0));
+    }
+
+    /// Acceptance 1: at a 120px frame the calendar element keeps its own
+    /// 884px natural client width, so the harness distinguishes the chart
+    /// from the frame that scrolls it.
+    #[test]
+    fn browser_narrow_calendar_element_is_wider_than_its_frame() {
+        let payload = year_of_calendar_rows();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            true,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var card = env.cards["shipped-calendar"];
+  var svg = card.querySelector("svg");
+  return JSON.stringify({
+    svgClientWidth: svg.clientWidth,
+    frameClientWidth: card.querySelector(".chart-frame").clientWidth,
+    width: Number(svg.getAttribute("width"))
+  });
+})()"#,
+        );
+        assert_eq!(result["svgClientWidth"].as_f64(), Some(884.0));
+        assert_eq!(result["frameClientWidth"].as_f64(), Some(120.0));
+        assert_eq!(
+            result["width"].as_f64(),
+            Some(884.0),
+            "the element's own width attribute is its natural width"
+        );
     }
 
     /// Acceptance 8: at a 120px frame the rendered month labels sit at least

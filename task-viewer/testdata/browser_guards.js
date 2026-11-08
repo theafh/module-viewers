@@ -10,20 +10,88 @@
   var storageThrows = !!config.storageThrows;
   var cssValue = config.cssValue === undefined ? "#123456" : config.cssValue;
 
-  function Node(name) {
+  // The shipped stylesheet's chart heights: `.chart-frame svg` is 280px,
+  // `.chart-frame.calendar svg` is 190px, and `.chart-frame.radar svg` is
+  // 360px. Keeping them here gives a stylesheet change one edit site.
+  var CHART_HEIGHT = { line: 280, calendar: 190, radar: 360 };
+  // Each card's chart kind, so an SVG node reports the height its own
+  // stylesheet rule gives it instead of every node sharing one height.
+  var CHART_KIND = {
+    weekly: "line",
+    cumulative: "line",
+    "shipped-calendar": "calendar",
+    "created-calendar": "calendar",
+    backlog: "line",
+    age: "line",
+    "radar-shipped": "radar",
+    "radar-live": "radar"
+  };
+
+  // A pixel length as a number, or null when the value is not one.
+  function pixels(value) {
+    if (typeof value !== "string") return null;
+    var match = /^\s*(-?\d+(?:\.\d+)?)px\s*$/.exec(value);
+    return match ? Number(match[1]) : null;
+  }
+
+  // An SVG length attribute, which carries either a bare number or a pixel
+  // length, as a number, or null when the value is neither.
+  function attributeLength(value) {
+    if (typeof value !== "string") return null;
+    var trimmed = value.trim();
+    if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
+    return pixels(trimmed);
+  }
+
+  function Node(name, chart) {
     this.name = name;
+    this.chart = chart || null;
     this.children = [];
     this.attrs = {};
     this.textContent = "";
     this.listeners = {};
     this.style = {};
     this.hidden = false;
-    this.clientWidth = width;
-    this.clientHeight = 190;
-    this.viewBox = { baseVal: { width: this.clientWidth, height: this.clientHeight } };
+    this.viewBox = {
+      baseVal: { x: 0, y: 0, width: this.clientWidth, height: this.clientHeight }
+    };
   }
+  // A chart SVG reports its own laid-out size, which the page can make wider
+  // or taller than its frame: an inline `style` wins, then the `width`
+  // attribute a chart writes for its natural width, and only then the frame.
+  // Every other node, such as the card, the frame, and the tooltip, stays at
+  // the frame's client width.
+  Object.defineProperty(Node.prototype, "clientWidth", {
+    get: function () {
+      if (!this.chart) return width;
+      var inline = pixels(this.style.width);
+      if (inline !== null) return inline;
+      if (typeof this.style.width === "string" && this.style.width.trim() === "100%") {
+        return width;
+      }
+      var attribute = attributeLength(this.getAttribute("width"));
+      if (attribute !== null) return attribute;
+      return width;
+    }
+  });
+  Object.defineProperty(Node.prototype, "clientHeight", {
+    get: function () {
+      if (!this.chart) return 190;
+      var inline = pixels(this.style.height);
+      if (inline !== null) return inline;
+      return CHART_HEIGHT[this.chart] || 190;
+    }
+  });
   Node.prototype.setAttribute = function (key, value) {
     this.attrs[key] = String(value);
+    // The line chart's overlay converts a pointer position through the
+    // element's current viewBox, so keep `baseVal` in step with every write.
+    if (key === "viewBox") {
+      var parts = String(value).trim().split(/\s+/).map(Number);
+      if (parts.length === 4 && parts.every(function (part) { return isFinite(part); })) {
+        this.viewBox.baseVal = { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
+      }
+    }
   };
   Node.prototype.getAttribute = function (key) {
     return Object.prototype.hasOwnProperty.call(this.attrs, key) ? this.attrs[key] : null;
@@ -83,7 +151,7 @@
   var cards = {};
   CARD_NAMES.forEach(function (name) {
     var root = new Node("card:" + name);
-    var svg = new Node("svg");
+    var svg = new Node("svg", CHART_KIND[name]);
     var frame = new Node("frame");
     var tip = new Node("tip");
     var summary = new Node("summary");
