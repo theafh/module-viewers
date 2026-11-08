@@ -1,8 +1,8 @@
 ---
-description: "Strip trailing # comments from frontmatter values, close frontmatter only on a bare --- line, log every dropped task file, and fail the scan on an unreadable tasks directory."
+description: "Strip trailing # comments from frontmatter values, close frontmatter only on a bare --- line, log every task file dropped for bad frontmatter, and fail the scan on an unreadable tasks directory."
 scope: task-viewer
 created: 2026-11-08T14:13:24
-updated: 2026-11-08T14:13:24
+updated: 2026-11-08T14:51:13
 status: open
 reported-by: "Andreas Hoffmann"
 ---
@@ -11,7 +11,7 @@ reported-by: "Andreas Hoffmann"
 
 ## Goal
 
-A task file whose frontmatter carries a trailing comment, such as `status: finished  # shipped early`, charts like its plain spelling. A frontmatter value line that happens to begin with `---` no longer ends the block early. A task file that harvest drops leaves a log line naming it and the reason, and a directory under `tasks/` that cannot be read fails that repository's scan, which keeps its earlier rows and shows the error, instead of silently charting fewer tasks. The parser stays the flat key-value reader it is today.
+A task file whose frontmatter carries a trailing comment, such as `status: finished  # shipped early`, charts like its plain spelling. A frontmatter value line that happens to begin with `---` no longer ends the block early. A task file that `harvest_file` drops leaves a log line naming it and the reason, and a directory under `tasks/` that cannot be read fails that repository's scan, which keeps its earlier rows and shows the error, instead of silently charting fewer tasks. The parser stays the flat key-value reader it is today.
 
 ## Context
 
@@ -30,7 +30,7 @@ The archived `task-viewer_harvest-input-robustness` task settled that the flat k
 
 1. Before `unquote_frontmatter_value`, strip a trailing comment from each value. A value that opens with `"` or `'` keeps everything up to its matching closing quote, and a `#` after that quote that follows whitespace starts a comment. An unquoted value ends at the first `#` that follows a space or a tab. Trim the result.
 2. End the frontmatter block at the first line, after the opening delimiter, whose content without a trailing `\r` and trailing whitespace is exactly `---`.
-3. In `harvest_file`, log `tracing::debug!` naming the path when a file has no frontmatter, which is how a stray `README.md` under `tasks/` reads, and `tracing::warn!` naming the path and the missing or unparseable field when the frontmatter lacks `status` or its `created` value does not parse. The returned rows stay unchanged.
+3. In `harvest_file`, log `tracing::debug!` naming the path when a file has no frontmatter, which is how a stray `README.md` under `tasks/` reads, and `tracing::warn!` naming the path and the missing or unparseable field when `status` is missing, or `created` is missing or does not parse. The returned rows stay unchanged.
 4. In `files_on_disk`, return `HarvestError::Io` built from the first walk error, so the repository's scan fails, its rows stay, and the error names the unreadable path. A file that opens but cannot be read as text keeps today's skip.
 5. Extend the **3. Repositories** sentence in `FEATURES.md` that lists a BOM, leading blank lines, quoted values, and a space-separated timestamp with a trailing `#` comment, and extend its scan-error sentence with an unreadable directory under `tasks/`. Extend the `ARCHITECTURE.md` **Data Layout** sentence about a missing directory to cover an unreadable one, and add the comment and walk-error cases to the Harvest bullet of `TESTING.md`.
 
@@ -40,5 +40,6 @@ The archived `task-viewer_harvest-input-robustness` task settled that the flat k
 - A harvest test charts a live task whose `created: 2026-01-01\t# note` value carries a tab-separated comment with created day 2026-01-01.
 - A unit test of `frontmatter` reads `status: "fin#ished" # note` as `fin#ished`, and reads a block whose value line is `title: ---draft` followed by `status: open` with both keys present.
 - A harvest test under a thread-scoped `tracing` subscriber, like the existing lossy-path warning test, finds one warning naming a task file whose `created` is `not-a-date`, and no warning for a `README.md` without frontmatter in the same `tasks/` tree.
+- A harvest test under the same subscriber finds one warning naming a task file whose frontmatter has no `status` key, and one naming a file with no `created` key.
 - A harvest test on a folder outside git whose `tasks/archive/` directory has its read permission removed returns `HarvestError::Io` naming that directory, and a scan test finds the repository's earlier rows intact with the error recorded. The test restores the permission before its temp directory is removed, and returns early when the directory stays readable after the mode change, as it does for root.
 - The **3. Repositories** section of `FEATURES.md` names the trailing comment and the unreadable directory, the **Data Layout** section of `ARCHITECTURE.md` covers an unreadable directory, and each rule appears once with no superseded wording beside it.

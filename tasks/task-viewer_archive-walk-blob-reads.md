@@ -2,7 +2,7 @@
 description: "Read each archived task's walk with one cat-file --batch that reports missing objects inline, dropping the --batch-check pass, and drain oversized blobs without allocating them."
 scope: task-viewer
 created: 2026-11-08T14:13:24
-updated: 2026-11-08T14:13:24
+updated: 2026-11-08T14:42:52
 status: open
 reported-by: "Andreas Hoffmann"
 ---
@@ -28,9 +28,9 @@ The leave-day walk of an archived task starts two git processes instead of three
 1. Change `parse_batch` to hand its callback an `Option<String>`: `None` for a header that ends in ` missing`, and `Some(text)` for a present object, with the non-UTF-8 case still `Some(String::new())`. A truncated or otherwise unreadable header keeps its current error and message.
 2. In `archived_leave_lookup`, feed every walk expression to `read_blobs` and skip a `None` entry the way a content without the expected status is skipped. Remove `existing_object_indices` and `parse_batch_check` together with their unit tests, and rewrite the newline-skip comment to say `cat-file` reads one expression per line.
 3. In the ref-union caller of `read_blobs`, turn a `None` entry into a `GitFailure::Other` whose message names the path whose object vanished, so the scan fails as it does today but says why.
-4. Add a constant `MAX_TASK_FILE_BYTES` of 4 MiB. In `parse_batch`, a present object larger than the cap is drained with `std::io::copy` over `reader.by_ref().take(size)` into `std::io::sink()`, its trailing newline is consumed as today, and the callback receives `Some(String::new())`, which parses to no task. In `files_on_disk`, read each file through `File::open(..)?.take(MAX_TASK_FILE_BYTES + 1)` and skip a file that yields more than the cap, like an unreadable one.
+4. Add a constant `MAX_TASK_FILE_BYTES` of 4 MiB. In `parse_batch`, a present object larger than the cap is drained with `std::io::copy` over `reader.by_ref().take(size)` into `std::io::sink()`, its trailing newline is consumed as today, and the callback receives `Some(String::new())`, which parses to no task. In `files_on_disk`, open each file with `File::open` and skip it when the open fails, as today, then read through `.take(MAX_TASK_FILE_BYTES + 1)` into a `String`, skipping a file that yields more than the cap or is not valid UTF-8, like an unreadable one.
 5. Rewrite the tests that route a hanging stand-in git to `--batch-check`, found with `rg -n 'batch-check' task-viewer/src/harvest.rs`, so each one hangs `--batch` instead, or remove it where another test already covers the `--batch` timeout.
-6. Rewrite the leave-day bullet in `ARCHITECTURE.md` so it says one `git cat-file --batch` reads every archived-path `<commit>:<path>` and an expression that names no object answers `missing` and counts as no qualifying commit, and so the newline sentence speaks of `cat-file` in the singular. Add the size cap to the **3. Repositories** sentence in `FEATURES.md` that names the non-UTF-8 skip, and to the matching Harvest bullet in `TESTING.md`.
+6. Rewrite the leave-day bullet in `ARCHITECTURE.md` so it says one `git cat-file --batch` reads every archived-path `<commit>:<path>` and an expression that names no object answers `missing` and counts as no qualifying commit, and so the newline sentence speaks of `cat-file` in the singular. Rewrite the `parse_archive_log` doc comment that says the batch-check pass drops its record, so it says `cat-file --batch` answers `missing` for a path that names no object. Add the size cap to the **3. Repositories** sentence in `FEATURES.md` that names the non-UTF-8 skip, and to the matching Harvest bullet in `TESTING.md`.
 
 ## Acceptance
 

@@ -1,8 +1,8 @@
 ---
-description: "Start the weekly, cumulative, backlog, and mean-age series no earlier than 1970-01-01, keeping every row, so a mistyped early year cannot stretch the charts across centuries."
+description: "Start the cumulative, backlog, and mean-age series at 1970-01-01 and the weekly series at that week's Monday, keeping every row, so a mistyped early year cannot stretch the charts."
 scope: task-viewer
 created: 2026-11-08T14:13:24
-updated: 2026-11-08T14:30:10
+updated: 2026-11-08T14:51:13
 status: open
 reported-by: "Andreas Hoffmann"
 ---
@@ -11,7 +11,7 @@ reported-by: "Andreas Hoffmann"
 
 ## Goal
 
-One mistyped year in a task's frontmatter, such as `created: 0026-03-01` for 2026, can no longer make the dashboard build and send hundreds of thousands of chart points. The weekly, cumulative, backlog, and mean-age series start no earlier than 1970-01-01, so their size stays bounded by roughly 20,000 days however a year is mistyped, and the render, the JSON payload, and the browser's drawing and hover stay proportionate to real history. Harvest keeps every row as it is: the mistyped task still counts in the backlog, the radars, and the summary counts, and events before the floor fold into the first charted day. The user chose this placement of the floor over rejecting the row at harvest, which keeps the principle the archived `task-viewer_chart-date-anomalies` task recorded, that the charts stay usable for imperfect data.
+One mistyped year in a task's frontmatter, such as `created: 0026-03-01` for 2026, can no longer make the dashboard build and send hundreds of thousands of chart points. The cumulative, backlog, and mean-age series start no earlier than 1970-01-01, and the weekly series at the Monday of that week, so their size stays bounded by roughly 20,000 days however a year is mistyped, and the render, the JSON payload, and the browser's drawing and hover stay proportionate to real history. Harvest keeps every row as it is: the mistyped task still counts in the backlog, the radars, and the summary counts, and events before the floor fold into the first charted day. The user chose this placement of the floor over rejecting the row at harvest, which keeps the principle the archived `task-viewer_chart-date-anomalies` task recorded, that the charts stay usable for imperfect data.
 
 ## Context
 
