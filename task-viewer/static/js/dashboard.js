@@ -72,11 +72,10 @@
     var tip = frame.querySelector(".tooltip");
     return {
       show: function (event, text) {
-        var bounds = frame.getBoundingClientRect();
         tip.hidden = false;
         tip.textContent = text;
-        tip.style.left = event.clientX - bounds.left + 12 + "px";
-        tip.style.top = event.clientY - bounds.top + 12 + "px";
+        tip.style.left = event.clientX + 12 + "px";
+        tip.style.top = event.clientY + 12 + "px";
       },
       hide: function () {
         tip.hidden = true;
@@ -245,9 +244,7 @@
       return;
     }
     clear(svg);
-    var width = svg.clientWidth || 1000;
     var height = svg.clientHeight || 190;
-    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
     var parsed = rows.map(function (row) {
       return { date: parseDay(row.date), count: row.count };
     });
@@ -257,18 +254,32 @@
     parsed.forEach(function (day) { cells.push(day); });
     var columns = Math.ceil(cells.length / 7);
     var labelW = 28;
-    var cell = Math.max(1, Math.min(14, Math.floor((width - labelW - 8) / columns) - 2));
+    // Calendar: scroll horizontally. A contribution-style heatmap has a natural
+    // width, so the cells keep a fixed 14px size and the frame scrolls when that
+    // natural width exceeds the client width, instead of shrinking the cells to
+    // a 1px strip or scaling the whole chart down to illegible text.
+    var cell = 14;
     var gap = 2;
+    var naturalWidth = labelW + columns * (cell + gap) + 8;
+    svg.setAttribute("viewBox", "0 0 " + naturalWidth + " " + height);
+    svg.setAttribute("width", String(naturalWidth));
     var maxLog = Math.log1p(peak);
     var tip = tipFor(root.querySelector(".chart-frame"));
     var color = cssVar(colorName);
     var track = cssVar("--chart-track");
+    var lastLabelX = null;
     for (var col = 0; col < columns; col += 1) {
       var first = cells[col * 7];
       if (first && first.date.getDate() <= 7) {
-        el(svg, "text", {
-          x: labelW + col * (cell + gap), y: 12, fill: cssVar("--chart-muted"), "font-size": "11"
-        }).textContent = monthName(first.date);
+        var labelX = labelW + col * (cell + gap);
+        // Keep consecutive month labels at least 24px apart so an 11px month
+        // name keeps a visible gap at every width.
+        if (lastLabelX === null || labelX - lastLabelX >= 24) {
+          el(svg, "text", {
+            x: labelX, y: 12, fill: cssVar("--chart-muted"), "font-size": "11"
+          }).textContent = monthName(first.date);
+          lastLabelX = labelX;
+        }
       }
       for (var row = 0; row < 7; row += 1) {
         var item = cells[col * 7 + row];
@@ -299,6 +310,13 @@
   function drawRadar(name, rows, colorName, noun, mode) {
     var root = card(name);
     var svg = root.querySelector("svg");
+    // Radar: fit the frame by expanding the viewBox rather than shrinking the
+    // 64px label margin, and render the expanded chart at 1:1 so the 11px
+    // labels keep their size. The inline size is cleared first because
+    // renderAll reruns on resize and theme change, so a stale inline width or
+    // height would feed back into the next measurement.
+    svg.style.width = "";
+    svg.style.height = "";
     var slice = mode === "project" ? "project" : "scope";
     var total = rows.reduce(function (sum, row) { return sum + row.count; }, 0);
     summary(name, fmt(total) + " " + noun + " · one spoke per " + slice);
@@ -309,10 +327,26 @@
     clear(svg);
     var width = svg.clientWidth || 520;
     var height = svg.clientHeight || 360;
-    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
     var cx = width / 2;
     var cy = height / 2 + 4;
-    var radius = Math.max(1, Math.min(width, height) / 2 - 64);
+    // The radius comes from the frame dimensions before any viewBox expansion,
+    // so the expansion never feeds back into it. The 31px floor is the largest
+    // the shipped formula reaches in a 190px-tall frame, so it binds only below
+    // that width and never raises the normal-width radius.
+    var radius = Math.max(31, Math.min(width, height) / 2 - 64);
+    var ringWidth = 2 * radius + 150.8;
+    var ringHeight = 2 * radius + 49.6;
+    if (ringWidth <= width && ringHeight <= height) {
+      svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    } else {
+      // Centre the ring's bounds on the same cx/cy the labels are drawn around,
+      // so the expanded viewBox keeps every label inside it.
+      var minX = cx - ringWidth / 2;
+      var minY = cy - ringHeight / 2;
+      svg.setAttribute("viewBox", minX + " " + minY + " " + ringWidth + " " + ringHeight);
+      svg.style.width = ringWidth + "px";
+      svg.style.height = ringHeight + "px";
+    }
     var max = 1;
     rows.forEach(function (row) { max = Math.max(max, row.count); });
     var color = cssVar(colorName);

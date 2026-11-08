@@ -6,6 +6,7 @@
 (function () {
   var config = globalThis.__config || {};
   var narrow = !!config.narrow;
+  var width = typeof config.width === "number" ? config.width : narrow ? 120 : 1000;
   var storageThrows = !!config.storageThrows;
   var cssValue = config.cssValue === undefined ? "#123456" : config.cssValue;
 
@@ -17,7 +18,7 @@
     this.listeners = {};
     this.style = {};
     this.hidden = false;
-    this.clientWidth = narrow ? 120 : 1000;
+    this.clientWidth = width;
     this.clientHeight = 190;
     this.viewBox = { baseVal: { width: this.clientWidth, height: this.clientHeight } };
   }

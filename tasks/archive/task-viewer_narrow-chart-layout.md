@@ -2,9 +2,11 @@
 description: "Make the calendar and radar charts readable at narrow widths, where the geometry clamp only keeps them non-negative."
 scope: task-viewer
 created: 2026-11-06T21:04:32
-updated: 2026-11-07T19:22:32
-status: ready
+updated: 2026-11-08T07:39:22
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Make the narrow-width charts readable

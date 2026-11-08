@@ -206,6 +206,7 @@ select {
 
 .chart-card {
     background: var(--chart-card);
+    min-width: 0;
 }
 
 .card h2,
@@ -267,8 +268,17 @@ select {
     display: block;
 }
 
+.chart-frame.calendar {
+    overflow-x: auto;
+}
+
 .chart-frame.calendar svg {
     height: 190px;
+    width: auto;
+}
+
+.chart-frame.radar {
+    overflow-x: auto;
 }
 
 .chart-frame.radar svg {
@@ -276,7 +286,7 @@ select {
 }
 
 .tooltip {
-    position: absolute;
+    position: fixed;
     z-index: 5;
     pointer-events: none;
     background: var(--card-bg);
