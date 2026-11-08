@@ -2777,6 +2777,86 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_keeps_earlier_rows_when_a_tasks_subdirectory_is_unreadable() {
+        // An unreadable directory under `tasks/` fails the repository's scan,
+        // so its earlier rows stay instead of being replaced by a smaller set.
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_database("scan_unreadable_subdir");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let repo = unique_temp_dir("scan_unreadable_repo");
+        let archive = repo.join("tasks/archive");
+        std::fs::create_dir_all(&archive).expect("archive");
+        std::fs::write(
+            archive.join("scope_done.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: finished\n---\n\n# Done\n",
+        )
+        .expect("archived task");
+        let id = db::insert_repository(&pool, "unreadable", &repo.to_string_lossy())
+            .await
+            .expect("insert");
+        sqlx::query(
+            "INSERT INTO tasks
+                (repository_id, path, scope, kind, created, updated, ship_date, leave_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("tasks/scope_old.md")
+        .bind("scope")
+        .bind("live")
+        .bind("2026-05-01")
+        .bind("2026-05-01")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("earlier rows");
+
+        let original = std::fs::metadata(&archive)
+            .expect("archive metadata")
+            .permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        std::fs::set_permissions(&archive, locked).expect("lock archive");
+        if std::fs::read_dir(&archive).is_ok() {
+            // Root reads the directory whatever its mode. Restore it and skip.
+            std::fs::set_permissions(&archive, original).expect("restore archive");
+            let _ = std::fs::remove_dir_all(&repo);
+            cleanup(&path);
+            return;
+        }
+
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        scan_core(
+            &pool,
+            &repositories,
+            1,
+            Arc::new(harvest::harvest_repository_with_prior),
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+        std::fs::set_permissions(&archive, original).expect("restore archive");
+
+        let after = db::list_repositories(&pool).await.expect("after");
+        let failed = after
+            .iter()
+            .find(|repository| repository.repository_id == id)
+            .expect("repository");
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("The scan could not read the repository."),
+            "the unreadable directory records a scan error"
+        );
+        let rows = db::load_tasks(&pool, Some(id)).await.expect("earlier rows");
+        assert_eq!(rows.len(), 1, "the earlier rows stay intact");
+        assert_eq!(rows[0].scope, "scope");
+        let _ = std::fs::remove_dir_all(&repo);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn web_scan_report_names_the_failed_repository() {
         let path = temp_database("scan_report_failure");
         db::test_db::set(path.clone());

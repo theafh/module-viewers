@@ -464,17 +464,56 @@ struct HarvestState {
 
 impl HarvestState {
     /// Fold one task file's text into the pending and task accumulators.
+    ///
+    /// A file this reader cannot chart leaves one log line naming it and the
+    /// reason, so a task that vanishes from the charts is traceable. The
+    /// returned rows stay the same: a file without the fields a row needs is
+    /// still skipped.
     fn harvest_file(&mut self, rel: &str, text: &str, path_is_lossy: bool) {
         let Some(fields) = frontmatter(text) else {
+            if has_task_name_shape(rel) {
+                tracing::warn!(
+                    path = %rel,
+                    "task file has no frontmatter; skipping it"
+                );
+            } else {
+                // A stray file such as `README.md` under `tasks/` is not a task
+                // the person lost, so it stays out of the warning stream.
+                tracing::debug!(
+                    path = %rel,
+                    "file under tasks/ has no frontmatter; skipping it"
+                );
+            }
             return;
         };
-        let Some(created) = fields
-            .get("created")
-            .and_then(|value| parse_iso_date(value))
-        else {
-            return;
+        let created = match fields.get("created") {
+            Some(value) => match parse_iso_date(value) {
+                Some(created) => created,
+                None => {
+                    tracing::warn!(
+                        path = %rel,
+                        field = "created",
+                        value = %value,
+                        "task file has an unparseable created value; skipping it"
+                    );
+                    return;
+                }
+            },
+            None => {
+                tracing::warn!(
+                    path = %rel,
+                    field = "created",
+                    "task file has no created value; skipping it"
+                );
+                return;
+            }
         };
         let Some(status) = fields.get("status").map(|value| value.trim().to_string()) else {
+            tracing::warn!(
+                path = %rel,
+                field = "status",
+                "task file has no status value; skipping it"
+            );
             return;
         };
         let updated = fields
@@ -786,12 +825,15 @@ fn parse_batch_check<R: BufRead>(mut reader: R, expected: usize) -> Result<Vec<u
 
 /// The markdown files of `tasks/` as the folder holds them, for a folder
 /// outside git.
+///
+/// A walk error fails the scan instead of shrinking the listing. An unreadable
+/// directory would otherwise yield fewer files, and the store that follows
+/// would replace the repository's rows with that smaller set. The error keeps
+/// the walk's own text, which names the path it could not read.
 fn files_on_disk(repo: &Path) -> Result<Vec<(String, String, bool)>, HarvestError> {
     let mut files = Vec::new();
-    for entry in WalkDir::new(repo.join("tasks"))
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-    {
+    for entry in WalkDir::new(repo.join("tasks")) {
+        let entry = entry.map_err(|error| HarvestError::Io(std::io::Error::other(error)))?;
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "md") {
             continue;
@@ -838,6 +880,14 @@ fn relative_path(path: &Path, base: &Path) -> (String, bool) {
     (joined, path_is_lossy)
 }
 
+/// The task naming shape `harvest_file` splits for `scope`: a `.md` file whose
+/// name carries an `_`. A stray `README.md` under `tasks/` does not match, so a
+/// file that is not a task stays out of the warning stream.
+fn has_task_name_shape(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or_default();
+    name.ends_with(".md") && name.contains('_')
+}
+
 fn classify(in_archive: bool, status: &str) -> TaskKind {
     if in_archive && status == "finished" {
         TaskKind::Finished
@@ -873,6 +923,68 @@ fn unquote_frontmatter_value(value: &str) -> &str {
     value
 }
 
+/// The byte index of the first `#` in `value` that follows a space or a tab.
+///
+/// A `#` glued to the value, as in `fin#ished`, is part of the value. Only a
+/// whitespace-separated `#` starts a comment.
+fn comment_offset(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(index, byte)| **byte == b'#' && matches!(bytes[index - 1], b' ' | b'\t'))
+        .map(|(index, _)| index)
+}
+
+/// Strip a trailing `#` comment from a frontmatter value before it is unquoted.
+///
+/// A quoted value keeps everything up to its matching closing quote, so a `#`
+/// inside the quotes stays part of the value; only a `#` after that quote and
+/// after whitespace starts a comment. An unquoted value ends at the first `#`
+/// that follows a space or a tab. The result is trimmed.
+fn strip_frontmatter_comment(value: &str) -> &str {
+    let rest = value.trim_start();
+    if let Some(quote) = rest
+        .as_bytes()
+        .first()
+        .copied()
+        .filter(|byte| *byte == b'"' || *byte == b'\'')
+        && let Some(close) = rest[1..].find(quote as char).map(|offset| offset + 1)
+    {
+        let after = &rest[close + 1..];
+        if let Some(offset) = comment_offset(after) {
+            return rest[..close + 1 + offset].trim_end();
+        }
+        return rest.trim_end();
+    }
+    // Run the unquoted search on the raw value, so the whitespace that precedes
+    // a comment is still there to find.
+    match comment_offset(value) {
+        Some(offset) => value[..offset].trim(),
+        None => value.trim(),
+    }
+}
+
+/// The byte offset where the frontmatter block ends: the first line after the
+/// opening delimiter whose content, with a trailing `\r` and trailing
+/// whitespace removed, is exactly `---`.
+///
+/// A value line that merely starts with `---`, such as `---draft`, is content,
+/// not a delimiter, so the keys after it still read.
+fn frontmatter_end(rest: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        if content.trim_end() == "---" {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
 fn frontmatter(text: &str) -> Option<std::collections::HashMap<String, String>> {
     // A UTF-8 BOM and blank lines ahead of the opening delimiter are common
     // editor artifacts. Dropping them keeps a file with either variation
@@ -887,7 +999,7 @@ fn frontmatter(text: &str) -> Option<std::collections::HashMap<String, String>> 
     let rest = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))?;
-    let end = rest.find("\n---").or_else(|| rest.find("\r\n---"))?;
+    let end = frontmatter_end(rest)?;
     let mut fields = std::collections::HashMap::new();
     for line in rest[..end].lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
@@ -898,7 +1010,7 @@ fn frontmatter(text: &str) -> Option<std::collections::HashMap<String, String>> 
         };
         fields.insert(
             key.trim().to_string(),
-            unquote_frontmatter_value(value.trim()).to_string(),
+            unquote_frontmatter_value(strip_frontmatter_comment(value)).to_string(),
         );
     }
     Some(fields)
@@ -1675,16 +1787,31 @@ fn enclosing_prefix(repo: &Path) -> Result<Option<(String, PathBuf, PathBuf)>, G
     )))
 }
 
-/// A stable 64-bit FNV-1a hash of the bytes a task row was parsed from. Only
-/// equality matters: a changed file changes the hash and re-runs its leave-day
-/// walk, while an unchanged file keeps the stored leave day.
-fn content_hash(text: &str) -> String {
+/// The frontmatter reader revision the content hash covers. Bumping it makes
+/// every stored row mismatch once, so each archived row re-walks its leave-day
+/// history under the new reader and stores a hash that matches again.
+///
+/// r2 strips a trailing `#` comment from a value and closes the block only on a
+/// bare `---` line, so a row stored by r1 must not keep its old leave day.
+const CONTENT_HASH_REVISION: &str = "r2";
+
+/// The bare 64-bit FNV-1a digest of `text`. Only equality matters: a changed
+/// file changes the digest.
+fn fnv1a_digest(text: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+/// A stable hash of the bytes a task row was parsed from and the frontmatter
+/// reader revision that parsed them. Only equality matters: a changed file or a
+/// new reader changes the hash and re-runs the row's leave-day walk, while an
+/// unchanged file under the same reader keeps the stored leave day.
+fn content_hash(text: &str) -> String {
+    format!("{CONTENT_HASH_REVISION}:{}", fnv1a_digest(text))
 }
 
 fn is_archived_path(path: &str) -> bool {
@@ -1880,14 +2007,15 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GIT_COMMAND_TIMEOUT, GitContext, GitFailure, HarvestError, HarvestState, LogLookup,
-        ParsedTask, PriorTask, TaskKind, archive_log_args, archived_leave_lookup, blob_days,
-        blob_days_log_args, enclosing_prefix, escape_posix_ere, existing_object_indices,
-        first_status_commit_date, git_bin, git_deadline, git_dir_command, git_log_args,
-        git_override, git_path, git_read, harvest_repository, harvest_repository_with_prior,
-        parse_archive_log, parse_batch, parse_batch_check, pickaxe_log_args, read_blobs,
-        run_git_command, run_git_log, scan_log_dates, scrub_git_env, stream_blob_days,
-        take_leave_walk_count, take_worktree_read_count,
+        CONTENT_HASH_REVISION, GIT_COMMAND_TIMEOUT, GitContext, GitFailure, HarvestError,
+        HarvestState, LogLookup, ParsedTask, PriorTask, TaskKind, archive_log_args,
+        archived_leave_lookup, blob_days, blob_days_log_args, content_hash, enclosing_prefix,
+        escape_posix_ere, existing_object_indices, first_status_commit_date, fnv1a_digest,
+        frontmatter, git_bin, git_deadline, git_dir_command, git_log_args, git_override, git_path,
+        git_read, harvest_repository, harvest_repository_with_prior, parse_archive_log,
+        parse_batch, parse_batch_check, pickaxe_log_args, read_blobs, run_git_command, run_git_log,
+        scan_log_dates, scrub_git_env, stream_blob_days, take_leave_walk_count,
+        take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -2680,6 +2808,185 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
         );
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_an_archived_task_with_a_trailing_status_comment() {
+        // `status: finished  # shipped early` reads as `finished`, so the task
+        // classifies as finished and dates from its archive commit.
+        let repo = scratch("harvest_status_comment");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/scope_done.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "create"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        fs::remove_file(repo.join("tasks/scope_done.md")).expect("remove live copy");
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-07-17",
+            "finished  # shipped early",
+        );
+        git(&repo, &["add", "-A"], "2026-07-17T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive with a trailing comment"],
+            "2026-07-17T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let done = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/scope_done.md")
+            .expect("the archived task charts");
+        assert_eq!(done.kind, TaskKind::Finished);
+        assert_eq!(
+            done.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 7, 17).expect("day")),
+            "the comment must not hide the finished status from the archive walk"
+        );
+        assert_eq!(done.leave_date, done.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_rewalks_a_prior_row_whose_hash_predates_the_comment_reader() {
+        // A row stored by the old reader carries the bare FNV digest. The new
+        // reader's hash carries the revision, so that row mismatches once and
+        // the archive walk replaces its earlier leave day with the real ship
+        // day, even though the file bytes are unchanged.
+        let repo = scratch("harvest_hash_revision");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/scope_done.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "create"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        fs::remove_file(repo.join("tasks/scope_done.md")).expect("remove live copy");
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-07-17",
+            "finished  # shipped early",
+        );
+        git(&repo, &["add", "-A"], "2026-07-17T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive with a trailing comment"],
+            "2026-07-17T12:00:00+00:00",
+        );
+        let text =
+            fs::read_to_string(repo.join("tasks/archive/scope_done.md")).expect("read task bytes");
+        let prior = vec![PriorTask {
+            path: "tasks/archive/scope_done.md".to_string(),
+            leave_date: Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day")),
+            content_hash: Some(fnv1a_digest(&text)),
+        }];
+
+        let tasks = harvest_repository_with_prior(&repo, &prior).expect("harvest");
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            1,
+            "a bare-digest row must re-walk its leave day once"
+        );
+        let done = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/scope_done.md")
+            .expect("the archived task charts");
+        assert_eq!(done.kind, TaskKind::Finished);
+        assert_eq!(
+            done.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 7, 17).expect("day")),
+            "the archive commit day replaces the stale prior day"
+        );
+        assert_eq!(
+            done.content_hash,
+            Some(content_hash(&text)),
+            "the stored hash carries the current reader revision"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_created_value_with_a_tab_separated_comment() {
+        let repo = scratch("harvest_tab_comment");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_dated.md"),
+            "---\ncreated: 2026-01-01\t# note\nupdated: 2026-01-02T10:00:00\nstatus: open\n---\n\n# Dated\n",
+        )
+        .expect("task");
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let dated = tasks.first().expect("the live task charts");
+        assert_eq!(dated.kind, TaskKind::Live);
+        assert_eq!(
+            dated.created,
+            NaiveDate::from_ymd_opt(2026, 1, 1).expect("day")
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn frontmatter_strips_a_trailing_comment_and_closes_only_on_a_bare_delimiter() {
+        let quoted = frontmatter("---\nstatus: \"fin#ished\" # note\n---\n").expect("frontmatter");
+        assert_eq!(
+            quoted.get("status").map(String::as_str),
+            Some("fin#ished"),
+            "a # inside quotes stays part of the value"
+        );
+
+        let unquoted = frontmatter("---\nstatus: fin#ished\n---\n").expect("frontmatter");
+        assert_eq!(
+            unquoted.get("status").map(String::as_str),
+            Some("fin#ished"),
+            "a # glued to the value does not start a comment"
+        );
+
+        let block =
+            frontmatter("---\ntitle: draft\n---draft\nstatus: open\n---\n").expect("frontmatter");
+        assert_eq!(block.get("title").map(String::as_str), Some("draft"));
+        assert_eq!(
+            block.get("status").map(String::as_str),
+            Some("open"),
+            "a value line starting with --- must not end the block"
+        );
+    }
+
+    #[test]
+    fn content_hash_carries_the_reader_revision() {
+        let text = "---\ncreated: 2026-05-01\nstatus: open\n---\n";
+        assert_eq!(
+            content_hash(text),
+            format!("{CONTENT_HASH_REVISION}:{}", fnv1a_digest(text))
+        );
+        assert_ne!(content_hash(text), fnv1a_digest(text));
     }
 
     #[test]
@@ -5407,6 +5714,150 @@ mod tests {
             warnings.is_empty(),
             "a valid UTF-8 name must not warn: {warnings:?}"
         );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_warns_about_task_files_it_cannot_parse() {
+        // A task-shaped file that loses its row leaves one warning naming it.
+        // A stray README under `tasks/` is not a lost task and stays at debug.
+        let repo = scratch("harvest_warn_unparseable");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_bad_date.md"),
+            "---\ncreated: not-a-date\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n",
+        )
+        .expect("bad date task");
+        fs::write(
+            repo.join("tasks/scope_no_frontmatter.md"),
+            "# No frontmatter here\n",
+        )
+        .expect("task without frontmatter");
+        fs::write(repo.join("tasks/README.md"), "# Read me\n").expect("readme");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("the harvest still succeeds");
+        assert!(
+            tasks.is_empty(),
+            "the unparseable files still contribute no rows: {tasks:?}"
+        );
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 2, "two task files warn: {warnings:?}");
+        let bad_date = warnings
+            .iter()
+            .find(|warning| warning.contains("scope_bad_date.md"))
+            .unwrap_or_else(|| panic!("the bad created value must warn: {warnings:?}"));
+        assert!(
+            bad_date.contains("unparseable created value"),
+            "the warning must name the field and reason: {bad_date}"
+        );
+        let no_frontmatter = warnings
+            .iter()
+            .find(|warning| warning.contains("scope_no_frontmatter.md"))
+            .unwrap_or_else(|| panic!("the absent frontmatter must warn: {warnings:?}"));
+        assert!(
+            no_frontmatter.contains("no frontmatter"),
+            "the warning must name the absent frontmatter: {no_frontmatter}"
+        );
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("README.md")),
+            "a stray README must not warn: {warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_warns_about_missing_created_and_status_fields() {
+        let repo = scratch("harvest_warn_missing_fields");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_no_status.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\n---\n",
+        )
+        .expect("task without status");
+        fs::write(
+            repo.join("tasks/scope_no_created.md"),
+            "---\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n",
+        )
+        .expect("task without created");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("the harvest still succeeds");
+        assert!(tasks.is_empty(), "neither file charts: {tasks:?}");
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 2, "two files warn: {warnings:?}");
+        let no_status = warnings
+            .iter()
+            .find(|warning| warning.contains("scope_no_status.md"))
+            .unwrap_or_else(|| panic!("the missing status must warn: {warnings:?}"));
+        assert!(
+            no_status.contains("no status value"),
+            "the warning must name the missing status: {no_status}"
+        );
+        let no_created = warnings
+            .iter()
+            .find(|warning| warning.contains("scope_no_created.md"))
+            .unwrap_or_else(|| panic!("the missing created must warn: {warnings:?}"));
+        assert!(
+            no_created.contains("no created value"),
+            "the warning must name the missing created field: {no_created}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_fails_on_an_unreadable_tasks_subdirectory() {
+        // A directory under `tasks/` that cannot be read must fail the scan so
+        // the repository keeps its earlier rows instead of charting fewer.
+        let repo = scratch("harvest_unreadable_archive");
+        write_task_dated(
+            &repo,
+            "tasks/scope_live.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        let archive = repo.join("tasks/archive");
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        let original = fs::metadata(&archive)
+            .expect("archive metadata")
+            .permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        fs::set_permissions(&archive, locked).expect("lock archive");
+        if fs::read_dir(&archive).is_ok() {
+            // Root reads the directory whatever its mode, so the mode change
+            // cannot make it unreadable. Restore it and skip.
+            fs::set_permissions(&archive, original).expect("restore archive");
+            let _ = fs::remove_dir_all(&repo);
+            return;
+        }
+
+        let result = harvest_repository(&repo);
+        fs::set_permissions(&archive, original).expect("restore archive");
+        let error = result.expect_err("an unreadable tasks subdirectory must fail the scan");
+        match error {
+            HarvestError::Io(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("tasks/archive"),
+                    "the error must name the unreadable directory: {message}"
+                );
+            }
+            other => panic!("expected an I/O error, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(&repo);
     }
 
