@@ -12,7 +12,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 
 - Language: Rust (edition 2024), `unsafe_code` forbidden, clippy `unwrap_used`, `float_cmp`, and `format_push_string` denied.
 - Web: axum, Tera templates, static assets under `task-viewer/static/`.
-- Storage: SQLite via sqlx, WAL journal mode, foreign keys on.
+- Storage: SQLite via sqlx, WAL journal mode, `synchronous=NORMAL`, foreign keys on.
 - Runtime: tokio.
 - Charts: browser SVG drawn from a JSON payload the server builds out of the task rows.
 

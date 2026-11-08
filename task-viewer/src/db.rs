@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use sqlx::{
     Pool, QueryBuilder, Sqlite,
-    sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{
+        SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions,
+        SqliteSynchronous,
+    },
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -108,10 +111,15 @@ pub async fn init_at(path: &Path) -> Result<Pool<Sqlite>> {
 /// Read `PRAGMA user_version`, apply `SCHEMA` to a brand-new database, then
 /// apply each later migration in order.
 async fn migrate(pool: &Pool<Sqlite>) -> Result<()> {
-    let mut version: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(pool)
+    let mut version = read_schema_version(pool)
         .await
-        .unwrap_or(0);
+        .context("the database schema version could not be read")?;
+    if version > SCHEMA_VERSION {
+        anyhow::bail!(
+            "the database schema version {version} is newer than schema version \
+             {SCHEMA_VERSION}, the latest this binary knows"
+        );
+    }
     if version == 0 {
         sqlx::query(SCHEMA).execute(pool).await?;
         version = 1;
@@ -136,12 +144,27 @@ async fn migrate(pool: &Pool<Sqlite>) -> Result<()> {
     Ok(())
 }
 
+/// Read the stored schema version. A failure here must reach the caller instead
+/// of reading as 0, because 0 means "brand-new file" and would re-stamp a
+/// database that is already at a later version.
+async fn read_schema_version(pool: &Pool<Sqlite>) -> Result<i64> {
+    #[cfg(test)]
+    if test_version_read::take() {
+        anyhow::bail!("the injected schema-version read failure fired");
+    }
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await?;
+    Ok(version)
+}
+
 async fn connect(path: &Path) -> Result<Pool<Sqlite>> {
     create_parent_dir(path)?;
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
@@ -423,11 +446,35 @@ pub(crate) mod test_db {
     }
 }
 
+/// A thread-local seam beside `test_db` that makes the next `PRAGMA
+/// user_version` read in `migrate` fail. The failure is injected in front of the
+/// statement, so the database file itself stays untouched and writable, and a
+/// fresh connection still reads its version normally. It lives on the test
+/// thread, so a parallel test never sees the armed flag.
+#[cfg(test)]
+pub(crate) mod test_version_read {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn fail_next() {
+        FAIL_NEXT.with(|slot| slot.set(true));
+    }
+
+    /// Consume the flag, so one armed seam fails exactly one read.
+    pub fn take() -> bool {
+        FAIL_NEXT.with(|slot| slot.replace(false))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SCHEMA, SCHEMA_VERSION, StoreHookFn, database_path, delete_repository, init, init_with,
-        list_repositories, load_prior_tasks, load_tasks, replace_tasks, set_scan_error, test_db,
+        SCHEMA, SCHEMA_VERSION, StoreHookFn, database_path, delete_repository, init, init_at,
+        init_with, list_repositories, load_prior_tasks, load_tasks, migrate, replace_tasks,
+        set_scan_error, test_db, test_version_read,
     };
     use crate::harvest::{ParsedTask, TaskKind};
     use crate::test_support::unique_temp_dir;
@@ -754,6 +801,115 @@ mod tests {
             .await
             .expect("content hash");
         assert!(content_hash.is_none(), "the migrated row starts uncached");
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Acceptance: a read that fails makes start-up report that cause instead of
+    /// treating the database as brand new.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_reports_a_schema_version_read_that_fails() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        pool.close().await;
+
+        let error = migrate(&pool)
+            .await
+            .expect_err("a closed pool cannot read the schema version");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("schema version could not be read"),
+            "{message}"
+        );
+        remove_scratch(&path);
+    }
+
+    /// Acceptance: a schema version that cannot be read fails start-up with that
+    /// cause, and the database file stays untouched and writable, so the next
+    /// launch reads the version it already had instead of re-stamping the file
+    /// as new.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_keeps_an_unreadable_schema_version_untouched() {
+        let path = temp_database();
+        let first = init_at(&path).await.expect("first init");
+        first.close().await;
+
+        test_version_read::fail_next();
+        let error = init_at(&path)
+            .await
+            .expect_err("the injected read failure fails start-up");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("schema version could not be read"),
+            "{message}"
+        );
+
+        let fresh = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .expect("fresh connection");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&fresh)
+            .await
+            .expect("version");
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "the failed read left the stamp as it was"
+        );
+        sqlx::query("CREATE TABLE writable_probe (value INTEGER)")
+            .execute(&fresh)
+            .await
+            .expect("the file still accepts writes");
+        fresh.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Acceptance: a database stamped above `SCHEMA_VERSION` is refused with
+    /// both versions named, before any statement runs, and keeps its stamp.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_refuses_a_schema_version_newer_than_the_binary() {
+        let path = temp_database();
+        let newer = SCHEMA_VERSION + 1;
+        let pool = init_at(&path).await.expect("init");
+        sqlx::query(&format!("PRAGMA user_version = {newer}"))
+            .execute(&pool)
+            .await
+            .expect("stamp a newer version");
+        pool.close().await;
+
+        let error = init_at(&path)
+            .await
+            .expect_err("a newer database is refused");
+        let message = format!("{error:#}");
+        assert!(message.contains(&SCHEMA_VERSION.to_string()), "{message}");
+        assert!(message.contains(&newer.to_string()), "{message}");
+
+        let fresh = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .expect("fresh connection");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&fresh)
+            .await
+            .expect("version");
+        assert_eq!(version, newer, "the refusal leaves the stamp untouched");
+        fresh.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Acceptance: every store commits under `synchronous=NORMAL`, SQLite's 1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_commits_under_normal_synchronous() {
+        let path = temp_database();
+        let pool = init_at(&path).await.expect("init");
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .expect("synchronous");
+        assert_eq!(synchronous, 1, "SQLite reports 1 for synchronous=NORMAL");
         pool.close().await;
         remove_scratch(&path);
     }
