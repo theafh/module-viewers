@@ -247,27 +247,32 @@ fn union_files(
     dir: &Path,
     prefix: &str,
 ) -> Result<(Vec<ChosenFile>, WorktreeFiles), HarvestError> {
+    // `ls-tree` and `git log` match this raw prefix literally, so it needs no
+    // `:(literal)` magic, unlike the per-file lookups below.
     let pathspec = format!("{prefix}tasks");
     let listing = git_read(
         root,
         dir,
         &[
             "for-each-ref",
-            "--format=%(refname)",
+            "--format=%(objectname) %(refname)",
             "refs/heads",
             "refs/remotes",
         ],
     )
     .map_err(HarvestError::Git)?;
-    let refs: Vec<&str> = listing
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    // Every (ref, path, blob, lossy) pair, then the newest touch of each blob once.
+    // Every (path, blob, lossy) triple, then the newest touch of each blob once.
+    // Two refs at one commit list identical triples, so the second is skipped.
     let mut found: Vec<(String, String, bool)> = Vec::new();
-    let mut all_blobs: Vec<String> = Vec::new();
-    for reference in &refs {
+    let mut all_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut listed_commits: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for line in listing.lines() {
+        let Some((commit, reference)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        if !listed_commits.insert(commit) {
+            continue;
+        }
         let tree = git_read_bytes(
             root,
             dir,
@@ -394,16 +399,15 @@ fn archive_rank(path: &str, from_worktree: u8, stamp: i64) -> (u8, u8, i64) {
 fn blob_days(
     root: &Path,
     dir: &Path,
-    blobs: &[String],
+    blobs: &std::collections::HashSet<String>,
     pathspec: &str,
 ) -> Result<std::collections::HashMap<String, i64>, HarvestError> {
     let mut command = git_dir_command(root, dir);
     scrub_git_env(&mut command);
     command.args(blob_days_log_args(pathspec));
-    let wanted: std::collections::HashSet<&str> = blobs.iter().map(String::as_str).collect();
     let mut days: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     run_git_streaming(command, None, git_deadline(root), |reader| {
-        stream_blob_days(reader, &wanted, |sha, stamp| {
+        stream_blob_days(reader, blobs, |sha, stamp| {
             // Log order is newest first, so the first hit is the newest touch.
             days.entry(sha.to_string()).or_insert(stamp);
         })
@@ -417,7 +421,7 @@ fn blob_days(
 /// log ever being resident.
 fn stream_blob_days<R: BufRead>(
     mut reader: R,
-    wanted: &std::collections::HashSet<&str>,
+    wanted: &std::collections::HashSet<String>,
     mut on_entry: impl FnMut(&str, i64),
 ) -> Result<(), GitFailure> {
     let mut line = Vec::new();
@@ -435,8 +439,9 @@ fn stream_blob_days<R: BufRead>(
             let Some(meta) = raw.split('\t').next() else {
                 continue;
             };
-            let fields: Vec<&str> = meta.split_whitespace().collect();
-            let Some(sha) = fields.get(3) else { continue };
+            let Some(sha) = meta.split_whitespace().nth(3) else {
+                continue;
+            };
             if !wanted.contains(sha) {
                 continue;
             }
@@ -1203,6 +1208,7 @@ fn blob_days_log_args(pathspec: &str) -> Vec<String> {
         "--all",
         "--format=%ct",
         "--raw",
+        "--diff-merges=first-parent",
         "--no-renames",
         "--no-abbrev",
         "--",
@@ -2168,7 +2174,7 @@ mod tests {
     #[test]
     fn stream_blob_days_matches_the_whole_buffer_parser() {
         let (log, ids) = synthetic_blob_log(80, 12);
-        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let wanted: HashSet<String> = ids.iter().cloned().collect();
         let expected = whole_buffer_blob_days(&log, &wanted);
         assert!(expected.len() > 100, "the synthetic log must be large");
 
@@ -2184,7 +2190,7 @@ mod tests {
 
     /// The whole-buffer parser the streaming one replaces, kept in the test so
     /// the two maps are compared against the same rules.
-    fn whole_buffer_blob_days(bytes: &[u8], wanted: &HashSet<&str>) -> HashMap<String, i64> {
+    fn whole_buffer_blob_days(bytes: &[u8], wanted: &HashSet<String>) -> HashMap<String, i64> {
         let text = String::from_utf8_lossy(bytes);
         let mut days = HashMap::new();
         let mut stamp = 0_i64;
@@ -2193,8 +2199,9 @@ mod tests {
                 let Some(meta) = raw.split('\t').next() else {
                     continue;
                 };
-                let fields: Vec<&str> = meta.split_whitespace().collect();
-                let Some(sha) = fields.get(3) else { continue };
+                let Some(sha) = meta.split_whitespace().nth(3) else {
+                    continue;
+                };
                 if !wanted.contains(sha) {
                     continue;
                 }
@@ -2209,7 +2216,7 @@ mod tests {
     #[test]
     fn stream_blob_days_reports_entries_before_the_reader_is_exhausted() {
         let (log, ids) = synthetic_blob_log(20, 6);
-        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let wanted: HashSet<String> = ids.iter().cloned().collect();
         let (reader, exhausted) = ChunkedReader::new(bounded_chunks(&log, 53));
         let mut entries = Vec::new();
         stream_blob_days(reader, &wanted, |sha, stamp| {
@@ -2537,6 +2544,7 @@ mod tests {
                 "--all",
                 "--format=%ct",
                 "--raw",
+                "--diff-merges=first-parent",
                 "--no-renames",
                 "--no-abbrev",
                 "--",
@@ -2571,8 +2579,15 @@ mod tests {
 
     #[test]
     fn harvest_log_call_sites_pin_output_options_ahead_of_log() {
+        let blob_days = blob_days_log_args("tasks");
+        assert!(
+            blob_days
+                .iter()
+                .any(|arg| arg == "--diff-merges=first-parent"),
+            "the blob-days log must diff merges against their first parent: {blob_days:?}"
+        );
         let assembled = [
-            blob_days_log_args("tasks"),
+            blob_days,
             archive_log_args("tasks/archive/scope_one.md"),
             pickaxe_log_args("-S", "status: finished", "tasks/scope_one.md"),
         ];
@@ -3843,6 +3858,206 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2026, 5, 1).expect("day"))
         );
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// One version of the merge fixture's task. The body is long enough that
+    /// the stale branch's edit sits far from the status line, so the merge
+    /// combines both changes without a conflict.
+    fn merged_fixture_task(status: &str, body_line: &str) -> String {
+        format!(
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: {status}\n---\n\n# Merged\n\n{body_line}\nline two\nline three\nline four\nline five\nline six\nline seven\n"
+        )
+    }
+
+    #[test]
+    fn harvest_dates_a_merge_produced_task_version_from_the_merge_commit() {
+        // Two branches edit the same task: `main` flips the status and `stale`
+        // edits a body line. The merged blob exists only because of the merge
+        // commit, so the merge's version must take the merge's committer time
+        // and outrank the older deferred copy on the stale branch.
+        let repo = scratch("harvest_union_merge_date");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let task = repo.join("tasks/archive/scope_merged.md");
+        fs::create_dir_all(task.parent().expect("parent")).expect("archive");
+        fs::write(&task, merged_fixture_task("deferred", "line one")).expect("first version");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "defer the task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let first = git_stdout(&repo, &["rev-parse", "HEAD"], "2026-05-01T12:00:00+00:00");
+
+        fs::write(&task, merged_fixture_task("finished", "line one")).expect("finish on main");
+        git(&repo, &["add", "-A"], "2026-05-02T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "finish the task"],
+            "2026-05-02T12:00:00+00:00",
+        );
+
+        git(
+            &repo,
+            &["checkout", "-b", "stale", &first],
+            "2026-05-03T12:00:00+00:00",
+        );
+        fs::write(
+            &task,
+            merged_fixture_task("deferred", "line one edited on the stale branch"),
+        )
+        .expect("stale edit");
+        git(&repo, &["add", "-A"], "2026-05-03T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "edit the body on stale"],
+            "2026-05-03T12:00:00+00:00",
+        );
+
+        git(&repo, &["checkout", "main"], "2026-05-04T12:00:00+00:00");
+        git(
+            &repo,
+            &["merge", "--no-ff", "-m", "merge stale", "stale"],
+            "2026-05-04T12:00:00+00:00",
+        );
+
+        // A branch whose tree lacks the task, so the working tree cannot decide
+        // and the ref union must pick among committed versions.
+        git(
+            &repo,
+            &["checkout", "--orphan", "empty"],
+            "2026-05-05T12:00:00+00:00",
+        );
+        git(&repo, &["rm", "-rf", "."], "2026-05-05T12:00:00+00:00");
+        write_task(&repo, "tasks/scope_keep.md", "2026-05-05", "open");
+        git(&repo, &["add", "-A"], "2026-05-05T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "empty branch"],
+            "2026-05-05T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let rows: Vec<_> = tasks
+            .iter()
+            .filter(|task| task.path.ends_with("scope_merged.md"))
+            .collect();
+        assert_eq!(rows.len(), 1, "the task must chart once: {tasks:?}");
+        assert_eq!(
+            rows[0].kind,
+            TaskKind::Finished,
+            "the merge's finished version must outrank the stale branch's deferred copy"
+        );
+
+        let merged_blob = git_stdout(
+            &repo,
+            &["rev-parse", "main:tasks/archive/scope_merged.md"],
+            "2026-05-05T12:00:00+00:00",
+        );
+        let merge_time = git_stdout(
+            &repo,
+            &["log", "-1", "--format=%ct", "main"],
+            "2026-05-05T12:00:00+00:00",
+        );
+        let mut blobs = HashSet::new();
+        blobs.insert(merged_blob.clone());
+        let dir = repo.join(".git");
+        let days = blob_days(&repo, &dir, &blobs, "tasks").expect("blob days");
+        assert_eq!(
+            days.get(&merged_blob).copied(),
+            Some(merge_time.parse::<i64>().expect("merge time")),
+            "the merged blob must take the merge commit's committer time"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_lists_each_ref_commit_once() {
+        // A second local branch, a remote-tracking ref, and a symbolic remote
+        // HEAD all sit at `main`'s commit, so one `ls-tree` serves all four.
+        let repo = scratch("harvest_union_ref_commit");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "tasks"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        git(&repo, &["branch", "duplicate"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+            "2026-06-01T12:00:00+00:00",
+        );
+
+        let bin = scratch("harvest_union_ref_commit_bin");
+        let calls = bin.join("ls-tree.log");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "case \"$*\" in\n  *ls-tree*) echo \"$*\" >> {} ;;\nesac\nexec {} \"$@\"",
+                calls.display(),
+                git_bin()
+            ),
+        );
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(30));
+
+        let with_refs = harvest_repository(&repo).expect("harvest with shared refs");
+        clear_fake_git(&repo);
+        let listing = fs::read_to_string(&calls).unwrap_or_default();
+        assert_eq!(
+            listing.lines().count(),
+            1,
+            "one ls-tree per distinct ref commit, got: {listing}"
+        );
+
+        // The same repository read with only `main` charts the same rows.
+        git(
+            &repo,
+            &["branch", "-D", "duplicate"],
+            "2026-06-02T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["symbolic-ref", "-d", "refs/remotes/origin/HEAD"],
+            "2026-06-02T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["update-ref", "-d", "refs/remotes/origin/main"],
+            "2026-06-02T12:00:00+00:00",
+        );
+        let main_only = harvest_repository(&repo).expect("harvest with only main");
+
+        assert_eq!(main_only.len(), 2);
+        assert_eq!(with_refs, main_only);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
     }
 
     #[test]
@@ -6105,7 +6320,8 @@ mod tests {
         let error = git_read(&repo, &dir, &["rev-parse", "--git-dir"]).expect_err("git_read");
         assert!(error.contains("did not finish"), "{error}");
 
-        let error = blob_days(&repo, &dir, &[], "tasks").expect_err("blob_days");
+        let error = blob_days(&repo, &dir, &std::collections::HashSet::new(), "tasks")
+            .expect_err("blob_days");
         assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
 
         let blobs = vec!["abc".to_string()];
