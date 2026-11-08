@@ -12,7 +12,9 @@
 
   // The shipped stylesheet's chart heights: `.chart-frame svg` is 280px,
   // `.chart-frame.calendar svg` is 190px, and `.chart-frame.radar svg` is
-  // 360px. Keeping them here gives a stylesheet change one edit site.
+  // 360px. They are published on `__env` so
+  // `browser_chart_heights_match_the_stylesheet` in src/web.rs can hold them
+  // to `style.css` and fail when the two drift apart.
   var CHART_HEIGHT = { line: 280, calendar: 190, radar: 360 };
   // Each card's chart kind, so an SVG node reports the height its own
   // stylesheet rule gives it instead of every node sharing one height.
@@ -273,6 +275,7 @@
     localStorage: localStorage,
     cards: cards,
     cardNames: CARD_NAMES,
+    chartHeights: CHART_HEIGHT,
     html: html,
     themeButton: themeButton
   };

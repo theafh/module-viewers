@@ -4038,6 +4038,21 @@ mod tests {
             .unwrap_or_else(|| panic!("no `{selector}` rule in style.css"))
     }
 
+    /// The pixel height a stylesheet rule body declares, so a height restated
+    /// outside `style.css` can be held to the shipped file rather than to
+    /// another literal.
+    fn css_px_height(body: &str) -> f64 {
+        body.split(';')
+            .find_map(|declaration| {
+                let (property, value) = declaration.split_once(':')?;
+                if property.trim() != "height" {
+                    return None;
+                }
+                value.trim().strip_suffix("px")?.trim().parse().ok()
+            })
+            .unwrap_or_else(|| panic!("no pixel `height` in `{body}`"))
+    }
+
     /// The full source of the function that starts at `signature`, from its
     /// name through its closing brace.
     fn function_source(signature: &str) -> String {
@@ -4189,6 +4204,28 @@ mod tests {
             card.contains("min-width: 0"),
             "the base chart card shrinks below its chart: {card}"
         );
+    }
+
+    /// The harness's `CHART_HEIGHT` values are the shipped stylesheet's chart
+    /// heights, so raising a rule in `style.css` fails here instead of leaving
+    /// the harness reporting the page the stylesheet no longer describes.
+    #[test]
+    fn browser_chart_heights_match_the_stylesheet() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(&config, r#"JSON.stringify(globalThis.__env.chartHeights)"#);
+        let rules = [
+            ("line", ".chart-frame svg"),
+            ("calendar", ".chart-frame.calendar svg"),
+            ("radar", ".chart-frame.radar svg"),
+        ];
+        for (kind, selector) in rules {
+            let body = css_rule(selector);
+            assert_eq!(
+                result[kind].as_f64(),
+                Some(css_px_height(&body)),
+                "the harness's {kind} chart height is the `{selector}` height: {body}"
+            );
+        }
     }
 
     /// Acceptance 3: `.tooltip` is fixed to the viewport and `tipFor` places
