@@ -85,6 +85,11 @@
 
   function message(svg, text) {
     clear(svg);
+    // A fallback belongs to the frame, not to the chart's own laid-out size: the
+    // calendar's `width: auto` keeps it at its natural width and the radar may
+    // carry an inline ring size, so force the frame width before measuring.
+    svg.style.width = "100%";
+    svg.style.height = "";
     var width = svg.clientWidth || 640;
     var height = svg.clientHeight || 280;
     svg.setAttribute("viewBox", "0 0 " + width + " " + height);
@@ -238,6 +243,9 @@
   function drawCalendar(name, rows, colorName, noun, peak) {
     var root = card(name);
     var svg = root.querySelector("svg");
+    // A fallback draw forces the width to the frame; clear it so a later
+    // successful draw returns the calendar to its natural, scrollable width.
+    svg.style.width = "";
     summary(name, fmt(rows.reduce(function (sum, row) { return sum + row.count; }, 0)) + " " + noun + " · peak " + fmt(peak) + " · colour log1p(count)");
     if (!rows.length) {
       message(svg, "No days yet");
@@ -262,7 +270,6 @@
     var gap = 2;
     var naturalWidth = labelW + columns * (cell + gap) + 8;
     svg.setAttribute("viewBox", "0 0 " + naturalWidth + " " + height);
-    svg.setAttribute("width", String(naturalWidth));
     var maxLog = Math.log1p(peak);
     var tip = tipFor(root.querySelector(".chart-frame"));
     var color = cssVar(colorName);
@@ -305,6 +312,11 @@
         rect.addEventListener("mouseleave", tip.hide);
       }
     }
+    // Record the natural width as the chart's intrinsic size once every cell is
+    // drawn. The stylesheet's `width: auto` lets the viewBox ratio size the
+    // element, so this attribute does not lay the fallback out; `message()`
+    // sizes that from the frame instead.
+    svg.setAttribute("width", String(naturalWidth));
   }
 
   function drawRadar(name, rows, colorName, noun, mode) {
