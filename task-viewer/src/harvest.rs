@@ -466,9 +466,11 @@ impl HarvestState {
     /// Fold one task file's text into the pending and task accumulators.
     ///
     /// A file this reader cannot chart leaves one log line naming it and the
-    /// reason, so a task that vanishes from the charts is traceable. The
-    /// returned rows stay the same: a file without the fields a row needs is
-    /// still skipped.
+    /// reason, so a task that vanishes from the charts is traceable. A file
+    /// whose name lacks the task shape, such as a `README.md` under `tasks/`,
+    /// logs that line at debug level instead, because it is not a task the
+    /// person lost. The returned rows stay the same: a file without the fields
+    /// a row needs is still skipped.
     fn harvest_file(&mut self, rel: &str, text: &str, path_is_lossy: bool) {
         let Some(fields) = frontmatter(text) else {
             if has_task_name_shape(rel) {
@@ -490,30 +492,55 @@ impl HarvestState {
             Some(value) => match parse_iso_date(value) {
                 Some(created) => created,
                 None => {
-                    tracing::warn!(
-                        path = %rel,
-                        field = "created",
-                        value = %value,
-                        "task file has an unparseable created value; skipping it"
-                    );
+                    if has_task_name_shape(rel) {
+                        tracing::warn!(
+                            path = %rel,
+                            field = "created",
+                            value = %value,
+                            "task file has an unparseable created value; skipping it"
+                        );
+                    } else {
+                        tracing::debug!(
+                            path = %rel,
+                            field = "created",
+                            value = %value,
+                            "file under tasks/ has an unparseable created value; skipping it"
+                        );
+                    }
                     return;
                 }
             },
             None => {
-                tracing::warn!(
-                    path = %rel,
-                    field = "created",
-                    "task file has no created value; skipping it"
-                );
+                if has_task_name_shape(rel) {
+                    tracing::warn!(
+                        path = %rel,
+                        field = "created",
+                        "task file has no created value; skipping it"
+                    );
+                } else {
+                    tracing::debug!(
+                        path = %rel,
+                        field = "created",
+                        "file under tasks/ has no created value; skipping it"
+                    );
+                }
                 return;
             }
         };
         let Some(status) = fields.get("status").map(|value| value.trim().to_string()) else {
-            tracing::warn!(
-                path = %rel,
-                field = "status",
-                "task file has no status value; skipping it"
-            );
+            if has_task_name_shape(rel) {
+                tracing::warn!(
+                    path = %rel,
+                    field = "status",
+                    "task file has no status value; skipping it"
+                );
+            } else {
+                tracing::debug!(
+                    path = %rel,
+                    field = "status",
+                    "file under tasks/ has no status value; skipping it"
+                );
+            }
             return;
         };
         let updated = fields
@@ -5808,6 +5835,72 @@ mod tests {
             no_created.contains("no created value"),
             "the warning must name the missing created field: {no_created}"
         );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_keeps_stray_files_out_of_the_drop_warnings() {
+        // A `README.md` under `tasks/` that carries frontmatter is still not a
+        // task, so a missing or unparseable field in it stays at debug level,
+        // while a task-shaped file with the same defect still warns.
+        let repo = scratch("harvest_warn_stray_files");
+        fs::create_dir_all(repo.join("tasks/archive")).expect("tasks tree");
+        fs::write(
+            repo.join("tasks/README.md"),
+            "---\ntitle: Read me\nstatus: open\n---\n",
+        )
+        .expect("readme without created");
+        fs::write(
+            repo.join("tasks/archive/README.md"),
+            "---\ntitle: Read me\ncreated: 2026-05-01T10:00:00\n---\n",
+        )
+        .expect("readme without status");
+        fs::write(
+            repo.join("tasks/notes.md"),
+            "---\ntitle: Notes\ncreated: not-a-date\nstatus: open\n---\n",
+        )
+        .expect("readme with an unparseable created value");
+        fs::write(
+            repo.join("tasks/scope_no_created.md"),
+            "---\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n",
+        )
+        .expect("task without created");
+        fs::write(
+            repo.join("tasks/scope_no_status.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\n---\n",
+        )
+        .expect("task without status");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("the harvest still succeeds");
+        assert!(tasks.is_empty(), "no file charts: {tasks:?}");
+
+        let warnings = captured.take();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "only the task-shaped files warn: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("scope_no_created.md")),
+            "the task-shaped file missing created must warn: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("scope_no_status.md")),
+            "the task-shaped file missing status must warn: {warnings:?}"
+        );
+        for stray in ["README.md", "notes.md"] {
+            assert!(
+                !warnings.iter().any(|warning| warning.contains(stray)),
+                "a stray {stray} must not warn: {warnings:?}"
+            );
+        }
         let _ = fs::remove_dir_all(&repo);
     }
 

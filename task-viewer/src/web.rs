@@ -200,7 +200,7 @@ pub fn static_version(static_dir: &FsPath) -> anyhow::Result<String> {
 }
 
 /// Fold `bytes` into a running FNV-1a hash, the same stable function
-/// `harvest::content_hash` uses for task bytes.
+/// `harvest::fnv1a_digest` uses for task bytes.
 fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
     for byte in bytes {
         *hash ^= u64::from(*byte);
