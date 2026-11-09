@@ -13,6 +13,12 @@ pub(crate) fn parse_iso_date(raw: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
 }
 
+/// The earliest day a chart series draws. A frontmatter date before this floor
+/// folds into the first charted day, so one mistyped year cannot stretch a walk
+/// to hundreds of thousands of points.
+pub(crate) const SERIES_FLOOR: NaiveDate =
+    NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid date");
+
 pub(crate) fn format_date(date: NaiveDate) -> String {
     date.format("%Y-%m-%d").to_string()
 }

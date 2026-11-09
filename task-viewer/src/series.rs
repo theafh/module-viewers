@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::dates::SERIES_FLOOR;
 use crate::harvest::TaskKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,12 +173,12 @@ fn weekly_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<WeekPoint> {
             *shipped.entry(monday(day)).or_insert(0) += 1;
         }
     }
-    let Some(start) = created.keys().chain(shipped.keys()).min().copied() else {
+    let Some(first) = created.keys().chain(shipped.keys()).min().copied() else {
         return Vec::new();
     };
     let end = monday(today);
     let mut points = Vec::new();
-    let mut cur = start;
+    let mut cur = first.max(monday(SERIES_FLOOR));
     while cur <= end {
         points.push(WeekPoint {
             week: crate::dates::format_date(cur),
@@ -193,11 +194,14 @@ fn weekly_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<WeekPoint> {
 }
 
 fn cumulative_points(shipped: &BTreeMap<NaiveDate, i64>, today: NaiveDate) -> Vec<CumPoint> {
-    let Some((&start, _)) = shipped.iter().next() else {
+    let Some((&first, _)) = shipped.iter().next() else {
         return Vec::new();
     };
+    let start = first.max(SERIES_FLOOR);
     let mut rows = Vec::new();
-    let mut total = 0_i64;
+    // Ships before the first charted day fold into that day's level, so the
+    // line still ends at `counts.shipped_events`.
+    let mut total = shipped.range(..start).map(|(_, count)| *count).sum::<i64>();
     let mut cur = start;
     while cur <= today {
         let day = shipped.get(&cur).copied().unwrap_or(0);
@@ -256,8 +260,21 @@ fn live_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<LivePoint> {
         }
     }
     let start = tasks.iter().map(|task| task.created).min().unwrap_or(today);
+    let start = start.max(SERIES_FLOOR);
     let mut rows = Vec::new();
+    // Tasks created before the first charted day and still open on it are
+    // already in the backlog, so they seed the first row instead of a walk
+    // from their own day.
     let mut stock = 0_i64;
+    for task in tasks {
+        if task.created < start
+            && task
+                .leave_date
+                .is_none_or(|leave| leave.max(task.created) >= start)
+        {
+            stock += 1;
+        }
+    }
     let mut cur = start;
     while cur <= today {
         stock += delta.get(&cur).copied().unwrap_or(0);
@@ -314,10 +331,24 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
         }
     }
     let start = tasks.iter().map(|task| task.created).min().unwrap_or(today);
+    let start = start.max(SERIES_FLOOR);
     let mut rows = Vec::new();
     let mut steps = 0_usize;
+    // Tasks created before the first charted day and still open on it seed the
+    // running count and created-day sum, so the first row applies only that
+    // day's own adds and removes while an old task still counts its real age.
     let mut count = 0_i64;
     let mut sum_created = 0_i64;
+    for task in tasks {
+        if task.created < start
+            && task
+                .leave_date
+                .is_none_or(|leave| leave.max(task.created) >= start)
+        {
+            count += 1;
+            sum_created += i64::from(task.created.num_days_from_ce());
+        }
+    }
     let mut cur = start;
     while cur <= today {
         steps += 1;
@@ -473,6 +504,7 @@ mod tests {
     use super::{
         AgePoint, RadarMode, TaskRecord, age_points, age_points_counted, dashboard, monday,
     };
+    use crate::dates::SERIES_FLOOR;
     use crate::harvest::TaskKind;
     use chrono::{Days, NaiveDate};
     use std::sync::Arc;
@@ -634,16 +666,18 @@ mod tests {
         );
     }
 
-    /// Acceptance: the fixed 500-task set starting 1900-01-01 stays within the
-    /// linear work-step bound for `today` 2026-11-06. The pre-change
-    /// day-times-task loop would report about 23,000,000 steps here.
+    /// Acceptance: the fixed 500-task set starting at the chart floor stays
+    /// within the linear work-step bound for `today` 2026-11-06. The pre-change
+    /// day-times-task loop would report about 10,000,000 steps here.
     #[test]
     fn series_age_sweep_stays_linear_for_an_old_task_set() {
         let today = day(2026, 11, 6);
-        let start = day(1900, 1, 1);
+        let start = SERIES_FLOOR;
+        let span = (today - start).num_days();
+        let step = (span / 500).max(1) as u64;
         let tasks = (0..500_u64)
             .map(|index| {
-                let created = start + Days::new(index * 90);
+                let created = start + Days::new(index * step);
                 let leave = created + Days::new(30);
                 task(
                     "alpha",
@@ -656,10 +690,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let (points, steps) = age_points_counted(&tasks, today);
-        let days = (today - start).num_days() + 1;
-        assert_eq!(days, 46_331, "the fixture spans the declared day count");
+        let days = span + 1;
+        assert_eq!(days, 20_764, "the fixture spans the declared day count");
         let bound = days as usize + 2 * tasks.len();
-        assert_eq!(bound, 47_331, "the bound is days + 2 * tasks");
+        assert_eq!(bound, 21_764, "the bound is days + 2 * tasks");
         assert!(
             steps <= bound,
             "the sweep reported {steps} work steps for {days} days and {} tasks, above the linear bound of {bound}",
@@ -670,6 +704,147 @@ mod tests {
             days,
             "the sweep still emits one point per day"
         );
+    }
+
+    /// Acceptance: one mistyped year cannot stretch any series, because every
+    /// walk starts at the chart floor.
+    #[test]
+    fn series_stays_bounded_when_a_task_year_is_mistyped() {
+        let today = day(2026, 11, 6);
+        let tasks = vec![
+            task("alpha", "scope", TaskKind::Live, day(26, 3, 1), None, None),
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Finished,
+                day(2026, 1, 5),
+                Some(day(2026, 2, 1)),
+                Some(day(2026, 2, 1)),
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let span = (today - SERIES_FLOOR).num_days();
+        for (name, len) in [
+            ("cumulative", board.cumulative.len()),
+            ("live_backlog", board.live_backlog.len()),
+            ("mean_age", board.mean_age.len()),
+        ] {
+            assert!(
+                len as i64 <= span + 1,
+                "{name} has {len} points, above the bounded {span} days plus one"
+            );
+        }
+        assert!(
+            board.weekly.len() as i64 <= span / 7 + 2,
+            "the weekly series has {} points, above the bounded {} weeks plus two",
+            board.weekly.len(),
+            span / 7
+        );
+    }
+
+    /// Acceptance: a task created before the floor folds into the first charted
+    /// day exactly once, and the radar and the counts still see it.
+    #[test]
+    fn series_backlog_folds_a_pre_floor_created_day_into_the_floor() {
+        let today = day(2026, 11, 6);
+        let tasks = vec![
+            task(
+                "alpha",
+                "ancient",
+                TaskKind::Live,
+                day(26, 3, 1),
+                None,
+                None,
+            ),
+            task(
+                "alpha",
+                "modern",
+                TaskKind::Live,
+                day(1970, 1, 1),
+                None,
+                None,
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let first = board.live_backlog.first().expect("first point");
+        assert_eq!(first.date, "1970-01-01");
+        assert_eq!(first.live, 2, "one fold, not a double count");
+        let ancient = board
+            .radar_live
+            .iter()
+            .find(|row| row.label == "ancient")
+            .expect("the pre-floor scope");
+        assert_eq!(ancient.count, 1);
+        assert_eq!(board.counts.created_events, 2);
+    }
+
+    /// Acceptance: ships before the floor fold into the first charted day and
+    /// the line still ends at the shipped event count.
+    #[test]
+    fn series_cumulative_folds_a_pre_floor_ship_day_into_the_floor() {
+        let today = day(2026, 11, 6);
+        let tasks = vec![
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Finished,
+                day(26, 3, 1),
+                Some(day(26, 3, 1)),
+                Some(day(26, 3, 1)),
+            ),
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Finished,
+                day(1970, 1, 1),
+                Some(day(1970, 1, 1)),
+                Some(day(1970, 1, 1)),
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let first = board.cumulative.first().expect("first point");
+        assert_eq!(first.date, "1970-01-01");
+        assert_eq!(first.shipped, 1);
+        assert_eq!(first.cumulative, 2, "one fold, not a double count");
+        let span = (today - SERIES_FLOOR).num_days();
+        assert!(board.cumulative.len() as i64 <= span + 1);
+        assert_eq!(
+            board.cumulative.last().expect("last point").cumulative,
+            board.counts.shipped_events as i64
+        );
+    }
+
+    /// Acceptance: a task created before the floor counts its real age on the
+    /// first charted day and leaves the average on its ship day.
+    #[test]
+    fn series_mean_age_folds_a_pre_floor_created_day_into_the_floor() {
+        let today = day(2026, 11, 6);
+        let created = day(26, 3, 1);
+        let shipped = day(2026, 6, 1);
+        let tasks = vec![task(
+            "alpha",
+            "scope",
+            TaskKind::Finished,
+            created,
+            Some(shipped),
+            Some(shipped),
+        )];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let first = board.mean_age.first().expect("first point");
+        assert_eq!(first.date, "1970-01-01");
+        assert_eq!(first.n, 1);
+        let expected = (SERIES_FLOOR - created).num_days() as f64;
+        assert_eq!(
+            first.avg_age.to_bits(),
+            expected.to_bits(),
+            "the first row keeps the task's real age"
+        );
+        let ship = board
+            .mean_age
+            .iter()
+            .find(|point| point.date == "2026-06-01")
+            .expect("ship day");
+        assert_eq!(ship.n, 0);
     }
 
     #[test]
