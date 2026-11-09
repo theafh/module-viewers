@@ -1,5 +1,5 @@
 use chrono::NaiveDate;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -352,18 +352,31 @@ fn harvest_chosen(
         .collect();
     let mut state = HarvestState::default();
     let mut rows = chosen.into_iter();
-    read_blobs(root, Some(dir), &blobs, |text| {
+    // A listed blob that `cat-file` answers `missing` vanished between the
+    // `ls-tree` listing and the batch read. Record its path so the scan fails
+    // with a message that says which object went away instead of charting the
+    // rest as if that task never existed.
+    let mut vanished: Option<String> = None;
+    read_blobs(root, Some(dir), &blobs, |content| {
         // Advance to the next row that names a blob, harvesting the
         // working-tree rows that sit ahead of it.
         for (path, blob, path_is_lossy) in rows.by_ref() {
             if blob.is_some() {
-                state.harvest_file(&path, &text, path_is_lossy);
+                match content {
+                    Some(text) => state.harvest_file(&path, &text, path_is_lossy),
+                    None => vanished = Some(path.clone()),
+                }
                 break;
             }
             let text = worktree_content(repo, &mut worktree, &path);
             state.harvest_file(&path, &text, path_is_lossy);
         }
     })?;
+    if let Some(path) = vanished {
+        return Err(HarvestError::from(GitFailure::Other(format!(
+            "the object for {path} vanished during the scan"
+        ))));
+    }
     // Every committed row has taken its content, so the rows left are
     // working-tree ones.
     for (path, _, path_is_lossy) in rows {
@@ -710,12 +723,13 @@ fn markdown_blobs(listing: &[u8], prefix: &str) -> (Vec<String>, Vec<String>, Ve
 }
 
 /// Read many blobs in one `git cat-file` process, in the order they are given,
-/// handing each decoded content to `on_content` as it arrives.
+/// handing each decoded content to `on_content` as it arrives. An expression
+/// that names no object answers `missing` and delivers `None`.
 fn read_blobs(
     repo: &Path,
     dir: Option<&Path>,
     blobs: &[String],
-    mut on_content: impl FnMut(String),
+    mut on_content: impl FnMut(Option<String>),
 ) -> Result<(), GitFailure> {
     if blobs.is_empty() {
         return Ok(());
@@ -735,27 +749,6 @@ fn read_blobs(
         Some(input.into_bytes()),
         git_deadline(repo),
         |reader| parse_batch(reader, expected, &mut on_content),
-    )
-}
-
-/// The indexes of expressions that name an object present in the repository.
-fn existing_object_indices(
-    repo: &Path,
-    dir: Option<&Path>,
-    exprs: &[String],
-) -> Result<Vec<usize>, GitFailure> {
-    if exprs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut command = cat_file_command(repo, dir);
-    command.args(["cat-file", "--batch-check"]);
-    let input = format!("{}\n", exprs.join("\n"));
-    let expected = exprs.len();
-    run_git_streaming(
-        command,
-        Some(input.into_bytes()),
-        git_deadline(repo),
-        |reader| parse_batch_check(reader, expected),
     )
 }
 
@@ -779,12 +772,23 @@ fn cat_file_command(repo: &Path, dir: Option<&Path>) -> Command {
     command
 }
 
+/// A task file larger than this contributes no row, whether a committed blob or
+/// a working-tree file supplied it. A committed blob above the cap is drained
+/// without being held, and a working-tree file is read only through the cap plus
+/// one byte, so one such file can never sit in memory whole.
+const MAX_TASK_FILE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Parse the length-prefixed records of a `git cat-file --batch` stream,
 /// handing each decoded content to `on_content` as it arrives.
+///
+/// A header that ends in ` missing` names no object, so it delivers `None`.
+/// A present object larger than `MAX_TASK_FILE_BYTES` is drained and delivers
+/// `Some(String::new())`, which parses to no task, and a blob whose bytes are
+/// not valid UTF-8 delivers an empty string for the same reason.
 fn parse_batch<R: BufRead>(
     mut reader: R,
     expected: usize,
-    mut on_content: impl FnMut(String),
+    mut on_content: impl FnMut(Option<String>),
 ) -> Result<(), GitFailure> {
     let mut header = Vec::new();
     for _ in 0..expected {
@@ -803,6 +807,12 @@ fn parse_batch<R: BufRead>(
             ));
         }
         let header_text = String::from_utf8_lossy(&header[..newline]).into_owned();
+        // A missing object prints `<expr> missing` and no body, so it consumes
+        // no content line and the next expression follows at once.
+        if header_text.ends_with(" missing") {
+            on_content(None);
+            continue;
+        }
         let size = header_text
             .split_whitespace()
             .nth(2)
@@ -812,6 +822,19 @@ fn parse_batch<R: BufRead>(
                     "git printed an unreadable object header: {header_text}"
                 ))
             })?;
+        if size > MAX_TASK_FILE_BYTES {
+            // Drain the oversized body in fixed-size chunks instead of
+            // allocating what git announced, so a huge or hostile size cannot
+            // exhaust memory. A body shorter than its header simply ends at
+            // EOF.
+            let mut body = reader.by_ref().take(size as u64);
+            std::io::copy(&mut body, &mut std::io::sink()).map_err(read_failure)?;
+            // A newline follows each body; the last record may end at EOF.
+            let mut trailing = [0_u8; 1];
+            let _ = reader.read(&mut trailing).map_err(read_failure)?;
+            on_content(Some(String::new()));
+            continue;
+        }
         let mut body = vec![0_u8; size];
         reader.read_exact(&mut body).map_err(|_| {
             GitFailure::Other("git printed less content than it announced.".to_string())
@@ -825,34 +848,9 @@ fn parse_batch<R: BufRead>(
         // consumes one content per chosen blob and every later blob keeps its
         // position.
         let text = String::from_utf8(body).unwrap_or_default();
-        on_content(text);
+        on_content(Some(text));
     }
     Ok(())
-}
-
-/// Read a `git cat-file --batch-check` stream one line per expression and
-/// return the index of every present one.
-///
-/// A missing object prints `<expr> missing`; a present one prints its type and
-/// size. The missing ones are skipped before the batch read.
-fn parse_batch_check<R: BufRead>(mut reader: R, expected: usize) -> Result<Vec<usize>, GitFailure> {
-    let mut indices = Vec::new();
-    let mut line = Vec::new();
-    let mut index = 0usize;
-    loop {
-        line.clear();
-        let read = reader.read_until(b'\n', &mut line).map_err(read_failure)?;
-        if read == 0 || index >= expected {
-            break;
-        }
-        let text = String::from_utf8_lossy(&line);
-        let text = text.trim_end_matches(['\n', '\r']);
-        if !text.ends_with(" missing") {
-            indices.push(index);
-        }
-        index += 1;
-    }
-    Ok(indices)
 }
 
 /// The markdown files of `tasks/` as the folder holds them, for a folder
@@ -862,6 +860,11 @@ fn parse_batch_check<R: BufRead>(mut reader: R, expected: usize) -> Result<Vec<u
 /// directory would otherwise yield fewer files, and the store that follows
 /// would replace the repository's rows with that smaller set. The error keeps
 /// the walk's own text, which names the path it could not read.
+///
+/// A file larger than `MAX_TASK_FILE_BYTES` is read only through the cap plus
+/// one byte, so it is never held whole, and it contributes no row. A file that
+/// opens but cannot be read as text, including one that is not valid UTF-8,
+/// keeps today's skip.
 fn files_on_disk(repo: &Path) -> Result<Vec<(String, String, bool)>, HarvestError> {
     let mut files = Vec::new();
     for entry in WalkDir::new(repo.join("tasks")) {
@@ -870,12 +873,24 @@ fn files_on_disk(repo: &Path) -> Result<Vec<(String, String, bool)>, HarvestErro
         if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
+        let (rel, path_is_lossy) = relative_path(path, repo);
         #[cfg(test)]
         worktree_read_count::record(repo);
-        let Ok(text) = fs::read_to_string(path) else {
+        let Ok(mut file) = File::open(path) else {
             continue;
         };
-        let (rel, path_is_lossy) = relative_path(path, repo);
+        let mut text = String::new();
+        let Ok(read) = (&mut file)
+            .take(MAX_TASK_FILE_BYTES as u64 + 1)
+            .read_to_string(&mut text)
+        else {
+            continue;
+        };
+        #[cfg(test)]
+        worktree_read_count::record_bytes(repo, &rel, read);
+        if read > MAX_TASK_FILE_BYTES {
+            continue;
+        }
         files.push((rel, text, path_is_lossy));
     }
     files.sort();
@@ -1526,6 +1541,19 @@ mod git_override {
     }
 }
 
+/// Register a stand-in git for `repo` from a test outside this module, which
+/// cannot reach the private `git_override` registry.
+#[cfg(test)]
+pub(crate) fn register_test_git(repo: &Path, program: &Path, deadline: Duration) {
+    git_override::register(repo, Some(program.to_path_buf()), Some(deadline));
+}
+
+/// Clear the stand-in git registered for `repo`.
+#[cfg(test)]
+pub(crate) fn clear_test_git(repo: &Path) {
+    git_override::clear(repo);
+}
+
 /// Test-only tally of leave-day `git log` launches, keyed by repository path so
 /// parallel tests and parallel repositories cannot see each other's counts.
 #[cfg(test)]
@@ -1565,7 +1593,8 @@ pub(crate) fn take_leave_walk_count(repo: &Path) -> usize {
 
 /// Test-only tally of working-tree `tasks/` markdown reads, keyed by repository
 /// path so parallel tests and parallel repositories cannot see each other's
-/// counts.
+/// counts. The byte tally beside it records how many bytes each read consumed,
+/// so a test can assert the size cap bounds a working-tree read.
 #[cfg(test)]
 mod worktree_read_count {
     use std::collections::HashMap;
@@ -1577,9 +1606,23 @@ mod worktree_read_count {
         COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    fn byte_counts() -> &'static Mutex<HashMap<PathBuf, HashMap<String, usize>>> {
+        static BYTES: OnceLock<Mutex<HashMap<PathBuf, HashMap<String, usize>>>> = OnceLock::new();
+        BYTES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
     pub(super) fn record(repo: &Path) {
         if let Ok(mut counts) = counts().lock() {
             *counts.entry(repo.to_path_buf()).or_insert(0) += 1;
+        }
+    }
+
+    pub(super) fn record_bytes(repo: &Path, path: &str, bytes: usize) {
+        if let Ok(mut counts) = byte_counts().lock() {
+            counts
+                .entry(repo.to_path_buf())
+                .or_default()
+                .insert(path.to_string(), bytes);
         }
     }
 
@@ -1590,6 +1633,14 @@ mod worktree_read_count {
             .and_then(|mut counts| counts.remove(repo))
             .unwrap_or(0)
     }
+
+    pub(super) fn take_bytes(repo: &Path) -> HashMap<String, usize> {
+        byte_counts()
+            .lock()
+            .ok()
+            .and_then(|mut counts| counts.remove(repo))
+            .unwrap_or_default()
+    }
 }
 
 /// The working-tree `tasks/` markdown reads recorded for `repo` since the last
@@ -1599,6 +1650,16 @@ pub(crate) fn take_worktree_read_count(repo: &Path) -> usize {
     // Harvest canonicalizes its repository path, so key the lookup the same way.
     let repo = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     worktree_read_count::take(&repo)
+}
+
+/// The bytes each working-tree `tasks/` markdown file read for `repo` since the
+/// last call, keyed by its stored relative path, for a test that asserts the
+/// size cap bounds the read.
+#[cfg(test)]
+pub(crate) fn take_worktree_read_bytes(repo: &Path) -> std::collections::HashMap<String, usize> {
+    // Harvest canonicalizes its repository path, so key the lookup the same way.
+    let repo = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    worktree_read_count::take_bytes(&repo)
 }
 
 type LeaveDays = Vec<(usize, Option<NaiveDate>)>;
@@ -1703,9 +1764,9 @@ fn archived_leave_lookup(
     let mut days = Vec::new();
     run_git_streaming(command, None, git_deadline(repo), |reader| {
         parse_archive_log(reader, |day, commit, path| {
-            // Both `cat-file` passes read one expression per line, so a path
-            // that holds a newline would split its expression and shift every
-            // later answer onto the wrong record.
+            // `cat-file` reads one expression per line, so a path that holds a
+            // newline would split its expression and shift every later answer
+            // onto the wrong record.
             if path.contains('\n') {
                 return;
             }
@@ -1718,20 +1779,23 @@ fn archived_leave_lookup(
             days.push(day);
         })
     })?;
-    let indices = existing_object_indices(repo, dir, &exprs)?;
-    let blobs: Vec<String> = indices.iter().map(|&index| exprs[index].clone()).collect();
     // Consume one content at a time as the batch stream delivers it, folding
     // each archived status into the earliest day instead of holding the set.
-    let mut next = indices.iter();
+    // An expression that names no object answers `missing`, which counts as no
+    // qualifying commit, so its day is skipped like a content without the
+    // expected status.
+    let mut next = days.iter();
     let mut earliest: Option<NaiveDate> = None;
-    read_blobs(repo, dir, &blobs, |text| {
-        let Some(&index) = next.next() else {
+    read_blobs(repo, dir, &exprs, |content| {
+        let Some(&day) = next.next() else {
+            return;
+        };
+        let Some(text) = content else {
             return;
         };
         if !has_archived_status(&text, expected) {
             return;
         }
-        let day = days[index];
         earliest = Some(match earliest {
             Some(current) => current.min(day),
             None => day,
@@ -1748,8 +1812,8 @@ fn archived_leave_lookup(
 /// `<date> <id>\0\n<path>\0<date> <id>\0\n<path>\0`. Each NUL-separated field
 /// loses one leading newline and decodes lossily: a header opens a record and
 /// any other field is a path of the current one. A path that is not valid
-/// UTF-8 thus names no object, so the batch-check pass drops its record and
-/// the records after it still count.
+/// UTF-8 thus names no object, so `cat-file --batch` answers `missing` for its
+/// expression and the records after it still count.
 fn parse_archive_log<R: BufRead>(
     mut reader: R,
     mut on_record: impl FnMut(NaiveDate, &str, &str),
@@ -2042,13 +2106,13 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 mod tests {
     use super::{
         CONTENT_HASH_REVISION, GIT_COMMAND_TIMEOUT, GitContext, GitFailure, HarvestError,
-        HarvestState, LogLookup, ParsedTask, PriorTask, TaskKind, archive_log_args,
-        archived_leave_lookup, blob_days, blob_days_log_args, content_hash, enclosing_prefix,
-        escape_posix_ere, existing_object_indices, first_status_commit_date, fnv1a_digest,
-        frontmatter, git_bin, git_deadline, git_dir_command, git_log_args, git_override, git_path,
-        git_read, harvest_repository, harvest_repository_with_prior, parse_archive_log,
-        parse_batch, parse_batch_check, pickaxe_log_args, read_blobs, run_git_command, run_git_log,
-        scan_log_dates, scrub_git_env, stream_blob_days, take_leave_walk_count,
+        HarvestState, LogLookup, MAX_TASK_FILE_BYTES, ParsedTask, PriorTask, TaskKind,
+        archive_log_args, archived_leave_lookup, blob_days, blob_days_log_args, content_hash,
+        enclosing_prefix, escape_posix_ere, first_status_commit_date, fnv1a_digest, frontmatter,
+        git_bin, git_deadline, git_dir_command, git_log_args, git_override, git_path, git_read,
+        harvest_repository, harvest_repository_with_prior, parse_archive_log, parse_batch,
+        pickaxe_log_args, read_blobs, run_git_command, run_git_log, scan_log_dates, scrub_git_env,
+        stream_blob_days, take_leave_walk_count, take_worktree_read_bytes,
         take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
@@ -2241,14 +2305,63 @@ mod tests {
         let contents = ["alpha".to_string(), String::new(), "gamma".to_string()];
         let stream = batch_stream(&contents);
         let mut streamed = Vec::new();
-        parse_batch(&stream[..], contents.len(), |text| streamed.push(text)).expect("stream batch");
+        parse_batch(&stream[..], contents.len(), |text| {
+            streamed.push(text.expect("present blob"));
+        })
+        .expect("stream batch");
         assert_eq!(streamed, contents);
 
         // The same records split into bounded chunks.
         let (reader, _exhausted) = ChunkedReader::new(bounded_chunks(&stream, 7));
         let mut chunked = Vec::new();
-        parse_batch(reader, contents.len(), |text| chunked.push(text)).expect("chunked batch");
+        parse_batch(reader, contents.len(), |text| {
+            chunked.push(text.expect("present blob"));
+        })
+        .expect("chunked batch");
         assert_eq!(chunked, contents);
+    }
+
+    #[test]
+    fn parse_batch_delivers_present_missing_present_in_order() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"aaaa blob 5\nalpha\n");
+        stream.extend_from_slice(b"bbbb missing\n");
+        stream.extend_from_slice(b"cccc blob 5\ngamma\n");
+        let mut contents = Vec::new();
+        parse_batch(&stream[..], 3, |text| contents.push(text)).expect("stream batch");
+        assert_eq!(
+            contents,
+            vec![Some("alpha".to_string()), None, Some("gamma".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_batch_drains_a_blob_over_the_cap_and_keeps_the_next_one() {
+        let oversized = MAX_TASK_FILE_BYTES + 1;
+        let mut stream = Vec::new();
+        stream.extend_from_slice(format!("aaaa blob {oversized}\n").as_bytes());
+        stream.extend(std::iter::repeat_n(b'x', oversized));
+        stream.push(b'\n');
+        stream.extend_from_slice(b"cccc blob 5\ngamma\n");
+        let mut contents = Vec::new();
+        parse_batch(&stream[..], 2, |text| contents.push(text)).expect("stream batch");
+        assert_eq!(
+            contents,
+            vec![Some(String::new()), Some("gamma".to_string())],
+            "an oversized blob parses to no task and the next blob keeps its content"
+        );
+    }
+
+    #[test]
+    fn parse_batch_does_not_allocate_the_announced_huge_size() {
+        let stream = format!("aaaa blob {}\n", usize::MAX).into_bytes();
+        // No body behind the header: the drain must end at EOF instead of
+        // reserving the announced size.
+        let mut contents = Vec::new();
+        parse_batch(&stream[..], 1, |text| contents.push(text))
+            .expect("a huge header with no body must not overflow the capacity");
+        assert_eq!(contents.len(), 1, "at most one content per expression");
+        assert_eq!(contents[0], Some(String::new()));
     }
 
     fn batch_stream(contents: &[String]) -> Vec<u8> {
@@ -2280,6 +2393,7 @@ mod tests {
         let mut state = HarvestState::default();
         let mut first_arrival: Option<(String, bool, bool)> = None;
         parse_batch(reader, 2, |text| {
+            let text = text.expect("present blob");
             let path = format!("tasks/scope_{}.md", state.tasks.len());
             state.harvest_file(&path, &text, false);
             if first_arrival.is_none() {
@@ -2337,14 +2451,6 @@ mod tests {
             "{tasks:?}"
         );
         let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn batch_check_reader_returns_present_indices_and_skips_missing() {
-        let stream = b"abc blob 12\ndef blob 3\ngone missing\nghi blob 3\n".to_vec();
-        let (reader, _exhausted) = ChunkedReader::new(bounded_chunks(&stream, 5));
-        let indices = parse_batch_check(reader, 4).expect("batch check");
-        assert_eq!(indices, vec![0, 1, 3]);
     }
 
     #[test]
@@ -2414,7 +2520,6 @@ mod tests {
         for name in [
             "blob_days",
             "read_blobs",
-            "existing_object_indices",
             "archived_leave_lookup",
             "run_git_log",
         ] {
@@ -6523,10 +6628,6 @@ mod tests {
         let error = read_blobs(&repo, Some(&dir), &blobs, |_| {}).expect_err("read_blobs");
         assert!(matches!(error, GitFailure::Timeout(_)), "{error:?}");
 
-        let exprs = vec!["abc".to_string()];
-        let error = existing_object_indices(&repo, Some(&dir), &exprs).expect_err("batch-check");
-        assert!(matches!(error, GitFailure::Timeout(_)), "{error:?}");
-
         let lookup = run_git_log(
             &repo,
             git_dir_command(&repo, &dir),
@@ -6629,20 +6730,16 @@ mod tests {
     }
 
     #[test]
-    fn harvest_nested_batch_check_timeout_records_a_scan_error() {
-        // The archive log answers, so the hang happens in the nested batch
+    fn harvest_nested_leave_day_batch_timeout_records_a_scan_error() {
+        // The archive log answers, so the hang happens in the leave-day batch
         // reader and must reach the scan error instead of becoming a miss.
-        let parent = nested_enclosing_fixture("harvest_nested_batch_check_timeout");
-        let bin = scratch("harvest_nested_batch_check_timeout_bin");
-        let script = fake_git_script(
-            &bin,
-            "git",
-            &dispatch_script("*\"cat-file --batch-check\"*"),
-        );
+        let parent = nested_enclosing_fixture("harvest_nested_leave_day_batch_timeout");
+        let bin = scratch("harvest_nested_leave_day_batch_timeout_bin");
+        let script = fake_git_script(&bin, "git", &dispatch_script("*\"cat-file --batch\"*"));
         register_fake_git(&parent, &script);
 
-        let error =
-            harvest_repository(&parent.join("nested")).expect_err("the batch-check must time out");
+        let error = harvest_repository(&parent.join("nested"))
+            .expect_err("the leave-day batch read must time out");
         assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
         clear_fake_git(&parent);
         let _ = fs::remove_dir_all(&parent);
@@ -6753,21 +6850,181 @@ mod tests {
             "2026-06-01T12:00:00+00:00",
         );
         let bin = scratch("harvest_batch_timeout_bin");
-        // The dispatch pattern also matches `--batch-check`, so answer that
-        // form with the real git before the batch arm can see it.
-        let script = fake_git_script(
-            &bin,
-            "git",
-            &format!(
-                "case \"$*\" in\n  *\"cat-file --batch-check\"*) exec {} \"$@\" ;;\n  *\"cat-file --batch\"*) exec sleep 10 ;;\n  *) exec {} \"$@\" ;;\nesac",
-                git_bin(),
-                git_bin()
-            ),
-        );
+        let script = fake_git_script(&bin, "git", &dispatch_script("*\"cat-file --batch\"*"));
         register_fake_git(&repo, &script);
 
         let error = harvest_repository(&repo).expect_err("the batch read must time out");
         assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_leave_day_walk_uses_one_cat_file_batch_and_no_batch_check() {
+        let repo = scratch("harvest_one_batch_pass");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archived task"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        let bin = scratch("harvest_one_batch_pass_bin");
+        let calls = bin.join("calls");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "echo \"$*\" >> {}\nexec {} \"$@\"",
+                calls.display(),
+                git_bin()
+            ),
+        );
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(5));
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        assert_eq!(tasks.len(), 1);
+        let recorded = fs::read_to_string(&calls).unwrap_or_default();
+        let batch_calls = recorded
+            .lines()
+            .filter(|line| {
+                line.contains("cat-file --batch") && !line.contains("cat-file --batch-check")
+            })
+            .count();
+        let check_calls = recorded
+            .lines()
+            .filter(|line| line.contains("cat-file --batch-check"))
+            .count();
+        assert_eq!(
+            batch_calls, 1,
+            "one batch pass reads the leave-day walk: {recorded}"
+        );
+        assert_eq!(
+            check_calls, 0,
+            "the batch-check pre-pass is gone: {recorded}"
+        );
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_skips_a_working_tree_file_larger_than_the_cap_and_charts_its_neighbour() {
+        let repo = scratch("harvest_oversized_worktree");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_normal.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "normal task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let mut huge = task_text("2026-05-01", "2026-05-01", "open");
+        huge.push_str(&"x".repeat(MAX_TASK_FILE_BYTES));
+        fs::write(repo.join("tasks/scope_huge.md"), huge).expect("huge task");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["tasks/scope_normal.md"],
+            "the oversized working-tree file contributes no row"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_records_the_bytes_read_for_each_working_tree_task_file() {
+        let repo = scratch("harvest_worktree_bytes");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        let normal = task_text("2026-05-01", "2026-05-01", "open");
+        fs::write(repo.join("tasks/scope_normal.md"), &normal).expect("normal task");
+        let mut huge = task_text("2026-05-01", "2026-05-01", "open");
+        huge.push_str(&"x".repeat(MAX_TASK_FILE_BYTES * 3));
+        fs::write(repo.join("tasks/scope_huge.md"), &huge).expect("huge task");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(paths, vec!["tasks/scope_normal.md"]);
+        assert_eq!(
+            take_worktree_read_count(&repo),
+            2,
+            "one read per working-tree task file"
+        );
+        let bytes = take_worktree_read_bytes(&repo);
+        assert_eq!(
+            bytes.get("tasks/scope_normal.md"),
+            Some(&normal.len()),
+            "the normal file is read whole"
+        );
+        let huge_bytes = *bytes
+            .get("tasks/scope_huge.md")
+            .expect("the oversized file's read");
+        assert!(
+            huge_bytes <= MAX_TASK_FILE_BYTES + 1,
+            "the oversized file is read at most the cap plus one byte: {huge_bytes}"
+        );
+        assert!(
+            huge_bytes > MAX_TASK_FILE_BYTES,
+            "the oversized file really is over the cap: {huge_bytes}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_ref_union_missing_blob_names_the_path() {
+        let repo = scratch("harvest_ref_union_missing");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_vanished.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "committed task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // Keep only the committed copy, so the ref union lists a blob that the
+        // stand-in then answers `missing`.
+        fs::remove_file(repo.join("tasks/scope_vanished.md")).expect("remove worktree copy");
+        let bin = scratch("harvest_ref_union_missing_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "case \"$*\" in\n  *\"cat-file --batch\"*) IFS= read -r expr; printf '%s missing\\n' \"$expr\" ;;\n  *) exec {} \"$@\" ;;\nesac",
+                git_bin()
+            ),
+        );
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(5));
+
+        let error =
+            harvest_repository(&repo).expect_err("a vanished listed blob must fail the scan");
+        match error {
+            HarvestError::Git(message) => assert!(
+                message.contains("tasks/scope_vanished.md"),
+                "the scan error must name the vanished object's path: {message}"
+            ),
+            other => panic!("expected a Git error naming the path, got {other:?}"),
+        }
         clear_fake_git(&repo);
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&bin);

@@ -2,9 +2,11 @@
 description: "Read each archived task's walk with one cat-file --batch that reports missing objects inline, dropping the --batch-check pass, and drain oversized blobs without allocating them."
 scope: task-viewer
 created: 2026-11-08T13:13:24Z
-updated: 2026-11-08T20:56:12Z
-status: ready
+updated: 2026-11-09T17:33:46Z
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Read archive-walk blobs in one cat-file pass and cap blob size
@@ -21,7 +23,7 @@ The leave-day walk of an archived task starts two git processes instead of three
 
 `parse_batch` reads a `<sha> <type> <size>` header, allocates `vec![0_u8; size]` for whatever size git announces, reads the body, and hands `String::from_utf8(body).unwrap_or_default()` to its callback, so a non-UTF-8 blob becomes an empty string and every caller still consumes exactly one entry per expression in order. A `missing` header has no size field, so today it fails the stream with "git printed an unreadable object header". The ref union's committed read (`read_blobs` called from the union in `harvest.rs`) lists its blob ids from `ls-tree`, so a `missing` answer there means an object vanished during the scan, for example through a ref deletion and a prune between the two commands. That failure stays a scan error, because the repository then keeps its earlier rows and the next Update lists the refs again, which is the pattern `ARCHITECTURE.md` keeps for a git history that cannot be read.
 
-`files_on_disk` reads each working-tree task file whole with `fs::read_to_string` and skips one it cannot read. [task-viewer_harvest-silent-drops.md](archive/task-viewer_harvest-silent-drops.md) also edits `files_on_disk`, turning its walk errors into a scan error; the size cap here changes only the per-file read inside that walk, so the two edits sit side by side in whichever order they land. `FEATURES.md` describes the skip under **3. Repositories** ("A task file whose content is not valid UTF-8 is skipped like an unreadable file").
+`files_on_disk` reads each working-tree task file whole with `fs::read_to_string` and skips one it cannot read. [task-viewer_harvest-silent-drops.md](task-viewer_harvest-silent-drops.md) also edits `files_on_disk`, turning its walk errors into a scan error; the size cap here changes only the per-file read inside that walk, so the two edits sit side by side in whichever order they land. `FEATURES.md` describes the skip under **3. Repositories** ("A task file whose content is not valid UTF-8 is skipped like an unreadable file").
 
 ## Approach
 

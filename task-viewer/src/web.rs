@@ -3613,6 +3613,113 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_keeps_earlier_rows_when_a_ref_union_blob_vanishes() {
+        // A listed blob that `cat-file --batch` answers `missing` must fail the
+        // scan with a Git error that names its path, and the repository keeps
+        // the rows the previous scan stored.
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_database("scan_ref_union_missing");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let repo = unique_temp_dir("scan_ref_union_missing_repo");
+        std::fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::write(
+            repo.join("tasks/scope_vanished.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Vanished\n",
+        )
+        .expect("task");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "committed task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // Keep only the committed copy, so the ref union lists a blob that the
+        // stand-in then answers `missing`.
+        std::fs::remove_file(repo.join("tasks/scope_vanished.md")).expect("remove worktree copy");
+
+        let bin = unique_temp_dir("scan_ref_union_missing_bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let script = bin.join("git");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$*\" in\n  *\"cat-file --batch\"*) IFS= read -r expr; printf '%s missing\\n' \"$expr\" ;;\n  *) exec git \"$@\" ;;\nesac\n",
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+        harvest::register_test_git(&repo, &script, std::time::Duration::from_secs(5));
+
+        let id = db::insert_repository(&pool, "vanished", &repo.to_string_lossy())
+            .await
+            .expect("insert");
+        sqlx::query(
+            "INSERT INTO tasks
+                (repository_id, path, scope, kind, created, updated, ship_date, leave_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("tasks/scope_old.md")
+        .bind("scope")
+        .bind("live")
+        .bind("2026-05-01")
+        .bind("2026-05-01")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("earlier rows");
+
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        let harvest: Arc<HarvestFn> = Arc::new(|path: &Path, prior: &[PriorTask]| {
+            let outcome = harvest::harvest_repository_with_prior(path, prior);
+            match &outcome {
+                Err(HarvestError::Git(message)) => assert!(
+                    message.contains("tasks/scope_vanished.md"),
+                    "the ref-union missing object must name its path: {message}"
+                ),
+                other => panic!("expected a Git error naming the vanished path, got {other:?}"),
+            }
+            outcome
+        });
+        scan_core(
+            &pool,
+            &repositories,
+            1,
+            harvest,
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+
+        let after = db::list_repositories(&pool).await.expect("after");
+        let failed = after
+            .iter()
+            .find(|repository| repository.repository_id == id)
+            .expect("repository");
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("Git could not read the history, so the rows were left as they were."),
+            "the vanished object records a scan error"
+        );
+        let rows = db::load_tasks(&pool, Some(id)).await.expect("earlier rows");
+        assert_eq!(rows.len(), 1, "the earlier rows stay intact");
+        assert_eq!(rows[0].scope, "scope");
+
+        harvest::clear_test_git(&repo);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bin);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn web_scan_report_names_the_failed_repository() {
         let path = temp_database("scan_report_failure");
         db::test_db::set(path.clone());
