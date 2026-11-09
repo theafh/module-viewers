@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Local;
+use chrono::Utc;
 use sqlx::{
     Pool, QueryBuilder, Sqlite,
     sqlite::{
@@ -192,7 +192,7 @@ fn create_parent_dir(path: &Path) -> Result<()> {
 }
 
 pub fn now_stamp() -> String {
-    Local::now().format("%Y-%m-%d %H:%M").to_string()
+    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 pub async fn list_repositories(pool: &Pool<Sqlite>) -> Result<Vec<Repository>> {
@@ -473,8 +473,8 @@ pub(crate) mod test_version_read {
 mod tests {
     use super::{
         SCHEMA, SCHEMA_VERSION, StoreHookFn, database_path, delete_repository, init, init_at,
-        init_with, list_repositories, load_prior_tasks, load_tasks, migrate, replace_tasks,
-        set_scan_error, test_db, test_version_read,
+        init_with, list_repositories, load_prior_tasks, load_tasks, migrate, now_stamp,
+        replace_tasks, set_scan_error, test_db, test_version_read,
     };
     use crate::harvest::{ParsedTask, TaskKind};
     use crate::test_support::unique_temp_dir;
@@ -512,6 +512,17 @@ mod tests {
 
     fn immediate_hook() -> Arc<StoreHookFn> {
         Arc::new(|| Box::pin(ready(())))
+    }
+
+    #[test]
+    fn db_stamps_now_as_a_utc_rfc3339_instant() {
+        let stamp = now_stamp();
+        assert!(
+            stamp.ends_with('Z'),
+            "the repository stamp carries its zone designator: {stamp}"
+        );
+        chrono::DateTime::parse_from_rfc3339(&stamp)
+            .unwrap_or_else(|error| panic!("{stamp} must parse as RFC 3339: {error}"));
     }
 
     #[allow(clippy::too_many_arguments)]

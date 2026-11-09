@@ -6,6 +6,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -706,10 +707,44 @@ fn scan_label(repositories: &[Repository], selected: Option<i64>) -> String {
         .filter(|repo| selected.is_none_or(|id| repo.repository_id == id))
         .filter_map(|repo| repo.scanned_at.as_deref())
         .collect();
-    match stamps.iter().max() {
+    let latest = stamps
+        .iter()
+        .filter_map(|stamp| scan_instant(stamp).map(|instant| (instant, *stamp)))
+        .max_by_key(|(instant, _)| *instant)
+        .map(|(_, stamp)| stamp);
+    match latest.or_else(|| stamps.iter().max().copied()) {
         Some(stamp) => format!("Last scan {stamp}"),
         None => "Not scanned yet".to_string(),
     }
+}
+
+/// Read a stored scan stamp as an instant. A stamp written before the UTC clock
+/// is a Berlin wall time; a `Z` or offset stamp states its own instant.
+fn scan_instant(stamp: &str) -> Option<DateTime<Utc>> {
+    if let Ok(instant) = DateTime::parse_from_rfc3339(stamp) {
+        return Some(instant.with_timezone(&Utc));
+    }
+    // The stored text keeps its seconds optional, so a `Z` stamp written
+    // without them still states an instant.
+    if let Some(rest) = stamp.strip_suffix(['Z', 'z']) {
+        for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"] {
+            if let Ok(wall) = NaiveDateTime::parse_from_str(rest, format) {
+                return Some(wall.and_utc());
+            }
+        }
+        return None;
+    }
+    for format in ["%Y-%m-%dT%H:%M:%S%.f%:z", "%Y-%m-%dT%H:%M%:z"] {
+        if let Ok(instant) = DateTime::parse_from_str(stamp, format) {
+            return Some(instant.with_timezone(&Utc));
+        }
+    }
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+        if let Ok(wall) = NaiveDateTime::parse_from_str(stamp, format) {
+            return crate::dates::berlin_instant(wall);
+        }
+    }
+    None
 }
 
 #[derive(Serialize)]
@@ -1166,7 +1201,8 @@ mod tests {
         AppState, HarvestFn, HomeQuery, PickerFn, PriorReadHookFn, ProjectForm, ScanFailure,
         ScanReport, StoreHookFn, add_repository, claim_banner, encode_query, init_templates,
         is_local_host, remaining, remove_repository, render_blocking_thread, render_home, router,
-        scan_all, scan_core, scan_flash, scan_response, scan_worker_cap, serve, static_version,
+        scan_all, scan_core, scan_flash, scan_label, scan_response, scan_worker_cap, serve,
+        static_version,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -2113,6 +2149,36 @@ mod tests {
             "Gr%C3%BC%C3%9Fe%20%E2%80%94%20ok"
         );
         assert_eq!(encode_query("a-b_c.d~e"), "a-b_c.d%7Ee");
+    }
+
+    #[test]
+    fn web_scan_label_compares_stamps_as_instants() {
+        let repository = |id: i64, scanned_at: Option<&str>| db::Repository {
+            repository_id: id,
+            name: format!("repo {id}"),
+            path: format!("/tmp/repo-{id}"),
+            created_at: "2026-11-01T00:00:00Z".to_string(),
+            scanned_at: scanned_at.map(str::to_string),
+            last_error: None,
+        };
+
+        // 2026-11-09 00:30 Berlin is 2026-11-08 23:30 UTC, earlier than the
+        // 23:45 UTC scan, even though its text sorts later.
+        let repositories = vec![
+            repository(1, Some("2026-11-09 00:30")),
+            repository(2, Some("2026-11-08T23:45Z")),
+        ];
+        assert_eq!(
+            scan_label(&repositories, None),
+            "Last scan 2026-11-08T23:45Z"
+        );
+
+        // No stamp parses, so the string maximum still names a latest scan.
+        let repositories = vec![
+            repository(1, Some("pending")),
+            repository(2, Some("unknown")),
+        ];
+        assert_eq!(scan_label(&repositories, None), "Last scan unknown");
     }
 
     #[test]

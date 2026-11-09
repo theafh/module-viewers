@@ -1825,8 +1825,9 @@ fn enclosing_prefix(repo: &Path) -> Result<Option<(String, PathBuf, PathBuf)>, G
 /// history under the new reader and stores a hash that matches again.
 ///
 /// r2 strips a trailing `#` comment from a value and closes the block only on a
-/// bare `---` line, so a row stored by r1 must not keep its old leave day.
-const CONTENT_HASH_REVISION: &str = "r2";
+/// bare `---` line. r3 reads a timestamp as an instant and charts its UTC day,
+/// so a row stored by r2 must not keep the Berlin wall-time leave day.
+const CONTENT_HASH_REVISION: &str = "r3";
 
 /// The bare 64-bit FNV-1a digest of `text`. Only equality matters: a changed
 /// file changes the digest.
@@ -2973,6 +2974,200 @@ mod tests {
             Some(content_hash(&text)),
             "the stored hash carries the current reader revision"
         );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_commit_crossing_midnight_in_berlin_on_its_utc_day() {
+        // 2026-11-09T00:30:00+01:00 is 2026-11-08T23:30:00Z, so the commit that
+        // archives the task belongs to the previous UTC day.
+        let repo = scratch("harvest_utc_commit");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-11-08T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/scope_done.md",
+            "2026-11-08",
+            "2026-11-08",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-11-08T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "create"],
+            "2026-11-08T12:00:00+00:00",
+        );
+        fs::remove_file(repo.join("tasks/scope_done.md")).expect("remove live copy");
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-11-08",
+            "2026-11-09",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-11-09T00:30:00+01:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive after midnight in Berlin"],
+            "2026-11-09T00:30:00+01:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let done = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/scope_done.md")
+            .expect("the archived task charts");
+        let utc_day = NaiveDate::from_ymd_opt(2026, 11, 8).expect("day");
+        assert_eq!(done.kind, TaskKind::Finished);
+        assert_eq!(
+            done.ship_date,
+            Some(utc_day),
+            "the commit's Berlin wall time charts on its UTC day"
+        );
+        assert_eq!(done.leave_date, done.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_reads_a_naive_created_as_berlin_and_a_z_created_as_utc() {
+        let repo = scratch("harvest_utc_frontmatter");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_naive.md"),
+            "---\ncreated: 2026-11-09T00:30:00\nupdated: 2026-11-09T00:30:00\nstatus: open\n---\n\n# Naive\n",
+        )
+        .expect("naive task");
+        fs::write(
+            repo.join("tasks/scope_utc.md"),
+            "---\ncreated: 2026-11-09T00:30:00Z\nupdated: 2026-11-09T00:30:00Z\nstatus: open\n---\n\n# Utc\n",
+        )
+        .expect("utc task");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let naive = tasks
+            .iter()
+            .find(|task| task.path == "tasks/scope_naive.md")
+            .expect("the naive-created task charts");
+        assert_eq!(
+            naive.created,
+            NaiveDate::from_ymd_opt(2026, 11, 8).expect("day"),
+            "a zone-less timestamp is a Berlin wall time"
+        );
+        let utc = tasks
+            .iter()
+            .find(|task| task.path == "tasks/scope_utc.md")
+            .expect("the Z-created task charts");
+        assert_eq!(
+            utc.created,
+            NaiveDate::from_ymd_opt(2026, 11, 9).expect("day"),
+            "a Z timestamp states its own UTC day"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_keeps_the_created_skip_and_the_updated_fallback() {
+        let repo = scratch("harvest_utc_skip_fallback");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_bad_created.md"),
+            "---\ncreated: not-a-date\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n",
+        )
+        .expect("unparseable created task");
+        fs::write(
+            repo.join("tasks/scope_bad_updated.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: not-a-date\nstatus: open\n---\n",
+        )
+        .expect("unparseable updated task");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the unparseable created value still skips its file: {tasks:?}"
+        );
+        let row = tasks.first().expect("the readable task charts");
+        assert_eq!(row.path, "tasks/scope_bad_updated.md");
+        let created = NaiveDate::from_ymd_opt(2026, 5, 1).expect("day");
+        assert_eq!(row.created, created);
+        assert_eq!(
+            row.updated, created,
+            "an unparseable updated value still falls back to created"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_rewalks_a_prior_row_whose_hash_predates_the_utc_reader() {
+        // A row stored by the r2 reader carries `r2:` plus the file digest. The
+        // r3 reader reads timestamps as instants, so that row mismatches once
+        // and the archive walk stores the UTC leave day.
+        let repo = scratch("harvest_hash_utc_revision");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/scope_done.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "create"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        fs::remove_file(repo.join("tasks/scope_done.md")).expect("remove live copy");
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-07-17",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-07-17T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive"],
+            "2026-07-17T12:00:00+00:00",
+        );
+        let text =
+            fs::read_to_string(repo.join("tasks/archive/scope_done.md")).expect("read task bytes");
+        let prior = vec![PriorTask {
+            path: "tasks/archive/scope_done.md".to_string(),
+            leave_date: Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day")),
+            content_hash: Some(format!("r2:{}", fnv1a_digest(&text))),
+        }];
+
+        let tasks = harvest_repository_with_prior(&repo, &prior).expect("harvest");
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            1,
+            "an r2 row must re-walk its leave day once"
+        );
+        let done = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/scope_done.md")
+            .expect("the archived task charts");
+        assert_eq!(done.kind, TaskKind::Finished);
+        assert_eq!(
+            done.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 7, 17).expect("day")),
+            "the archive commit day replaces the stale prior day"
+        );
+        let stored = done.content_hash.as_deref().expect("the row stores a hash");
+        assert!(
+            stored.starts_with("r3:"),
+            "the stored hash carries the current reader revision: {stored}"
+        );
+        assert_eq!(done.content_hash, Some(content_hash(&text)));
         let _ = fs::remove_dir_all(&repo);
     }
 

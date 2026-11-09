@@ -2,9 +2,11 @@
 description: "Read every task timestamp as an instant, chart it on its UTC day, assume Europe/Berlin for a naive time, and run the viewer's clock in UTC."
 scope: task-viewer
 created: 2026-11-09T10:21:33Z
-updated: 2026-11-09T10:58:59Z
-status: ready
+updated: 2026-11-09T11:13:05Z
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Chart task dates on their UTC day
@@ -25,7 +27,7 @@ The task system stamps a fresh `created` and every `updated` with `date -u +%Y-%
 
 `ARCHITECTURE.md` under **Extraction Rules** records the current gap: "Calendar days use the date prefix as written (local Berlin wall time until timezone conversion exists)." That sentence is the passage this task supersedes.
 
-[task-viewer_harvest-input-robustness.md](archive/task-viewer_harvest-input-robustness.md) defines the frontmatter spellings the parser must keep accepting: a UTF-8 BOM, leading blank lines, quoted values, and a space-separated timestamp.
+[task-viewer_harvest-input-robustness.md](task-viewer_harvest-input-robustness.md) defines the frontmatter spellings the parser must keep accepting: a UTF-8 BOM, leading blank lines, quoted values, and a space-separated timestamp.
 
 `chrono-tz` 0.9 already resolves through `tera` in `Cargo.lock`, so a direct dependency adds no new crate version.
 
