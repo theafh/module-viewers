@@ -1,8 +1,8 @@
 ---
 description: "Close the remaining raw-path gaps for task names holding a backslash, a glob character, or a non-UTF-8 byte."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-07T20:04:51
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-07T19:04:51Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

@@ -1,8 +1,8 @@
 ---
 description: "Run the finished-task archive walk with git log -z so a path holding a non-ASCII character or a double quote still dates from its first archived commit instead of its updated day."
 scope: task-viewer
-created: 2026-10-31T13:52:53
-updated: 2026-10-31T14:43:25
+created: 2026-10-31T12:52:53Z
+updated: 2026-10-31T13:43:25Z
 status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann

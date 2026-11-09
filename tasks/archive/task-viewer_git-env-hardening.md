@@ -1,8 +1,8 @@
 ---
 description: "Scrub the remaining inherited git environment and pin log output options so user configuration cannot change parsed paths, dates, or signatures."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-07T16:54:29
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-07T15:54:29Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

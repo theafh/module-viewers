@@ -11,6 +11,10 @@
   }
   var CARD_NAMES = ["weekly", "cumulative", "shipped-calendar", "created-calendar", "backlog", "age", "radar-shipped", "radar-live"];
   var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  // Calendars whose initial scroll position is already chosen, so a redraw on
+  // a theme change or a resize keeps the reader's scroll position instead of
+  // snapping the frame back to the newest days.
+  var calendarOpened = {};
 
   function cssVar(name) {
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -280,7 +284,9 @@
       if (first && first.date.getDate() <= 7) {
         var labelX = labelW + col * (cell + gap);
         // Keep consecutive month labels at least 24px apart so an 11px month
-        // name keeps a visible gap at every width.
+        // name keeps a visible gap at every width. The shipped 53-column
+        // layout already spaces month starts 64px or more apart, so this guard
+        // is defensive and only binds if a payload packs month starts closer.
         if (lastLabelX === null || labelX - lastLabelX >= 24) {
           el(svg, "text", {
             x: labelX, y: 12, fill: cssVar("--chart-muted"), "font-size": "11"
@@ -317,6 +323,15 @@
     // element, so this attribute does not lay the fallback out; `message()`
     // sizes that from the frame instead.
     svg.setAttribute("width", String(naturalWidth));
+    // Open on the newest days once per card: the frame scrolls to its right
+    // edge so a narrow frame shows the recent cells rather than the oldest
+    // columns, and a frame that fits the natural width clamps back to zero.
+    // Later draws leave the reader's scroll position alone.
+    var frame = root.querySelector(".chart-frame");
+    if (!calendarOpened[name]) {
+      calendarOpened[name] = true;
+      frame.scrollLeft = frame.scrollWidth;
+    }
   }
 
   function drawRadar(name, rows, colorName, noun, mode) {

@@ -1,8 +1,8 @@
 ---
 description: "Serialize Remove with Update so deleting a repository cannot race a scan store and produce a foreign-key failure or a spurious scan error."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-05T15:49:21
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-05T14:49:21Z
 status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: false

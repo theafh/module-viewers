@@ -1,8 +1,8 @@
 ---
 description: "Model each element's own client size in the browser-guard stub so the chart tests observe natural widths, the radar's 360px height, and the frame-centred fallback."
 scope: task-viewer
-created: 2026-11-08T11:24:05
-updated: 2026-11-08T12:17:50
+created: 2026-11-08T10:24:05Z
+updated: 2026-11-08T11:17:50Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

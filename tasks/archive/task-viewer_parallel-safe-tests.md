@@ -1,8 +1,8 @@
 ---
 description: "Make the inline suite parallel-safe with Aurora-style unique_temp_dir scratch paths and hermetic git fixtures."
 scope: task-viewer
-created: 2026-10-23T16:23:16
-updated: 2026-10-23T16:23:16
+created: 2026-10-23T14:23:16Z
+updated: 2026-10-23T14:23:16Z
 status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann

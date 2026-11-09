@@ -1,8 +1,8 @@
 ---
 description: "Parse each chart date once per draw, reuse the computed x positions for paths and hover, read theme colours once per draw, and cap weekly y-axis labels."
 scope: task-viewer/static/js
-created: 2026-11-08T14:13:24
-updated: 2026-11-08T15:37:46
+created: 2026-11-08T13:13:24Z
+updated: 2026-11-08T14:37:46Z
 status: ready
 reported-by: "Andreas Hoffmann"
 ---

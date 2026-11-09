@@ -1,8 +1,8 @@
 ---
 description: "Read raw ls-tree paths so a task that exists only on another branch is charted when its name is non-ASCII or contains a double quote."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-05T21:49:51
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-05T20:49:51Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

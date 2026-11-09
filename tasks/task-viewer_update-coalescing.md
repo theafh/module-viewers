@@ -1,8 +1,8 @@
 ---
 description: "Let Update clicks that arrive while a scan is queued share that one follow-up scan, so repeated clicks run at most one extra scan instead of one each."
 scope: task-viewer
-created: 2026-11-08T14:30:10
-updated: 2026-11-08T19:12:57
+created: 2026-11-08T13:30:10Z
+updated: 2026-11-08T18:12:57Z
 status: ready
 reported-by: "Andreas Hoffmann"
 ---

@@ -1,8 +1,8 @@
 ---
 description: "Ship the first task-viewer: local loopback dashboard, ~/.task-viewer storage, harvest, eight charts, and root guardrails."
 scope: task-viewer
-created: 2026-10-18T22:30:27
-updated: 2026-10-23T16:18:37
+created: 2026-10-18T20:30:27Z
+updated: 2026-10-23T14:18:37Z
 status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann

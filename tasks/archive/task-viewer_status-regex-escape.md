@@ -1,8 +1,8 @@
 ---
 description: "Escape the frontmatter status before it reaches a git -G regex so unusual statuses cannot fail the whole repository scan."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-06T04:57:55
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-06T03:57:55Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

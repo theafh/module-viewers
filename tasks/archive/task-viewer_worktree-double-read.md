@@ -1,8 +1,8 @@
 ---
 description: "Read each worktree task file once per harvest instead of reading it for candidates and again for the chosen content."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-06T16:31:03
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-06T15:31:03Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

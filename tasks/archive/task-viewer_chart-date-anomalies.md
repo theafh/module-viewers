@@ -1,8 +1,8 @@
 ---
 description: "Keep the live backlog and weekly charts consistent when a leave date precedes created or a ship event precedes the first created day."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-05T22:30:15
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-05T21:30:15Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

@@ -1,8 +1,8 @@
 ---
 description: "Trim unused dependency features and add release-profile size and link-time settings without changing runtime behavior."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-06T16:10:13
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-06T15:10:13Z
 status: deferred
 reported-by: "Andreas Hoffmann"
 ---

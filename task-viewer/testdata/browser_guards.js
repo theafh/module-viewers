@@ -157,6 +157,26 @@
     var frame = new Node("frame");
     var tip = new Node("tip");
     var summary = new Node("summary");
+    // A scrolling frame reports its chart's laid-out width as its content
+    // width, so a chart wider than the frame scrolls, and `scrollLeft` clamps
+    // to the range a browser allows.
+    Object.defineProperty(frame, "scrollWidth", {
+      get: function () {
+        return Math.max(frame.clientWidth, svg.clientWidth);
+      }
+    });
+    var scrollLeftValue = 0;
+    Object.defineProperty(frame, "scrollLeft", {
+      get: function () {
+        return scrollLeftValue;
+      },
+      set: function (value) {
+        var max = Math.max(0, frame.scrollWidth - frame.clientWidth);
+        var number = Number(value);
+        if (!isFinite(number)) number = 0;
+        scrollLeftValue = Math.max(0, Math.min(number, max));
+      }
+    });
     root.querySelector = function (selector) {
       if (selector === "svg") return svg;
       if (selector === ".summary") return summary;

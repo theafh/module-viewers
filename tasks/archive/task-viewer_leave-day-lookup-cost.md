@@ -1,8 +1,8 @@
 ---
 description: "Reduce the per-archived-task git walks and cache the repository's git context, including skipping git entirely for a folder outside git."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-07T16:27:53
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-07T15:27:53Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

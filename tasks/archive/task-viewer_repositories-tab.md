@@ -1,8 +1,8 @@
 ---
 description: "Move the repository list onto a Repositories tab; keep Dashboard as the default charts view."
 scope: task-viewer
-created: 2026-10-23T16:32:49
-updated: 2026-10-23T16:32:49
+created: 2026-10-23T14:32:49Z
+updated: 2026-10-23T14:32:49Z
 status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann

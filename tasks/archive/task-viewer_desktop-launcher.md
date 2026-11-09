@@ -1,8 +1,8 @@
 ---
 description: "Add Artemis-style task-viewer start/stop/toggle scripts and macOS Dock / Linux menu install with the chart icon."
 scope: task-viewer
-created: 2026-10-23T16:18:37
-updated: 2026-10-23T16:18:37
+created: 2026-10-23T14:18:37Z
+updated: 2026-10-23T14:18:37Z
 status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann

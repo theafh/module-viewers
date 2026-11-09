@@ -1,8 +1,8 @@
 ---
 description: "On SIGTERM or SIGINT stop accepting, give a running Update up to 4 s to store, close the database, and exit inside the launcher's stop window; document every launcher state file."
 scope: task-viewer
-created: 2026-11-08T14:13:24
-updated: 2026-11-08T19:37:03
+created: 2026-11-08T13:13:24Z
+updated: 2026-11-08T18:37:03Z
 status: ready
 reported-by: "Andreas Hoffmann"
 ---

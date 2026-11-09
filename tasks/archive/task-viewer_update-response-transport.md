@@ -1,8 +1,8 @@
 ---
 description: "Keep the Update outcome out of a long redirect URL with a compact flash token, and build the redirect query without a String allocation per byte."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-06T22:34:39
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-06T21:34:39Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

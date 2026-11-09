@@ -1,8 +1,8 @@
 ---
 description: "Strip trailing # comments from frontmatter values, close frontmatter only on a bare --- line, log every task file dropped for bad frontmatter, and fail the scan on an unreadable tasks directory."
 scope: task-viewer
-created: 2026-11-08T14:13:24
-updated: 2026-11-08T21:56:12
+created: 2026-11-08T13:13:24Z
+updated: 2026-11-08T20:56:12Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

@@ -1,8 +1,8 @@
 ---
 description: "Cap the flash store, build the loopback host and origin strings once from PORT, and escape the chart JSON while serializing instead of copying it."
 scope: task-viewer
-created: 2026-11-08T14:13:24
-updated: 2026-11-08T18:43:42
+created: 2026-11-08T13:13:24Z
+updated: 2026-11-08T17:43:42Z
 status: ready
 reported-by: "Andreas Hoffmann"
 ---

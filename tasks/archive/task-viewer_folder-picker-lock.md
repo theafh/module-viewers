@@ -1,8 +1,8 @@
 ---
 description: "Do not hold the scan lock while the native folder picker is open, so an unattended Add dialog cannot block Update."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-05T11:41:41
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-05T10:41:41Z
 status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: false

@@ -1,8 +1,8 @@
 ---
 description: "Date merge-produced task blobs in the ref union so the newest commit decides, and list each distinct ref commit and blob id once."
 scope: task-viewer
-created: 2026-11-08T14:13:24
-updated: 2026-11-08T22:39:31
+created: 2026-11-08T13:13:24Z
+updated: 2026-11-08T21:39:31Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

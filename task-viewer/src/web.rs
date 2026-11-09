@@ -3745,7 +3745,7 @@ mod tests {
         })
     }
 
-    /// Acceptance 1: a throwing `localStorage` still flips `data-theme`, keeps
+    /// browser-robustness Acceptance 1: a throwing `localStorage` still flips `data-theme`, keeps
     /// the button label in sync, recolors the charts through the theme event,
     /// and lets no exception escape the click handler.
     #[test]
@@ -3829,7 +3829,7 @@ mod tests {
         );
     }
 
-    /// Acceptance 2: a 120px SVG with a year of calendar rows draws no
+    /// browser-robustness Acceptance 2: a 120px SVG with a year of calendar rows draws no
     /// negative-width rect and no negative-radius circle.
     #[test]
     fn browser_narrow_viewport_draws_no_negative_geometry() {
@@ -3892,7 +3892,7 @@ mod tests {
             .collect()
     }
 
-    /// Acceptance 3: a malformed payload renders "Charts unavailable" on every
+    /// browser-robustness Acceptance 3: a malformed payload renders "Charts unavailable" on every
     /// chart card, and `dashboard.js` loads without throwing.
     #[test]
     fn browser_malformed_payload_renders_the_fallback_on_every_card() {
@@ -3941,7 +3941,7 @@ mod tests {
         }
     }
 
-    /// Acceptance 4: a parseable payload whose `counts` is absent and whose
+    /// browser-robustness Acceptance 4: a parseable payload whose `counts` is absent and whose
     /// `shipped_calendar` is not an array leaves only the throwing cards
     /// (weekly and shipped-calendar) on the fallback, while cumulative and
     /// radar render normally with no uncaught error.
@@ -4011,7 +4011,7 @@ mod tests {
         payload
     }
 
-    /// Acceptance 3: the fallback centres on the frame, not on the chart's
+    /// browser-stub-element-sizes Acceptance 3: the fallback centres on the frame, not on the chart's
     /// own seeded size. At a 1000px frame the calendar's seeded 884px width
     /// would centre at 442 and the radar's 212.8px at 106.4, so 500 is the
     /// value the frame-forcing line in `message()` alone produces.
@@ -4178,7 +4178,7 @@ mod tests {
         blocks
     }
 
-    /// Acceptance 1: at a 120px frame the calendar's viewBox width is its
+    /// narrow-chart-layout Acceptance 1: at a 120px frame the calendar's viewBox width is its
     /// natural content width, the SVG width attribute matches it so the chart
     /// renders at 1:1, every cell is 14x14, and every rect and month label
     /// lies inside the viewBox.
@@ -4250,7 +4250,7 @@ mod tests {
         assert_eq!(result["labelsOutside"].as_u64(), Some(0));
     }
 
-    /// Acceptance 2 and Acceptance 5's stylesheet clause: the calendar and
+    /// narrow-chart-layout Acceptance 2 and Acceptance 5's stylesheet clause: the calendar and
     /// radar frames scroll a chart wider than the frame, and the base chart
     /// card shrinks below its chart's intrinsic width so the page never
     /// overflows.
@@ -4308,7 +4308,7 @@ mod tests {
         }
     }
 
-    /// Acceptance 3: `.tooltip` is fixed to the viewport and `tipFor` places
+    /// narrow-chart-layout Acceptance 3: `.tooltip` is fixed to the viewport and `tipFor` places
     /// it from the pointer's client coordinates with no frame offset, so the
     /// scrolling calendar frame neither clips nor shifts it.
     #[test]
@@ -4333,7 +4333,7 @@ mod tests {
         );
     }
 
-    /// Acceptance 4: at a 120px frame the radar's radius is at least 31px and
+    /// narrow-chart-layout Acceptance 4: at a 120px frame the radar's radius is at least 31px and
     /// every label's measured extent lies inside the viewBox on both axes, so
     /// the top label is not clipped by a frame-sized viewBox.
     #[test]
@@ -4385,7 +4385,7 @@ mod tests {
         );
     }
 
-    /// Acceptance 5: at a 120px frame the radar's inline size is the ring's
+    /// narrow-chart-layout Acceptance 5: at a 120px frame the radar's inline size is the ring's
     /// natural size and divides its viewBox to 1 in both axes, so the expanded
     /// chart renders at 1:1 instead of scaling into the frame.
     #[test]
@@ -4442,7 +4442,7 @@ mod tests {
         assert!((result["heightScale"].as_f64().expect("height scale") - 1.0).abs() < 1e-9);
     }
 
-    /// Acceptance 5: at a 1000px frame the radar's ring fits, so the element
+    /// narrow-chart-layout Acceptance 5: at a 1000px frame the radar's ring fits, so the element
     /// carries no inline size, the viewBox is the frame size, and the
     /// element's own client size divides the viewBox to 1 in both axes.
     #[test]
@@ -4483,7 +4483,7 @@ mod tests {
         assert!((result["heightScale"].as_f64().expect("height scale") - 1.0).abs() < 1e-9);
     }
 
-    /// Acceptance 2: at a 1000px frame the radar element takes the
+    /// browser-stub-element-sizes Acceptance 2: at a 1000px frame the radar element takes the
     /// stylesheet's 360px height, so its radius and viewBox follow the
     /// geometry the page produces.
     #[test]
@@ -4517,7 +4517,7 @@ mod tests {
         assert_eq!(result["viewBox"], "0 0 1000 360");
     }
 
-    /// Acceptance 6: at a 1000px frame the calendar cell size is 14 and the
+    /// narrow-chart-layout Acceptance 6: at a 1000px frame the calendar cell size is 14 and the
     /// radar radius and viewBox follow the 360px stylesheet height, so the
     /// normal-width layout is unchanged.
     #[test]
@@ -4560,7 +4560,7 @@ mod tests {
         assert_eq!(result["viewBox"], "0 0 1000 360");
     }
 
-    /// Acceptance 7: an 800px frame, below the 884px threshold, still renders
+    /// narrow-chart-layout Acceptance 7: an 800px frame, below the 884px threshold, still renders
     /// the calendar at its natural width and scrolls it, through the stub's
     /// numeric `config.width`. The element's client width is its own 884px
     /// natural width, not the narrower frame it sits in.
@@ -4596,7 +4596,7 @@ mod tests {
         assert_eq!(result["width"].as_f64(), Some(884.0));
     }
 
-    /// Acceptance 1: at a 120px frame the calendar element keeps its own
+    /// browser-stub-element-sizes Acceptance 1: at a 120px frame the calendar element keeps its own
     /// 884px natural client width, so the harness distinguishes the chart
     /// from the frame that scrolls it.
     #[test]
@@ -4631,7 +4631,73 @@ mod tests {
         );
     }
 
-    /// Acceptance 8: at a 120px frame the rendered month labels sit at least
+    /// narrow-chart-layout follow-up: a frame narrower than the calendar's
+    /// natural width opens on the newest days, a frame that fits it stays at
+    /// its left edge, and a theme redraw keeps the reader's scroll position.
+    #[test]
+    fn browser_calendar_opens_on_the_newest_days() {
+        let payload = year_of_calendar_rows();
+        let payload_text = payload.to_string();
+        let assertion = r#"(function () {
+  var env = globalThis.__env;
+  var card = env.cards["shipped-calendar"];
+  var frame = card.querySelector(".chart-frame");
+  var svg = card.querySelector("svg");
+  var afterLoad = frame.scrollLeft;
+  frame.scrollLeft = 0;
+  var afterUserScroll = frame.scrollLeft;
+  env.window.dispatchEvent(new env.Event("task-viewer-theme"));
+  return JSON.stringify({
+    afterLoad: afterLoad,
+    afterUserScroll: afterUserScroll,
+    afterRedraw: frame.scrollLeft,
+    scrollWidth: frame.scrollWidth,
+    clientWidth: frame.clientWidth,
+    natural: Number(svg.getAttribute("width"))
+  });
+})()"#;
+        let narrow = browser_config(
+            true,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let narrow_result = run_browser(&narrow, assertion);
+        assert_eq!(narrow_result["natural"].as_f64(), Some(884.0));
+        assert_eq!(narrow_result["scrollWidth"].as_f64(), Some(884.0));
+        assert_eq!(
+            narrow_result["afterLoad"].as_f64(),
+            Some(764.0),
+            "a narrow frame opens on the newest days"
+        );
+        assert_eq!(
+            narrow_result["afterUserScroll"].as_f64(),
+            Some(0.0),
+            "the stub models the reader's own scroll position"
+        );
+        assert_eq!(
+            narrow_result["afterRedraw"].as_f64(),
+            Some(0.0),
+            "a theme redraw keeps the reader's scroll position"
+        );
+        // At 1000px the frame has no scroll range, so a browser clamps any
+        // assignment to zero. Assert the range rather than the clamped value,
+        // which no chart behaviour can distinguish.
+        let wide = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let wide_result = run_browser(&wide, assertion);
+        assert_eq!(
+            wide_result["scrollWidth"].as_f64(),
+            wide_result["clientWidth"].as_f64(),
+            "a wide frame has no horizontal scroll range"
+        );
+    }
+
+    /// narrow-chart-layout Acceptance 8: at a 120px frame the rendered month labels sit at least
     /// 24px apart.
     #[test]
     fn browser_narrow_calendar_month_labels_are_spaced() {
@@ -4670,7 +4736,7 @@ mod tests {
         );
     }
 
-    /// Acceptance 9: `dashboard.js` carries one comment stating the calendar's
+    /// narrow-chart-layout Acceptance 9: `dashboard.js` carries one comment stating the calendar's
     /// layout strategy and its reason and one stating the radar's.
     #[test]
     fn dashboard_carries_the_chart_strategy_comments() {

@@ -1,8 +1,8 @@
 ---
 description: "Make static asset caching safe with a content-hash version, serving static assets as immutable while HTML responses stay uncached."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-07T22:21:59
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-07T21:21:59Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

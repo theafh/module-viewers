@@ -1,8 +1,8 @@
 ---
 description: "Propagate a failed schema-version read, refuse a database newer than the binary, and run SQLite at synchronous=NORMAL under WAL."
 scope: task-viewer
-created: 2026-11-08T14:13:24
-updated: 2026-11-08T21:09:53
+created: 2026-11-08T13:13:24Z
+updated: 2026-11-08T20:09:53Z
 status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: true

@@ -1,8 +1,8 @@
 ---
 description: "Read each archived task's walk with one cat-file --batch that reports missing objects inline, dropping the --batch-check pass, and drain oversized blobs without allocating them."
 scope: task-viewer
-created: 2026-11-08T14:13:24
-updated: 2026-11-08T21:56:12
+created: 2026-11-08T13:13:24Z
+updated: 2026-11-08T20:56:12Z
 status: ready
 reported-by: "Andreas Hoffmann"
 ---

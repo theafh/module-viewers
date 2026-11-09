@@ -1,8 +1,8 @@
 ---
 description: "Chart a configured folder inside a parent git repository from the enclosing repository's refs."
 scope: task-viewer
-created: 2026-11-05T07:00:45
-updated: 2026-11-07T00:01:38
+created: 2026-11-05T06:00:45Z
+updated: 2026-11-06T23:01:38Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

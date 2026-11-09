@@ -1,8 +1,8 @@
 ---
 description: "Start the cumulative, backlog, and mean-age series at 1970-01-01 and the weekly series at that week's Monday, keeping every row, so a mistyped early year cannot stretch the charts."
 scope: task-viewer
-created: 2026-11-08T14:13:24
-updated: 2026-11-09T05:34:01
+created: 2026-11-08T13:13:24Z
+updated: 2026-11-09T04:34:01Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
