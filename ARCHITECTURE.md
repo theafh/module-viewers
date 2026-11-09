@@ -6,7 +6,7 @@ How module-viewers is structured and where that structure is headed. This docume
 
 module-viewers is a Cargo workspace of local viewers. `task-viewer` is a single Rust binary that serves a browser UI on `127.0.0.1:7880`. There is no account and no background daemon. The person starts the binary and it serves until they stop it.
 
-The git tree holds the program. The SQLite file `~/.task-viewer` holds the repository list and the parsed task rows that the charts read. `TASK_VIEWER_DB` overrides that path for a test or a private location. `TASK_VIEWER_SCAN_WORKERS` caps how many repositories Update harvests at once and defaults to 4. Nothing in the database is required to build or run the program for the first time. The first launch creates an empty database.
+The git tree holds the program. The SQLite file `~/.task-viewer` holds the repository list and the parsed task rows that the charts read. `TASK_VIEWER_DB` overrides that path for a test or a private location. `TASK_VIEWER_SCAN_WORKERS` caps how many repositories Update harvests at once and defaults to 4. `TASK_VIEWER_PORT` overrides the listen port for a test only, so an isolated test runs the built binary on a free loopback port beside a running dashboard; the address stays `127.0.0.1`, and the host allowlist and the same-origin `Origin` check stay derived from the default port. Nothing in the database is required to build or run the program for the first time. The first launch creates an empty database.
 
 ## Stack
 
@@ -18,7 +18,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 
 ## Components
 
-**`task-viewer/src/main.rs`** binds `127.0.0.1:7880`, opens the database, and starts the router.
+**`task-viewer/src/main.rs`** binds `127.0.0.1:7880`, or the port named by the test-only `TASK_VIEWER_PORT` on that same loopback address when a test sets it, opens the database, and starts the router.
 
 **`task-viewer/src/web.rs`** owns the routes. The dashboard is `GET /`. The repository list is `GET /repositories`. Add repository is `POST /repositories` and opens the operating-system folder picker on this machine. Remove is `POST /repositories/{id}/delete`. Update is `POST /scan`; it harvests up to the configured cap at once and stores each result one repository at a time. Routes name a repository by its integer id. The folder path is taken from the picker, not from the browser body.
 
