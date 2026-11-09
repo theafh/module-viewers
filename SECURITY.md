@@ -43,6 +43,8 @@ Dependencies stay pinned in `Cargo.lock`. Run `make audit` when they change.
 
 `Cargo.lock` also pins `rsa` 0.9.10 through `sqlx-mysql`, an optional `sqlx` backend that this workspace never builds. `cargo audit` reports RUSTSEC-2023-0071 against that crate, and the advisory has no fixed upgrade. `.cargo/audit.toml` records it in `[advisories] ignore`, and `cargo tree -i rsa` rechecks reachability: it prints nothing while `rsa` stays outside the build graph. A dependency change that pulls `rsa` into a built target removes the ignore and fixes the advisory instead.
 
+The SQLite driver is `sqlx-sqlite` 0.8.6 vendored at `vendor/sqlx-sqlite`; its only change from the published crate is a widened `libsqlite3-sys` bound (`>=0.30.1, <0.40.0`), matching sqlx's own upstream bump. That bound lets `Cargo.lock` carry `libsqlite3-sys` 0.39.1, whose bundled SQLite 3.54.1 carries the fix for RUSTSEC-2026-0459, and a database test pins the floor at 3.54.0. Remove the vendored copy and the `[patch.crates-io]` entry once a released `sqlx` carries the widened bound.
+
 ## Per-Change Checklist
 
 - [ ] No outbound network client introduced.

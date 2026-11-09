@@ -525,6 +525,29 @@ mod tests {
             .unwrap_or_else(|error| panic!("{stamp} must parse as RFC 3339: {error}"));
     }
 
+    /// The bundled SQLite carries the fix for RUSTSEC-2026-0459, so a future
+    /// dependency change cannot quietly fall back below 3.54.0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_bundles_the_patched_sqlite_version() {
+        let dir = unique_temp_dir("db_sqlite_version");
+        let path = dir.join("test.db");
+        let pool = init_at(&path).await.expect("init");
+        let version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&pool)
+            .await
+            .expect("sqlite version");
+        let parts: Vec<u32> = version
+            .split('.')
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        assert!(
+            parts.as_slice() >= [3, 54, 0].as_slice(),
+            "the bundled SQLite must carry the RUSTSEC-2026-0459 fix: {version}"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn parsed(
         path: &str,

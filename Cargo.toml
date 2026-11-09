@@ -2,5 +2,12 @@
 resolver = "2"
 members = ["task-viewer"]
 
+# `sqlx-sqlite` 0.8.6 pins `libsqlite3-sys ^0.30.1`, whose bundled SQLite is
+# affected by RUSTSEC-2026-0459. This vendored copy carries sqlx's own widened
+# bound (launchbadge/sqlx#4502) so the build can use the patched
+# `libsqlite3-sys` 0.39.x. Remove the patch once a released sqlx carries it.
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
+
 [profile.release]
 overflow-checks = true
