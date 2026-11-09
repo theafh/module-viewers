@@ -1,10 +1,12 @@
 use chrono::NaiveDate;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::num::IntErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
@@ -1065,17 +1067,21 @@ fn frontmatter(text: &str) -> Option<std::collections::HashMap<String, String>> 
 
 fn git_bin() -> &'static str {
     // Prefer a real git over macOS `/usr/bin/git` (an xcrun shim that depends on
-    // DEVELOPER_DIR / Xcode or Command Line Tools).
-    for candidate in [
-        "/opt/homebrew/bin/git",
-        "/usr/local/bin/git",
-        "/usr/bin/git",
-    ] {
-        if Path::new(candidate).is_file() {
-            return candidate;
+    // DEVELOPER_DIR / Xcode or Command Line Tools). The candidates are stat'd
+    // once per process, so a harvest of many repositories does not repeat it.
+    static GIT_BIN: LazyLock<&'static str> = LazyLock::new(|| {
+        for candidate in [
+            "/opt/homebrew/bin/git",
+            "/usr/local/bin/git",
+            "/usr/bin/git",
+        ] {
+            if Path::new(candidate).is_file() {
+                return candidate;
+            }
         }
-    }
-    "git"
+        "git"
+    });
+    *GIT_BIN
 }
 
 const GIT_SEARCH_DIRS: [&str; 6] = [
@@ -1087,10 +1093,42 @@ const GIT_SEARCH_DIRS: [&str; 6] = [
     "/sbin",
 ];
 
-/// How long a read-only git command may run before harvest kills it and records
-/// a scan error for that repository. A hung command must not hold the scan lock
-/// or a blocking thread forever.
+/// The default deadline for a read-only git command, raised per process by
+/// `TASK_VIEWER_GIT_TIMEOUT_SECS`. A hung command must not hold the scan lock
+/// or a blocking thread forever, so harvest kills it once the deadline passes.
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The largest deadline `TASK_VIEWER_GIT_TIMEOUT_SECS` may raise to.
+const MAX_GIT_TIMEOUT_SECS: u64 = 600;
+
+/// Turn `TASK_VIEWER_GIT_TIMEOUT_SECS` into the deadline for one git command.
+///
+/// Unset, zero, negative, and non-numeric values keep the 30-second default; a
+/// whole number of seconds from 1 to 600 is used as given, and a larger value
+/// or an overflow is clamped to 600.
+fn git_timeout(raw: Option<&str>) -> Duration {
+    let Some(raw) = raw else {
+        return GIT_COMMAND_TIMEOUT;
+    };
+    match raw.trim().parse::<i64>() {
+        Ok(value) if (1..=MAX_GIT_TIMEOUT_SECS as i64).contains(&value) => {
+            Duration::from_secs(value as u64)
+        }
+        Ok(value) if value > MAX_GIT_TIMEOUT_SECS as i64 => {
+            Duration::from_secs(MAX_GIT_TIMEOUT_SECS)
+        }
+        Err(error) if *error.kind() == IntErrorKind::PosOverflow => {
+            Duration::from_secs(MAX_GIT_TIMEOUT_SECS)
+        }
+        _ => {
+            tracing::warn!(
+                value = %raw,
+                "TASK_VIEWER_GIT_TIMEOUT_SECS is not a usable deadline; using the default"
+            );
+            GIT_COMMAND_TIMEOUT
+        }
+    }
+}
 
 /// The git program to run for a repository. Production always uses `git_bin`;
 /// tests may route a fixture repository to a stand-in script through the
@@ -1107,19 +1145,30 @@ fn git_program(repo: &Path) -> PathBuf {
     PathBuf::from(git_bin())
 }
 
-/// The deadline for a git command in `repo`. Production always returns
-/// `GIT_COMMAND_TIMEOUT`; a test may register a short deadline for its fixture
-/// repository.
+/// The deadline for a git command in `repo`. Production reads
+/// `TASK_VIEWER_GIT_TIMEOUT_SECS` once per process through a `LazyLock` and
+/// falls back to `GIT_COMMAND_TIMEOUT`; a test may register a short deadline
+/// for its fixture repository.
 fn git_deadline(repo: &Path) -> Duration {
     #[cfg(test)]
     {
         if let Some(deadline) = git_override::deadline(repo) {
             return deadline;
         }
+        GIT_COMMAND_TIMEOUT
     }
     #[cfg(not(test))]
-    let _ = repo;
-    GIT_COMMAND_TIMEOUT
+    {
+        let _ = repo;
+        static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+            git_timeout(
+                std::env::var("TASK_VIEWER_GIT_TIMEOUT_SECS")
+                    .ok()
+                    .as_deref(),
+            )
+        });
+        *TIMEOUT
+    }
 }
 
 fn git_path() -> std::ffi::OsString {
@@ -1132,6 +1181,10 @@ fn git_path() -> std::ffi::OsString {
     std::env::join_paths(&dirs)
         .unwrap_or_else(|_| std::env::join_paths(GIT_SEARCH_DIRS).unwrap_or_default())
 }
+
+/// The `PATH` handed to every git child, built once per process from
+/// `git_path()` instead of once per command.
+static GIT_PATH: LazyLock<std::ffi::OsString> = LazyLock::new(git_path);
 
 fn git_dir(repo: &Path) -> Option<PathBuf> {
     let dot = repo.join(".git");
@@ -1154,7 +1207,7 @@ fn scrub_git_env(command: &mut Command) {
     // only have Xcode.app, and Homebrew git does not need it.
     command
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("PATH", git_path())
+        .env("PATH", GIT_PATH.as_os_str())
         // The viewed repository is read-only input, so git must not take an
         // optional lock while it refreshes an index or writes a reflog.
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -1271,12 +1324,23 @@ fn pickaxe_log_args(flag: &str, pattern: &str, rel: &str) -> Vec<String> {
     ])
 }
 
+/// The failure a git command contributes when it outlives its deadline.
+fn git_timeout_failure(deadline: Duration) -> GitFailure {
+    GitFailure::Timeout(format!(
+        "git did not finish within {} ms",
+        deadline.as_millis()
+    ))
+}
+
 /// Run one read-only git command with a deadline.
 ///
 /// The child's stdout and stderr are drained on their own threads while it
 /// runs, and an optional stdin payload is written from its own thread, so a
-/// child that fills a pipe cannot deadlock the wait. When the deadline passes
-/// the child is killed and reaped, and `GitFailure::Timeout` is returned.
+/// child that fills a pipe cannot deadlock the wait. The wait ends the moment
+/// stdout reaches end of file, because the child is usually about to exit, and
+/// a short poll covers the child that closes stdout and keeps running. When the
+/// deadline passes the child is killed and reaped, and `GitFailure::Timeout` is
+/// returned.
 fn run_git_command(
     mut command: Command,
     input: Option<Vec<u8>>,
@@ -1293,11 +1357,14 @@ fn run_git_command(
     let mut child = command
         .spawn()
         .map_err(|error| GitFailure::Other(format!("git did not start: {error}")))?;
+    let (stdout_done, stdout_done_rx) = std::sync::mpsc::channel();
     let stdout = child.stdout.take().map(|mut pipe| {
         std::thread::spawn(move || {
             use std::io::Read;
             let mut buffer = Vec::new();
             let _ = pipe.read_to_end(&mut buffer);
+            // Signal even when the read failed, so the caller stops idling.
+            let _ = stdout_done.send(());
             buffer
         })
     });
@@ -1318,6 +1385,18 @@ fn run_git_command(
         })
     });
     let started = Instant::now();
+    // Idle until stdout ends or the deadline passes, so a running child is not
+    // polled every few milliseconds.
+    match stdout_done_rx.recv_timeout(deadline.saturating_sub(started.elapsed())) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+        Err(RecvTimeoutError::Timeout) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(git_timeout_failure(deadline));
+        }
+    }
+    // stdout can close before the child exits, so poll for the exit with a
+    // short backoff for the rest of the deadline.
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1325,12 +1404,9 @@ fn run_git_command(
                 if started.elapsed() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(GitFailure::Timeout(format!(
-                        "git did not finish within {} ms",
-                        deadline.as_millis()
-                    )));
+                    return Err(git_timeout_failure(deadline));
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(error) => {
                 let _ = child.kill();
@@ -1362,9 +1438,12 @@ fn run_git_command(
 /// payload is written from another, while a watcher thread owns the child and
 /// enforces the deadline. The parser runs on the calling thread over a
 /// `BufReader` on the child's `ChildStdout`, so it can hand each record to a
-/// consumer as it arrives and borrow the caller's accumulators. A parser that
-/// stops early signals the watcher to kill the child, so a broken stream never
-/// waits out the deadline.
+/// consumer as it arrives and borrow the caller's accumulators. The watcher
+/// idles on a channel that the calling thread signals once the parser returns,
+/// so a finished stream is noticed at once instead of on the next poll, and it
+/// keeps polling for the rest of the deadline because the child can close
+/// stdout and keep running. A parser that stops early signals the watcher to
+/// kill the child, so a broken stream never waits out the deadline.
 fn run_git_streaming<T, F>(
     mut command: Command,
     input: Option<Vec<u8>>,
@@ -1406,8 +1485,27 @@ where
     });
     let abort = Arc::new(AtomicBool::new(false));
     let abort_watcher = Arc::clone(&abort);
+    let (parser_done, parser_done_rx) = std::sync::mpsc::channel();
     let watcher = std::thread::spawn(move || -> Result<std::process::ExitStatus, GitFailure> {
         let started = Instant::now();
+        // Idle until the parser returns or the deadline passes, so a child that
+        // keeps stdout open is not polled every few milliseconds.
+        match parser_done_rx.recv_timeout(deadline.saturating_sub(started.elapsed())) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(git_timeout_failure(deadline));
+            }
+        }
+        if abort_watcher.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GitFailure::Other(String::new()));
+        }
+        // The parser is done, but the child may have closed stdout and kept
+        // running, so poll for its exit with a short backoff until the
+        // deadline.
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => return Ok(status),
@@ -1415,17 +1513,9 @@ where
                     if started.elapsed() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
-                        return Err(GitFailure::Timeout(format!(
-                            "git did not finish within {} ms",
-                            deadline.as_millis()
-                        )));
+                        return Err(git_timeout_failure(deadline));
                     }
-                    if abort_watcher.load(Ordering::Relaxed) {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(GitFailure::Other(String::new()));
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => {
                     let _ = child.kill();
@@ -1441,6 +1531,9 @@ where
     if parsed.is_err() {
         abort.store(true, Ordering::Relaxed);
     }
+    // Wake the watcher now that the parser has returned, so it stops idling and
+    // either reaps the exited child or kills the aborted one.
+    let _ = parser_done.send(());
     let status = watcher
         .join()
         .unwrap_or_else(|_| Err(GitFailure::Other("git watcher stopped".to_string())));
@@ -2109,11 +2202,11 @@ mod tests {
         HarvestState, LogLookup, MAX_TASK_FILE_BYTES, ParsedTask, PriorTask, TaskKind,
         archive_log_args, archived_leave_lookup, blob_days, blob_days_log_args, content_hash,
         enclosing_prefix, escape_posix_ere, first_status_commit_date, fnv1a_digest, frontmatter,
-        git_bin, git_deadline, git_dir_command, git_log_args, git_override, git_path, git_read,
-        harvest_repository, harvest_repository_with_prior, parse_archive_log, parse_batch,
-        pickaxe_log_args, read_blobs, run_git_command, run_git_log, scan_log_dates, scrub_git_env,
-        stream_blob_days, take_leave_walk_count, take_worktree_read_bytes,
-        take_worktree_read_count,
+        git_bin, git_deadline, git_dir_command, git_log_args, git_override, git_path, git_program,
+        git_read, git_timeout, harvest_repository, harvest_repository_with_prior,
+        parse_archive_log, parse_batch, pickaxe_log_args, read_blobs, run_git_command, run_git_log,
+        run_git_streaming, scan_log_dates, scrub_git_env, stream_blob_days, take_leave_walk_count,
+        take_worktree_read_bytes, take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -2126,7 +2219,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::rc::Rc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tracing_subscriber::layer::SubscriberExt;
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -6507,6 +6600,117 @@ mod tests {
         let repo = scratch("harvest_deadline_default");
         assert_eq!(git_deadline(&repo), GIT_COMMAND_TIMEOUT);
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_parses_the_git_timeout() {
+        assert_eq!(git_timeout(None), Duration::from_secs(30));
+        assert_eq!(git_timeout(Some("45")), Duration::from_secs(45));
+        assert_eq!(git_timeout(Some("600")), Duration::from_secs(600));
+        assert_eq!(git_timeout(Some("601")), Duration::from_secs(600));
+        assert_eq!(
+            git_timeout(Some("99999999999999999999")),
+            Duration::from_secs(600)
+        );
+        assert_eq!(git_timeout(Some("0")), Duration::from_secs(30));
+        assert_eq!(git_timeout(Some("-3")), Duration::from_secs(30));
+        assert_eq!(git_timeout(Some("abc")), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn git_deadline_reads_the_process_timeout_override() {
+        let source = include_str!("harvest.rs");
+        let (production, _) = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module opening");
+        let body = function_body(production, "git_deadline");
+        let (_, production_only) = body
+            .split_once("#[cfg(not(test))]")
+            .expect("git_deadline keeps a production branch");
+        assert!(
+            production_only.contains("LazyLock"),
+            "the production deadline must read a process-wide LazyLock"
+        );
+        assert!(
+            production_only.contains("git_timeout("),
+            "the LazyLock must be built from git_timeout"
+        );
+        assert!(
+            !production_only.contains("GIT_COMMAND_TIMEOUT"),
+            "the production branch must not return the fixed constant"
+        );
+    }
+
+    #[test]
+    fn git_runners_wake_on_stdout_end_before_polling() {
+        let source = include_str!("harvest.rs");
+        let (production, _) = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module opening");
+        for name in ["run_git_command", "run_git_streaming<T, F>"] {
+            let body = function_body(production, name);
+            assert!(
+                body.contains("send(())"),
+                "{name} must signal a channel when stdout ends"
+            );
+            let recv = body
+                .find("recv_timeout")
+                .unwrap_or_else(|| panic!("{name} must wait on that channel with recv_timeout"));
+            if let Some(sleep) = body.find("std::thread::sleep") {
+                assert!(
+                    sleep > recv,
+                    "{name} must wait on the channel before it polls with a sleep"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn git_runners_time_out_when_a_child_closes_stdout_and_keeps_running() {
+        // A child that closes stdout but keeps running must still be killed at
+        // the deadline: the wake-on-stdout wait covers only the first phase.
+        let repo = scratch("harvest_closed_stdout_repo");
+        let dir = scratch("harvest_closed_stdout_timeout");
+        let script = fake_git_script(&dir, "closed-stdout.sh", "exec 1>&-\nexec sleep 10");
+        register_fake_git_with_deadline(&repo, &script, Duration::from_millis(100));
+
+        let started = Instant::now();
+        let result = run_git_command(Command::new(git_program(&repo)), None, git_deadline(&repo));
+        assert!(
+            matches!(result, Err(GitFailure::Timeout(_))),
+            "the buffered runner must time out: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the buffered runner waited {:?}",
+            started.elapsed()
+        );
+
+        let started = Instant::now();
+        let result = run_git_streaming(
+            Command::new(git_program(&repo)),
+            None,
+            git_deadline(&repo),
+            |reader| {
+                let mut buffer = Vec::new();
+                reader
+                    .read_to_end(&mut buffer)
+                    .map_err(|error| GitFailure::Other(error.to_string()))?;
+                Ok(buffer.len())
+            },
+        );
+        assert!(
+            matches!(result, Err(GitFailure::Timeout(_))),
+            "the streaming runner must time out: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the streaming runner waited {:?}",
+            started.elapsed()
+        );
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The pid a stand-in recorded, when its write completed.

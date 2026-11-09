@@ -10,7 +10,7 @@ This repository holds the programs, their guardrails, and the build tooling. It 
 
 The configuration and the parsed chart rows live in a SQLite database at `~/.task-viewer`. Update re-reads every configured repository and replaces that repository's rows. Removing a repository from the dashboard deletes only its rows in that database. The source repository is left unchanged.
 
-Set `TASK_VIEWER_SCAN_WORKERS` to change how many repositories Update scans at once; it defaults to 4.
+Set `TASK_VIEWER_SCAN_WORKERS` to change how many repositories Update scans at once; it defaults to 4. Set `TASK_VIEWER_GIT_TIMEOUT_SECS` to raise the 30-second deadline for one read-only git command.
 
 ## Run
 

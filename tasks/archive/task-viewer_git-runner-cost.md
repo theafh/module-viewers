@@ -2,9 +2,11 @@
 description: "Wait for git children on their output instead of a 5 ms poll, resolve the git binary and PATH once, and let TASK_VIEWER_GIT_TIMEOUT_SECS raise the 30 s git deadline."
 scope: task-viewer
 created: 2026-11-08T13:13:24Z
-updated: 2026-11-08T14:46:20Z
-status: ready
+updated: 2026-11-09T17:57:28Z
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Wake git runners on output, resolve git once, and make the deadline configurable
