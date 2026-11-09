@@ -9,14 +9,14 @@ use axum::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::future::{Future, ready};
 use std::num::IntErrorKind;
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tera::{Context, Tera};
 use tokio::net::TcpListener;
@@ -109,6 +109,14 @@ impl AppState {
     }
 }
 
+/// How many banners the flash store keeps. Eviction drops the oldest slot once
+/// an insert takes the store past this, so a redirect whose dashboard read
+/// never happens cannot grow the store for the life of the process. The cap
+/// sits far above the number of outcomes one person can produce between a
+/// redirect and the read it leads to, so it never evicts a banner whose
+/// redirect is still being followed.
+const FLASH_CAPACITY: usize = 32;
+
 /// The banner one Update run leaves for the dashboard. Each slot is named by a
 /// short incrementing token that the redirect carries, and a read claims the
 /// slot under one lock acquisition, so the banner renders once however many
@@ -117,7 +125,7 @@ impl AppState {
 #[derive(Default)]
 struct FlashStore {
     next_token: u64,
-    slots: HashMap<String, (&'static str, String)>,
+    slots: BTreeMap<u64, (&'static str, String)>,
 }
 
 /// One flash slot a dashboard read claimed, kept with its token so a render
@@ -128,18 +136,31 @@ struct ClaimedBanner {
     message: String,
 }
 
+/// The numeric slot a request's token names. A token that is not a plain
+/// decimal `u64`, or whose spelling is not the canonical `to_string` form, so
+/// that `+7` and `07` name no slot, names no slot at all.
+fn flash_token_key(token: &str) -> Option<u64> {
+    let key = token.parse::<u64>().ok()?;
+    (key.to_string() == token).then_some(key)
+}
+
 impl FlashStore {
-    /// Store one banner and return the token that names it.
+    /// Store one banner and return the token that names it. Once the store
+    /// holds more than `FLASH_CAPACITY` slots, the smallest token, the oldest
+    /// banner, is dropped.
     fn insert(&mut self, key: &'static str, message: String) -> String {
         self.next_token = self.next_token.wrapping_add(1);
-        let token = self.next_token.to_string();
-        self.slots.insert(token.clone(), (key, message));
-        token
+        let token = self.next_token;
+        self.slots.insert(token, (key, message));
+        while self.slots.len() > FLASH_CAPACITY {
+            let _ = self.slots.pop_first();
+        }
+        token.to_string()
     }
 
     /// Take the banner `token` names, leaving that slot empty.
     fn take(&mut self, token: &str) -> Option<(&'static str, String)> {
-        self.slots.remove(token)
+        self.slots.remove(&flash_token_key(token)?)
     }
 
     /// Claim the banner `token` names together with its token, so a render that
@@ -155,8 +176,9 @@ impl FlashStore {
     /// Put a claimed banner back under its own token, so the next read shows
     /// the same message.
     fn restore(&mut self, claimed: ClaimedBanner) {
-        self.slots
-            .insert(claimed.token, (claimed.key, claimed.message));
+        if let Some(key) = flash_token_key(&claimed.token) {
+            self.slots.insert(key, (claimed.key, claimed.message));
+        }
     }
 
     /// The banner `token` names without taking it, so a test can read the slot
@@ -164,7 +186,7 @@ impl FlashStore {
     #[cfg(test)]
     fn peek(&self, token: &str) -> Option<(&'static str, &str)> {
         self.slots
-            .get(token)
+            .get(&flash_token_key(token)?)
             .map(|(key, message)| (*key, message.as_str()))
     }
 }
@@ -412,14 +434,30 @@ fn names_flash_token(uri: &axum::http::Uri) -> bool {
     Query::<HomeQuery>::try_from_uri(uri).is_ok_and(|query| !query.flash.is_empty())
 }
 
+/// The `Host` values a browser on this machine sends, built once from `PORT` so
+/// the allowlist cannot drift from the listener. The bare loopback names are
+/// accepted too, so a request that carries no port still passes.
+static LOOPBACK_HOSTS: LazyLock<[String; 3]> = LazyLock::new(|| {
+    [
+        format!("127.0.0.1:{PORT}"),
+        format!("localhost:{PORT}"),
+        format!("[::1]:{PORT}"),
+    ]
+});
+
 /// The origins a browser page on this machine uses to reach the dashboard,
-/// built from `PORT` so the allowlist cannot drift from the listener.
-fn loopback_origins() -> [String; 3] {
+/// built once from `PORT` so the allowlist cannot drift from the listener.
+static LOOPBACK_ORIGINS: LazyLock<[String; 3]> = LazyLock::new(|| {
     [
         format!("http://127.0.0.1:{PORT}"),
         format!("http://localhost:{PORT}"),
         format!("http://[::1]:{PORT}"),
     ]
+});
+
+/// The loopback origins the `Origin` checks compare against.
+fn loopback_origins() -> &'static [String; 3] {
+    &LOOPBACK_ORIGINS
 }
 
 /// A request is same-origin when its `Origin` names a loopback origin. An opaque
@@ -480,9 +518,7 @@ fn is_local_host(host: &str) -> bool {
     // Accept loopback with or without an explicit port. DNS-rebinding Host
     // values cannot be a loopback name, so bare names stay as tight as :7880.
     matches!(host, "127.0.0.1" | "localhost" | "[::1]")
-        || host == format!("127.0.0.1:{PORT}")
-        || host == format!("localhost:{PORT}")
-        || host == format!("[::1]:{PORT}")
+        || LOOPBACK_HOSTS.iter().any(|allowed| allowed == host)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -609,6 +645,46 @@ fn render_blocking_thread() -> Option<std::thread::ThreadId> {
     RENDER_BLOCKING_THREAD.lock().ok().and_then(|slot| *slot)
 }
 
+/// A `std::io::Write` adapter that writes the six-character `\u003c` escape in
+/// place of every `<` byte, so the chart JSON is escaped as it serializes
+/// instead of through a second buffer the size of the whole payload.
+struct EscapeLt<W> {
+    inner: W,
+}
+
+impl<W: std::io::Write> std::io::Write for EscapeLt<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut start = 0;
+        for (index, byte) in buf.iter().enumerate() {
+            if *byte != b'<' {
+                continue;
+            }
+            if index > start {
+                self.inner.write_all(&buf[start..index])?;
+            }
+            self.inner.write_all(b"\\u003c")?;
+            start = index + 1;
+        }
+        if start < buf.len() {
+            self.inner.write_all(&buf[start..])?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The chart JSON exactly as the page embeds it: `serde_json`'s text with every
+/// `<` written as `\u003c` while the bytes pass. JSON places `<` only inside
+/// string values, so this is the same text as escaping the finished payload.
+fn chart_payload(board: &series::Dashboard) -> anyhow::Result<String> {
+    let mut buffer = Vec::new();
+    serde_json::to_writer(EscapeLt { inner: &mut buffer }, board)?;
+    Ok(String::from_utf8(buffer)?)
+}
+
 async fn render_dashboard(
     state: &AppState,
     query: &HomeQuery,
@@ -653,8 +729,7 @@ async fn render_dashboard(
         #[cfg(test)]
         record_render_blocking_thread();
         let board = series::dashboard(&tasks, crate::dates::today(), mode, &label);
-        let mut data_json = serde_json::to_string(&board)?;
-        data_json = data_json.replace('<', "\\u003c");
+        let data_json = chart_payload(&board)?;
         let page = DashboardPage {
             version,
             page: "dashboard",
@@ -1253,11 +1328,11 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, HarvestFn, HomeQuery, MISSING_TASKS_ERROR, PickerFn, PriorReadHookFn,
-        ProjectForm, STOPPED_ERROR, ScanFailure, ScanReport, StoreHookFn, add_repository,
-        claim_banner, encode_query, init_templates, is_local_host, remaining, remove_repository,
-        render_blocking_thread, render_home, router, scan_all, scan_core, scan_flash, scan_label,
-        scan_response, scan_worker_cap, serve, static_version,
+        AppState, FLASH_CAPACITY, FlashStore, HarvestFn, HomeQuery, MISSING_TASKS_ERROR, PickerFn,
+        PriorReadHookFn, ProjectForm, STOPPED_ERROR, ScanFailure, ScanReport, StoreHookFn,
+        add_repository, claim_banner, encode_query, init_templates, is_local_host, remaining,
+        remove_repository, render_blocking_thread, render_home, router, scan_all, scan_core,
+        scan_flash, scan_label, scan_response, scan_worker_cap, serve, static_version,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -1387,16 +1462,24 @@ mod tests {
         }
     }
 
+    /// Acceptance: the host check accepts the three loopback names bare and
+    /// with the listener's port, and rejects a non-canonical port spelling, a
+    /// different port, and a foreign host.
     #[test]
     fn web_accepts_only_the_loopback_host() {
-        assert!(is_local_host("127.0.0.1:7880"));
-        assert!(is_local_host("localhost:7880"));
-        assert!(is_local_host("[::1]:7880"));
-        assert!(is_local_host("127.0.0.1"));
-        assert!(is_local_host("localhost"));
-        assert!(!is_local_host("example.com"));
-        assert!(!is_local_host("127.0.0.1:80"));
-        assert!(!is_local_host("localhost:80"));
+        for host in [
+            "127.0.0.1",
+            "localhost",
+            "[::1]",
+            "127.0.0.1:7880",
+            "localhost:7880",
+            "[::1]:7880",
+        ] {
+            assert!(is_local_host(host), "{host} must be accepted");
+        }
+        for host in ["localhost:07880", "127.0.0.1:7881", "example.com:7880"] {
+            assert!(!is_local_host(host), "{host} must be rejected");
+        }
     }
 
     /// One form POST carrying the loopback Host a same-machine browser sends,
@@ -1807,6 +1890,59 @@ mod tests {
         assert!(
             html.contains(&payload),
             "the page carries the chart payload series::dashboard builds for the fixture"
+        );
+
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Acceptance: the embedded chart payload is the JSON serialized with every
+    /// `<` written as `\u003c` while the bytes pass, so a repository name that
+    /// holds `</script><b>` cannot close the payload script element and the
+    /// payload holds no raw `<`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_escapes_the_chart_payload_while_serializing() {
+        let (state, path) = app_state("payload_escape").await;
+        let folder = unique_temp_dir("payload_escape_repo");
+        std::fs::create_dir_all(&folder).expect("repository folder");
+        let repository_id =
+            db::insert_repository(&state.pool, "</script><b>", &folder.to_string_lossy())
+                .await
+                .expect("insert");
+        db::replace_tasks(
+            &state.pool,
+            repository_id,
+            &[parsed_task()],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("store rows");
+
+        let html = render_home(&state, &HomeQuery::default())
+            .await
+            .expect("render");
+        let marker = "<script id=\"payload\" type=\"application/json\">";
+        let start = html.find(marker).expect("the payload script") + marker.len();
+        let end = html[start..]
+            .find("</script>")
+            .map(|offset| start + offset)
+            .expect("the payload script closes");
+        let embedded = &html[start..end];
+
+        let tasks = db::load_tasks(&state.pool, None).await.expect("tasks");
+        let board = series::dashboard(
+            &tasks,
+            crate::dates::today(),
+            RadarMode::Project,
+            "All projects",
+        );
+        let expected = serde_json::to_string(&board)
+            .expect("payload")
+            .replace('<', "\\u003c");
+        assert_eq!(embedded, expected, "the page embeds the escaped payload");
+        assert!(
+            !embedded.contains('<'),
+            "the embedded payload holds no raw `<`"
         );
 
         let _ = std::fs::remove_dir_all(folder);
@@ -3685,6 +3821,88 @@ mod tests {
         for folder in folders {
             let _ = std::fs::remove_dir_all(folder);
         }
+        cleanup(&path);
+    }
+
+    /// Acceptance: the flash store keeps at most `FLASH_CAPACITY` slots, evicts
+    /// the oldest tokens first, still serves the newest banner, and names no
+    /// slot for a token that is not a plain decimal number.
+    #[test]
+    fn web_flash_store_caps_its_slots_and_ignores_non_numeric_tokens() {
+        let mut store = FlashStore::default();
+        let mut tokens = Vec::new();
+        for index in 0..FLASH_CAPACITY + 5 {
+            tokens.push(store.insert("notice", format!("banner {index}")));
+        }
+        assert_eq!(
+            store.slots.len(),
+            FLASH_CAPACITY,
+            "the store holds at most its capacity"
+        );
+        for token in &tokens[..5] {
+            assert!(
+                store.take(token).is_none(),
+                "the five oldest banners are evicted: {token}"
+            );
+        }
+        assert_eq!(
+            store.take(tokens.last().expect("a newest token")),
+            Some(("notice", format!("banner {}", FLASH_CAPACITY + 4))),
+            "the newest banner is still readable"
+        );
+        assert!(
+            store.take("not-a-token").is_none(),
+            "a non-numeric token names no slot"
+        );
+        assert!(
+            store
+                .take(&format!("+{}", tokens[FLASH_CAPACITY]))
+                .is_none(),
+            "a non-canonical spelling names no slot"
+        );
+    }
+
+    /// Acceptance: a token is only read when it is spelled exactly as the
+    /// redirect carries it, so `0<token>` and the percent-encoded `+<token>`
+    /// name no slot, while the canonical `flash=<token>` read still shows the
+    /// banner.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_flash_read_ignores_non_canonical_token_spellings() {
+        let (state, path) = app_state("flash_token_spellings").await;
+        let report = ScanReport {
+            attempted: 1,
+            failures: Vec::new(),
+        };
+        let location = redirect_location(&scan_response(&state, "all", &report).await);
+        let token = flash_token(&location, "all");
+
+        for flash in [format!("0{token}"), format!("%2B{token}")] {
+            let html = body_text(
+                send(
+                    state.clone(),
+                    get_page(&format!("/?project=all&flash={flash}"), "127.0.0.1:7880"),
+                )
+                .await,
+            )
+            .await;
+            assert!(
+                !html.contains("Charts updated."),
+                "a non-canonical token shows no banner: {flash}"
+            );
+        }
+
+        let canonical = body_text(
+            send(
+                state.clone(),
+                get_page(&format!("/?project=all&flash={token}"), "127.0.0.1:7880"),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            canonical.contains("Charts updated."),
+            "the canonical read still shows the banner"
+        );
         cleanup(&path);
     }
 
