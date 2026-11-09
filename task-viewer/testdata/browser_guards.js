@@ -184,6 +184,13 @@
       if (selector === ".tooltip") return tip;
       return null;
     };
+    // The page puts `.tooltip` inside `.chart-frame`, so a draw that reaches
+    // the tip through the frame finds its own card's node. Every other frame
+    // lookup stays null, as the base node's `querySelector` returns.
+    frame.querySelector = function (selector) {
+      if (selector === ".tooltip") return tip;
+      return null;
+    };
     cards[name] = root;
   });
   CARD_NAMES.forEach(function (name) {

@@ -4616,6 +4616,8 @@ mod tests {
     }
 
     const BROWSER_GUARDS: &str = include_str!("../testdata/browser_guards.js");
+    const DASHBOARD_DRAW_SNAPSHOTS: &str =
+        include_str!("../testdata/dashboard_draw_snapshots.json");
     const THEME_BOOT_SCRIPT: &str = include_str!("../static/js/theme-boot.js");
     const THEME_SCRIPT: &str = include_str!("../static/js/theme.js");
     const DASHBOARD_SCRIPT: &str = include_str!("../static/js/dashboard.js");
@@ -4626,12 +4628,24 @@ mod tests {
     /// script that throws fails the test, which is how an uncaught error in
     /// `theme-boot.js`, `theme.js` or `dashboard.js` surfaces.
     fn run_browser(config: &serde_json::Value, assertion: &str) -> serde_json::Value {
+        run_browser_with("", config, assertion)
+    }
+
+    /// `run_browser` with `prelude` evaluated after the stub DOM and before
+    /// `theme-boot.js`, `theme.js`, and `dashboard.js`, so a test can install a
+    /// counting wrapper the dashboard load itself passes through.
+    fn run_browser_with(
+        prelude: &str,
+        config: &serde_json::Value,
+        assertion: &str,
+    ) -> serde_json::Value {
         let runtime = rquickjs::Runtime::new().expect("quickjs runtime");
         let context = rquickjs::Context::full(&runtime).expect("quickjs context");
         context.with(|ctx| {
             ctx.eval::<(), _>(format!("globalThis.__config = {config};"))
                 .expect("config script");
             ctx.eval::<(), _>(BROWSER_GUARDS).expect("dom harness");
+            ctx.eval::<(), _>(prelude).expect("prelude script");
             ctx.eval::<(), _>(THEME_BOOT_SCRIPT)
                 .expect("theme-boot.js loads");
             ctx.eval::<(), _>(THEME_SCRIPT).expect("theme.js loads");
@@ -5698,6 +5712,547 @@ mod tests {
                 .contains("Radar: fit the frame by expanding the viewBox")
                 && block.contains("label margin")),
             "a comment names the radar's viewBox strategy and its reason"
+        );
+    }
+
+    /// The harness's default payload, mirrored here so a test can hand the
+    /// same rows to two runs that differ by one week.
+    fn fixture_payload() -> serde_json::Value {
+        serde_json::json!({
+            "counts": {"shipped_events": 3, "created_events": 5},
+            "weekly": [
+                {"week": "2026-01-05", "shipped": 1, "created": 2},
+                {"week": "2026-01-12", "shipped": 2, "created": 3}
+            ],
+            "cumulative": [
+                {"date": "2026-01-05", "cumulative": 1, "shipped": 1, "trend": 1},
+                {"date": "2026-01-12", "cumulative": 2, "shipped": 1, "trend": 1.5}
+            ],
+            "shipped_calendar": [{"date": "2026-01-05", "count": 1}],
+            "created_calendar": [{"date": "2026-01-05", "count": 2}],
+            "calendar_peak_shipped": 1,
+            "calendar_peak_created": 2,
+            "live_backlog": [{"date": "2026-01-05", "live": 1}],
+            "mean_age": [{"date": "2026-01-05", "avg_age": 2, "n": 1}],
+            "radar_shipped": [{"label": "alpha", "count": 1}],
+            "radar_live": [{"label": "alpha", "count": 1}],
+            "radar_mode": "scope"
+        })
+    }
+
+    /// The fixture with five consecutive cumulative days, so the line chart's
+    /// x positions land on whole pixels and their midpoints on half pixels.
+    fn line_hover_payload() -> serde_json::Value {
+        let mut payload = fixture_payload();
+        payload["cumulative"] = serde_json::json!([
+            {"date": "2026-01-05", "cumulative": 1, "shipped": 1, "trend": 1},
+            {"date": "2026-01-06", "cumulative": 2, "shipped": 1, "trend": 1.2},
+            {"date": "2026-01-07", "cumulative": 3, "shipped": 2, "trend": 1.4},
+            {"date": "2026-01-08", "cumulative": 3, "shipped": 1, "trend": 1.6},
+            {"date": "2026-01-09", "cumulative": 4, "shipped": 1, "trend": 1.8}
+        ]);
+        payload
+    }
+
+    /// A payload with 3,000 daily rows in every date-bearing series, so one
+    /// parse per row per draw is distinguishable from the extra parses a
+    /// path or a hover would make.
+    fn long_line_payload() -> serde_json::Value {
+        let start = chrono::NaiveDate::from_ymd_opt(2016, 1, 1).expect("start date");
+        let dates: Vec<String> = (0..3000)
+            .map(|offset| {
+                (start + chrono::Duration::days(offset))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect();
+        let cumulative: Vec<serde_json::Value> = dates
+            .iter()
+            .enumerate()
+            .map(|(index, date)| {
+                serde_json::json!({
+                    "date": date,
+                    "cumulative": index,
+                    "shipped": index % 3,
+                    "trend": index
+                })
+            })
+            .collect();
+        let shipped_calendar: Vec<serde_json::Value> = dates
+            .iter()
+            .enumerate()
+            .map(|(index, date)| serde_json::json!({"date": date, "count": index % 3}))
+            .collect();
+        let created_calendar: Vec<serde_json::Value> = dates
+            .iter()
+            .enumerate()
+            .map(|(index, date)| serde_json::json!({"date": date, "count": index % 2}))
+            .collect();
+        let live_backlog: Vec<serde_json::Value> = dates
+            .iter()
+            .enumerate()
+            .map(|(index, date)| serde_json::json!({"date": date, "live": index % 5}))
+            .collect();
+        let mean_age: Vec<serde_json::Value> = dates
+            .iter()
+            .enumerate()
+            .map(|(index, date)| {
+                serde_json::json!({"date": date, "avg_age": index % 7, "n": index % 4})
+            })
+            .collect();
+        let weekly: Vec<serde_json::Value> = dates
+            .iter()
+            .step_by(7)
+            .enumerate()
+            .map(|(index, week)| {
+                serde_json::json!({"week": week, "shipped": index % 4, "created": index % 5})
+            })
+            .collect();
+        serde_json::json!({
+            "counts": {"shipped_events": 3000, "created_events": 3000},
+            "weekly": weekly,
+            "cumulative": cumulative,
+            "shipped_calendar": shipped_calendar,
+            "created_calendar": created_calendar,
+            "calendar_peak_shipped": 2,
+            "calendar_peak_created": 1,
+            "live_backlog": live_backlog,
+            "mean_age": mean_age,
+            "radar_shipped": [
+                {"label": "alpha", "count": 6},
+                {"label": "beta", "count": 5},
+                {"label": "gamma", "count": 4},
+                {"label": "delta", "count": 3},
+                {"label": "epsilon", "count": 2},
+                {"label": "zeta", "count": 1}
+            ],
+            "radar_live": [
+                {"label": "alpha", "count": 1},
+                {"label": "beta", "count": 2},
+                {"label": "gamma", "count": 3},
+                {"label": "delta", "count": 4},
+                {"label": "epsilon", "count": 5},
+                {"label": "zeta", "count": 6}
+            ],
+            "radar_mode": "scope"
+        })
+    }
+
+    /// The fixture with one week whose busiest bar is `max`.
+    fn weekly_payload(max: i64) -> serde_json::Value {
+        let mut payload = fixture_payload();
+        payload["weekly"] =
+            serde_json::json!([{"week": "2026-01-05", "shipped": max, "created": 1}]);
+        payload
+    }
+
+    /// Counts only the six-argument `Date` constructions `parseDay` makes, so a
+    /// draw that parses a day shows up while a three-argument month cursor does
+    /// not.
+    const COUNTING_DATE: &str = r#"(function () {
+  var RealDate = Date;
+  globalThis.__dateParses = 0;
+  function CountingDate() {
+    var args = Array.prototype.slice.call(arguments);
+    if (args.length === 6) globalThis.__dateParses += 1;
+    return Reflect.construct(RealDate, args);
+  }
+  CountingDate.prototype = RealDate.prototype;
+  CountingDate.now = RealDate.now;
+  CountingDate.parse = RealDate.parse;
+  CountingDate.UTC = RealDate.UTC;
+  globalThis.Date = CountingDate;
+})();"#;
+
+    /// Wraps the stub `getComputedStyle` so a draw's theme reads are countable.
+    const COUNTING_GET_COMPUTED_STYLE: &str = r#"(function () {
+  var real = globalThis.getComputedStyle;
+  globalThis.__computedStyleCalls = 0;
+  globalThis.getComputedStyle = function () {
+    globalThis.__computedStyleCalls += 1;
+    return real.apply(null, arguments);
+  };
+})();"#;
+
+    /// draw-cost Acceptance 1: a 3,000-row draw parses one day per row and a
+    /// hover parses none, tooltip text included.
+    #[test]
+    fn browser_line_draw_parses_each_row_once() {
+        let payload = long_line_payload();
+        let expected: u64 = [
+            "weekly",
+            "cumulative",
+            "shipped_calendar",
+            "created_calendar",
+            "live_backlog",
+            "mean_age",
+        ]
+        .iter()
+        .map(|key| payload[*key].as_array().expect("series array").len() as u64)
+        .sum();
+        assert!(expected >= 3000, "the line payload carries 3,000+ rows");
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser_with(
+            COUNTING_DATE,
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var overlay = env.cards["cumulative"].querySelector("svg").children.filter(function (node) {
+    return node.name === "rect" && node.attrs.fill === "transparent";
+  })[0];
+  var afterLoad = globalThis.__dateParses;
+  var afterMoves = [];
+  [120, 400, 640, 900].forEach(function (px) {
+    overlay.listeners.mousemove[0]({ type: "mousemove", clientX: px, clientY: 100 });
+    afterMoves.push(globalThis.__dateParses);
+  });
+  return JSON.stringify({ afterLoad: afterLoad, afterMoves: afterMoves });
+})()"#,
+        );
+        assert_eq!(
+            result["afterLoad"].as_u64(),
+            Some(expected),
+            "one parse per row per draw"
+        );
+        for count in result["afterMoves"].as_array().expect("move counts") {
+            assert_eq!(
+                count.as_u64(),
+                Some(expected),
+                "a mousemove parses no date, tooltip text included"
+            );
+        }
+    }
+
+    /// draw-cost Acceptance 2: the hover picks the row the old linear scan
+    /// picked at every probe, and the exact midpoint keeps the earlier row.
+    #[test]
+    fn browser_line_hover_picks_the_nearest_day() {
+        let payload = line_hover_payload();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var payload = JSON.parse(globalThis.__config.payloadText);
+  var rows = payload.cumulative;
+  var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function dayOf(text) {
+    var parts = text.split("-").map(Number);
+    return Date.UTC(parts[0], parts[1] - 1, parts[2]);
+  }
+  function label(text) {
+    var parts = text.split("-").map(Number);
+    return months[parts[1] - 1] + " " + parts[2] + ", " + parts[0];
+  }
+  var days = rows.map(function (row) { return dayOf(row.date); });
+  var xs = days.map(function (day) {
+    return 44 + ((day - days[0]) / (days[days.length - 1] - days[0])) * (984 - 44);
+  });
+  function expectedText(index) {
+    var row = rows[index];
+    return label(row.date) + " · cumulative " + row.cumulative + " · shipped " + row.shipped;
+  }
+  function reference(px) {
+    var best = 0;
+    var bestDist = Infinity;
+    xs.forEach(function (value, index) {
+      var dist = Math.abs(value - px);
+      if (dist < bestDist) {
+        best = index;
+        bestDist = dist;
+      }
+    });
+    return best;
+  }
+  var svg = env.cards["cumulative"].querySelector("svg");
+  var overlay = svg.children.filter(function (node) {
+    return node.name === "rect" && node.attrs.fill === "transparent";
+  })[0];
+  var tip = env.cards["cumulative"].querySelector(".chart-frame").querySelector(".tooltip");
+  var probes = [xs[0]];
+  for (var index = 1; index < xs.length; index += 1) {
+    probes.push((xs[index - 1] + xs[index]) / 2);
+    probes.push(xs[index]);
+  }
+  probes.push(xs[1] + 1, xs[xs.length - 2] - 1);
+  var mismatches = [];
+  probes.forEach(function (px) {
+    overlay.listeners.mousemove[0]({ type: "mousemove", clientX: px, clientY: 100 });
+    var expected = expectedText(reference(px));
+    if (tip.textContent !== expected) {
+      mismatches.push({ px: px, expected: expected, actual: tip.textContent });
+    }
+  });
+  var midpointPicks = [];
+  for (var index = 1; index < xs.length; index += 1) {
+    var px = (xs[index - 1] + xs[index]) / 2;
+    overlay.listeners.mousemove[0]({ type: "mousemove", clientX: px, clientY: 100 });
+    midpointPicks.push(tip.textContent === expectedText(index - 1));
+  }
+  return JSON.stringify({
+    probes: probes.length,
+    mismatches: mismatches,
+    midpointPicks: midpointPicks
+  });
+})()"#,
+        );
+        assert_eq!(result["probes"].as_u64(), Some(11));
+        assert_eq!(
+            result["mismatches"],
+            serde_json::json!([]),
+            "every probe matches the old linear scan"
+        );
+        for picks in result["midpointPicks"].as_array().expect("midpoint picks") {
+            assert_eq!(picks, true, "the exact midpoint keeps the earlier row");
+        }
+    }
+
+    /// draw-cost Acceptance 3: one full render reads each theme colour once per
+    /// draw function, so the count is the same for a small payload and a
+    /// 3,000-row one.
+    #[test]
+    fn browser_draw_reads_each_theme_colour_once() {
+        let small = fixture_payload().to_string();
+        let big = long_line_payload().to_string();
+        let assertion = r#"JSON.stringify({ calls: globalThis.__computedStyleCalls })"#;
+        let mut counts = Vec::new();
+        for payload_text in [&small, &big] {
+            let config = browser_config(
+                false,
+                false,
+                Some(payload_text),
+                serde_json::json!("#123456"),
+            );
+            let result = run_browser_with(COUNTING_GET_COMPUTED_STYLE, &config, assertion);
+            counts.push(result["calls"].as_u64().expect("computed style calls"));
+        }
+        // Weekly reads its zero line, two bar colours, and the muted tick
+        // colour (4); each line chart reads its series colour, the grid, and
+        // the muted ticks (3); each calendar reads its colour, the track, and
+        // the muted month labels (3); each radar reads its colour, the grid,
+        // and the label colour (3).
+        assert_eq!(counts[0], 25, "one full render reads 25 theme colours");
+        assert_eq!(
+            counts[1], counts[0],
+            "the count does not grow with the rows"
+        );
+    }
+
+    /// draw-cost Acceptance 4: a theme switch redraws the marks in the new
+    /// theme's colours.
+    #[test]
+    fn browser_theme_switch_recolors_the_second_draw() {
+        let config = browser_config(
+            false,
+            false,
+            None,
+            serde_json::json!({"dark": "#111111", "light": "#eeeeee"}),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function fills(name) {
+    return env.cards[name].querySelector("svg").children
+      .filter(function (node) { return node.name === "rect"; })
+      .map(function (node) { return node.attrs.fill; })
+      .filter(function (fill) { return fill !== "transparent"; });
+  }
+  function strokes(name) {
+    return env.cards[name].querySelector("svg").children
+      .filter(function (node) { return node.name === "path" && node.attrs.stroke; })
+      .map(function (node) { return node.attrs.stroke; });
+  }
+  var before = {
+    weekly: fills("weekly"),
+    cumulative: strokes("cumulative")
+  };
+  env.themeButton.click();
+  var polygon = env.cards["radar-shipped"].querySelector("svg").children.filter(function (node) {
+    return node.name === "polygon";
+  })[0];
+  return JSON.stringify({
+    theme: env.html.getAttribute("data-theme"),
+    before: before,
+    weekly: fills("weekly"),
+    cumulative: strokes("cumulative"),
+    radar: polygon.attrs.fill
+  });
+})()"#,
+        );
+        assert_eq!(result["theme"], "light");
+        assert!(
+            result["before"]["weekly"]
+                .as_array()
+                .expect("before fills")
+                .iter()
+                .all(|fill| fill.as_str() == Some("#111111")),
+            "the dark theme drew the weekly bars"
+        );
+        for fill in result["weekly"].as_array().expect("weekly fills") {
+            assert_eq!(
+                fill.as_str(),
+                Some("#eeeeee"),
+                "the weekly bars carry the light theme"
+            );
+        }
+        for stroke in result["cumulative"].as_array().expect("cumulative strokes") {
+            assert_eq!(
+                stroke.as_str(),
+                Some("#eeeeee"),
+                "the line chart carries the light theme"
+            );
+        }
+        assert_eq!(
+            result["radar"], "#eeeeee",
+            "the radar carries the light theme"
+        );
+    }
+
+    /// draw-cost Acceptance 5: a busiest week of 300 prints at most 11 y-axis
+    /// labels, and 18 keeps the labels the small step rule gives.
+    #[test]
+    fn browser_weekly_axis_labels_stay_readable() {
+        let assertion = r#"(function () {
+  var svg = globalThis.__env.cards["weekly"].querySelector("svg");
+  return JSON.stringify({
+    labels: svg.children
+      .filter(function (node) { return node.name === "text" && node.attrs.x === "34"; })
+      .map(function (node) { return node.textContent; })
+  });
+})()"#;
+        let big = weekly_payload(300).to_string();
+        let big_config = browser_config(false, false, Some(&big), serde_json::json!("#123456"));
+        let big_result = run_browser(&big_config, assertion);
+        let big_labels = big_result["labels"].as_array().expect("300 labels");
+        assert!(
+            big_labels.len() <= 11,
+            "a busiest week of 300 prints at most 11 labels, got {}",
+            big_labels.len()
+        );
+        assert!(
+            big_labels.iter().any(|label| label.as_str() == Some("300")),
+            "the 300 label is drawn"
+        );
+
+        let small = weekly_payload(18).to_string();
+        let small_config = browser_config(false, false, Some(&small), serde_json::json!("#123456"));
+        let small_result = run_browser(&small_config, assertion);
+        assert_eq!(
+            small_result["labels"],
+            serde_json::json!(["15", "10", "5", "0", "5", "10", "15"]),
+            "a busiest week of 18 keeps the step-5 labels"
+        );
+    }
+
+    /// draw-cost Acceptance 6: every card's SVG markup matches the snapshot
+    /// captured from the script before the change.
+    #[test]
+    fn browser_chart_markup_matches_the_pre_change_snapshots() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  function serialize(node) {
+    var attrs = {};
+    Object.keys(node.attrs).forEach(function (key) { attrs[key] = node.attrs[key]; });
+    var style = {};
+    Object.keys(node.style).forEach(function (key) { style[key] = node.style[key]; });
+    return {
+      name: node.name,
+      attrs: attrs,
+      style: style,
+      text: node.textContent,
+      children: node.children.map(serialize)
+    };
+  }
+  var env = globalThis.__env;
+  var cards = {};
+  env.cardNames.forEach(function (name) {
+    cards[name] = serialize(env.cards[name].querySelector("svg"));
+  });
+  return JSON.stringify({ cards: cards });
+})()"#,
+        );
+        let snapshot: serde_json::Value =
+            serde_json::from_str(DASHBOARD_DRAW_SNAPSHOTS).expect("snapshot json");
+        assert_eq!(
+            result["cards"], snapshot["cards"],
+            "the optimized draw keeps every mark, attribute, and tooltip"
+        );
+    }
+
+    /// draw-cost Acceptance 7: one extra weekly row costs exactly one more
+    /// date parse.
+    #[test]
+    fn browser_week_parse_rises_by_one_per_week() {
+        let assertion = r#"JSON.stringify({ parses: globalThis.__dateParses })"#;
+        let fixture = fixture_payload().to_string();
+        let fixture_config =
+            browser_config(false, false, Some(&fixture), serde_json::json!("#123456"));
+        let baseline = run_browser_with(COUNTING_DATE, &fixture_config, assertion);
+        let baseline = baseline["parses"].as_u64().expect("baseline parses");
+
+        let mut plus_one = fixture_payload();
+        plus_one["weekly"]
+            .as_array_mut()
+            .expect("weekly rows")
+            .push(serde_json::json!({"week": "2026-01-19", "shipped": 1, "created": 1}));
+        let plus_text = plus_one.to_string();
+        let plus_config =
+            browser_config(false, false, Some(&plus_text), serde_json::json!("#123456"));
+        let added = run_browser_with(COUNTING_DATE, &plus_config, assertion);
+        let added = added["parses"].as_u64().expect("added parses");
+        assert_eq!(baseline, 8, "the fixture draws parse eight days");
+        assert_eq!(added, baseline + 1, "one extra week costs one more parse");
+    }
+
+    /// draw-cost Acceptance 8: the weekly chart's second-week hit rect shows
+    /// that week's tooltip through the frame's own `.tooltip` node.
+    #[test]
+    fn browser_weekly_hover_reads_the_second_week() {
+        let payload = fixture_payload();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["weekly"].querySelector("svg");
+  var hits = svg.children.filter(function (node) {
+    return node.name === "rect" && node.attrs.fill === "transparent";
+  });
+  var second = hits.filter(function (node) { return Number(node.attrs.x) > 500; })[0];
+  second.listeners.mousemove[0]({
+    type: "mousemove",
+    clientX: Number(second.attrs.x) + Number(second.attrs.width) / 2,
+    clientY: 100
+  });
+  var tip = env.cards["weekly"].querySelector(".chart-frame").querySelector(".tooltip");
+  return JSON.stringify({ hits: hits.length, text: tip.textContent });
+})()"#,
+        );
+        assert_eq!(result["hits"].as_u64(), Some(2));
+        assert_eq!(
+            result["text"],
+            "Week of Jan 12, 2026 · shipped 2 · created 3"
         );
     }
 
