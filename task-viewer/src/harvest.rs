@@ -1395,8 +1395,8 @@ fn run_git_command(
             return Err(git_timeout_failure(deadline));
         }
     }
-    // stdout can close before the child exits, so poll for the exit with a
-    // short backoff for the rest of the deadline.
+    // stdout can close before the child exits, so poll for the exit every 1 ms
+    // for the rest of the deadline.
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1504,8 +1504,7 @@ where
             return Err(GitFailure::Other(String::new()));
         }
         // The parser is done, but the child may have closed stdout and kept
-        // running, so poll for its exit with a short backoff until the
-        // deadline.
+        // running, so poll for its exit every 1 ms until the deadline.
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => return Ok(status),
