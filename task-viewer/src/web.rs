@@ -16,7 +16,9 @@ use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tera::{Context, Tera};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tower_http::services::ServeDir;
@@ -254,6 +256,93 @@ pub fn router(state: AppState) -> Router {
             HeaderValue::from_static("frame-ancestors 'none'"),
         ))
         .with_state(state)
+}
+
+/// The grace period a stopped server drains within: one second inside the
+/// launcher's five-second stop window.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
+
+/// The time left to `deadline`, and zero once it has passed.
+pub fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// Serve `app` on `listener` until `shutdown` resolves, then drain within
+/// `grace` and close the database. Returns the deadline the drain worked
+/// against, so the caller can bound its own teardown with `remaining`.
+///
+/// The deadline is taken when the shutdown future resolves. `axum`'s graceful
+/// shutdown stops accepting and drains the open connections; a running Update
+/// holds `state.scan` from listing through the last store, so the drain waits
+/// for that lock under the same deadline. The database close then runs under
+/// the time the deadline has left and is dropped once it is spent, leaving an
+/// unfinished store to the WAL rollback on the next open.
+pub async fn serve(
+    listener: TcpListener,
+    app: Router,
+    state: AppState,
+    grace: Duration,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Instant {
+    let deadline = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let (notified_tx, notified_rx) = tokio::sync::oneshot::channel();
+    let shutdown = {
+        let deadline = Arc::clone(&deadline);
+        async move {
+            shutdown.await;
+            if let Ok(mut slot) = deadline.lock() {
+                *slot = Some(Instant::now() + grace);
+            }
+            let _ = notified_tx.send(());
+        }
+    };
+    let mut server = Box::pin(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
+    });
+    let deadline = tokio::select! {
+        // Prefer the signal so a server that drained in the same poll still
+        // reports the deadline it drained against.
+        biased;
+        _ = notified_rx => deadline
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .unwrap_or_else(Instant::now),
+        ended = &mut server => {
+            // The listener stopped before any signal arrived, so there is
+            // nothing left to drain.
+            if let Err(error) = ended {
+                tracing::error!(%error, "the listener stopped");
+            }
+            return Instant::now();
+        }
+    };
+    // Stop accepting has already happened; wait for the open connections and a
+    // running Update to finish, bounded by the deadline.
+    let drain = async {
+        let (ended, guard) = tokio::join!(&mut server, state.scan.lock());
+        drop(guard);
+        if let Err(error) = ended {
+            tracing::error!(%error, "the listener stopped");
+        }
+    };
+    if tokio::time::timeout_at(deadline.into(), drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!("the shutdown grace period ended before the drain finished");
+    }
+    let left = remaining(deadline);
+    if !left.is_zero()
+        && tokio::time::timeout(left, state.pool.close())
+            .await
+            .is_err()
+    {
+        tracing::warn!("the database close did not finish inside the shutdown grace period");
+    }
+    deadline
 }
 
 async fn require_local_host(request: axum::extract::Request, next: Next) -> Response {
@@ -1076,8 +1165,8 @@ mod tests {
     use super::{
         AppState, HarvestFn, HomeQuery, PickerFn, PriorReadHookFn, ProjectForm, ScanFailure,
         ScanReport, StoreHookFn, add_repository, claim_banner, encode_query, init_templates,
-        is_local_host, remove_repository, render_blocking_thread, render_home, router, scan_all,
-        scan_core, scan_flash, scan_response, scan_worker_cap, static_version,
+        is_local_host, remaining, remove_repository, render_blocking_thread, render_home, router,
+        scan_all, scan_core, scan_flash, scan_response, scan_worker_cap, serve, static_version,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -1092,7 +1181,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tower::ServiceExt;
 
     /// The production store hook: it resolves at once, so a scan stores without
@@ -4754,5 +4843,265 @@ mod tests {
                 && block.contains("label margin")),
             "a comment names the radar's viewBox strategy and its reason"
         );
+    }
+
+    /// A loopback listener on a free port, so a serve test never competes for
+    /// the documented 7880.
+    async fn test_listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("listener addr");
+        (listener, addr)
+    }
+
+    /// A shutdown future and the sender that fires it.
+    fn shutdown_pair() -> (
+        tokio::sync::oneshot::Sender<()>,
+        impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        (tx, async move {
+            let _ = rx.await;
+        })
+    }
+
+    /// Acceptance: the serve function stops accepting while the drain waits for
+    /// a held `state.scan`, returns once that lock is released, and closes the
+    /// pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_serve_stops_accepting_while_the_drain_waits() {
+        let (state, path) = app_state("serve_drain").await;
+        let (listener, addr) = test_listener().await;
+        let app = router(state.clone());
+        // A stand-in for a running Update: the drain must wait for this lock.
+        let held = state.scan.lock().await;
+        let (fire, shutdown) = shutdown_pair();
+        let serving = tokio::spawn(serve(
+            listener,
+            app,
+            state.clone(),
+            Duration::from_secs(4),
+            shutdown,
+        ));
+        fire.send(()).expect("fire the shutdown");
+        let mut refused = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(addr).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            refused,
+            "a connection after the shutdown is refused while the drain waits"
+        );
+        assert!(
+            !serving.is_finished(),
+            "the drain still waits for the held scan lock"
+        );
+        drop(held);
+        let deadline = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the serve call returns")
+            .expect("the serve task joins");
+        assert!(
+            remaining(deadline) > Duration::ZERO,
+            "the drain finished inside its grace period"
+        );
+        assert!(state.pool.is_closed(), "the pool is closed");
+        cleanup(&path);
+    }
+
+    /// Acceptance: a scan held past a short grace period returns within that
+    /// grace plus a small margin instead of waiting for the scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_serve_returns_when_the_scan_outlives_the_grace() {
+        let (state, path) = app_state("serve_scan_grace").await;
+        let (listener, _addr) = test_listener().await;
+        let app = router(state.clone());
+        let held = state.scan.lock().await;
+        let grace = Duration::from_millis(150);
+        let (fire, shutdown) = shutdown_pair();
+        let started = Instant::now();
+        let serving = tokio::spawn(serve(listener, app, state.clone(), grace, shutdown));
+        fire.send(()).expect("fire the shutdown");
+        let deadline = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the serve call returns")
+            .expect("the serve task joins");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < grace + Duration::from_secs(1),
+            "the serve call returned in {elapsed:?}, inside the grace plus a margin"
+        );
+        assert!(
+            remaining(deadline).is_zero(),
+            "the grace period is spent when the scan still holds the lock"
+        );
+        drop(held);
+        cleanup(&path);
+    }
+
+    /// Acceptance: a store held past a short grace period, signalled from
+    /// `state.store_hook`, lets the serve call return within that grace plus a
+    /// small margin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_serve_returns_when_a_store_outlives_the_grace() {
+        let (state, path, folder, _id) = state_with_repository("serve_store_grace").await;
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let state = AppState {
+            store_hook: Arc::new(move || {
+                let entered_tx = entered_tx.clone();
+                let release_rx = Arc::clone(&release_rx);
+                Box::pin(async move {
+                    let _ = entered_tx.send(()).await;
+                    let release = release_rx.lock().await.take();
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                })
+            }),
+            ..state
+        };
+        let update = start_update(state.clone());
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the store hook runs")
+            .expect("the hook signalled");
+        let (listener, _addr) = test_listener().await;
+        let app = router(state.clone());
+        let grace = Duration::from_millis(150);
+        let (fire, shutdown) = shutdown_pair();
+        let started = Instant::now();
+        let serving = tokio::spawn(serve(listener, app, state.clone(), grace, shutdown));
+        fire.send(()).expect("fire the shutdown");
+        let deadline = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the serve call returns")
+            .expect("the serve task joins");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < grace + Duration::from_secs(1),
+            "the serve call returned in {elapsed:?} while the store still held the write lock"
+        );
+        assert!(
+            remaining(deadline).is_zero(),
+            "the grace period is spent when the store still holds the write lock"
+        );
+        release_tx.send(()).expect("release the store");
+        let _ = tokio::time::timeout(Duration::from_secs(5), update).await;
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Acceptance: an Update that stores through the hook inside the grace
+    /// period keeps every row after the serve call returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_serve_lets_an_update_finish_storing_inside_the_grace() {
+        let (state, path) = app_state("serve_store_finishes").await;
+        let folder = live_repository("serve_store_finishes_repo");
+        let id = db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let state = AppState {
+            store_hook: Arc::new(move || {
+                let entered_tx = entered_tx.clone();
+                let release_rx = Arc::clone(&release_rx);
+                Box::pin(async move {
+                    let _ = entered_tx.send(()).await;
+                    let release = release_rx.lock().await.take();
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                })
+            }),
+            ..state
+        };
+        let update = start_update(state.clone());
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the store hook runs")
+            .expect("the hook signalled");
+        let (listener, _addr) = test_listener().await;
+        let app = router(state.clone());
+        let (fire, shutdown) = shutdown_pair();
+        let serving = tokio::spawn(serve(
+            listener,
+            app,
+            state.clone(),
+            Duration::from_secs(4),
+            shutdown,
+        ));
+        fire.send(()).expect("fire the shutdown");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release_tx
+            .send(())
+            .expect("release the store inside the grace");
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the serve call returns")
+            .expect("the serve task joins");
+        let response = tokio::time::timeout(Duration::from_secs(5), update)
+            .await
+            .expect("the update finishes")
+            .expect("the update task joins");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let reopened = db::init_at(&path).await.expect("reopen the database");
+        let rows = db::load_tasks(&reopened, Some(id)).await.expect("rows");
+        assert_eq!(rows.len(), 1, "the Update kept every row it stored");
+        reopened.close().await;
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Acceptance: the returned deadline sits one grace period after the
+    /// signal, and `remaining` counts down and clamps at zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_serve_returns_the_drain_deadline_and_remaining_counts_down() {
+        let (state, path) = app_state("serve_deadline").await;
+        let (listener, _addr) = test_listener().await;
+        let app = router(state.clone());
+        let grace = Duration::from_secs(4);
+        let (fire, shutdown) = shutdown_pair();
+        let before = Instant::now();
+        let serving = tokio::spawn(serve(listener, app, state.clone(), grace, shutdown));
+        fire.send(()).expect("fire the shutdown");
+        let deadline = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the serve call returns")
+            .expect("the serve task joins");
+        let after = Instant::now();
+        assert!(
+            deadline >= before + grace,
+            "the deadline is one grace period after the signal, not {deadline:?}"
+        );
+        assert!(
+            deadline <= after + grace,
+            "the deadline falls inside the grace period after the signal"
+        );
+        let four = remaining(Instant::now() + Duration::from_secs(4));
+        let one = remaining(Instant::now() + Duration::from_secs(1));
+        let passed = remaining(Instant::now() - Duration::from_secs(1));
+        assert!(
+            four > one,
+            "a deadline four seconds ahead leaves a larger remainder"
+        );
+        assert!(
+            one > Duration::ZERO,
+            "a deadline one second ahead leaves a positive remainder"
+        );
+        assert_eq!(
+            passed,
+            Duration::ZERO,
+            "a passed deadline leaves no remainder"
+        );
+        cleanup(&path);
     }
 }

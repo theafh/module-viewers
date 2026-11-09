@@ -7,7 +7,7 @@ Standing project truth lives in the root guardrail docs. Consult the one whose d
 - `CHARTER.md` is the identity contract. Check a change against its boundaries and invariants, and stop and raise a crossing with the user.
 - `ARCHITECTURE.md` carries structure, the `~/.task-viewer` database, the extraction rules, and the declared direction.
 - `FEATURES.md` is the behaviour ledger.
-- `TESTING.md` is the verification methodology: inline tests and the `make test` / `make lint` gate.
+- `TESTING.md` is the verification methodology: inline `#[cfg(test)]` modules and a process-level test that spawns the built binary, under the `make test` / `make lint` gate.
 - `SECURITY.md` carries trust boundaries and the per-change checklist.
 
 ## Where data lives

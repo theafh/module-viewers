@@ -46,7 +46,7 @@ make stop
 make status
 ```
 
-The launcher writes its PID file and the server log to `~/Library/Logs/task-viewer/` on macOS and to `${XDG_STATE_HOME:-~/.local/state}/task-viewer/` on Linux. `make start` and a click on the icon rebuild the release binary first, so after a source change they restart the server on the new code; a failed build is reported and nothing stale is started. The launcher stops only the release binary from this checkout; when another program holds port 7880, start reports that and leaves it running.
+The launcher writes four files to `~/Library/Logs/task-viewer/` on macOS and to `${XDG_STATE_HOME:-~/.local/state}/task-viewer/` on Linux: the PID file, the server log, the build log, and the binary stamp. The directory is mode `700` and every one of those files is mode `600`. `make start` and a click on the icon rebuild the release binary first, so after a source change they restart the server on the new code; a failed build is reported and nothing stale is started. The launcher stops only the release binary from this checkout; when another program holds port 7880, start reports that and leaves it running.
 
 ## Build
 

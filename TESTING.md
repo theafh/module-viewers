@@ -5,15 +5,15 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 ## Test Design Principles
 
 - Test observable behaviour: parsed rows, chart series, HTTP host checks, and database contents. Where the behaviour depends on process-wide state that a parallel-safe test must not change, such as the inherited git environment or the server's working directory, assert how harvest configures its `git` command instead.
-- Keep tests deterministic, isolated, offline, and parallel-safe. Every test owns its state through a per-test temp dir from `unique_temp_dir` (`task-viewer_<name>_<pid>_<nanos>_<n>`). Tests share no paths, no env overrides, and no execution-order assumptions. `cargo test` runs them in parallel.
+- Keep tests deterministic, isolated, offline, and parallel-safe. Every test owns its state through a per-test temp dir named `task-viewer_<name>_<pid>_<nanos>_<n>`, taken from `unique_temp_dir` in an inline test and from the process-level test's own helper, since `src/test_support.rs` opens `#![cfg(test)]` and `task-viewer` declares no lib target. Tests share no paths, no env overrides of the test process, and no execution-order assumptions, and a process-level test sets its child's environment per spawn. `cargo test` runs them in parallel.
 - Cover the success path and one failure path for a behaviour that can fail.
 - Match a status, a variant, or a field. Avoid asserting a whole error string when a variant is enough, and assert the stored message when that message is the contract.
 
 ## Test Organization
 
-- Tests live in `#[cfg(test)]` modules in the source file they exercise.
-- Shared helpers live in `#[cfg(test)]` `src/test_support.rs` (`unique_temp_dir`). The `[dev-dependencies]` block in `task-viewer/Cargo.toml` adds `tower` with its `util` feature for `tower::ServiceExt::oneshot` tests through `router(state)`, and `rquickjs` for tests that execute the shipped JavaScript. A JavaScript fixture shared by those tests sits in `task-viewer/testdata/`, such as `testdata/browser_guards.js` with its stub DOM: it is the JavaScript counterpart of the `src/test_support.rs` helpers, kept outside `src/` so it adds no Rust module. Those tests run the shipped `static/js/theme-boot.js`, `static/js/theme.js`, and `static/js/dashboard.js` against the fixture, and `theme-boot.js` carries its own storage-throwing test beside the theme toggle's.
-- Database tests set a thread-local database path under a unique temp dir and use the current-thread runtime so that path stays on the test thread.
+- Tests live in `#[cfg(test)]` modules in the source file they exercise, except a process-level test that spawns the built binary, which lives in `task-viewer/tests/` and reaches that binary through `env!("CARGO_BIN_EXE_task-viewer")`.
+- Shared helpers live in `#[cfg(test)]` `src/test_support.rs` (`unique_temp_dir`) for the inline suites, while the process-level test carries its own temp-dir helper on the same pattern. The `[dev-dependencies]` block in `task-viewer/Cargo.toml` adds `tower` with its `util` feature for `tower::ServiceExt::oneshot` tests through `router(state)`, and `rquickjs` for tests that execute the shipped JavaScript. A JavaScript fixture shared by those tests sits in `task-viewer/testdata/`, such as `testdata/browser_guards.js` with its stub DOM: it is the JavaScript counterpart of the `src/test_support.rs` helpers, kept outside `src/` so it adds no Rust module. Those tests run the shipped `static/js/theme-boot.js`, `static/js/theme.js`, and `static/js/dashboard.js` against the fixture, and `theme-boot.js` carries its own storage-throwing test beside the theme toggle's.
+- Database tests set a thread-local database path under a unique temp dir and use the current-thread runtime so that path stays on the test thread, while a process-level test that spawns the built binary sets `TASK_VIEWER_DB` in its own per-test temp dir for that child process and needs neither.
 - Git tests build a unique temporary repository with `user.email` and `user.name` passed on the command, and with author and committer dates in the environment.
 
 ## What Must Be Covered
@@ -28,6 +28,7 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 - Browser guards: the shipped `static/js/theme-boot.js`, loaded from `<head>`, applies a stored theme before the body loads and keeps the default theme when `localStorage` throws, with no uncaught error.
 - Security headers: a page, a host-rejected 403, a `/static` file response, and the router's own 404 carry `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Content-Security-Policy: frame-ancestors 'none'`, and the CSP leaves the pages' inline and static scripts running.
 - Static asset caching: the dashboard and repositories pages reference the content-derived version the server computed, the version changes when either a root-level or a nested static file changes, page responses carry `Cache-Control: no-store` while `/static` responses carry `Cache-Control: public, max-age=31536000, immutable`, and every `/static/...` URL either page emits carries the version.
+- Shutdown: SIGTERM and SIGINT each let an in-flight store finish and the process exit on its own inside the launcher's five-second window.
 
 ## Running the Suite
 

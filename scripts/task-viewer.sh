@@ -34,7 +34,7 @@ if [ -f "$PROJECT_DIR/.task-viewer.pid" ]; then
 fi
 rm -f "$PROJECT_DIR/.task-viewer.log"
 # umask only covers new files; repair modes left by older launchers.
-chmod 600 "$PID_FILE" "$LOG_FILE" "$BUILD_LOG" 2>/dev/null
+chmod 600 "$PID_FILE" "$LOG_FILE" "$BUILD_LOG" "$STAMP_FILE" 2>/dev/null
 
 # Dock / GUI launches have a minimal PATH; pull in rustup cargo when needed.
 if [ -f "$HOME/.cargo/env" ]; then
