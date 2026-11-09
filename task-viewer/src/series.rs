@@ -177,13 +177,19 @@ fn weekly_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<WeekPoint> {
         return Vec::new();
     };
     let end = monday(today);
+    let start = first.max(monday(SERIES_FLOOR));
     let mut points = Vec::new();
-    let mut cur = first.max(monday(SERIES_FLOOR));
+    // Weeks before the first charted week fold into that week's row, the way
+    // `cumulative_points` seeds its running total, so the weekly sums still
+    // reach `counts`.
+    let mut carry_created = created.range(..start).map(|(_, count)| *count).sum::<i64>();
+    let mut carry_shipped = shipped.range(..start).map(|(_, count)| *count).sum::<i64>();
+    let mut cur = start;
     while cur <= end {
         points.push(WeekPoint {
             week: crate::dates::format_date(cur),
-            created: created.get(&cur).copied().unwrap_or(0),
-            shipped: shipped.get(&cur).copied().unwrap_or(0),
+            created: std::mem::take(&mut carry_created) + created.get(&cur).copied().unwrap_or(0),
+            shipped: std::mem::take(&mut carry_shipped) + shipped.get(&cur).copied().unwrap_or(0),
         });
         match cur.checked_add_days(Days::new(7)) {
             Some(next) => cur = next,
@@ -990,6 +996,50 @@ mod tests {
             .find(|point| point.week == crate::dates::format_date(monday(ship_day)))
             .expect("early ship week");
         assert_eq!(week.shipped, 1);
+        assert_eq!(
+            board.weekly.iter().map(|point| point.shipped).sum::<i64>(),
+            board.counts.shipped_events as i64
+        );
+    }
+
+    /// Acceptance: a task created and shipped before the chart floor folds into
+    /// the first charted week, so the weekly sums still reach `counts`.
+    #[test]
+    fn series_weekly_folds_a_pre_floor_week_into_the_floor() {
+        let today = day(2026, 11, 6);
+        let tasks = vec![
+            task(
+                "alpha",
+                "ancient",
+                TaskKind::Finished,
+                day(26, 3, 1),
+                Some(day(26, 3, 1)),
+                Some(day(26, 3, 1)),
+            ),
+            task(
+                "alpha",
+                "modern",
+                TaskKind::Live,
+                day(2026, 6, 1),
+                None,
+                None,
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let first = board.weekly.first().expect("first week");
+        assert_eq!(first.week, crate::dates::format_date(monday(SERIES_FLOOR)));
+        assert_eq!(
+            first.created, 1,
+            "the pre-floor created week folds into the first row"
+        );
+        assert_eq!(
+            first.shipped, 1,
+            "the pre-floor ship week folds into the first row"
+        );
+        assert_eq!(
+            board.weekly.iter().map(|point| point.created).sum::<i64>(),
+            board.counts.created_events as i64
+        );
         assert_eq!(
             board.weekly.iter().map(|point| point.shipped).sum::<i64>(),
             board.counts.shipped_events as i64
