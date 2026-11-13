@@ -1,8 +1,8 @@
 ---
 description: "Fix hover hit-rects, repeated y labels, multi-year month labels, radar draw order and collisions, surrogate-pair truncation, and impossible-date fallback."
-scope: task-viewer/static/js
+scope: task-viewer
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-13T17:30:00Z
+updated: 2026-11-13T20:30:00Z
 status: open
 reported-by: Andreas Hoffmann
 ---
@@ -25,7 +25,7 @@ Hover reports the bar under the cursor instead of its neighbour, every y axis sh
 - Give both y axes distinct labels. The weekly axis prints `fmt(Math.abs(value))`, so a symmetric range repeats every label above zero; print the signed value instead. The line charts print `fmt(Math.round(value))` at a fixed quarter of `maxY`, so a small range repeats a rounded label; choose the step from the range so no two neighbouring ticks round alike.
 - Changing the weekly labels moves two shipped tests, so update them with the change: `browser_weekly_axis_labels_stay_readable` pins `["15","10","5","0","5","10","15"]` for a busiest week of 18, and `browser_chart_markup_matches_the_pre_change_snapshots` compares every weekly text node against `task-viewer/testdata/dashboard_draw_snapshots.json`, which holds `3,2,1,0,1,2,3`.
 - Add a year label when the chart spans more than one year, and suppress a month label that would overlap its neighbour.
-- Draw the radar polygon before its dots, skip a zero-count spoke at the centre, and separate colliding labels: two labels collide when their anchors sit less than 24px apart, the separation the calendar month labels already enforce; move the later label outward along its own spoke in 12px steps until it clears every label already placed, at most three steps. Add that 36px to `ringWidth` and `ringHeight` before the viewBox is set: as shipped, `ringHeight` leaves only about 8.8px beyond the label ring vertically against about 59px horizontally, so without the allowance a nudge on a near-vertical spoke pushes the label outside the viewBox.
+- Draw the radar polygon before its dots, skip a zero-count spoke at the centre, and separate colliding labels: two labels collide when their anchors sit less than 24px apart, the separation the calendar month labels already enforce; move the later label outward along its own spoke in 12px steps until it clears every label already placed, at most three steps. Add that 36px to `ringWidth` and `ringHeight` before the viewBox is set: as shipped, `ringHeight` leaves only about 8.8px beyond the label ring vertically against about 59px horizontally, so without the allowance a nudge on a near-vertical spoke pushes the label outside the viewBox. The allowance also moves the `browser_narrow_radar_renders_at_one_to_one` test in `task-viewer/src/web.rs`, which pins the shipped ring constants in its `ring_width` and `ring_height` expectations and asserts them against the inline width, the inline height, the viewBox width, and the viewBox height, so update those four assertions with the change.
 - Truncate radar labels by code point (`Array.from`) so a surrogate pair stays whole.
 - Make `parseDay` verify the year, month, and day round-trip, so `2024-13-45` throws instead of being normalised by the `Date` constructor into 2025-02-14 and drawn; `renderCard` turns that throw into "Charts unavailable". A missing numeric field needs no new check in `parseDay`: `fmt(row.shipped)` already throws on a non-number and reaches the same fallback.
 

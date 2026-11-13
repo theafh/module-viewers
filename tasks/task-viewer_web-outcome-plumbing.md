@@ -2,7 +2,7 @@
 description: "Log discarded scan-error writes, give zero-repository Update its own message, move banners to the flash store, and close the pool on early listener end."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-13T13:25:45Z
+updated: 2026-11-13T20:30:00Z
 status: open
 reported-by: Andreas Hoffmann
 ---
@@ -27,7 +27,7 @@ A failed `set_scan_error` write logs instead of vanishing. Update over zero repo
 - Render banners from a closed enum of message codes; map the query to that enum and ignore unknown values.
 - Run the same `pop_first` eviction loop in `FlashStore::restore`.
 - Close the pool on the early-listener-end path.
-- Correct the two doc sentences that claim `~` is encoded and that only one caller takes the scan lock.
+- Correct the two doc sentences: the `fn encode_query` comment in `task-viewer/src/web.rs` that says every byte outside the unreserved set is encoded, while its keep-set match encodes `~` as `%7E`, and the `fn run_scan` comment that says only this task acquires the scan lock, while `fn add_repository` and `fn remove_repository` take it too.
 
 ## Acceptance
 
