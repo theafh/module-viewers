@@ -2,7 +2,7 @@
 description: "Name the chart SVGs for assistive tech, hoist the number formatter, recolour on theme change without redrawing, and guard the fallback logger."
 scope: task-viewer/static/js
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-13T17:30:00Z
+updated: 2026-11-13T20:37:54Z
 status: open
 reported-by: Andreas Hoffmann
 ---
@@ -22,10 +22,10 @@ Each chart SVG carries an accessible name and description. Formatting a number a
 
 ## Approach
 
-- Add `aria-labelledby` and `aria-describedby` to each chart SVG, pointing at an existing heading and a short description node.
+- In `task-viewer/templates/dashboard.html`, give each card's `<h2>` an `id` and point that card's `<svg role="img">` at it with `aria-labelledby`, plus `aria-describedby` at the card's existing `<p class="muted summary">`, which the draw already fills with a one-line description of the series. The description node sits outside the `<svg>`, so `clear(svg)` leaves it in place, and the script writes no attribute and no node inside the SVG, so the serialized chart markup stays as it is.
 - Hoist one module-level `Intl.NumberFormat` and reuse it.
-- Recolour from CSS custom properties on theme change instead of re-rendering, and drop the redraw listener.
-- Route the fallback error through one helper that no-ops when `console` is absent, and add a `web.rs` browser test that installs a recording `console` through the `run_browser_with` prelude and asserts the caught error reaches it.
+- Recolour on the theme event with a pass over the drawn marks instead of a redraw: each draw records the marks it coloured together with the custom-property name it read, and the theme listener rewrites each mark's `fill` or `stroke` from `cssVar` of that name, replacing the `renderAll` redraw it registers today. The drawn markup keeps its concrete hex `fill`/`stroke` values and gains no attribute, and a draw keeps its 25 `getComputedStyle` reads, so `browser_theme_switch_recolors_the_second_draw`, `browser_theme_toggle_survives_throwing_storage`, `browser_draw_reads_each_theme_colour_once`, and `browser_chart_markup_matches_the_pre_change_snapshots` pass unedited, `task-viewer/testdata/dashboard_draw_snapshots.json` included.
+- Route the fallback error through one helper that no-ops when `console` is absent, have the fallback also write "Charts unavailable" into the card's summary so the description never dangles empty, and add a `web.rs` browser test that installs a recording `console` through the `run_browser_with` prelude and asserts the caught error reaches it.
 - Reword the mean-age subtitle to match the series: deferred tasks are aged until their leave day, not excluded.
 
 ## Acceptance
@@ -35,4 +35,4 @@ Each chart SVG carries an accessible name and description. Formatting a number a
 - Toggling the theme changes chart colours without a redraw, verified by a node-count or redraw spy.
 - The fallback logs the caught draw error through the guarded helper: a browser test that installs a recording `console` through the `run_browser_with` prelude records the log, and the console-less harness still shows "Charts unavailable" without throwing.
 - The mean-age subtitle no longer claims deferred tasks are excluded.
-- `make lint` and `make test` pass.
+- The standing gate applies unchanged: `make format`, `make lint`, and `make test` pass per the verification loop in `AGENTS.md`, with the intermittent `harvest_timeout_does_not_retry_the_git_dir_fallback` failure in `task-viewer/src/harvest.rs` tracked in `tasks/task-viewer_harvest-timeout-flake.md` and not fixed here.

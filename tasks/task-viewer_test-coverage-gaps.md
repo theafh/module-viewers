@@ -1,8 +1,8 @@
 ---
-description: "Add the promised date, oversized-blob, and in-flight-signal tests, and harden the graceful-shutdown test against port races, panics, and tautologies."
+description: "Add the promised quoted-date, oversized-blob, and in-flight and past-grace signal tests, and harden the graceful-shutdown test against port races, panics, and tautologies."
 scope: task-viewer/tests
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-13T17:30:00Z
+updated: 2026-11-14T23:09:37Z
 status: open
 reported-by: Andreas Hoffmann
 ---
@@ -11,34 +11,35 @@ reported-by: Andreas Hoffmann
 
 ## Goal
 
-`TESTING.md`'s promised scenarios each have a test that would fail if the behavior regressed: a quoted date, a committed blob over 4 MiB end to end, and a signal delivered while a store is in flight. The graceful-shutdown test no longer races another process for its port, leaves no live server behind after a panic, cleans its scratch directory on every path, asserts against the documented grace window, and its failure messages state what actually happened.
+`TESTING.md`'s promised scenarios each have a test that would fail if the behavior regressed: a quoted date value, a committed blob over 4 MiB skipped rather than charted, and a signal delivered while a store is in flight, together with a second run that holds a store past the grace and proves the open store rolls back. The graceful-shutdown test no longer races another process for its port, leaves no live server behind after a panic, cleans its scratch directory on every path, asserts against the documented grace window, and its failure messages state what actually happened.
 
 ## Context
 
 - `TESTING.md` lists scenarios with no test or only a partial one.
 - `task-viewer/tests/graceful_shutdown.rs` sends its signal before any scan exists, binds port 0 and drops the listener before the child binds, has no `Drop` guard, and measures elapsed time from a deadline captured after the signal.
 - `task-viewer` declares no library target: `task-viewer/Cargo.toml` carries no `[lib]` and `task-viewer/src/main.rs` declares `mod web;`, so the process-level test reaches the binary only through `env!("CARGO_BIN_EXE_task-viewer")` and can neither name `web::SHUTDOWN_GRACE` nor install a `cfg(test)` hook in the child process.
-- `task-viewer/src/launcher_tests.rs` uses `std::os::unix::fs::PermissionsExt` but its module declaration is gated only on `test`, so a non-unix `cargo test` fails to compile.
+- `task-viewer/src/launcher_tests.rs` uses `std::os::unix::fs::PermissionsExt` but its module declaration is gated only on `test`, so a non-unix `cargo test` fails to compile. Further unix-only test sites share that gap: `task-viewer/src/harvest.rs`'s `#[cfg(test)] mod tests` imports `std::os::unix::ffi::OsStringExt` and `std::os::unix::fs::PermissionsExt` unconditionally, where `OsString::from_vec` sits in the `commit_non_utf8_named_task` helper and `PermissionsExt::set_mode` with `fs::set_permissions` sits in the `fake_git_script` helper beside the one test, `harvest_fails_on_an_unreadable_tasks_subdirectory`, that calls `fs::set_permissions` directly, and two `#[tokio::test]` functions in `task-viewer/src/web.rs` set file modes through `PermissionsExt`.
+- This task ships after [task-viewer_startup-diagnostics.md](task-viewer_startup-diagnostics.md), which logs `listener.local_addr()` only after a successful bind and rejects a zero port, so the shutdown test reads the bound port from that post-bind line.
 - Prior art: [task-viewer_graceful-shutdown.md](archive/task-viewer_graceful-shutdown.md) delivered the shutdown behavior; these are the test gaps that let it regress.
 
 ## Approach
 
-- Add a test for a quoted date value, a committed blob over 4 MiB charted end to end, and a signal sent while a store is in flight with the stored rows asserted afterward.
+- Add the promised tests where each can observe its behavior, since the target functions are private and the crate exposes no library target: in `task-viewer/src/harvest.rs`'s `#[cfg(test)] mod tests`, a frontmatter `created` wrapped in one matching pair of single quotes and again in double quotes charts on the day it names, like its bare spelling, and a task file committed over `MAX_TASK_FILE_BYTES` contributes no row while a sibling task in the same commit still charts, the skip `ARCHITECTURE.md` states as "A task file larger than 4 MiB contributes no row"; in `task-viewer/tests/graceful_shutdown.rs`, a signal sent while a store is in flight, driven by two process-level runs — one whose store pause sits inside the grace, whose stored rows the test reads back from the child's database file with `sqlx` after the child exits, and one whose store pause runs past the grace, so its transaction rolls back.
 - Give the shutdown test a deterministic store pause without `cfg(test)` code in the spawned binary: read a test-only `TASK_VIEWER_TEST_STORE_PAUSE_MS` override in `web::AppState::new` in `task-viewer/src/web.rs`, beside the existing `TASK_VIEWER_SCAN_WORKERS` read, where a whole number of milliseconds replaces the default `store_hook` with one that sleeps that long inside `db::replace_tasks`, so the test holds a store open across the signal. `AppState::store_hook` is private to the `web` module, so the override is read where that field is built rather than in `task-viewer/src/main.rs`, whose `RUST_LOG` and `TASK_VIEWER_PORT` reads stay the only environment reads there. Name the override in the environment paragraph of `ARCHITECTURE.md` and leave it unset everywhere else.
-- Replace the free-port helper with a bind-retry loop, or read the actual port from the server's log line.
+- Start the child on a candidate `TASK_VIEWER_PORT` and, when it exits before serving with a bind error, retry the next candidate port, taking the port it actually bound from the post-bind `task-viewer listening on http://{addr}` line that task-viewer_startup-diagnostics.md delivers; the test binds no listener itself, so two runs started together cannot take each other's port.
 - Add a `Drop` guard that kills and waits for the child and removes the scratch directory.
 - Assert the drain against the documented four-second grace, declared as a local `GRACE: Duration = Duration::from_secs(4)` in the test whose doc comment names `web::SHUTDOWN_GRACE` in `task-viewer/src/web.rs` as the single source it mirrors, since the binary exposes no library target to import it from.
 - Correct the two failure messages that state the opposite of what happened, and the doc comment that claims "drains" with no assertion.
-- Gate `launcher_tests` on `#[cfg(all(test, unix))]`.
+- Gate every unix-only test site on `unix`: `#[cfg(all(test, unix))]` on `task-viewer/src/main.rs`'s `mod launcher_tests;`; in `task-viewer/src/harvest.rs`'s test module, `#[cfg(unix)]` on the two `use std::os::unix::…` lines, on the `fake_git_script` and `commit_non_utf8_named_task` helpers, and on every test that calls either helper or calls `fs::set_permissions` directly, since gating the imports alone takes `PermissionsExt` and `OsStringExt` out of scope for the helpers and gating the helpers alone leaves their callers naming an absent function; and `#[cfg(unix)]` on the two `task-viewer/src/web.rs` tests that set file modes. Add a source-shape test beside them that reads those three files and asserts each unix-only site carries its gate.
 
 ## Acceptance
 
 - Each of the three promised scenarios has a test that fails when the behavior is reverted, verified by temporarily reverting one.
-- The in-flight test passes ten consecutive runs with no timing-based flake.
+- The in-flight run, with the store pause inside the grace, passes ten consecutive runs with no timing-based flake.
 - A panic in the shutdown test leaves no `task-viewer` process running and no scratch directory behind.
-- The elapsed assertion fails when the test's `GRACE` mirror and `web::SHUTDOWN_GRACE` disagree: with a store held in flight past the grace, the server exits no earlier than the mirrored grace and still inside the launcher's window, so lowering `web::SHUTDOWN_GRACE` alone fails the run.
-- The port comes from a bind-retry loop or the child's own log line, so no listener is bound and dropped before the child binds, and two runs started together cannot take each other's port.
+- The elapsed assertion fails when the test's `GRACE` mirror and `web::SHUTDOWN_GRACE` disagree: in the past-grace run, with a store held in flight longer than the grace, the server exits no earlier than the mirrored grace and still inside the launcher's window, so lowering `web::SHUTDOWN_GRACE` alone fails the run.
+- The in-flight run's stored rows are in the child's database after it exits, while the past-grace run leaves the repository's rows exactly as they stood before the run, so the two runs distinguish a finished store from a rolled-back one.
+- The test binds no listener of its own: it starts the child on a candidate port, retries the next candidate when the child reports the address in use, and takes the bound port from the child's post-bind listening line, so two runs started together cannot take each other's port.
 - The corrected failure messages name the actual condition.
-- `cargo test` compiles on a non-unix target configuration (or the module is provably excluded there).
+- A source-shape test in `harvest.rs`'s test module finds, across `main.rs`, `harvest.rs`, and `web.rs`, every `use std::os::unix::…` line, every function whose body calls `fs::set_permissions`, `PermissionsExt::set_mode`, or `OsString::from_vec`, and every test that calls `fake_git_script` or `commit_non_utf8_named_task`, and asserts each sits under a `unix` cfg gate, so the unix-only test code is excluded from a non-unix `cargo test` build.
 - `ARCHITECTURE.md` names the test-only store-pause override with its default of unset, beside `TASK_VIEWER_PORT`.
-- `make lint` and `make test` pass.

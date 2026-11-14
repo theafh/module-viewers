@@ -2,7 +2,7 @@
 description: "Accept a whitespace-padded opener, trim quoted status values in the archive walk, skip an empty status, and warn on an unparseable updated date."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-13T13:25:45Z
+updated: 2026-11-14T23:09:37Z
 status: open
 reported-by: Andreas Hoffmann
 ---
@@ -11,7 +11,7 @@ reported-by: Andreas Hoffmann
 
 ## Goal
 
-A frontmatter block that opens with `---` plus trailing whitespace parses like a plain `---`. A quoted status padded with spaces (`" finished "`) both classifies as finished and matches the archive walk, so its ship day is the real archived commit instead of the updated fallback. An empty `status:` is skipped rather than charted. An unparseable `updated` date logs a warning the way an unparseable `created` already does.
+A frontmatter block that opens with `---` plus trailing whitespace parses like a plain `---`. A quoted status padded with spaces (`" finished "`) both classifies as finished and matches the archive walk, so its ship day is the real archived commit instead of the updated fallback. An empty `status:` is skipped rather than charted. An unparseable `updated` date logs a warning and the task still charts on its `created` day.
 
 ## Context
 
@@ -33,4 +33,4 @@ A frontmatter block that opens with `---` plus trailing whitespace parses like a
 - A fixture with `status: " finished "` inside `tasks/archive/` charts its real archived-commit ship day, not its `updated` day.
 - A fixture with an empty `status:` produces no row and one warning.
 - A fixture with `updated: not-a-date` produces one warning naming the path and value.
-- `make lint` and `make test` pass.
+- `CONTENT_HASH_REVISION` in `task-viewer/src/harvest.rs` reads a value other than `r3`, so a row stored by the current build mismatches and re-parses on the next Update.
