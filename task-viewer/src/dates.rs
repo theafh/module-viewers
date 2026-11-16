@@ -10,15 +10,16 @@ pub(crate) fn today() -> NaiveDate {
 /// Read a task timestamp as the UTC calendar day it names.
 ///
 /// A bare `YYYY-MM-DD` value keeps the day it states. A value with a time
-/// converts its instant to UTC: an explicit `Z` or `±HH:MM` / `±HHMM` offset
-/// states its own instant, while a value with no offset is a `Europe/Berlin`
-/// wall time, the zone the legacy task system wrote. Seconds and fractional
-/// seconds are optional. A value whose date prefix parses but whose time or
-/// offset does not keeps that date prefix, so an unreadable time changes no
-/// harvest skip, warning, or fallback.
+/// converts its instant to UTC: an explicit `Z` or `±HH:MM` / `±HHMM` / `±HH`
+/// offset states its own instant, while a value with no offset is a
+/// `Europe/Berlin` wall time, the zone the legacy task system wrote. The date
+/// and time may be separated by `T`, `t`, or a space, the offset may follow a
+/// space, and seconds and fractional seconds are optional. A value whose date
+/// prefix parses but whose time or offset does not keeps that date prefix, so
+/// an unreadable time changes no harvest skip, warning, or fallback.
 pub(crate) fn parse_iso_date(raw: &str) -> Option<NaiveDate> {
     let trimmed = strip_one_quote_pair(raw.trim());
-    let Some((date_part, time_part)) = trimmed.split_once(['T', ' ']) else {
+    let Some((date_part, time_part)) = trimmed.split_once(['T', 't', ' ']) else {
         return NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").ok();
     };
     let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y-%m-%d") else {
@@ -62,14 +63,15 @@ fn timestamp_day(date: NaiveDate, time_part: &str) -> Option<NaiveDate> {
     Some(instant.date_naive())
 }
 
-/// Split a time from its `Z` or numeric offset suffix.
+/// Split a time from its `Z` or numeric offset suffix. The time text is
+/// trimmed, so a space before the offset does not reach the wall-time parser.
 fn split_offset(time_part: &str) -> (&str, Option<&str>) {
     if let Some(rest) = time_part.strip_suffix(['Z', 'z']) {
-        return (rest, Some("Z"));
+        return (rest.trim(), Some("Z"));
     }
     match time_part.rfind(['+', '-']) {
-        Some(index) => (&time_part[..index], Some(&time_part[index..])),
-        None => (time_part, None),
+        Some(index) => (time_part[..index].trim(), Some(&time_part[index..])),
+        None => (time_part.trim(), None),
     }
 }
 
@@ -82,8 +84,8 @@ fn parse_wall_time(time_text: &str) -> Option<NaiveTime> {
     None
 }
 
-/// The signed seconds east of UTC an offset such as `+01:00`, `-0500`, or
-/// `+00:00` names.
+/// The signed seconds east of UTC an offset such as `+01:00`, `-0500`, `+01`,
+/// or `+00:00` names. A two-digit hour-only offset counts as `±HH:00`.
 fn parse_offset_seconds(offset: &str) -> Option<i32> {
     let (sign, rest) = match offset.as_bytes().first()? {
         b'+' => (1, &offset[1..]),
@@ -92,7 +94,8 @@ fn parse_offset_seconds(offset: &str) -> Option<i32> {
     };
     let (hours, minutes) = match rest.split_once(':') {
         Some((hours, minutes)) => (hours, minutes),
-        None if rest.len() == 4 => rest.split_at(2),
+        None if rest.len() == 2 => (rest, "00"),
+        None if rest.len() == 4 => rest.split_at_checked(2)?,
         None => return None,
     };
     if hours.len() != 2 || minutes.len() != 2 {
@@ -190,6 +193,52 @@ mod tests {
         assert_eq!(
             parse_iso_date("2026-07-17T12:00:00+00:00"),
             Some(day(2026, 7, 17))
+        );
+    }
+
+    #[test]
+    fn dates_parse_a_lowercase_t_separator() {
+        assert_eq!(
+            parse_iso_date("2026-11-09t00:30:00+01"),
+            Some(day(2026, 11, 8)),
+            "a lowercase t separates the date from its time"
+        );
+    }
+
+    #[test]
+    fn dates_parse_an_hour_only_offset() {
+        assert_eq!(
+            parse_iso_date("2026-11-09T00:30:00+01"),
+            Some(day(2026, 11, 8)),
+            "an hour-only offset is read as +01:00"
+        );
+        assert_eq!(
+            parse_iso_date("2026-11-09T10:30:00-05"),
+            Some(day(2026, 11, 9)),
+            "a negative hour-only offset converts its instant"
+        );
+    }
+
+    #[test]
+    fn dates_parse_a_space_before_the_offset() {
+        assert_eq!(
+            parse_iso_date("2026-11-09 00:30:00 +0100"),
+            Some(day(2026, 11, 8)),
+            "a space before the offset still reads the offset"
+        );
+    }
+
+    #[test]
+    fn dates_keep_the_date_prefix_for_a_non_ascii_offset_tail() {
+        assert_eq!(
+            parse_iso_date("2026-11-09T10:00:00+€0"),
+            Some(day(2026, 11, 9)),
+            "a multi-byte offset tail keeps the date prefix instead of panicking"
+        );
+        assert_eq!(
+            parse_iso_date("2026-11-09T10:00:00+0100"),
+            Some(day(2026, 11, 9)),
+            "the same value with a valid offset charts its UTC day"
         );
     }
 
