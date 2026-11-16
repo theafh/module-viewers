@@ -2,7 +2,7 @@
 description: "Name the chart SVGs for assistive tech, hoist the number formatter, recolour on theme change without redrawing, and guard the fallback logger."
 scope: task-viewer/static/js
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-15T07:13:26Z
+updated: 2026-11-16T14:19:14Z
 status: ready
 reported-by: Andreas Hoffmann
 ---
@@ -36,4 +36,4 @@ Each chart SVG carries an accessible name and description. Formatting a number a
 - Toggling the theme changes chart colours without a redraw, verified by a node-count or redraw spy.
 - The fallback logs the caught draw error through the guarded helper: a browser test that installs a recording `console` through the `run_browser_with` prelude records the log, and the console-less harness still shows "Charts unavailable" without throwing.
 - The mean-age subtitle no longer claims deferred tasks are excluded.
-- The standing gate applies unchanged: `make format`, `make lint`, and `make test` pass per the verification loop in `AGENTS.md`, with the intermittent `harvest_timeout_does_not_retry_the_git_dir_fallback` failure in `task-viewer/src/harvest.rs` tracked in `tasks/task-viewer_harvest-timeout-flake.md` and not fixed here.
+- The standing gate applies unchanged: `make format`, `make lint`, and `make test` pass per the verification loop in `AGENTS.md`.

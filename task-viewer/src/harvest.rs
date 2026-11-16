@@ -6573,7 +6573,13 @@ mod tests {
     fn register_fake_git_with_deadline(repo: &Path, script: &Path, deadline: Duration) {
         // Start the stand-in once at a generous deadline so the production-site
         // deadline measures the hang, not the first process start under load.
-        let _ = run_git_command(Command::new(script), None, Duration::from_secs(1));
+        // The warm-up passes no arguments, so a stand-in returns at once when it
+        // either falls through to its catch-all arm, which runs the real git and
+        // exits, or opens with a `case "$#" in 0) exit 0 ;; esac` guard. A
+        // stand-in that ignores its arguments and hangs must carry that guard or
+        // register directly with `git_override::register`, or the warm-up blocks
+        // for its full hang.
+        let _ = run_git_command(Command::new(script), None, Duration::from_secs(60));
         git_override::register(repo, Some(script.to_path_buf()), Some(deadline));
     }
 
@@ -6671,7 +6677,15 @@ mod tests {
         let repo = scratch("harvest_closed_stdout_repo");
         let dir = scratch("harvest_closed_stdout_timeout");
         let script = fake_git_script(&dir, "closed-stdout.sh", "exec 1>&-\nexec sleep 10");
-        register_fake_git_with_deadline(&repo, &script, Duration::from_millis(100));
+        // The measured calls pass no arguments, exactly like the helper's
+        // warm-up, so register directly rather than warm up: this test only
+        // needs the child killed at the deadline, and process-start cost cannot
+        // reach its 5 s bound.
+        git_override::register(
+            &repo,
+            Some(script.to_path_buf()),
+            Some(Duration::from_millis(100)),
+        );
 
         let started = Instant::now();
         let result = run_git_command(Command::new(git_program(&repo)), None, git_deadline(&repo));
@@ -6797,7 +6811,12 @@ mod tests {
             "2026-05-01T12:00:00+00:00",
         );
         let bin = scratch("harvest_hanging_git_bin");
-        let script = fake_git_script(&bin, "git", "exec sleep 10");
+        // The no-argument warm-up returns at once; every real invocation hangs.
+        let script = fake_git_script(
+            &bin,
+            "git",
+            "case \"$#\" in 0) exit 0 ;; esac\nexec sleep 10",
+        );
         register_fake_git(&repo, &script);
 
         let error = harvest_repository(&repo).expect_err("a hanging git must fail the scan");
@@ -6817,7 +6836,12 @@ mod tests {
         );
         let dir = repo.join(".git");
         let bin = scratch("harvest_sites_timeout_bin");
-        let script = fake_git_script(&bin, "git", "exec sleep 10");
+        // The no-argument warm-up returns at once; every real invocation hangs.
+        let script = fake_git_script(
+            &bin,
+            "git",
+            "case \"$#\" in 0) exit 0 ;; esac\nexec sleep 10",
+        );
         register_fake_git(&repo, &script);
 
         let error = git_read(&repo, &dir, &["rev-parse", "--git-dir"]).expect_err("git_read");
@@ -6983,41 +7007,40 @@ mod tests {
         let bin = scratch("harvest_no_retry_bin");
         let calls = bin.join("calls");
         // Answer the commands before the pickaxe from the wrapper itself, so
-        // the only process work under the 100 ms deadline is the hang. The
+        // the only process work under the 10 s deadline is the hang. The
         // pickaxe's `--follow` call is the sole invocation the test counts.
         let script = fake_git_script(
             &bin,
             "git",
             &format!(
-                "case \"$*\" in\n  *--follow*) echo \"$*\" >> {}; exec sleep 10 ;;\n  *rev-parse*) echo .git ;;\n  *for-each-ref*) ;;\n  *ls-tree*) ;;\n  *\"log --all\"*) ;;\n  *) exec {} \"$@\" ;;\nesac",
+                "case \"$*\" in\n  *--follow*) echo \"$*\" >> {}; exec sleep 60 ;;\n  *rev-parse*) echo .git ;;\n  *for-each-ref*) ;;\n  *ls-tree*) ;;\n  *\"log --all\"*) ;;\n  *) exec {} \"$@\" ;;\nesac",
                 calls.display(),
                 git_bin()
             ),
         );
-        register_fake_git(&repo, &script);
+        // The deadline starts when the child spawns, so it must clear the
+        // worst-case process start by a wide margin, and the margin has to hold
+        // under a full-suite run that spawns git from every test at once. A 2 s
+        // deadline failed 7 of 20 such runs, each time with the stand-in killed
+        // before its `echo` created the `calls` file, so the deadline sits at
+        // 10 s against a 60 s hang: six times the margin the hang needs, and
+        // fivefold over the 2 s deadline that flaked.
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(10));
 
-        // The wrapper records its invocation from inside the stand-in, so a
-        // loaded machine can expire the 100 ms deadline before the wrapper
-        // reaches its first line. Retry the scan until the stand-in has
-        // demonstrably run once, then count within that single scan, so the
-        // count never depends on process-start latency while the deadline and
-        // the exactly-one assertion stay unchanged.
-        let mut recorded = String::new();
-        let mut outcome = None;
-        for _ in 0..6 {
-            let _ = fs::remove_file(&calls);
-            let attempt = harvest_repository(&repo);
-            recorded = fs::read_to_string(&calls).unwrap_or_default();
-            let started = !recorded.trim().is_empty();
-            outcome = Some(attempt);
-            if started {
-                break;
-            }
+        // One scan proves the property. The message assertion cannot pass on
+        // its own, because a stand-in that never starts times out on an
+        // earlier command with an empty `calls` file, and the count assertion
+        // cannot pass on its own, because an ordinary git failure also ends
+        // the scan after one invocation.
+        let error = harvest_repository(&repo).expect_err("the pickaxe log must time out");
+        match error {
+            HarvestError::Git(message) => assert!(
+                message.contains("git did not finish within 10000 ms"),
+                "the scan error must carry the deadline's message: {message}"
+            ),
+            other => panic!("expected a Git error carrying the deadline, got {other:?}"),
         }
-        let error = outcome
-            .expect("the scan ran")
-            .expect_err("the pickaxe log must time out");
-        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        let recorded = fs::read_to_string(&calls).expect("the stand-in recorded its call");
         let follow_calls = recorded
             .lines()
             .filter(|line| line.contains("--follow"))

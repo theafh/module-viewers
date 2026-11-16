@@ -2,7 +2,7 @@
 description: "Fix hover hit-rects, repeated y labels, multi-year month labels, radar draw order and collisions, surrogate-pair truncation, and impossible-date fallback."
 scope: task-viewer
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-15T07:28:16Z
+updated: 2026-11-16T14:19:14Z
 status: ready
 reported-by: Andreas Hoffmann
 ---
@@ -40,4 +40,4 @@ Hover reports the bar under the cursor instead of its neighbour, every y axis sh
 - A radar fixture whose count is not a number still renders "Charts unavailable" rather than NaN coordinates.
 - A radar label over 18 code units whose surrogate pair straddles the cut position keeps the pair intact and ends in the ellipsis.
 - A fixture with `2024-13-45` renders "Charts unavailable", and the already-working missing-`shipped` fallback keeps rendering it.
-- The standing `make lint` and `make test` gates in `TESTING.md` pass, apart from the intermittent `harvest_timeout_does_not_retry_the_git_dir_fallback` failure, which is filed separately as `tasks/task-viewer_harvest-timeout-flake.md` and not fixed here.
+- The standing `make lint` and `make test` gates in `TESTING.md` pass.

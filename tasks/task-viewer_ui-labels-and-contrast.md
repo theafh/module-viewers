@@ -2,7 +2,7 @@
 description: "Fix the unscanned-repository label so an unscanned repository reads \"not scanned yet\" once instead of the doubled \"scanned Not scanned yet\"."
 scope: task-viewer
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:52:55Z
+updated: 2026-11-16T14:19:14Z
 status: ready
 reported-by: Andreas Hoffmann
 ---
@@ -33,4 +33,4 @@ An unscanned repository reads as "not scanned yet" rather than "scanned Not scan
 - An unscanned repository renders "not scanned yet" once and no doubled "scanned".
 - A scanned repository still renders its timestamp.
 - `ProjectView.scanned_at` is optional, so the template receives no value for an unscanned repository.
-- `make lint` passes, and `make test` passes apart from the known intermittent `harvest_timeout_does_not_retry_the_git_dir_fallback` failure in `task-viewer/src/harvest.rs`.
+- `make lint` passes, and `make test` passes.
