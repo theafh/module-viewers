@@ -2,8 +2,8 @@
 description: "Close the database pool when the listener ends without a shutdown signal, and correct the encode_query and run_scan doc comments in web.rs."
 scope: task-viewer/src
 created: 2026-11-13T20:45:23Z
-updated: 2026-11-14T23:09:37Z
-status: open
+updated: 2026-11-14T23:52:55Z
+status: ready
 reported-by: Andreas Hoffmann
 ---
 
@@ -15,6 +15,7 @@ A `serve` call whose listener ends before any shutdown signal arrives closes the
 
 ## Context
 
+- Build order: independent. Its two doc-comment corrections were split out of `task-viewer_web-outcome-plumbing.md`, which needs no order against this task.
 - `task-viewer/src/web.rs`'s `pub async fn serve` selects between a fired shutdown future and the `axum::serve` future ending on its own. The second arm logs `the listener stopped` and returns `Instant::now()` before the tail runs, and that tail holds the only `state.pool.close()` call, so the pool stays open on that path.
 - The tail guards the close with `if !left.is_zero()`, so the early arm's `Instant::now()` is also a spent deadline: falling through with that value would skip the close as well. The arm needs its own grace budget.
 - `fn encode_query`'s doc comment says a space becomes `%20` and every other byte outside the unreserved set becomes `%XX`. The keep-set match is `b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_'`, which omits `~`, an RFC 3986 unreserved character, so `~` is written `%7E`; `web_encode_query_matches_the_query_transport` pins that with `assert_eq!(encode_query("a-b_c.d~e"), "a-b_c.d%7Ee");`.

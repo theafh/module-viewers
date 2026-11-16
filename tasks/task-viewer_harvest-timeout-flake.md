@@ -2,8 +2,8 @@
 description: "Make the intermittent harvest git-timeout non-retry test deterministic, and drop the gate carve-outs that name it."
 scope: task-viewer/src
 created: 2026-11-13T20:47:07Z
-updated: 2026-11-14T23:11:14Z
-status: open
+updated: 2026-11-14T23:52:55Z
+status: ready
 reported-by: Andreas Hoffmann
 ---
 
@@ -15,6 +15,7 @@ reported-by: Andreas Hoffmann
 
 ## Context
 
+- Build order: ships before `task-viewer_chart-a11y-and-cost.md`, `task-viewer_chart-geometry-and-labels.md`, and `task-viewer_ui-labels-and-contrast.md`, each of which carries a gate carve-out this task removes.
 - `task-viewer/src/harvest.rs` holds the test in its `#[cfg(test)] mod tests`, as `fn harvest_timeout_does_not_retry_the_git_dir_fallback`. It builds a scratch repository with one live task and one archived task whose status is `open`, so that task's leave day comes from `fn git_pickaxe`, installs a stand-in `git`, and scans once per attempt.
 - The stand-in appends its arguments to a `calls` file inside its `*--follow*` arm and then `exec sleep 10`; the test counts the `--follow` lines in that file. `fn register_fake_git` registers a 100 ms deadline for the fixture repository, and `fn register_fake_git_with_deadline` starts the stand-in once at a 1-second deadline before registering it.
 - The flake: the deadline starts when the child spawns, so on a loaded machine the 100 ms can expire before `/bin/sh` reaches its `echo`. The `calls` file then stays empty, and the six-attempt retry loop can lose that same race on every attempt, leaving a zero count against `assert_eq!(follow_calls, 1, …)`.
@@ -37,6 +38,6 @@ reported-by: Andreas Hoffmann
 
 - The test asserts the failure is `HarvestError::Git` whose message contains `git did not finish within 2000 ms`, and asserts the recorded `calls` file holds exactly one `--follow` line; one run records both.
 - The test body carries a single `harvest_repository(&repo)` call and a single read of the `calls` file, with the retry loop gone.
-- Ten consecutive runs of `cargo test -p task-viewer harvest_timeout_does_not_retry_the_git_dir_fallback`, taken in one shell loop on the same tree, each print `test result: ok`. Fail branch: a run that fails means the deadline margin is too small on that machine, so raise it, re-pin the message assertion to the new deadline, and repeat the ten; restoring the retry loop or dropping the exactly-one assertion is not a repair.
+- Ten consecutive runs of `cargo test -p task-viewer harvest_timeout_does_not_retry_the_git_dir_fallback`, taken in one shell loop on the same tree, each print `test result: ok`. Fail branch: a run that fails means the deadline margin is too small on that machine, so raise it, re-pin the `Duration::from_secs(…)` value in this task's first Approach bullet and in the fourth Acceptance item, re-pin the `2000 ms` message text in the third Approach bullet and in the first Acceptance item, and repeat the ten; restoring the retry loop or dropping the exactly-one assertion is not a repair.
 - The test registers its fixture with `Duration::from_secs(2)` and hangs with `sleep 30`, `fn register_fake_git` still registers 100 ms, and `cargo test -p task-viewer harvest_` passes on the same tree.
 - A grep for `harvest_timeout_does_not_retry_the_git_dir_fallback` over `tasks/task-viewer_*.md` names only this task, and `git diff -- tasks/` shows each gate item that exempted the test now carrying its own gate sentence alone.

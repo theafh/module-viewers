@@ -2,8 +2,8 @@
 description: "Give the primary button a per-theme --on-accent text colour that clears 4.5:1 on the light accent at rest and on hover, with the four measured ratios recorded beside the declaration."
 scope: task-viewer/static
 created: 2026-11-13T20:46:34Z
-updated: 2026-11-13T20:46:58Z
-status: open
+updated: 2026-11-14T23:52:55Z
+status: ready
 reported-by: Andreas Hoffmann
 ---
 
@@ -15,6 +15,7 @@ The primary button's label reads against its accent background in both themes an
 
 ## Context
 
+- Build order: independent. No other live task edits `task-viewer/static/style.css`.
 - `task-viewer/static/style.css` opens with the two theme blocks `:root,` / `[data-theme="dark"]` and `[data-theme="light"]`, each declaring `--accent` and `--accent-hover`; `.btn` sets `color: #1a1408` on `background: var(--accent)`, and `.btn:hover` swaps the background to `var(--accent-hover)` while the ink stays.
 - Measured with the WCAG relative-luminance formula, `#1a1408` on the light `--accent` `#8a6a2f` is 3.65:1 and on the light `--accent-hover` `#6f5424` is 2.59:1, both below the 4.5:1 floor for the 600-weight label. The same ink on the dark pair measures 7.61:1 and 9.27:1, so the dark theme already passes.
 - Only `task-viewer/templates/repositories.html`'s `Add repository` button carries `class="btn"` alone. The theme toggle, Update, and Remove buttons carry `class="btn btn-secondary"` and take their text colour from `.btn-secondary`'s `color: var(--text-primary)`, which outranks `.btn`'s colour by later position.

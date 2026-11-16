@@ -2,8 +2,8 @@
 description: "Fix the unscanned-repository label so an unscanned repository reads \"not scanned yet\" once instead of the doubled \"scanned Not scanned yet\"."
 scope: task-viewer
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-13T21:10:58Z
-status: open
+updated: 2026-11-14T23:52:55Z
+status: ready
 reported-by: Andreas Hoffmann
 ---
 
@@ -15,6 +15,7 @@ An unscanned repository reads as "not scanned yet" rather than "scanned Not scan
 
 ## Context
 
+- Build order: after `task-viewer_harvest-timeout-flake.md`, which removes the gate carve-out this task carries.
 - `task-viewer/templates/repositories.html` renders `Added {{ project.created_at }} · scanned {{ project.scanned_at }}`, so an absent `scanned_at` produces the doubled phrase.
 - The absent case is decided in Rust, not in the template: `fn project_view` in `task-viewer/src/web.rs` builds `scanned_at: repo.scanned_at.clone().unwrap_or_else(|| "Not scanned yet".to_string())` in its `scanned_at` initializer, and `ProjectView.scanned_at` is a `String` on the `ProjectView` struct, so the template never sees an absent value.
 

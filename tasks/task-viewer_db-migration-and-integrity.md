@@ -2,8 +2,8 @@
 description: "Serialize schema migration under one transaction, make the ALTER idempotent, warn on unparseable rows, and handle the database env var explicitly."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:09:37Z
-status: open
+updated: 2026-11-14T23:52:55Z
+status: ready
 reported-by: Andreas Hoffmann
 ---
 
@@ -15,6 +15,7 @@ Two processes starting against one database cannot wedge it: the schema version 
 
 ## Context
 
+- Build order: no required order against `task-viewer_chart-future-dates.md`. Both add the `path` field to `TaskRecord`, and each reuses the field when the other ships first.
 - `task-viewer/src/db.rs` has `fn migrate`, which reads `PRAGMA user_version` outside any transaction and stamps `PRAGMA user_version = 1` in autocommit on a fresh file; `fn migration` returns a non-idempotent `ALTER TABLE tasks ADD COLUMN content_hash TEXT`; `fn row_to_record` returns `None` on a parse failure that `load_tasks` drops silently.
 - The fresh-file race: two processes both read 0; the loser re-runs the `IF NOT EXISTS` schema and stamps 1 over a file the winner already migrated to 3, after which every start fails on `duplicate column name`. The database needs manual deletion to recover.
 - `task-viewer/src/schema.sql` creates `tasks_repository_id`, which migration 2 drops.
@@ -26,9 +27,10 @@ Two processes starting against one database cannot wedge it: the schema version 
 ## Approach
 
 - Begin an `IMMEDIATE` transaction on one connection before reading `user_version`, hold it across the whole migration loop, and commit once at the end.
-- Re-read `user_version` inside that transaction, and guard the migration-3 `ALTER` on `PRAGMA table_info(tasks)` so it is idempotent.
+- Read `user_version` once, inside that transaction, and guard the migration-3 `ALTER` on `PRAGMA table_info(tasks)` so it is idempotent.
 - Attach the version and database path as context to each migration error.
-- Warn from `load_tasks` when `row_to_record` returns `None`, naming the repository, path, and failing value, and carry `t.path` through `TaskRow` and `TaskRecord` for it, reusing the field the sibling task named in Context already added when that task ships first.
+- Roll the transaction back and return the error when any migration step fails, so the file keeps its prior schema version and the connection returns to the pool without a transaction left open.
+- Warn from `load_tasks` when `row_to_record` returns `None` because a stored row fails to parse, naming the repository, path, and failing value, and carry `t.path` through `TaskRow` and `TaskRecord` for it, reusing the field the sibling task named in Context already added when that task ships first. A `None` from a missing project handle keeps its current silent drop, because it has no failing value to name.
 - Read `TASK_VIEWER_DB` with `var_os`, reject a non-Unicode value with a message naming the variable, and trim surrounding whitespace once into a local that both the emptiness test and the opened path use.
 - Delete the `tasks_repository_id` index from `schema.sql`.
 
@@ -38,7 +40,7 @@ Two processes starting against one database cannot wedge it: the schema version 
 - A test that captures the statements `init_at` issues on a fresh file finds one `BEGIN IMMEDIATE` before the schema-version read and exactly one `COMMIT` after the last migration, so the read and the whole migration loop share one transaction.
 - A database stamped below version 3 whose `tasks` table already carries `content_hash` migrates to the latest version with exactly one `content_hash` column and no error.
 - A fixture row with an unparseable `created` produces one warning naming its repository, path, and value.
-- A forced migration failure reports the version and database path.
+- A forced migration failure reports the version and database path, leaves the file at its prior schema version, and a later `init_at` on that file succeeds.
 - `TASK_VIEWER_DB` set to non-Unicode bytes fails start-up naming the variable.
 - A `TASK_VIEWER_DB` value padded with spaces opens the same file as its unpadded form, so padding never names a second database.
 - `schema.sql` contains no `tasks_repository_id` index.

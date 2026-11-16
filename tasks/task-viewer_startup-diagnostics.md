@@ -2,8 +2,8 @@
 description: "Log after a successful bind, reject a malformed port, name the bind address, and stop treating a ctrl_c registration error as a signal."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:09:37Z
-status: open
+updated: 2026-11-14T23:52:55Z
+status: ready
 reported-by: Andreas Hoffmann
 ---
 
@@ -15,6 +15,7 @@ The "listening" line is logged only after the bind succeeds and names the bound 
 
 ## Context
 
+- Build order: ships before `task-viewer_test-coverage-gaps.md`, whose shutdown test reads the post-bind listening line and relies on the zero-port rejection this task adds.
 - `task-viewer/src/main.rs` logs `task-viewer listening on http://{addr}` before `TcpListener::bind`, parses the port with `raw.trim().parse().unwrap_or(web::PORT)`, and awaits `ctrl_c()` without distinguishing a registration error from a signal.
 - `task-viewer/src/db.rs` builds the default-path directory error with a message that blames `TASK_VIEWER_DB` even when it is unset.
 - Prior art: [task-viewer_utc-timestamps.md](archive/task-viewer_utc-timestamps.md) covers the clock base; this task covers the start-up messages.

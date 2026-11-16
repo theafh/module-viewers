@@ -2,8 +2,8 @@
 description: "Serialize launcher invocations, compare canonical paths, guard every kill, and never report a stop that did not take."
 scope: scripts
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:09:37Z
-status: open
+updated: 2026-11-14T23:52:55Z
+status: ready
 reported-by: Andreas Hoffmann
 ---
 
@@ -15,6 +15,7 @@ Two launcher invocations cannot race the PID file: the exclusive lock spans the 
 
 ## Context
 
+- Build order: second of the launcher pair. Ships after `task-viewer_launcher-build-truth.md`.
 - `scripts/task-viewer.sh` writes `echo "$candidate" >"$PID_FILE"` with no lock around the check, compares the whole `ps -o args=` line to `$BINARY` in `is_ours` (so a relative path, a bare name, or a trailing argument reads as foreign), runs `kill "$pid" 2>/dev/null || true` unguarded, prints `task-viewer stopped` after `kill -9` with no re-test, and starts the server with `nohup "$BINARY"` on the no-python3 path. `is_running` and both `do_start` failure paths also delete the PID file, and `do_stop` deletes it after a stop.
 - Shared surface and ordering: [task-viewer_launcher-build-truth.md](task-viewer_launcher-build-truth.md) rewrites `do_start`, `do_toggle`, and the `start_detached` no-python3 branch of the same file and ships first, replacing that `nohup "$BINARY"` line with a `setsid`-or-refuse branch; this task takes the launcher as that task leaves it, re-reads the detach branch before quoting it, and keeps every guard here working under whatever detach it leaves.
 - The launcher's `PORT=7880` reaches only its own probes and printed URLs: `port_pid` asks `lsof`/`ss` about `:"$PORT"` and `port_answers` opens `/dev/tcp/127.0.0.1/$PORT`, while the server binds `TASK_VIEWER_PORT` or `web::PORT` (`7880`) from `task-viewer/src/main.rs` and `start_detached` passes it neither an argument nor that variable. `TESTING.md` requires deterministic, isolated, parallel-safe tests, so the concurrency test needs a launcher copy that moves the server's bind port, not only the probes.
@@ -23,8 +24,8 @@ Two launcher invocations cannot race the PID file: the exclusive lock spans the 
 
 ## Approach
 
-- Take the exclusive lock once in the command dispatch, before `do_start`, `do_stop`, or `do_toggle` runs, and release it from an `EXIT` trap; the helpers take no lock of their own, so `do_start`'s restart path (`do_stop` under `if is_running && is_outdated`) runs inside the lock already held instead of nesting on it.
-- Build the lock from `mkdir`, which is atomic on macOS and Linux, record the holder's PID in a file inside the directory, and reclaim a directory whose recorded PID is not alive; `flock` is absent on macOS and stays unused.
+- Take the exclusive lock once, wrapping the whole `case` dispatch so every command — `start`, `stop`, `status`, `restart`, and `toggle` — runs under it, and release it from an `EXIT` trap. `status` and `restart` must be covered because `status` reaches `is_running`, which writes and deletes the PID file, and `restart` runs `do_stop` and `do_start` as one command. The helpers take no lock of their own, so `do_start`'s restart path (`do_stop` under `if is_running && is_outdated`) runs inside the lock already held instead of nesting on it.
+- Build the lock from `mkdir`, which is atomic on macOS and Linux, record the holder's PID in a file inside the directory, and reclaim a directory whose recorded PID is not alive by renaming it to a unique name first, so exactly one waiter wins the rename and the losers retry the normal acquire; a check-then-delete reclaim lets two waiters both act on one stale observation and lets the second delete a fresh live lock. `flock` is absent on macOS and stays unused.
 - Delete the PID file only from inside the lock: remove one whose PID is not this checkout's live server, and remove the one the stop just performed wrote. A second invocation waits for the lock and re-reads the PID file under it, so a start never removes the file a concurrent start wrote.
 - In `is_ours`, compare the first whitespace-delimited token of the `ps` args to `$BINARY`: an absolute token compares as written, a token holding a `/` resolves against `$PROJECT_DIR`, and a bare token resolves with `command -v`; canonicalize `$PROJECT_DIR` once with `pwd -P` so a checkout reached through a symlink compares equal. A token that resolves to nothing is not ours.
 - Resolve a relative token against `$PROJECT_DIR` because every launcher-started server inherits that working directory; a server started from another directory under a relative path stays unrecognized and is left alone.
@@ -38,8 +39,10 @@ Two launcher invocations cannot race the PID file: the exclusive lock spans the 
 ## Acceptance
 
 - A test that runs two `start` invocations concurrently against one launcher copy whose `PORT` line names a free loopback port leaves one running server on that port, one invocation reporting a start and the other reporting an already-running server, and the loser leaves the winner's PID file in place; a `stop` under the lock then removes that file and leaves no live process.
-- `is_ours` accepts a staged `ps` line printing the binary as `./target/release/task-viewer` and one printing the absolute binary followed by an argument, and rejects a path outside the checkout.
-- A lock directory whose recorded PID is not alive is reclaimed by the next invocation, which starts the server.
+- `is_ours` accepts a staged `ps` line printing the binary as `./target/release/task-viewer`, one printing the absolute binary followed by an argument, and one printing a bare `task-viewer` name resolved on `PATH`, and rejects a path outside the checkout.
+- A stop aimed at a PID belonging to an unrelated program sends it no signal, so neither the graceful `kill` nor the `kill -9` fires.
+- A lock directory whose recorded PID is not alive is reclaimed by the next invocation, which starts the server; two invocations racing on one stale lock leave exactly one running server.
+- A `status` invocation run while another invocation holds the lock waits for the holder to release it before reading the PID file, so it never reads a concurrent start's half-written file.
 - A stop whose process survives `kill -9` exits non-zero and does not print "stopped".
 - A forced start timeout leaves no live server process.
 - An exported `TASK_VIEWER_PORT` does not change the port the launcher's server binds.

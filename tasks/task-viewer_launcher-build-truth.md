@@ -2,8 +2,8 @@
 description: "Fail when cargo is missing, build with --locked, prefer rustup's cargo, build once per restart, and print success only when it happened."
 scope: scripts
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:09:37Z
-status: open
+updated: 2026-11-14T23:52:55Z
+status: ready
 reported-by: Andreas Hoffmann
 ---
 
@@ -15,6 +15,7 @@ A missing `cargo` fails the start with a clear message instead of launching a po
 
 ## Context
 
+- Build order: first of the launcher pair. Ships before `task-viewer_launcher-process-safety.md`, which takes the launcher as this task leaves it.
 - `scripts/task-viewer.sh` returns success from `build_binary` when `cargo` is absent and the binary exists, runs `cargo build --release -p task-viewer` without `--locked`, prepends fixed Homebrew directories ahead of rustup's `~/.cargo/bin`, and builds twice on a Dock-icon click: `do_toggle` runs `if build_binary && is_outdated; then do_start`, and the `do_start` it calls opens with `build_binary || return 1`.
 - `Makefile`'s `build` target runs `cargo build --release -p task-viewer` without `--locked`, so the release path `README.md` documents can rewrite `Cargo.lock` even after the launcher is fixed.
 - `scripts/install-desktop.sh` prints a checkmark after a `|| true` icon-cache refresh.
