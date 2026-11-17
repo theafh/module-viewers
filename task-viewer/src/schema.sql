@@ -19,5 +19,3 @@ CREATE TABLE IF NOT EXISTS tasks (
     leave_date TEXT,
     UNIQUE (repository_id, path)
 );
-
-CREATE INDEX IF NOT EXISTS tasks_repository_id ON tasks (repository_id);

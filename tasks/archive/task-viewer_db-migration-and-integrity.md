@@ -2,9 +2,11 @@
 description: "Serialize schema migration under one transaction, make the ALTER idempotent, warn on unparseable rows, and handle the database env var explicitly."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:52:55Z
-status: ready
+updated: 2026-11-17T20:03:18Z
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Make database migration race-safe and row loss visible
@@ -21,7 +23,7 @@ Two processes starting against one database cannot wedge it: the schema version 
 - `task-viewer/src/schema.sql` creates `tasks_repository_id`, which migration 2 drops.
 - `TASK_VIEWER_DB` is read with `std::env::var(...).ok()` and trimmed only for the emptiness test, so the padding reaches the opened path today.
 - `tasks/task-viewer_chart-future-dates.md` carries the same stored path to its own warn site: it adds `t.path` to both `SELECT` lists in `fn load_tasks` and a `path` field to `TaskRow` and `TaskRecord`. That additive surface is shared with no required order, so whichever task ships second reuses the field the first added instead of adding a duplicate.
-- Prior art: [task-viewer_db-hardening.md](archive/task-viewer_db-hardening.md) added migrations; [task-viewer_db-init-durability.md](archive/task-viewer_db-init-durability.md) made start-up fail safely. Neither serializes concurrent migration.
+- Prior art: [task-viewer_db-hardening.md](task-viewer_db-hardening.md) added migrations; [task-viewer_db-init-durability.md](task-viewer_db-init-durability.md) made start-up fail safely. Neither serializes concurrent migration.
 - Resolved by the user's standing instruction to follow the audit recommendation: take the `BEGIN IMMEDIATE` fix, which closes both the benign duplicate-ALTER race and the permanent fresh-file re-stamp.
 
 ## Approach

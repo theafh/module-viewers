@@ -9,6 +9,9 @@ use crate::harvest::TaskKind;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
     pub project: Arc<str>,
+    /// The stored path of the task file, relative to its repository. It names
+    /// the row in a warning and is otherwise not charted.
+    pub path: String,
     pub scope: String,
     pub kind: TaskKind,
     pub created: NaiveDate,
@@ -529,6 +532,7 @@ mod tests {
     ) -> TaskRecord {
         TaskRecord {
             project: Arc::from(project),
+            path: format!("tasks/{project}_{scope}.md"),
             scope: scope.to_string(),
             kind,
             created,

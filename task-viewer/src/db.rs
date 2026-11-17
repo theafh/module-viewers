@@ -8,6 +8,7 @@ use sqlx::{
     },
 };
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -30,7 +31,9 @@ pub const SCHEMA: &str = include_str!("schema.sql");
 pub const SCHEMA_VERSION: i64 = 3;
 
 /// The statement that moves a database from version `version - 1` to
-/// `version`, or `None` when no such migration exists.
+/// `version`, or `None` when no such migration exists. The caller guards
+/// version 3 on the table's own columns, so a database stamped below 3 that
+/// already carries `content_hash` migrates without repeating the `ALTER`.
 fn migration(version: i64) -> Option<&'static str> {
     match version {
         2 => Some("DROP INDEX IF EXISTS tasks_repository_id"),
@@ -52,6 +55,7 @@ pub struct Repository {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct TaskRow {
     repository_id: i64,
+    path: String,
     scope: String,
     kind: String,
     created: String,
@@ -65,19 +69,27 @@ struct TaskRow {
 const INSERT_CHUNK_ROWS: usize = 500;
 
 /// Turn the configured `TASK_VIEWER_DB` value into a database path. An unset
-/// value falls back to `~/.task-viewer`; an empty value is rejected.
-pub fn database_path(raw: Option<&str>) -> Result<PathBuf> {
-    if let Some(raw) = raw {
-        if raw.trim().is_empty() {
-            anyhow::bail!("TASK_VIEWER_DB is empty; set it to a database file path or unset it");
-        }
-        return Ok(PathBuf::from(raw));
+/// value falls back to `~/.task-viewer`; an empty value is rejected. The value
+/// is trimmed once, so padding around a path names the same file as the
+/// unpadded path instead of a second database, and a value that is not valid
+/// UTF-8 is rejected by name rather than silently read lossily.
+pub fn database_path(raw: Option<&OsStr>) -> Result<PathBuf> {
+    let Some(raw) = raw else {
+        let mut path =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find the home directory"))?;
+        path.push(".task-viewer");
+        return Ok(path);
+    };
+    let raw = raw.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "TASK_VIEWER_DB is not valid UTF-8; set it to a database file path or unset it"
+        )
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("TASK_VIEWER_DB is empty; set it to a database file path or unset it");
     }
-
-    let mut path =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find the home directory"))?;
-    path.push(".task-viewer");
-    Ok(path)
+    Ok(PathBuf::from(trimmed))
 }
 
 /// Open the database named by the configured `TASK_VIEWER_DB` value, or the
@@ -88,14 +100,15 @@ pub async fn init() -> Result<Pool<Sqlite>> {
         return init_at(&path).await;
     }
 
-    let raw = std::env::var("TASK_VIEWER_DB").ok();
+    let raw = std::env::var_os("TASK_VIEWER_DB");
     init_with(raw.as_deref()).await
 }
 
 /// The sibling entry point that takes the configured `TASK_VIEWER_DB` value
 /// instead of reading the environment, so a test can reach the explicit-path
-/// branch without setting process-wide state.
-pub async fn init_with(raw: Option<&str>) -> Result<Pool<Sqlite>> {
+/// branch, its non-Unicode rejection included, without setting process-wide
+/// state.
+pub async fn init_with(raw: Option<&OsStr>) -> Result<Pool<Sqlite>> {
     let path = database_path(raw)?;
     init_at(&path).await
 }
@@ -104,16 +117,68 @@ pub async fn init_with(raw: Option<&str>) -> Result<Pool<Sqlite>> {
 /// version-1 schema to a new file, and migrate it to the latest version.
 pub async fn init_at(path: &Path) -> Result<Pool<Sqlite>> {
     let pool = connect(path).await?;
-    migrate(&pool).await?;
+    migrate(&pool, path).await?;
     Ok(pool)
 }
 
 /// Read `PRAGMA user_version`, apply `SCHEMA` to a brand-new database, then
-/// apply each later migration in order.
-async fn migrate(pool: &Pool<Sqlite>) -> Result<()> {
-    let mut version = read_schema_version(pool)
+/// apply each later migration in order, all inside one `BEGIN IMMEDIATE`
+/// transaction on one connection. Two processes starting against one file
+/// serialize here instead of both reading version 0 and stamping the file
+/// back, and a step that fails rolls the whole run back, so the file keeps the
+/// version it had.
+async fn migrate(pool: &Pool<Sqlite>, path: &Path) -> Result<()> {
+    let mut conn = pool.acquire().await.with_context(|| {
+        format!(
+            "the database at {} could not be opened for its schema migration",
+            path.display()
+        )
+    })?;
+    // A raw `BEGIN IMMEDIATE` carries SQLite's write lock from the version read
+    // through the last migration. Closing this connection on drop is the
+    // safety net: a cancelled migration never hands a connection that still
+    // holds that lock back to the pool.
+    conn.close_on_drop();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
         .await
-        .context("the database schema version could not be read")?;
+        .with_context(|| {
+            format!(
+                "the database at {} could not begin its schema migration",
+                path.display()
+            )
+        })?;
+
+    let migrated = migrate_locked(&mut conn, path).await;
+    if let Err(error) = migrated {
+        // The rollback is best effort: the step's own error is the one that
+        // names what went wrong, and the file keeps its prior version either
+        // way.
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        return Err(error);
+    }
+
+    if let Err(error) = sqlx::query("COMMIT").execute(&mut *conn).await {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        return Err(error).with_context(|| {
+            format!(
+                "the schema migration of {} could not be committed",
+                path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+/// The work `migrate` holds its transaction across: one version read, the
+/// version-1 baseline for a new file, and each later step with its stamp.
+async fn migrate_locked(conn: &mut SqliteConnection, path: &Path) -> Result<()> {
+    let mut version = read_schema_version(conn).await.with_context(|| {
+        format!(
+            "the database schema version could not be read from {}",
+            path.display()
+        )
+    })?;
     if version > SCHEMA_VERSION {
         anyhow::bail!(
             "the database schema version {version} is newer than schema version \
@@ -121,45 +186,126 @@ async fn migrate(pool: &Pool<Sqlite>) -> Result<()> {
         );
     }
     if version == 0 {
-        sqlx::query(SCHEMA).execute(pool).await?;
+        sqlx::query(SCHEMA)
+            .execute(&mut *conn)
+            .await
+            .with_context(|| {
+                format!(
+                    "the baseline schema could not be created in {}",
+                    path.display()
+                )
+            })?;
         version = 1;
-        sqlx::query("PRAGMA user_version = 1").execute(pool).await?;
+        stamp_version(conn, version).await.with_context(|| {
+            format!(
+                "the baseline schema could not be stamped in {}",
+                path.display()
+            )
+        })?;
     }
     while version < SCHEMA_VERSION {
         let next = version + 1;
-        let Some(statement) = migration(next) else {
-            anyhow::bail!("No migration from database schema version {version}");
-        };
-        // The step's schema statement and its version stamp commit together, so
-        // a failure between them cannot leave a statement applied under an older
-        // `user_version` that the next init would re-run and fail on.
-        let mut tx = pool.begin().await?;
-        sqlx::query(statement).execute(&mut *tx).await?;
-        sqlx::query(&format!("PRAGMA user_version = {next}"))
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+        migrate_step(conn, next).await.with_context(|| {
+            format!(
+                "the database schema migration to version {next} failed for {}",
+                path.display()
+            )
+        })?;
         version = next;
     }
+    Ok(())
+}
+
+/// Apply one migration step and stamp the version it reaches. The step's
+/// schema statement and its stamp land in the same transaction, so a failure
+/// between them cannot leave a statement applied under an older
+/// `user_version` that the next start would re-run and fail on.
+async fn migrate_step(conn: &mut SqliteConnection, version: i64) -> Result<()> {
+    #[cfg(test)]
+    if test_migration::take(version) {
+        anyhow::bail!("the injected schema migration failure fired");
+    }
+    let Some(statement) = migration(version) else {
+        anyhow::bail!("No migration from database schema version {}", version - 1);
+    };
+    if version == 3 && column_exists(conn, "content_hash").await? {
+        // A file stamped below 3 that already carries the column only needs
+        // its stamp, so the `ALTER` stays idempotent.
+        return stamp_version(conn, version).await;
+    }
+    sqlx::query(statement).execute(&mut *conn).await?;
+    stamp_version(conn, version).await
+}
+
+/// Whether `tasks` already carries `column`, read through SQLite's own table
+/// info so the check needs no schema text of its own.
+async fn column_exists(conn: &mut SqliteConnection, column: &str) -> Result<bool> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?")
+            .bind(column)
+            .fetch_one(&mut *conn)
+            .await?;
+    Ok(count > 0)
+}
+
+async fn stamp_version(conn: &mut SqliteConnection, version: i64) -> Result<()> {
+    sqlx::query(&format!("PRAGMA user_version = {version}"))
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 
 /// Read the stored schema version. A failure here must reach the caller instead
 /// of reading as 0, because 0 means "brand-new file" and would re-stamp a
 /// database that is already at a later version.
-async fn read_schema_version(pool: &Pool<Sqlite>) -> Result<i64> {
+async fn read_schema_version(conn: &mut SqliteConnection) -> Result<i64> {
     #[cfg(test)]
     if test_version_read::take() {
         anyhow::bail!("the injected schema-version read failure fired");
     }
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     Ok(version)
 }
 
+/// How many times one start retries the journal-mode race on a brand-new file.
+const CONNECT_ATTEMPTS: u32 = 20;
+
+/// The wait between those retries, which is long enough for the other start's
+/// momentary exclusive lock to clear and short enough to stay invisible.
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+/// Open the pool against `path`. Two processes creating one file at once can
+/// both ask for `journal_mode = WAL`, and SQLite answers `SQLITE_BUSY` for that
+/// change without running the busy handler, so a start that loses the race
+/// retries instead of failing outright.
 async fn connect(path: &Path) -> Result<Pool<Sqlite>> {
     create_parent_dir(path)?;
+    let mut attempts = 0;
+    loop {
+        match open_pool(path).await {
+            Ok(pool) => return Ok(pool),
+            Err(error) if attempts < CONNECT_ATTEMPTS && is_locked(&error) => {
+                attempts += 1;
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("the database at {} could not be opened", path.display())
+                });
+            }
+        }
+    }
+}
+
+/// Whether a connection failure is SQLite's `SQLITE_BUSY`, which the
+/// journal-mode change returns without waiting on the busy handler.
+fn is_locked(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some("5"))
+}
+
+async fn open_pool(path: &Path) -> std::result::Result<Pool<Sqlite>, sqlx::Error> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
@@ -167,6 +313,11 @@ async fn connect(path: &Path) -> Result<Pool<Sqlite>> {
         .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
+    #[cfg(test)]
+    let options = match test_worker_name::take() {
+        Some(prefix) => options.thread_name(move |id| format!("{prefix}-{id}")),
+        None => options,
+    };
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
         .connect_with(options)
@@ -314,35 +465,45 @@ pub async fn load_tasks(
     let mut tx = pool.begin().await?;
     let projects = load_project_handles(&mut tx, repository_id).await?;
     let rows = match repository_id {
-        Some(id) => {
-            sqlx::query_as::<_, TaskRow>(
-                "SELECT t.repository_id, t.scope, t.kind, t.created, t.ship_date, t.leave_date
+        Some(id) => sqlx::query_as::<_, TaskRow>(
+            "SELECT t.repository_id, t.path, t.scope, t.kind, t.created, t.ship_date, t.leave_date
                  FROM tasks t
                  INNER JOIN repositories r ON r.repository_id = t.repository_id
                  WHERE r.repository_id = ?
                  ORDER BY t.path",
-            )
-            .bind(id)
-            .fetch_all(&mut *tx)
-            .await?
-        }
-        None => {
-            sqlx::query_as::<_, TaskRow>(
-                "SELECT t.repository_id, t.scope, t.kind, t.created, t.ship_date, t.leave_date
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?,
+        None => sqlx::query_as::<_, TaskRow>(
+            "SELECT t.repository_id, t.path, t.scope, t.kind, t.created, t.ship_date, t.leave_date
                  FROM tasks t
                  INNER JOIN repositories r ON r.repository_id = t.repository_id
                  ORDER BY r.name COLLATE NOCASE, t.path",
-            )
-            .fetch_all(&mut *tx)
-            .await?
-        }
+        )
+        .fetch_all(&mut *tx)
+        .await?,
     };
     tx.commit().await?;
 
     let mut tasks = Vec::new();
     for row in rows {
-        if let Some(task) = row_to_record(row, &projects) {
-            tasks.push(task);
+        // A row whose repository has no handle has nothing to chart and no
+        // failing value to name, so it keeps its silent drop.
+        let Some(project) = projects.get(&row.repository_id).map(Arc::clone) else {
+            continue;
+        };
+        match row_to_record(row, Arc::clone(&project)) {
+            Ok(task) => tasks.push(task),
+            Err(unparsed) => {
+                tracing::warn!(
+                    repository = %project,
+                    path = %unparsed.path,
+                    kind = %unparsed.kind,
+                    created = %unparsed.created,
+                    "stored task row did not parse; no row charted"
+                );
+            }
         }
     }
     Ok(tasks)
@@ -378,24 +539,53 @@ async fn load_project_handles(
         .collect())
 }
 
+/// The stored values of one row that did not parse, kept so the warning that
+/// names them can report the raw text without a second read.
+struct UnparsedRow {
+    path: String,
+    kind: String,
+    created: String,
+}
+
+impl UnparsedRow {
+    fn new(row: &TaskRow) -> Self {
+        Self {
+            path: row.path.clone(),
+            kind: row.kind.clone(),
+            created: row.created.clone(),
+        }
+    }
+}
+
+/// Turn one stored row into a record, handing back the row's stored values when
+/// one does not parse, so the caller can name the failing value in its warning.
+/// The success path moves the row's strings instead of copying them.
 fn row_to_record(
     row: TaskRow,
-    projects: &HashMap<i64, Arc<str>>,
-) -> Option<crate::series::TaskRecord> {
-    let project = Arc::clone(projects.get(&row.repository_id)?);
-    let kind = crate::harvest::TaskKind::parse(&row.kind)?;
-    let created = crate::dates::parse_iso_date(&row.created)?;
-    Some(crate::series::TaskRecord {
+    project: Arc<str>,
+) -> std::result::Result<crate::series::TaskRecord, UnparsedRow> {
+    let Some(kind) = crate::harvest::TaskKind::parse(&row.kind) else {
+        return Err(UnparsedRow::new(&row));
+    };
+    let Some(created) = crate::dates::parse_iso_date(&row.created) else {
+        return Err(UnparsedRow::new(&row));
+    };
+    let ship_date = row
+        .ship_date
+        .as_deref()
+        .and_then(crate::dates::parse_iso_date);
+    let leave_date = row
+        .leave_date
+        .as_deref()
+        .and_then(crate::dates::parse_iso_date);
+    Ok(crate::series::TaskRecord {
         project,
+        path: row.path,
         scope: row.scope,
         kind,
         created,
-        ship_date: row
-            .ship_date
-            .and_then(|value| crate::dates::parse_iso_date(&value)),
-        leave_date: row
-            .leave_date
-            .and_then(|value| crate::dates::parse_iso_date(&value)),
+        ship_date,
+        leave_date,
     })
 }
 
@@ -469,18 +659,74 @@ pub(crate) mod test_version_read {
     }
 }
 
+/// A thread-local seam beside `test_version_read` that makes the next migration
+/// step to `version` fail before its statement runs. The file keeps the version
+/// it already had, so a test can hold a migration failure to its rollback. It
+/// lives on the test thread, so a parallel test never sees the armed version.
+#[cfg(test)]
+pub(crate) mod test_migration {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_AT: Cell<Option<i64>> = const { Cell::new(None) };
+    }
+
+    pub fn fail_at(version: i64) {
+        FAIL_AT.with(|slot| slot.set(Some(version)));
+    }
+
+    /// Consume the flag, so one armed seam fails exactly one step, and only the
+    /// step that reaches the armed version.
+    pub fn take(version: i64) -> bool {
+        FAIL_AT.with(|slot| {
+            if slot.get() == Some(version) {
+                slot.set(None);
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
+
+/// A thread-local seam beside `test_db` that names the threads a pool's
+/// connections run on. sqlx logs a statement on the connection's own worker
+/// thread, so a test's capture layer needs to recognize those threads by name.
+/// One armed prefix names exactly one pool, so a later test that reuses the
+/// test thread opens its pool with the default thread name.
+#[cfg(test)]
+pub(crate) mod test_worker_name {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static PREFIX: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub fn set(prefix: &str) {
+        PREFIX.with(|slot| {
+            *slot.borrow_mut() = Some(prefix.to_string());
+        });
+    }
+
+    pub fn take() -> Option<String> {
+        PREFIX.with(|slot| slot.borrow_mut().take())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         SCHEMA, SCHEMA_VERSION, StoreHookFn, database_path, delete_repository, init, init_at,
         init_with, list_repositories, load_prior_tasks, load_tasks, migrate, now_stamp,
-        replace_tasks, set_scan_error, test_db, test_version_read,
+        replace_tasks, set_scan_error, test_db, test_migration, test_version_read,
+        test_worker_name,
     };
     use crate::harvest::{ParsedTask, TaskKind};
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
     use sqlx::Row;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::ffi::OsStr;
     use std::future::ready;
     use std::sync::Arc;
     use std::time::Duration;
@@ -600,25 +846,113 @@ mod tests {
     }
 
     /// Installs one process-wide subscriber that records the statements sqlx
-    /// logs for a pool whose worker threads carry `CAPTURE_THREAD_PREFIX`. sqlx
-    /// logs on the connection's worker thread, so the capture layer checks that
-    /// thread's name as the event arrives.
-    fn install_statement_capture() {
+    /// logs for a pool whose worker threads carry `CAPTURE_THREAD_PREFIX`, and
+    /// the warnings `db` itself logs. sqlx logs on the connection's worker
+    /// thread, so the statement layer checks that thread's name as the event
+    /// arrives; a warning from `load_tasks` runs on the caller's thread.
+    fn install_capture() {
         static INSTALL: std::sync::Once = std::sync::Once::new();
         INSTALL.call_once(|| {
-            let layer = StatementCapture {
-                statements: captured_statements(),
-            };
             tracing::subscriber::set_global_default(
                 tracing_subscriber::registry()
                     .with(tracing_subscriber::filter::LevelFilter::DEBUG)
-                    .with(layer),
+                    .with(StatementCapture {
+                        statements: captured_statements(),
+                    })
+                    .with(WarningCapture {
+                        warnings: captured_warnings(),
+                    }),
             )
             .expect(
                 "the statement capture needs the process-wide subscriber: sqlx logs on the \
                  connection's worker thread, so a thread-scoped subscriber cannot see it",
             );
         });
+    }
+
+    static CAPTURED_WARNINGS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<String>>>> =
+        std::sync::OnceLock::new();
+
+    fn captured_warnings() -> Arc<std::sync::Mutex<Vec<String>>> {
+        Arc::clone(CAPTURED_WARNINGS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new()))))
+    }
+
+    #[derive(Clone)]
+    struct WarningCapture {
+        warnings: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN
+                || event.metadata().target() != "task_viewer::db"
+            {
+                return;
+            }
+            let mut fields = WarningFields::default();
+            event.record(&mut fields);
+            self.warnings
+                .lock()
+                .expect("warning log")
+                .push(fields.rendered());
+        }
+    }
+
+    #[derive(Default)]
+    struct WarningFields {
+        message: Option<String>,
+        repository: Option<String>,
+        path: Option<String>,
+        kind: Option<String>,
+        created: Option<String>,
+    }
+
+    impl WarningFields {
+        /// One line carrying every field the warning named, so a test can hold
+        /// the warning to the values it must mention.
+        fn rendered(&self) -> String {
+            let mut line = self.message.clone().unwrap_or_default();
+            for (name, value) in [
+                ("repository", &self.repository),
+                ("path", &self.path),
+                ("kind", &self.kind),
+                ("created", &self.created),
+            ] {
+                if let Some(value) = value {
+                    line.push(' ');
+                    line.push_str(name);
+                    line.push('=');
+                    line.push_str(value);
+                }
+            }
+            line
+        }
+
+        fn set(&mut self, name: &str, value: &str) {
+            let slot = match name {
+                "message" => &mut self.message,
+                "repository" => &mut self.repository,
+                "path" => &mut self.path,
+                "kind" => &mut self.kind,
+                "created" => &mut self.created,
+                _ => return,
+            };
+            *slot = Some(value.to_string());
+        }
+    }
+
+    impl tracing::field::Visit for WarningFields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.set(field.name(), value);
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.set(field.name(), &format!("{value:?}"));
+        }
     }
 
     #[derive(Clone)]
@@ -641,7 +975,15 @@ mod tests {
             }
             let mut fields = StatementFields::default();
             event.record(&mut fields);
-            if let Some(statement) = fields.statement.or(fields.message) {
+            // sqlx fills `db.statement` with the full text only when it differs
+            // from the one-line summary it logs beside it; a short statement
+            // arrives in `summary` alone.
+            let statement = fields
+                .statement
+                .filter(|statement| !statement.is_empty())
+                .or(fields.summary.filter(|summary| !summary.is_empty()))
+                .or(fields.message);
+            if let Some(statement) = statement {
                 self.statements
                     .lock()
                     .expect("statement log")
@@ -654,6 +996,7 @@ mod tests {
     struct StatementFields {
         message: Option<String>,
         statement: Option<String>,
+        summary: Option<String>,
     }
 
     impl tracing::field::Visit for StatementFields {
@@ -661,6 +1004,7 @@ mod tests {
             match field.name() {
                 "message" => self.message = Some(value.to_string()),
                 "db.statement" => self.statement = Some(value.to_string()),
+                "summary" => self.summary = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -839,6 +1183,193 @@ mod tests {
         remove_scratch(&path);
     }
 
+    /// Acceptance: a database stamped below version 3 whose `tasks` table
+    /// already carries `content_hash` migrates to the latest version with one
+    /// column and no error, because the `ALTER` runs only when the column is
+    /// absent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_migrates_a_version_two_database_that_already_has_content_hash() {
+        let path = temp_database();
+        let pool = init_at(&path).await.expect("init");
+        pool.close().await;
+
+        // Stamp the file back to version 2 while its `content_hash` column
+        // stays, the state a half-applied earlier migration leaves behind.
+        let raw = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .expect("version two connection");
+        sqlx::query("PRAGMA user_version = 2")
+            .execute(&raw)
+            .await
+            .expect("version stamp");
+        raw.close().await;
+
+        let pool = init_at(&path)
+            .await
+            .expect("the idempotent migration reaches the latest version");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let columns = sqlx::query("PRAGMA table_info('tasks')")
+            .fetch_all(&pool)
+            .await
+            .expect("table info");
+        let content_hash_columns = columns
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("name").ok())
+            .filter(|name| name == "content_hash")
+            .count();
+        assert_eq!(content_hash_columns, 1);
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Acceptance: a migration step that fails names its version and database
+    /// path, leaves the file at the version it already had, and a later start
+    /// on that file succeeds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_reports_a_forced_migration_failure_with_its_version_and_path() {
+        let path = temp_database();
+        let pool = init_at(&path).await.expect("init");
+        pool.close().await;
+        let raw = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .expect("version two connection");
+        sqlx::query("PRAGMA user_version = 2")
+            .execute(&raw)
+            .await
+            .expect("version stamp");
+        raw.close().await;
+
+        test_migration::fail_at(3);
+        let error = init_at(&path)
+            .await
+            .expect_err("the injected migration failure fails start-up");
+        let message = format!("{error:#}");
+        assert!(message.contains("version 3"), "{message}");
+        assert!(
+            message.contains(&path.display().to_string()),
+            "the failure names its database: {message}"
+        );
+
+        let fresh = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .expect("fresh connection");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&fresh)
+            .await
+            .expect("version");
+        assert_eq!(version, 2, "the failed migration keeps the prior version");
+        fresh.close().await;
+
+        let pool = init_at(&path)
+            .await
+            .expect("a later start migrates the file it left behind");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Acceptance: two starts against one fresh file serialize their migration
+    /// inside one exclusive transaction, so the file reaches the latest version
+    /// with one `content_hash` column and a later start still succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn db_two_starts_on_one_fresh_file_serialize_their_migration() {
+        let path = temp_database();
+        let (first, second) = tokio::join!(init_at(&path), init_at(&path));
+        let first = first.expect("the first start migrates the fresh file");
+        let second = second.expect("the second start reads the migrated file");
+
+        for pool in [&first, &second] {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(pool)
+                .await
+                .expect("version");
+            assert_eq!(version, SCHEMA_VERSION);
+        }
+        let columns = sqlx::query("PRAGMA table_info('tasks')")
+            .fetch_all(&first)
+            .await
+            .expect("table info");
+        let content_hash_columns = columns
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("name").ok())
+            .filter(|name| name == "content_hash")
+            .count();
+        assert_eq!(content_hash_columns, 1);
+        first.close().await;
+        second.close().await;
+
+        let later = init_at(&path)
+            .await
+            .expect("a later start succeeds on the migrated file");
+        later.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Acceptance: the whole migration of a fresh file runs in one
+    /// `BEGIN IMMEDIATE` transaction, with the schema-version read inside it and
+    /// exactly one `COMMIT` after the last migration.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_migrates_a_fresh_file_in_one_immediate_transaction() {
+        install_capture();
+        test_worker_name::set(CAPTURE_THREAD_PREFIX);
+        let path = temp_database();
+
+        captured_statements().lock().expect("statement log").clear();
+        let pool = init_at(&path).await.expect("init");
+        // Closing waits for the worker threads, so every statement's log event
+        // has run before the capture is read.
+        pool.close().await;
+
+        let statements = captured_statements().lock().expect("statement log").clone();
+        let trimmed = |statement: &String| statement.trim().to_string();
+        let begins: Vec<usize> = statements
+            .iter()
+            .enumerate()
+            .filter(|(_, statement)| trimmed(statement) == "BEGIN IMMEDIATE")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(begins.len(), 1, "one exclusive begin: {statements:?}");
+        let commits: Vec<usize> = statements
+            .iter()
+            .enumerate()
+            .filter(|(_, statement)| trimmed(statement) == "COMMIT")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(commits.len(), 1, "one commit: {statements:?}");
+        let version_read = statements
+            .iter()
+            .position(|statement| trimmed(statement) == "PRAGMA user_version")
+            .expect("the schema version is read");
+        assert!(
+            begins[0] < version_read,
+            "the version read happens inside the transaction: {statements:?}"
+        );
+        let last_migration = statements
+            .iter()
+            .rposition(|statement| trimmed(statement) == "PRAGMA user_version = 3")
+            .expect("the last migration stamps version 3");
+        assert!(
+            commits[0] > last_migration,
+            "the commit follows the last migration: {statements:?}"
+        );
+
+        remove_scratch(&path);
+    }
+
     /// Acceptance: a read that fails makes start-up report that cause instead of
     /// treating the database as brand new.
     #[tokio::test(flavor = "current_thread")]
@@ -846,16 +1377,21 @@ mod tests {
         let path = temp_database();
         test_db::set(path.clone());
         let pool = init().await.expect("init");
-        pool.close().await;
 
-        let error = migrate(&pool)
+        test_version_read::fail_next();
+        let error = migrate(&pool, &path)
             .await
-            .expect_err("a closed pool cannot read the schema version");
+            .expect_err("the injected read failure fails the migration");
         let message = format!("{error:#}");
         assert!(
             message.contains("schema version could not be read"),
             "{message}"
         );
+        assert!(
+            message.contains(&path.display().to_string()),
+            "the failure names its database: {message}"
+        );
+        pool.close().await;
         remove_scratch(&path);
     }
 
@@ -953,7 +1489,7 @@ mod tests {
         let root = unique_temp_dir("db_creates_parent");
         let path = root.join("nested").join("test.db");
         let raw = path.to_str().expect("utf-8 path");
-        let pool = init_with(Some(raw))
+        let pool = init_with(Some(OsStr::new(raw)))
             .await
             .expect("init creates the directory");
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
@@ -981,7 +1517,7 @@ mod tests {
         std::fs::write(&blocker, b"not a directory").expect("blocker file");
         let path = blocker.join("test.db");
         let raw = path.to_str().expect("utf-8 path");
-        let error = match init_with(Some(raw)).await {
+        let error = match init_with(Some(OsStr::new(raw))).await {
             Ok(_) => panic!("init must reject a parent that is a regular file"),
             Err(error) => error,
         };
@@ -993,11 +1529,63 @@ mod tests {
 
     #[test]
     fn db_rejects_an_empty_configured_path() {
-        let error = match database_path(Some("")) {
+        let error = match database_path(Some(OsStr::new(""))) {
             Ok(path) => panic!("expected an error, got {}", path.display()),
             Err(error) => error,
         };
         assert!(error.to_string().contains("TASK_VIEWER_DB"));
+    }
+
+    /// Acceptance: a `TASK_VIEWER_DB` that is not valid UTF-8 fails start-up
+    /// with the variable named instead of opening a lossily decoded path.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_rejects_a_non_unicode_configured_path() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = OsStr::from_bytes(b"/tmp/task-viewer-\xff.db");
+        let error = match init_with(Some(raw)).await {
+            Ok(_) => panic!("a non-Unicode path must not open a database"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("TASK_VIEWER_DB"), "{message}");
+        assert!(message.contains("UTF-8"), "{message}");
+    }
+
+    /// Acceptance: padding around `TASK_VIEWER_DB` names the same file as the
+    /// unpadded path, so it never opens a second database.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_trims_padding_around_a_configured_path() {
+        let dir = unique_temp_dir("db_padded_path");
+        std::fs::create_dir_all(&dir).expect("db scratch");
+        let path = dir.join("test.db");
+        let raw = path.to_str().expect("utf-8 path");
+        let padded = format!("  {raw}  ");
+        let pool = init_with(Some(OsStr::new(&padded)))
+            .await
+            .expect("init opens the padded path");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        pool.close().await;
+
+        assert!(
+            path.is_file(),
+            "the padding reached the opened path: {}",
+            path.display()
+        );
+        let mut databases: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read the scratch dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".db"))
+            .collect();
+        databases.sort_unstable();
+        assert_eq!(databases, vec!["test.db".to_string()]);
+        remove_scratch(&path);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1074,6 +1662,45 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    /// Acceptance: a stored row whose `created` does not parse produces one
+    /// warning naming its repository, path, and value, and contributes no row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_warns_once_about_a_stored_row_that_does_not_parse() {
+        install_capture();
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        sqlx::query(
+            "INSERT INTO tasks (repository_id, path, scope, kind, created, updated)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("tasks/scope_broken.md")
+        .bind("scope")
+        .bind("live")
+        .bind("not-a-date")
+        .bind("2026-01-01")
+        .execute(&pool)
+        .await
+        .expect("unparseable row");
+
+        let warnings = captured_warnings();
+        warnings.lock().expect("warning log").clear();
+        let loaded = load_tasks(&pool, None).await.expect("load");
+        assert!(loaded.is_empty(), "the unparseable row charts nothing");
+        let warnings = warnings.lock().expect("warning log").clone();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = &warnings[0];
+        assert!(warning.contains("ai-modules"), "{warning}");
+        assert!(warning.contains("tasks/scope_broken.md"), "{warning}");
+        assert!(warning.contains("not-a-date"), "{warning}");
+        pool.close().await;
+        remove_scratch(&path);
     }
 
     /// A leave day that only the frontmatter `updated` fallback supplies carries
@@ -1178,7 +1805,7 @@ mod tests {
     /// loads with the same project name through one shared handle.
     #[tokio::test(flavor = "current_thread")]
     async fn db_stores_a_large_repository_in_chunks_and_shares_one_project_handle() {
-        install_statement_capture();
+        install_capture();
         let path = temp_database();
         test_db::set(path.clone());
         let schema = init().await.expect("init");
