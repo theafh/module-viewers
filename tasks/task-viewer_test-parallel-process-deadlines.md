@@ -2,8 +2,8 @@
 description: "Make the two fixed five-second test deadlines immune to process-start latency under the parallel suite, with the margin measured rather than guessed."
 scope: task-viewer/src
 created: 2026-11-17T17:55:59Z
-updated: 2026-11-17T19:00:58Z
-status: checked
+updated: 2026-11-17T19:25:52Z
+status: ready
 reported-by: Andreas Hoffmann
 ---
 
@@ -25,8 +25,8 @@ reported-by: Andreas Hoffmann
 ## Approach
 
 - Reproduce first. Build a load harness that runs the full suite repeatedly under a fixed CPU load, and measure process-start latency the way these tests experience it: spawn a stand-in script and time it from spawn to its first output. Record the worst case, the load, and the run count.
-- Repair each site by warming the stand-in before the measured call, the one pattern both sites can carry. At the harvest site warm the script the way `fn register_fake_git_with_deadline` already does. At the web site warm it inside `harvest::register_test_git`, which takes the single `Duration` it registers, returns nothing, and `web.rs` holds its only call, so the warm-up belongs inside that helper. Retry is not the pattern at either site: one registration governs every git command in the scan, and `web.rs` cannot reach the private `run_git_command` to retry a call against a marker. Both sites follow the one rule that `TESTING.md`'s Test Design Principles states.
-- Set each deadline to `max(5 s, measured worst case × stated margin)`, so five seconds is the floor and the measured margin governs when process start dominates: `harvest.rs`'s `run_git_command` calls `spawn()` before it sets `let started = Instant::now()`, so the budget begins only after `spawn()` returns and the child's own startup and scheduling wait are charged against it, which is exactly the case where five seconds fails. Record the protocol and the number in a comment at each constant, so a later reader sees why the value is what it is.
+- Repair each site by warming the stand-in before the measured call, the one pattern both sites can carry. At the harvest site warm the script the way `fn register_fake_git_with_deadline` already does. At the web site warm it inside `harvest::register_test_git`, which takes the single `Duration` it registers, returns nothing, and `web.rs` calls it twice — at `web_scan_keeps_earlier_rows_when_a_ref_union_blob_vanishes` and at `web_scan_keeps_earlier_rows_when_the_enclosing_probe_fails`, both with `Duration::from_secs(5)` — so a warm-up inside that helper covers both callers, and the enclosing-probe test's existing warm-up before its own registration stays as it is. Retry is not the pattern at either site: one registration governs every git command in the scan, and `web.rs` cannot reach the private `run_git_command` to retry a call against a marker. Both sites follow the one rule that `TESTING.md`'s Test Design Principles states.
+- Set each deadline to `max(5 s, measured worst case × 5)`. The stated margin is that factor of 5×, taken from the archived `task-viewer_harvest-timeout-flake` precedent recorded in `## Context`, which raised a 2 s deadline that failed 7 of 20 loaded full-suite runs to 10 s — the only recorded margin measurement in this repo. Five seconds is the floor, and the measured worst case times 5× governs when process start dominates: `harvest.rs`'s `run_git_command` calls `spawn()` before it sets `let started = Instant::now()`, so the budget begins only after `spawn()` returns and the child's own startup and scheduling wait are charged against it, which is exactly the case where five seconds fails. Record the protocol and the number in a comment at each constant, so a later reader sees why the value is what it is.
 - State the rule once in `TESTING.md`'s Test Design Principles: a test that passes a wall-clock deadline for process work carries the measured start latency that justifies it, and warms or retries rather than guessing.
 - The two tests keep proving what they prove today: the drain test asserts the 256 KiB stdout and stderr contents, and the vanished-blob test asserts the scan's recorded error names the path.
 
@@ -38,7 +38,7 @@ reported-by: Andreas Hoffmann
 - The measurement protocol is recorded in this task's body as its run count, its load, and its harness command, and the recorded worst case is written beside each constant.
 - Ten consecutive full `make test` runs under the recorded load harness each report a passing suite, with no failure of either test.
 - The drain test asserts 262144 `o` bytes on stdout and 262144 `e` bytes on stderr, and the vanished-blob test asserts the scan's recorded error names `tasks/scope_vanished.md`, so a warm-up restructure that drops either assertion fails this item.
-- A grep over `task-viewer/src` for a `Duration::from_secs` argument passed to `run_git_command` or `register_test_git` finds no site carrying a value smaller than the measured worst case without a comment stating its measurement.
+- A grep over `task-viewer/src` for a `Duration::from_secs` argument passed to `run_git_command` or `register_test_git` at the two sites this task repairs — `harvest.rs`'s drain-test argument and the vanished-blob test's `register_test_git` argument — finds no value smaller than the measured worst case without a comment stating its measurement.
 - `TESTING.md`'s Test Design Principles carries the deadline rule once, and no other passage states a second version of it.
 - If the harness records no failure across its protocol, the task records that outcome and adopts the measured worst case times the stated margin, and restoring a guessed constant with no measurement is not a repair.
 - When a run in the ten-run protocol fails, the task re-measures process-start latency at that run's load, enlarges the margin from the new worst case, writes the new value and measurement beside the deadline or warm-up argument at the failing site, and restarts the full ten-run protocol from run one.

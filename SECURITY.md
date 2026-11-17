@@ -40,11 +40,11 @@ The desktop launcher keeps four files in a per-user directory outside the checko
 
 ## Dependencies
 
-Dependencies stay pinned in `Cargo.lock`. Run `make audit` when they change.
+Dependencies stay pinned in `Cargo.lock`. Run `make audit` when they change. It runs three checks: `cargo audit` over the lockfile, `scripts/vendor-sqlx-sqlite-sha256.sh verify`, which recomputes the per-file SHA-256 digests under `vendor/sqlx-sqlite` and fails on an added, a missing, or a changed file against the recorded `vendor/sqlx-sqlite.sha256`, and `scripts/check-rsa-reachability.sh`, which runs `cargo tree -i rsa` and fails when the reverse listing names `rsa`.
 
-`Cargo.lock` also pins `rsa` 0.9.10 through `sqlx-mysql`, an optional `sqlx` backend that this workspace never builds. `cargo audit` reports RUSTSEC-2023-0071 against that crate, and the advisory has no fixed upgrade. `.cargo/audit.toml` records it in `[advisories] ignore`, and `cargo tree -i rsa` rechecks reachability: it prints nothing while `rsa` stays outside the build graph. A dependency change that pulls `rsa` into a built target removes the ignore and fixes the advisory instead.
+`Cargo.lock` also pins `rsa` 0.9.10 through `sqlx-mysql`, an optional `sqlx` backend that this workspace never builds. `cargo audit` reports RUSTSEC-2023-0071 against that crate, and the advisory has no fixed upgrade. `.cargo/audit.toml` records it in `[advisories] ignore`, and `make audit` rechecks reachability with `cargo tree -i rsa`, which prints nothing while `rsa` stays outside the build graph, so the ignore cannot outlive its justification. A dependency change that pulls `rsa` into a built target removes the ignore and fixes the advisory instead.
 
-The SQLite driver is `sqlx-sqlite` 0.8.6 vendored at `vendor/sqlx-sqlite`; its only change from the published crate is a widened `libsqlite3-sys` bound (`>=0.30.1, <0.40.0`), matching sqlx's own upstream bump. That bound lets `Cargo.lock` carry `libsqlite3-sys` 0.39.1, whose bundled SQLite 3.54.1 carries the fix for RUSTSEC-2026-0459, and a database test pins the floor at 3.54.0. Remove the vendored copy and the `[patch.crates-io]` entry once a released `sqlx` carries the widened bound.
+The SQLite driver is `sqlx-sqlite` 0.8.6 vendored at `vendor/sqlx-sqlite`; its only change from the published crate is a widened `libsqlite3-sys` bound (`>=0.30.1, <0.40.0`), matching sqlx's own upstream bump. That bound lets `Cargo.lock` carry `libsqlite3-sys` 0.39.1, whose bundled SQLite 3.54.1 carries the fix for RUSTSEC-2026-0459, and a database test pins the floor at 3.54.0. A path-patched crate carries no `Cargo.lock` checksum and `cargo audit` never scans it, so `vendor/sqlx-sqlite.sha256` records one SHA-256 line per tracked file and `make audit` verifies it, which turns the gate red when a vendored byte changes. Remove the vendored copy and the `[patch.crates-io]` entry once a released `sqlx` carries the widened bound.
 
 ## Per-Change Checklist
 

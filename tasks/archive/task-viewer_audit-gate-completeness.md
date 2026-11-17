@@ -2,8 +2,10 @@
 description: "Pin the vendored sqlx-sqlite tree with per-file checksums recorded in the repository and verified by make audit, and run the rsa reverse-dependency check SECURITY.md conditions its ignore on."
 scope: task-viewer
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:52:55Z
-status: ready
+updated: 2026-11-17T20:57:06Z
+status: finished
+implemented-by: Andreas Hoffmann
+design-extended: false
 reported-by: Andreas Hoffmann
 ---
 
@@ -18,7 +20,7 @@ The vendored `sqlx-sqlite` tree is pinned by per-file checksums recorded in this
 - Build order: independent. No other live task edits the `Makefile` audit target, `SECURITY.md`'s `## Dependencies` section, or `vendor/`.
 - `vendor/sqlx-sqlite` sits outside `Cargo.lock`'s checksum coverage and outside `cargo audit`'s scan.
 - `SECURITY.md` makes the `rsa` advisory ignore conditional on a reverse-dependency check that `make audit` never runs.
-- Prior art: [task-viewer_cargo-audit-gate.md](archive/task-viewer_cargo-audit-gate.md) made the documented gate pass; these are the two remaining holes in it.
+- Prior art: [task-viewer_cargo-audit-gate.md](task-viewer_cargo-audit-gate.md) made the documented gate pass; these are the two remaining holes in it.
 
 ## Approach
 

@@ -29,6 +29,7 @@ restart:
 test:
 	RUSTFLAGS="$(TEST_RUSTFLAGS)" CARGO_TARGET_DIR="$(CURDIR)/target" cargo test -p task-viewer
 	./scripts/tests/launcher-build-truth.sh
+	./scripts/tests/audit-gate.sh
 
 lint:
 	CARGO_TARGET_DIR="$(CURDIR)/target" cargo clippy -p task-viewer --all-targets -- -D warnings
@@ -42,6 +43,8 @@ fix:
 
 audit:
 	cargo audit
+	./scripts/vendor-sqlx-sqlite-sha256.sh verify
+	./scripts/check-rsa-reachability.sh
 
 install install-desktop:
 	./scripts/install-desktop.sh
