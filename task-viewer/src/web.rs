@@ -332,7 +332,9 @@ pub fn remaining(deadline: Instant) -> Duration {
 /// holds `state.scan` from listing through the last store, so the drain waits
 /// for that lock under the same deadline. The database close then runs under
 /// the time the deadline has left and is dropped once it is spent, leaving an
-/// unfinished store to the WAL rollback on the next open.
+/// unfinished store to the WAL rollback on the next open. A listener that ends
+/// before any signal arrives skips the drain and still closes the pool within
+/// `grace`, so an ended server leaves no open handle on the database.
 pub async fn serve(
     listener: TcpListener,
     app: Router,
@@ -340,39 +342,50 @@ pub async fn serve(
     grace: Duration,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Instant {
-    let deadline = Arc::new(std::sync::Mutex::new(None::<Instant>));
     let (notified_tx, notified_rx) = tokio::sync::oneshot::channel();
-    let shutdown = {
-        let deadline = Arc::clone(&deadline);
-        async move {
-            shutdown.await;
-            if let Ok(mut slot) = deadline.lock() {
-                *slot = Some(Instant::now() + grace);
-            }
-            let _ = notified_tx.send(());
-        }
+    let shutdown = async move {
+        shutdown.await;
+        let _ = notified_tx.send(Instant::now() + grace);
     };
-    let mut server = Box::pin(async move {
+    let server = async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await
-    });
+    };
+    let notified = async move { notified_rx.await.unwrap_or_else(|_| Instant::now() + grace) };
+    serve_until_stopped(server, notified, state, grace).await
+}
+
+/// Drive `server` until `notified` hands over the deadline a signalled stop
+/// drains against, or until the listener ends on its own, then drain and close
+/// the pool. A server that ends before any signal has nothing left to drain, so
+/// it skips the drain and takes a fresh `grace` budget for the close instead of
+/// a spent one.
+async fn serve_until_stopped<F, N>(
+    server: F,
+    notified: N,
+    state: AppState,
+    grace: Duration,
+) -> Instant
+where
+    F: Future<Output = std::io::Result<()>> + Send,
+    N: Future<Output = Instant> + Send,
+{
+    let mut server = Box::pin(server);
     let deadline = tokio::select! {
         // Prefer the signal so a server that drained in the same poll still
         // reports the deadline it drained against.
         biased;
-        _ = notified_rx => deadline
-            .lock()
-            .ok()
-            .and_then(|slot| *slot)
-            .unwrap_or_else(Instant::now),
+        deadline = notified => deadline,
         ended = &mut server => {
             // The listener stopped before any signal arrived, so there is
-            // nothing left to drain.
+            // nothing left to drain. The close gets its own grace budget.
             if let Err(error) = ended {
                 tracing::error!(%error, "the listener stopped");
             }
-            return Instant::now();
+            let deadline = Instant::now() + grace;
+            close_pool(&state, deadline).await;
+            return deadline;
         }
     };
     // Stop accepting has already happened; wait for the open connections and a
@@ -390,6 +403,14 @@ pub async fn serve(
     {
         tracing::warn!("the shutdown grace period ended before the drain finished");
     }
+    close_pool(&state, deadline).await;
+    deadline
+}
+
+/// Close the database under the time `deadline` has left, warning when the
+/// close outlives it. Both the signalled stop and the early listener end call
+/// it, so the pool has one close site.
+async fn close_pool(state: &AppState, deadline: Instant) {
     let left = remaining(deadline);
     if !left.is_zero()
         && tokio::time::timeout(left, state.pool.close())
@@ -398,7 +419,6 @@ pub async fn serve(
     {
         tracing::warn!("the database close did not finish inside the shutdown grace period");
     }
-    deadline
 }
 
 async fn require_local_host(request: axum::extract::Request, next: Next) -> Response {
@@ -1132,11 +1152,12 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
 }
 
 /// List the repositories, harvest them, and store each result while holding the
-/// scan lock. Only this task acquires the lock; `scan_core` never does, so the
-/// whole list-then-harvest-then-store sequence stays under one owner. Taking
-/// the lock is the wait for a scan that already runs, and the pending-scan slot
-/// is emptied right after it, so a later click starts a new follow-up instead
-/// of joining a run that may already be reading files.
+/// scan lock. The lock is held across the whole list-then-harvest-then-store
+/// sequence, `fn add_repository` and `fn remove_repository` take the same lock,
+/// and `scan_core` never takes it. Taking the lock is the wait for a scan that
+/// already runs, and the pending-scan slot is emptied right after it, so a later
+/// click starts a new follow-up instead of joining a run that may already be
+/// reading files.
 async fn run_scan(state: AppState) -> Result<ScanReport, Banner> {
     let _guard = state.scan.lock().await;
     {
@@ -1473,8 +1494,9 @@ fn redirect_repositories(banner: Banner) -> Response {
 }
 
 /// Percent-encode a message for a redirect query, writing into one `String`.
-/// A space becomes `%20` and every other byte outside the unreserved set
-/// becomes `%XX` from the uppercase hex table, so no escape allocates.
+/// A space becomes `%20` and every other byte outside the keep-set
+/// `A-Z a-z 0-9 - . _` becomes `%XX` from the uppercase hex table, so `~` is
+/// written `%7E` and no escape allocates.
 fn encode_query(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(value.len());
@@ -1503,7 +1525,8 @@ mod tests {
         ScanReport, StoreHookFn, add_repository, claim_banner, encode_query, flash_banner,
         init_templates, is_local_host, query_banner, record_scan_error, remaining,
         remove_repository, render_blocking_thread, render_home, router, scan_all, scan_core,
-        scan_flash, scan_label, scan_response, scan_worker_cap, serve, static_version,
+        scan_flash, scan_label, scan_response, scan_worker_cap, serve, serve_until_stopped,
+        static_version,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -6936,6 +6959,27 @@ mod tests {
         assert!(
             remaining(deadline) > Duration::ZERO,
             "the drain finished inside its grace period"
+        );
+        assert!(state.pool.is_closed(), "the pool is closed");
+        cleanup(&path);
+    }
+
+    /// Acceptance: a listener that ends before any shutdown signal still closes
+    /// the pool, under a fresh grace budget rather than a spent one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_serve_closes_the_pool_when_the_listener_ends_early() {
+        let (state, path) = app_state("serve_listener_ends").await;
+        let ended = std::io::Error::other("the listener stopped");
+        let deadline = serve_until_stopped(
+            async move { Err::<(), std::io::Error>(ended) },
+            std::future::pending::<Instant>(),
+            state.clone(),
+            Duration::from_secs(4),
+        )
+        .await;
+        assert!(
+            remaining(deadline) > Duration::ZERO,
+            "the early end takes a fresh grace budget for the close"
         );
         assert!(state.pool.is_closed(), "the pool is closed");
         cleanup(&path);
