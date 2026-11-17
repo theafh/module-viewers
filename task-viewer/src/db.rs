@@ -127,6 +127,12 @@ pub async fn init_at(path: &Path) -> Result<Pool<Sqlite>> {
 /// serialize here instead of both reading version 0 and stamping the file
 /// back, and a step that fails rolls the whole run back, so the file keeps the
 /// version it had.
+///
+/// The transaction opens before the version read, so every start takes
+/// SQLite's write lock even when the schema is already current. A start that
+/// lands while another process holds that lock waits out the five-second
+/// busy timeout and fails with `the database at … could not begin its schema
+/// migration` rather than opening read-only.
 async fn migrate(pool: &Pool<Sqlite>, path: &Path) -> Result<()> {
     let mut conn = pool.acquire().await.with_context(|| {
         format!(
@@ -301,8 +307,19 @@ async fn connect(path: &Path) -> Result<Pool<Sqlite>> {
 
 /// Whether a connection failure is SQLite's `SQLITE_BUSY`, which the
 /// journal-mode change returns without waiting on the busy handler.
+///
+/// `sqlx` reports `sqlite3_extended_errcode`, so a busy variant arrives as
+/// `261` (`SQLITE_BUSY_RECOVERY`), `517` (`SQLITE_BUSY_SNAPSHOT`), or `773`
+/// (`SQLITE_BUSY_TIMEOUT`) rather than `5`. SQLite defines every extended code
+/// as its primary code in the low byte, so the comparison masks to that byte
+/// and the retry covers every busy shape.
 fn is_locked(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some("5"))
+    matches!(error, sqlx::Error::Database(database)
+        if database
+            .code()
+            .as_deref()
+            .and_then(|code| code.parse::<u32>().ok())
+            .is_some_and(|code| code & 0xff == 5))
 }
 
 async fn open_pool(path: &Path) -> std::result::Result<Pool<Sqlite>, sqlx::Error> {
@@ -717,7 +734,7 @@ pub(crate) mod test_worker_name {
 mod tests {
     use super::{
         SCHEMA, SCHEMA_VERSION, StoreHookFn, database_path, delete_repository, init, init_at,
-        init_with, list_repositories, load_prior_tasks, load_tasks, migrate, now_stamp,
+        init_with, is_locked, list_repositories, load_prior_tasks, load_tasks, migrate, now_stamp,
         replace_tasks, set_scan_error, test_db, test_migration, test_version_read,
         test_worker_name,
     };
@@ -758,6 +775,64 @@ mod tests {
 
     fn immediate_hook() -> Arc<StoreHookFn> {
         Arc::new(|| Box::pin(ready(())))
+    }
+
+    /// A `sqlx::Error::Database` carrying one SQLite result code, so the
+    /// `is_locked` predicate runs without a live database.
+    #[derive(Debug)]
+    struct CodeError(&'static str);
+
+    impl std::fmt::Display for CodeError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "(code: {}) stub error", self.0)
+        }
+    }
+
+    impl std::error::Error for CodeError {}
+
+    impl sqlx::error::DatabaseError for CodeError {
+        fn message(&self) -> &str {
+            "stub error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.0))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn is_locked_for(code: &'static str) -> bool {
+        is_locked(&sqlx::Error::Database(Box::new(CodeError(code))))
+    }
+
+    /// `sqlx` reports SQLite's extended result code, so the retry has to
+    /// recognize every busy variant and nothing else.
+    #[test]
+    fn is_locked_recognizes_every_busy_variant() {
+        for code in ["5", "261", "517", "773"] {
+            assert!(
+                is_locked_for(code),
+                "SQLITE_BUSY code {code} must be retried"
+            );
+        }
+        for code in ["19", "6", "not-a-code"] {
+            assert!(!is_locked_for(code), "code {code} must not be retried");
+        }
     }
 
     #[test]
