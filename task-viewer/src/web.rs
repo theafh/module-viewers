@@ -4233,6 +4233,42 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Acceptance: the sixteen codes the closed set names today round-trip
+    /// through `Banner::from_code`, so a `code` arm that disagrees with its
+    /// `from_code` arm fails here. `code` and `message` are exhaustive matches,
+    /// so a new variant forces an arm in each; `from_code` and this `ALL` array
+    /// are hand-written, so a new variant must be added to both.
+    #[test]
+    fn web_banner_codes_round_trip() {
+        const ALL: [Banner; 16] = [
+            Banner::RepositoryAdded,
+            Banner::RepositoryRemoved,
+            Banner::ChartsUpdated,
+            Banner::NothingToUpdate,
+            Banner::RepositoryExists,
+            Banner::RepositoryListUnreadable,
+            Banner::RepositorySaveFailed,
+            Banner::RepositoryRemoveFailed,
+            Banner::RepositoryNotFound,
+            Banner::NoTasksDirectory,
+            Banner::SaveFailed,
+            Banner::GitUnreadable,
+            Banner::ScanUnreadable,
+            Banner::ScanStopped,
+            Banner::PickerUnsupported,
+            Banner::PickerNoSession,
+        ];
+
+        for banner in ALL {
+            let code = banner.code();
+            assert_eq!(
+                Banner::from_code(code),
+                Some(banner),
+                "code {code} must decode to the banner it names"
+            );
+        }
+    }
+
     /// Acceptance: a flash store at capacity plus one keeps its bound after
     /// `restore`, evicting the oldest banner exactly as `insert` does.
     #[test]
