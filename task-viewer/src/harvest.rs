@@ -451,14 +451,27 @@ fn harvest_chosen(
 /// One chosen working-tree row's content: the text the cache retained, or a
 /// fresh read bounded by `MAX_TASK_FILE_BYTES + 1` when the cache evicted the
 /// row or the file changed since the walk. A file that can no longer be read,
-/// is not UTF-8, or is over the cap contributes no row.
+/// is not UTF-8, or is over the cap contributes no row and warns once with its
+/// path, byte count, and reason, as the walk does.
 fn worktree_content(repo: &Path, worktree: &mut WorktreeFiles, path: &str) -> Option<String> {
     if let Some((text, _)) = worktree.remove(path) {
         return Some(text);
     }
     #[cfg(test)]
     worktree_read_count::record(repo);
-    read_worktree_file(&repo.join(path)).outcome.ok()
+    let read = read_worktree_file(&repo.join(path));
+    match read.outcome {
+        Ok(text) => Some(text),
+        Err(reason) => {
+            // The byte count comes from the file's metadata, so a file that
+            // cannot be opened or is not UTF-8 still reports its real size.
+            let bytes = fs::metadata(repo.join(path))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            warn_skipped_worktree_task(path, bytes, reason);
+            None
+        }
+    }
 }
 
 /// Rank a version of a task: working tree before a commit, then an archived
@@ -740,13 +753,27 @@ fn harvest_files(
         }
         // An evicted row was charted during the walk, so re-read it one file at
         // a time through the same size cap. A file that changed since the walk
-        // is classified again instead of charted from stale text.
+        // is classified again instead of charted from stale text, and a re-read
+        // that fails warns once with its path, byte count, and reason.
         let text = match row.text {
             Some(text) => Some(text),
             None => {
                 #[cfg(test)]
                 worktree_read_count::record(repo);
-                read_worktree_file(&repo.join(&row.path)).outcome.ok()
+                let read = read_worktree_file(&repo.join(&row.path));
+                match read.outcome {
+                    Ok(text) => Some(text),
+                    Err(reason) => {
+                        // The byte count comes from the file's metadata, so a
+                        // file that cannot be opened or is not UTF-8 still
+                        // reports its real size.
+                        let bytes = fs::metadata(repo.join(&row.path))
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        warn_skipped_worktree_task(&row.path, bytes, reason);
+                        None
+                    }
+                }
             }
         };
         if let Some(text) = text {
