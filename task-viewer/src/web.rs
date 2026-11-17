@@ -3958,6 +3958,108 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Acceptance: an enclosing-repository probe that fails for a reason other
+    /// than the outside-git answer fails the scan, stores the fixed `GIT_ERROR`
+    /// message, and keeps the repository's previous rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_keeps_earlier_rows_when_the_enclosing_probe_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_database("scan_enclosing_probe_fails");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let parent = unique_temp_dir("scan_enclosing_probe_fails_repo");
+        std::fs::create_dir_all(parent.join("nested/tasks")).expect("tasks");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::write(
+            parent.join("nested/tasks/scope_live.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Live\n",
+        )
+        .expect("task");
+
+        let bin = unique_temp_dir("scan_enclosing_probe_fails_bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let script = bin.join("git");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$#\" in 0) exit 0 ;; esac\necho 'fatal: simulated probe failure' >&2\nexit 128\n",
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+        // Warm the stand-in's process start before the measured scan, so a
+        // loaded machine cannot charge start latency against the deadline.
+        let _ = std::process::Command::new(&script).status();
+        harvest::register_test_git(&parent, &script, std::time::Duration::from_secs(5));
+
+        let nested = parent.join("nested");
+        let id = db::insert_repository(&pool, "probe", &nested.to_string_lossy())
+            .await
+            .expect("insert");
+        sqlx::query(
+            "INSERT INTO tasks
+                (repository_id, path, scope, kind, created, updated, ship_date, leave_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("tasks/scope_old.md")
+        .bind("scope")
+        .bind("live")
+        .bind("2026-05-01")
+        .bind("2026-05-01")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("earlier rows");
+
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        let harvest: Arc<HarvestFn> = Arc::new(|path: &Path, prior: &[PriorTask]| {
+            let outcome = harvest::harvest_repository_with_prior(path, prior);
+            match &outcome {
+                Err(HarvestError::Git(message)) => assert!(
+                    message.contains("simulated probe failure"),
+                    "the probe failure must carry git's stderr: {message}"
+                ),
+                other => panic!("expected a Git error carrying git's stderr, got {other:?}"),
+            }
+            outcome
+        });
+        scan_core(
+            &pool,
+            &repositories,
+            1,
+            harvest,
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+
+        let after = db::list_repositories(&pool).await.expect("after");
+        let failed = after
+            .iter()
+            .find(|repository| repository.repository_id == id)
+            .expect("repository");
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some(GIT_ERROR),
+            "the failed probe stores the fixed git message"
+        );
+        let rows = db::load_tasks(&pool, Some(id)).await.expect("earlier rows");
+        assert_eq!(rows.len(), 1, "the earlier rows stay intact");
+        assert_eq!(rows[0].scope, "scope");
+
+        harvest::clear_test_git(&parent);
+        let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&bin);
+        cleanup(&path);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn web_scan_report_names_the_failed_repository() {
         let path = temp_database("scan_report_failure");

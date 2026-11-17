@@ -2,9 +2,11 @@
 description: "Give every skipped harvest input a log line with its real cause, surface git's stderr on parse failures, fail the scan on probe and listing failures, and bound the cached worktree text."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-15T00:24:37Z
-status: ready
+updated: 2026-11-17T19:08:33Z
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Make every harvest skip visible with its real cause
@@ -17,7 +19,7 @@ A working-tree task that cannot be opened, is not UTF-8, or exceeds the size cap
 
 - Build order: first in the harvest cluster. Blocks `task-viewer_harvest-git-failure-cases.md`, which reshapes the same `fn files_on_disk` and `fn union_files` surface, and blocks `task-viewer_guardrail-doc-sync.md`, which documents the failed-enclosing-probe rule this task establishes.
 - `task-viewer/src/harvest.rs` owns these paths: `fn files_on_disk` skips on `File::open` failure, read failure, and the size cap with a bare `continue`; the committed-blob path calls `String::from_utf8(body).unwrap_or_default()` and hands an empty string to the frontmatter parser; the `cat-file` reader reports "truncated object header" without git's stderr; `fn enclosing_prefix` collapses every non-timeout `rev-parse` failure to `Ok(None)`, both the spawn-failure arm and the nonzero-exit arm, so a probe that broke charts its folder as outside git; and one git read does `let _ = pipe.read_to_end(&mut buffer);`.
-- The finished task [task-viewer_harvest-silent-drops.md](archive/task-viewer_harvest-silent-drops.md) promised "a log line naming it and the reason". These are the paths that promise does not yet cover.
+- The finished task [task-viewer_harvest-silent-drops.md](task-viewer_harvest-silent-drops.md) promised "a log line naming it and the reason". These are the paths that promise does not yet cover.
 - `task-viewer/src/harvest.rs` also documents a worktree content map whose "never all resident" claim is false for worktree files: `fn worktree_content` already removes each row's text after use, but `fn files_on_disk` first materialises every file's text in one `Vec`, so peak residency is the whole `tasks/` tree. A budget that evicts leaves the evicted path out of `WorktreeFiles`, so `fn worktree_content` takes its fresh read. The read-count assertion in `harvest_reads_each_worktree_task_file_once` needs no change: its fixture is four task files of roughly 100 bytes each, far under any 8 MiB budget, so no row evicts and `take_worktree_read_count(&repo) == 4` still holds.
 
 ## Approach
@@ -33,7 +35,7 @@ A working-tree task that cannot be opened, is not UTF-8, or exceeds the size cap
   - **Skipped**: `skip` is `Some(reason)`. The row warned once and charts no row. `union_files` claims its name in the `seen` set and pushes no chosen row, so the path still blocks an older committed copy from claiming the name while `fn harvest_chosen` never calls `fn worktree_content` for it and never re-reads it. That is what keeps an oversized file from being read whole and stops a second "has no frontmatter" warning with the wrong reason. This task owns that placeholder; `task-viewer_harvest-git-failure-cases.md` owns only the proof that the ref-union path preserves it.
 - Correct every comment the change falsifies, including the "never all resident" one: `harvest_chosen`'s "The chosen set's contents are therefore never all resident.", `harvest_repository_with_prior`'s enclosing-probe comment, `union_files`'s reuse claim and its "the working-tree contents come from the walk that already read them" line, `WorktreeFiles`'s alias doc, `worktree_content`'s empty-content fallback claim, `files_on_disk`'s skip comment, and `parse_batch`'s `Some(String::new())` claim.
 
-**Out of scope:** The `ARCHITECTURE.md` git-fallback sentence that says "a command that exits with an ordinary error keeps the existing fallbacks" is rewritten to state this task's fail-on-other-error rule by [task-viewer_guardrail-doc-sync.md](task-viewer_guardrail-doc-sync.md), which owns the guardrail-doc amendments for the harvest cluster. That same doc task also owns the `TESTING.md` "What Must Be Covered" sentence that says a harvest reads each worktree task file once, which this task's 8 MiB budget makes false for a tree over the budget.
+**Out of scope:** The `ARCHITECTURE.md` git-fallback sentence that says "a command that exits with an ordinary error keeps the existing fallbacks" is rewritten to state this task's fail-on-other-error rule by [task-viewer_guardrail-doc-sync.md](../task-viewer_guardrail-doc-sync.md), which owns the guardrail-doc amendments for the harvest cluster. That same doc task also owns the `TESTING.md` "What Must Be Covered" sentence that says a harvest reads each worktree task file once, which this task's 8 MiB budget makes false for a tree over the budget.
 
 ## Acceptance
 

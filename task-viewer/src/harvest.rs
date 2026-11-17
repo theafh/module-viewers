@@ -102,7 +102,8 @@ impl From<GitFailure> for HarvestError {
 ///
 /// `Timeout` is final: a hung command must reach `store_outcome` as a scan
 /// error instead of being retried or flattened into a frontmatter fallback.
-/// `Other` keeps the pre-existing fallbacks.
+/// `Other` keeps the pre-existing fallbacks at the per-task lookups, while a
+/// failed enclosing probe carries its own reason to the scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GitFailure {
     Timeout(String),
@@ -146,8 +147,8 @@ pub fn harvest_repository_with_prior(
         Some((root, dir)) => {
             // A `.git` that git cannot open fails the scan; charting frontmatter
             // dates instead would pile every task onto its last bulk `updated`
-            // day. An enclosing repository that git cannot read never resolves
-            // to a context, so only the folder's own `.git` needs the probe.
+            // day. A failed enclosing probe already fails `GitContext::resolve`,
+            // so only the folder's own `.git` needs the probe here.
             if git.dir.is_some() {
                 git_read(&repo, dir, &["rev-parse", "--git-dir"]).map_err(HarvestError::Git)?;
             }
@@ -226,9 +227,43 @@ type Candidate = ((u8, u8, i64), Option<String>, String, bool);
 /// a commit, and whether that path decoded lossily.
 type ChosenFile = (String, Option<String>, bool);
 
-/// The working-tree task files keyed by path, each with its content and whether
-/// its path decoded lossily. The walk reads them to rank them, so the chosen
-/// rows reuse that content instead of reading each file again.
+/// Why a working-tree task file contributed no row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// The file could not be opened or read.
+    Unreadable,
+    /// Its bytes are not valid UTF-8.
+    NotUtf8,
+    /// It is larger than `MAX_TASK_FILE_BYTES`.
+    Oversized,
+}
+
+impl SkipReason {
+    /// The reason text a skip warning carries.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Unreadable => "could not be read",
+            Self::NotUtf8 => "is not valid UTF-8",
+            Self::Oversized => "is larger than the 4 MiB cap",
+        }
+    }
+}
+
+/// One `.md` file under `tasks/`, in one of three states: charted (`text` is
+/// `Some`), evicted (`text` and `skip` are both `None`, because the cache budget
+/// did not retain it), or skipped (`skip` is `Some`).
+#[derive(Debug)]
+struct WorktreeRow {
+    path: String,
+    lossy: bool,
+    text: Option<String>,
+    skip: Option<SkipReason>,
+}
+
+/// The working-tree task files the cache budget retained, keyed by path, each
+/// with its text and whether its path decoded lossily. Only charted rows are
+/// here; an evicted row keeps its path in the ranking and is re-read one file
+/// at a time when it is charted.
 type WorktreeFiles = std::collections::HashMap<String, (String, bool)>;
 
 /// Chart `folder` from the refs of the repository that holds it.
@@ -241,8 +276,9 @@ type WorktreeFiles = std::collections::HashMap<String, (String, bool)>;
 /// path stays relative to the configured folder.
 ///
 /// The chosen rows carry no file contents: the committed contents stream from
-/// `read_blobs` in row order, and the working-tree contents come from the walk
-/// that already read them.
+/// `read_blobs` in row order, and the working-tree contents come from the walk's
+/// retained cache, which holds at most `MAX_WORKTREE_CACHE_BYTES`. A working-tree
+/// row the cache evicted is re-read one file at a time when it is charted.
 fn union_files(
     folder: &Path,
     root: &Path,
@@ -306,16 +342,21 @@ fn union_files(
             path_is_lossy,
         ));
     }
-    // The working-tree walk reads each file's content to rank it, so keep that
-    // content and reuse it for the chosen files instead of reading them again.
-    // It reads the configured folder, whose paths are already relative to it.
+    // The working-tree walk reads every file so each skip keeps its warning, and
+    // retains the text of the rows that fit the cache budget. A skipped row
+    // still enters the ranking, so it claims its task name and blocks an older
+    // committed copy without charting anything.
     let worktree = files_on_disk(folder)?;
-    for (rel, _, path_is_lossy) in &worktree {
+    let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in &worktree {
+        if row.skip.is_some() {
+            skipped.insert(row.path.clone());
+        }
         candidates.push((
-            archive_rank(rel, 1, i64::MAX),
+            archive_rank(&row.path, 1, i64::MAX),
             None,
-            rel.clone(),
-            *path_is_lossy,
+            row.path.clone(),
+            row.lossy,
         ));
     }
     candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
@@ -323,13 +364,20 @@ fn union_files(
     let mut chosen: Vec<ChosenFile> = Vec::new();
     for (_, blob, path, path_is_lossy) in candidates {
         let name = path.rsplit('/').next().unwrap_or_default().to_string();
-        if seen.insert(name) {
-            chosen.push((path, blob, path_is_lossy));
+        if !seen.insert(name) {
+            continue;
         }
+        // A skipped working-tree row keeps its name out of the chosen set: it
+        // warned once and must not be read again, and no older committed copy
+        // may claim the name.
+        if blob.is_none() && skipped.contains(&path) {
+            continue;
+        }
+        chosen.push((path, blob, path_is_lossy));
     }
     let worktree: WorktreeFiles = worktree
         .into_iter()
-        .map(|(path, text, path_is_lossy)| (path, (text, path_is_lossy)))
+        .filter_map(|row| row.text.map(|text| (row.path, (text, row.lossy))))
         .collect();
     Ok((chosen, worktree))
 }
@@ -338,7 +386,9 @@ fn union_files(
 /// next committed content from the streaming `read_blobs` consumer for a row
 /// that names a blob, and read a working-tree row's cached content, handing
 /// each `(path, text)` to `harvest_file` as it arrives. The chosen set's
-/// contents are therefore never all resident.
+/// contents are therefore never all resident: committed contents stream one at
+/// a time, and the retained working-tree cache stays within
+/// `MAX_WORKTREE_CACHE_BYTES`.
 fn harvest_chosen(
     repo: &Path,
     git: &GitContext,
@@ -365,13 +415,22 @@ fn harvest_chosen(
         for (path, blob, path_is_lossy) in rows.by_ref() {
             if blob.is_some() {
                 match content {
-                    Some(text) => state.harvest_file(&path, &text, path_is_lossy),
-                    None => vanished = Some(path.clone()),
+                    BlobContent::Text(text) => {
+                        state.harvest_file(&path, &text, path_is_lossy);
+                    }
+                    BlobContent::Missing => vanished = Some(path.clone()),
+                    BlobContent::Oversized => {
+                        warn_skipped_task(&path, "the committed blob is larger than the 4 MiB cap")
+                    }
+                    BlobContent::NotUtf8 => {
+                        warn_skipped_task(&path, "the committed blob is not valid UTF-8");
+                    }
                 }
                 break;
             }
-            let text = worktree_content(repo, &mut worktree, &path);
-            state.harvest_file(&path, &text, path_is_lossy);
+            if let Some(text) = worktree_content(repo, &mut worktree, &path) {
+                state.harvest_file(&path, &text, path_is_lossy);
+            }
         }
     })?;
     if let Some(path) = vanished {
@@ -382,24 +441,24 @@ fn harvest_chosen(
     // Every committed row has taken its content, so the rows left are
     // working-tree ones.
     for (path, _, path_is_lossy) in rows {
-        let text = worktree_content(repo, &mut worktree, &path);
-        state.harvest_file(&path, &text, path_is_lossy);
+        if let Some(text) = worktree_content(repo, &mut worktree, &path) {
+            state.harvest_file(&path, &text, path_is_lossy);
+        }
     }
     state.finish(repo, git, prior)
 }
 
-/// One chosen working-tree row's content: the text the ranking walk already
-/// read, or a fresh read when the file disappeared since then, matching the
-/// walk's empty content for an unreadable file.
-fn worktree_content(repo: &Path, worktree: &mut WorktreeFiles, path: &str) -> String {
-    match worktree.remove(path) {
-        Some((text, _)) => text,
-        None => {
-            #[cfg(test)]
-            worktree_read_count::record(repo);
-            fs::read_to_string(repo.join(path)).unwrap_or_default()
-        }
+/// One chosen working-tree row's content: the text the cache retained, or a
+/// fresh read bounded by `MAX_TASK_FILE_BYTES + 1` when the cache evicted the
+/// row or the file changed since the walk. A file that can no longer be read,
+/// is not UTF-8, or is over the cap contributes no row.
+fn worktree_content(repo: &Path, worktree: &mut WorktreeFiles, path: &str) -> Option<String> {
+    if let Some((text, _)) = worktree.remove(path) {
+        return Some(text);
     }
+    #[cfg(test)]
+    worktree_read_count::record(repo);
+    read_worktree_file(&repo.join(path)).outcome.ok()
 }
 
 /// Rank a version of a task: working tree before a commit, then an archived
@@ -670,12 +729,29 @@ impl HarvestState {
 fn harvest_files(
     repo: &Path,
     git: &GitContext,
-    files: Vec<(String, String, bool)>,
+    files: Vec<WorktreeRow>,
     prior: &[PriorTask],
 ) -> Result<Vec<ParsedTask>, HarvestError> {
     let mut state = HarvestState::default();
-    for (rel, text, path_is_lossy) in files {
-        state.harvest_file(&rel, &text, path_is_lossy);
+    for row in files {
+        // A skipped row warned once during the walk and contributes no row.
+        if row.skip.is_some() {
+            continue;
+        }
+        // An evicted row was charted during the walk, so re-read it one file at
+        // a time through the same size cap. A file that changed since the walk
+        // is classified again instead of charted from stale text.
+        let text = match row.text {
+            Some(text) => Some(text),
+            None => {
+                #[cfg(test)]
+                worktree_read_count::record(repo);
+                read_worktree_file(&repo.join(&row.path)).outcome.ok()
+            }
+        };
+        if let Some(text) = text {
+            state.harvest_file(&row.path, &text, row.lossy);
+        }
     }
     state.finish(repo, git, prior)
 }
@@ -725,13 +801,14 @@ fn markdown_blobs(listing: &[u8], prefix: &str) -> (Vec<String>, Vec<String>, Ve
 }
 
 /// Read many blobs in one `git cat-file` process, in the order they are given,
-/// handing each decoded content to `on_content` as it arrives. An expression
-/// that names no object answers `missing` and delivers `None`.
+/// handing each record's `BlobContent` to `on_content` as it arrives. An
+/// expression that names no object answers `missing` and delivers
+/// `BlobContent::Missing`.
 fn read_blobs(
     repo: &Path,
     dir: Option<&Path>,
     blobs: &[String],
-    mut on_content: impl FnMut(Option<String>),
+    mut on_content: impl FnMut(BlobContent),
 ) -> Result<(), GitFailure> {
     if blobs.is_empty() {
         return Ok(());
@@ -780,17 +857,37 @@ fn cat_file_command(repo: &Path, dir: Option<&Path>) -> Command {
 /// one byte, so one such file can never sit in memory whole.
 const MAX_TASK_FILE_BYTES: usize = 4 * 1024 * 1024;
 
+/// The most working-tree task text one harvest keeps resident at once. A
+/// `tasks/` tree larger than this evicts the rows past the budget; each evicted
+/// row keeps its path in the ranking and is re-read one file at a time when it
+/// is charted, so a tree of any size still charts every task it holds.
+const MAX_WORKTREE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// What one `cat-file --batch` record held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlobContent {
+    /// The blob's bytes are chartable text.
+    Text(String),
+    /// A present object larger than `MAX_TASK_FILE_BYTES`.
+    Oversized,
+    /// A present object whose bytes are not valid UTF-8.
+    NotUtf8,
+    /// The expression names no object.
+    Missing,
+}
+
 /// Parse the length-prefixed records of a `git cat-file --batch` stream,
-/// handing each decoded content to `on_content` as it arrives.
+/// handing each record's `BlobContent` to `on_content` as it arrives.
 ///
-/// A header that ends in ` missing` names no object, so it delivers `None`.
-/// A present object larger than `MAX_TASK_FILE_BYTES` is drained and delivers
-/// `Some(String::new())`, which parses to no task, and a blob whose bytes are
-/// not valid UTF-8 delivers an empty string for the same reason.
+/// A header that ends in ` missing` names no object, so it delivers
+/// `BlobContent::Missing`. A present object larger than `MAX_TASK_FILE_BYTES`
+/// is drained and delivers `BlobContent::Oversized`, and a blob whose bytes are
+/// not valid UTF-8 delivers `BlobContent::NotUtf8`, so each skip carries its own
+/// reason instead of a synthesized empty string.
 fn parse_batch<R: BufRead>(
     mut reader: R,
     expected: usize,
-    mut on_content: impl FnMut(Option<String>),
+    mut on_content: impl FnMut(BlobContent),
 ) -> Result<(), GitFailure> {
     let mut header = Vec::new();
     for _ in 0..expected {
@@ -812,7 +909,7 @@ fn parse_batch<R: BufRead>(
         // A missing object prints `<expr> missing` and no body, so it consumes
         // no content line and the next expression follows at once.
         if header_text.ends_with(" missing") {
-            on_content(None);
+            on_content(BlobContent::Missing);
             continue;
         }
         let size = header_text
@@ -834,7 +931,7 @@ fn parse_batch<R: BufRead>(
             // A newline follows each body; the last record may end at EOF.
             let mut trailing = [0_u8; 1];
             let _ = reader.read(&mut trailing).map_err(read_failure)?;
-            on_content(Some(String::new()));
+            on_content(BlobContent::Oversized);
             continue;
         }
         let mut body = vec![0_u8; size];
@@ -845,30 +942,37 @@ fn parse_batch<R: BufRead>(
         let mut trailing = [0_u8; 1];
         let _ = reader.read(&mut trailing).map_err(read_failure)?;
         // A blob whose bytes are not valid UTF-8 parses to no task, the same
-        // way `files_on_disk` skips a worktree file it cannot read. Hand an
-        // empty string rather than failing the scan, so the caller still
-        // consumes one content per chosen blob and every later blob keeps its
-        // position.
-        let text = String::from_utf8(body).unwrap_or_default();
-        on_content(Some(text));
+        // way `files_on_disk` skips a worktree file it cannot read. Hand the
+        // reason rather than failing the scan, so the caller still consumes one
+        // content per chosen blob and every later blob keeps its position.
+        let content = match String::from_utf8(body) {
+            Ok(text) => BlobContent::Text(text),
+            Err(_) => BlobContent::NotUtf8,
+        };
+        on_content(content);
     }
     Ok(())
 }
 
 /// The markdown files of `tasks/` as the folder holds them, for a folder
-/// outside git.
+/// outside git and for ranking the working-tree candidates inside git.
 ///
 /// A walk error fails the scan instead of shrinking the listing. An unreadable
 /// directory would otherwise yield fewer files, and the store that follows
 /// would replace the repository's rows with that smaller set. The error keeps
 /// the walk's own text, which names the path it could not read.
 ///
-/// A file larger than `MAX_TASK_FILE_BYTES` is read only through the cap plus
-/// one byte, so it is never held whole, and it contributes no row. A file that
-/// opens but cannot be read as text, including one that is not valid UTF-8,
-/// keeps today's skip.
-fn files_on_disk(repo: &Path) -> Result<Vec<(String, String, bool)>, HarvestError> {
+/// Every `.md` file is read and classified so each skip keeps its warning: one
+/// that cannot be opened or read, one that is not valid UTF-8, and one larger
+/// than `MAX_TASK_FILE_BYTES` (read only through the cap plus one byte) each
+/// warn once with its path, its metadata length, and the reason. A file whose
+/// name lacks the task shape warns at debug level instead. The text of a charted
+/// file is retained only while the running total stays within
+/// `MAX_WORKTREE_CACHE_BYTES`; a row past that budget keeps its path and is
+/// re-read one file at a time when it is charted.
+fn files_on_disk(repo: &Path) -> Result<Vec<WorktreeRow>, HarvestError> {
     let mut files = Vec::new();
+    let mut retained = 0usize;
     for entry in WalkDir::new(repo.join("tasks")) {
         let entry = entry.map_err(|error| HarvestError::Io(std::io::Error::other(error)))?;
         let path = entry.path();
@@ -878,25 +982,98 @@ fn files_on_disk(repo: &Path) -> Result<Vec<(String, String, bool)>, HarvestErro
         let (rel, path_is_lossy) = relative_path(path, repo);
         #[cfg(test)]
         worktree_read_count::record(repo);
-        let Ok(mut file) = File::open(path) else {
-            continue;
-        };
-        let mut text = String::new();
-        let Ok(read) = (&mut file)
-            .take(MAX_TASK_FILE_BYTES as u64 + 1)
-            .read_to_string(&mut text)
-        else {
-            continue;
-        };
+        let read = read_worktree_file(path);
         #[cfg(test)]
-        worktree_read_count::record_bytes(repo, &rel, read);
-        if read > MAX_TASK_FILE_BYTES {
-            continue;
-        }
-        files.push((rel, text, path_is_lossy));
+        worktree_read_count::record_bytes(repo, &rel, read.bytes);
+        let row = match read.outcome {
+            Ok(text) => {
+                // Retain the text only while the cache stays within its budget.
+                // An evicted row keeps its path and is re-read one file at a
+                // time when it is charted.
+                if retained.saturating_add(text.len()) <= MAX_WORKTREE_CACHE_BYTES {
+                    retained += text.len();
+                    WorktreeRow {
+                        path: rel,
+                        lossy: path_is_lossy,
+                        text: Some(text),
+                        skip: None,
+                    }
+                } else {
+                    WorktreeRow {
+                        path: rel,
+                        lossy: path_is_lossy,
+                        text: None,
+                        skip: None,
+                    }
+                }
+            }
+            Err(reason) => {
+                // The byte count comes from the file's metadata, so a file that
+                // cannot be opened or is not UTF-8 still reports its real size.
+                let bytes = fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                warn_skipped_worktree_task(&rel, bytes, reason);
+                WorktreeRow {
+                    path: rel,
+                    lossy: path_is_lossy,
+                    text: None,
+                    skip: Some(reason),
+                }
+            }
+        };
+        files.push(row);
+        #[cfg(test)]
+        worktree_cache_peak::record(repo, retained);
     }
-    files.sort();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
+}
+
+/// One working-tree file read through `MAX_TASK_FILE_BYTES + 1` bytes.
+struct WorktreeRead {
+    /// The bytes the read consumed, so a test can assert the cap bounds it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    bytes: usize,
+    /// The file's text, or why it cannot be charted.
+    outcome: Result<String, SkipReason>,
+}
+
+/// Read one working-tree file through the size cap and classify it.
+///
+/// The read never takes more than `MAX_TASK_FILE_BYTES + 1` bytes, so one
+/// oversized file is never held whole, and the result says whether the file
+/// could not be read, is not UTF-8, or is over the cap.
+fn read_worktree_file(path: &Path) -> WorktreeRead {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => {
+            return WorktreeRead {
+                bytes: 0,
+                outcome: Err(SkipReason::Unreadable),
+            };
+        }
+    };
+    let mut bytes = Vec::new();
+    let Ok(read) = (&mut file)
+        .take(MAX_TASK_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+    else {
+        return WorktreeRead {
+            bytes: bytes.len(),
+            outcome: Err(SkipReason::Unreadable),
+        };
+    };
+    if read > MAX_TASK_FILE_BYTES {
+        return WorktreeRead {
+            bytes: read,
+            outcome: Err(SkipReason::Oversized),
+        };
+    }
+    WorktreeRead {
+        bytes: read,
+        outcome: String::from_utf8(bytes).map_err(|_| SkipReason::NotUtf8),
+    }
 }
 
 /// The path of `path` below `base`, with `/` separators, and whether any
@@ -935,6 +1112,45 @@ fn relative_path(path: &Path, base: &Path) -> (String, bool) {
 fn has_task_name_shape(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or_default();
     name.ends_with(".md") && name.contains('_')
+}
+
+/// Report one task file that contributes no row: a warning when its name has
+/// the task shape, a debug line otherwise, so a stray `README.md` under
+/// `tasks/` stays out of the warning stream.
+fn warn_skipped_task(path: &str, reason: &str) {
+    if has_task_name_shape(path) {
+        tracing::warn!(
+            path = %path,
+            reason = %reason,
+            "task file was skipped; no row charted"
+        );
+    } else {
+        tracing::debug!(
+            path = %path,
+            reason = %reason,
+            "file under tasks/ was skipped; no row charted"
+        );
+    }
+}
+
+/// Report one skipped working-tree task file with its metadata byte count and
+/// its reason, under the same task-shape gate as `warn_skipped_task`.
+fn warn_skipped_worktree_task(path: &str, bytes: u64, reason: SkipReason) {
+    if has_task_name_shape(path) {
+        tracing::warn!(
+            path = %path,
+            bytes,
+            reason = reason.describe(),
+            "task file was skipped; no row charted"
+        );
+    } else {
+        tracing::debug!(
+            path = %path,
+            bytes,
+            reason = reason.describe(),
+            "file under tasks/ was skipped; no row charted"
+        );
+    }
 }
 
 fn classify(in_archive: bool, status: &str) -> TaskKind {
@@ -1332,6 +1548,15 @@ fn git_timeout_failure(deadline: Duration) -> GitFailure {
     ))
 }
 
+/// Drain a child's pipe to end of file, so a child that fills its pipe cannot
+/// block. Returns the bytes read, or the I/O error that ended the drain, which
+/// the caller turns into a git failure instead of charting a partial listing.
+fn drain_reader(mut pipe: impl Read) -> Result<Vec<u8>, std::io::Error> {
+    let mut buffer = Vec::new();
+    pipe.read_to_end(&mut buffer)?;
+    Ok(buffer)
+}
+
 /// Run one read-only git command with a deadline.
 ///
 /// The child's stdout and stderr are drained on their own threads while it
@@ -1360,12 +1585,10 @@ fn run_git_command(
     let (stdout_done, stdout_done_rx) = std::sync::mpsc::channel();
     let stdout = child.stdout.take().map(|mut pipe| {
         std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buffer = Vec::new();
-            let _ = pipe.read_to_end(&mut buffer);
+            let result = drain_reader(&mut pipe);
             // Signal even when the read failed, so the caller stops idling.
             let _ = stdout_done.send(());
-            buffer
+            result
         })
     });
     let stderr = child.stderr.take().map(|mut pipe| {
@@ -1415,9 +1638,13 @@ fn run_git_command(
             }
         }
     };
-    let stdout = stdout
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default();
+    let stdout = match stdout {
+        Some(handle) => handle
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("git stdout reader stopped")))
+            .map_err(read_failure)?,
+        None => Vec::new(),
+    };
     let stderr = stderr
         .map(|handle| handle.join().unwrap_or_default())
         .unwrap_or_default();
@@ -1547,7 +1774,15 @@ where
     if let Err(GitFailure::Timeout(reason)) = &status {
         return Err(GitFailure::Timeout(reason.clone()));
     }
-    let value = parsed?;
+    let value = match parsed {
+        Ok(value) => value,
+        Err(failure) => {
+            // A parse failure cannot say why git refused, so prefer git's own
+            // first stderr line when it printed one. This is the only site that
+            // still holds git's stderr when a `cat-file` body fails to parse.
+            return Err(first_stderr_line(&stderr).map_or(failure, GitFailure::Other));
+        }
+    };
     let status = status?;
     if !status.success() {
         return Err(GitFailure::Other(git_exit_message(&Output {
@@ -1735,6 +1970,37 @@ mod worktree_read_count {
     }
 }
 
+/// Test-only peak of the working-tree text one harvest kept resident, keyed by
+/// repository path so parallel tests cannot see each other's peaks. It sits
+/// beside `worktree_read_count`, and a test asserts it never exceeds
+/// `MAX_WORKTREE_CACHE_BYTES`.
+#[cfg(test)]
+mod worktree_cache_peak {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn peaks() -> &'static Mutex<HashMap<PathBuf, usize>> {
+        static PEAKS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+        PEAKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn record(repo: &Path, retained: usize) {
+        if let Ok(mut peaks) = peaks().lock() {
+            let peak = peaks.entry(repo.to_path_buf()).or_insert(0);
+            *peak = (*peak).max(retained);
+        }
+    }
+
+    pub(super) fn take(repo: &Path) -> usize {
+        peaks()
+            .lock()
+            .ok()
+            .and_then(|mut peaks| peaks.remove(repo))
+            .unwrap_or(0)
+    }
+}
+
 /// The working-tree `tasks/` markdown reads recorded for `repo` since the last
 /// call, for a test that asserts each chosen file is read once per harvest.
 #[cfg(test)]
@@ -1742,6 +2008,15 @@ pub(crate) fn take_worktree_read_count(repo: &Path) -> usize {
     // Harvest canonicalizes its repository path, so key the lookup the same way.
     let repo = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     worktree_read_count::take(&repo)
+}
+
+/// The peak working-tree text `repo`'s harvest kept resident since the last
+/// call, for a test that asserts the cache stays within its budget.
+#[cfg(test)]
+pub(crate) fn take_worktree_cache_peak(repo: &Path) -> usize {
+    // Harvest canonicalizes its repository path, so key the lookup the same way.
+    let repo = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    worktree_cache_peak::take(&repo)
 }
 
 /// The bytes each working-tree `tasks/` markdown file read for `repo` since the
@@ -1873,16 +2148,16 @@ fn archived_leave_lookup(
     })?;
     // Consume one content at a time as the batch stream delivers it, folding
     // each archived status into the earliest day instead of holding the set.
-    // An expression that names no object answers `missing`, which counts as no
-    // qualifying commit, so its day is skipped like a content without the
-    // expected status.
+    // An expression that names no object answers `missing`, and an oversized or
+    // non-UTF-8 blob carries its own reason; each counts as no qualifying
+    // commit, so its day is skipped like a content without the expected status.
     let mut next = days.iter();
     let mut earliest: Option<NaiveDate> = None;
     read_blobs(repo, dir, &exprs, |content| {
         let Some(&day) = next.next() else {
             return;
         };
-        let Some(text) = content else {
+        let BlobContent::Text(text) = content else {
             return;
         };
         if !has_archived_status(&text, expected) {
@@ -1942,12 +2217,20 @@ fn parse_archive_log<R: BufRead>(
 
 /// The repository that holds a folder without its own `.git`: the folder's path
 /// inside it (ending in `/`), that repository's worktree root, and its git dir.
-/// `Ok(None)` when no enclosing repository holds the folder; a timed-out
-/// `rev-parse` is final and returns `Err(GitFailure::Timeout)`.
+///
+/// `Ok(None)` only when git answers that no repository holds the folder, which
+/// is the normal answer for a folder outside git. A probe that times out, does
+/// not start, or exits nonzero for any other reason fails the scan with git's
+/// own first stderr line (or a fixed message when stderr is empty), so a broken
+/// probe never charts the folder as outside git. A probe that exits zero while
+/// printing fewer than the three lines it was asked for also fails the scan.
 fn enclosing_prefix(repo: &Path) -> Result<Option<(String, PathBuf, PathBuf)>, GitFailure> {
     let mut command = Command::new(git_program(repo));
     command.arg("-C").arg(repo);
     scrub_git_env(&mut command);
+    // Pin the message language, so the outside-git answer matches below whatever
+    // locale the person runs git under.
+    command.env("LC_ALL", "C");
     // One `rev-parse` supplies the prefix, root, and git dir in argument order.
     command.args([
         "rev-parse",
@@ -1955,25 +2238,44 @@ fn enclosing_prefix(repo: &Path) -> Result<Option<(String, PathBuf, PathBuf)>, G
         "--show-toplevel",
         "--absolute-git-dir",
     ]);
-    let output = match run_git_command(command, None, git_deadline(repo)) {
-        Ok(output) => output,
-        Err(GitFailure::Timeout(reason)) => return Err(GitFailure::Timeout(reason)),
-        // An ordinary failure means git cannot name an enclosing repository.
-        Err(GitFailure::Other(_)) => return Ok(None),
-    };
+    // A probe that does not start carries its start error to the scan.
+    let output = run_git_command(command, None, git_deadline(repo))?;
     if !output.status.success() {
-        return Ok(None);
+        let first = first_stderr_line(&output.stderr);
+        if first.as_deref().is_some_and(is_not_a_repository_answer) {
+            return Ok(None);
+        }
+        return Err(GitFailure::Other(first.unwrap_or_else(|| {
+            "git rev-parse failed without an error message".to_string()
+        })));
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = text.lines();
     let (Some(prefix), Some(root), Some(dir)) = (lines.next(), lines.next(), lines.next()) else {
-        return Ok(None);
+        return Err(GitFailure::Other(
+            "git rev-parse printed fewer than three lines".to_string(),
+        ));
     };
     Ok(Some((
         prefix.to_string(),
         PathBuf::from(root),
         PathBuf::from(dir),
     )))
+}
+
+/// The first non-empty line of a process's stderr, trimmed.
+fn first_stderr_line(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+}
+
+/// Whether git's stderr is the answer a folder outside any repository gets.
+/// Matched case-insensitively, so the older capitalised "Not a git repository"
+/// wording stays silent too.
+fn is_not_a_repository_answer(line: &str) -> bool {
+    line.to_ascii_lowercase().contains("not a git repository")
 }
 
 /// The frontmatter reader revision the content hash covers. Bumping it makes
@@ -2197,15 +2499,16 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_HASH_REVISION, GIT_COMMAND_TIMEOUT, GitContext, GitFailure, HarvestError,
-        HarvestState, LogLookup, MAX_TASK_FILE_BYTES, ParsedTask, PriorTask, TaskKind,
-        archive_log_args, archived_leave_lookup, blob_days, blob_days_log_args, content_hash,
-        enclosing_prefix, escape_posix_ere, first_status_commit_date, fnv1a_digest, frontmatter,
-        git_bin, git_deadline, git_dir_command, git_log_args, git_override, git_path, git_program,
-        git_read, git_timeout, harvest_repository, harvest_repository_with_prior,
-        parse_archive_log, parse_batch, pickaxe_log_args, read_blobs, run_git_command, run_git_log,
-        run_git_streaming, scan_log_dates, scrub_git_env, stream_blob_days, take_leave_walk_count,
-        take_worktree_read_bytes, take_worktree_read_count,
+        BlobContent, CONTENT_HASH_REVISION, GIT_COMMAND_TIMEOUT, GitContext, GitFailure,
+        HarvestError, HarvestState, LogLookup, MAX_TASK_FILE_BYTES, MAX_WORKTREE_CACHE_BYTES,
+        ParsedTask, PriorTask, TaskKind, archive_log_args, archived_leave_lookup, blob_days,
+        blob_days_log_args, content_hash, drain_reader, enclosing_prefix, escape_posix_ere,
+        first_status_commit_date, fnv1a_digest, frontmatter, git_bin, git_deadline,
+        git_dir_command, git_log_args, git_override, git_path, git_program, git_read, git_timeout,
+        harvest_repository, harvest_repository_with_prior, parse_archive_log, parse_batch,
+        pickaxe_log_args, read_blobs, run_git_command, run_git_log, run_git_streaming,
+        scan_log_dates, scrub_git_env, stream_blob_days, take_leave_walk_count,
+        take_worktree_cache_peak, take_worktree_read_bytes, take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -2397,8 +2700,11 @@ mod tests {
         let contents = ["alpha".to_string(), String::new(), "gamma".to_string()];
         let stream = batch_stream(&contents);
         let mut streamed = Vec::new();
-        parse_batch(&stream[..], contents.len(), |text| {
-            streamed.push(text.expect("present blob"));
+        parse_batch(&stream[..], contents.len(), |content| {
+            let BlobContent::Text(text) = content else {
+                panic!("expected text, got {content:?}");
+            };
+            streamed.push(text);
         })
         .expect("stream batch");
         assert_eq!(streamed, contents);
@@ -2406,8 +2712,11 @@ mod tests {
         // The same records split into bounded chunks.
         let (reader, _exhausted) = ChunkedReader::new(bounded_chunks(&stream, 7));
         let mut chunked = Vec::new();
-        parse_batch(reader, contents.len(), |text| {
-            chunked.push(text.expect("present blob"));
+        parse_batch(reader, contents.len(), |content| {
+            let BlobContent::Text(text) = content else {
+                panic!("expected text, got {content:?}");
+            };
+            chunked.push(text);
         })
         .expect("chunked batch");
         assert_eq!(chunked, contents);
@@ -2420,10 +2729,14 @@ mod tests {
         stream.extend_from_slice(b"bbbb missing\n");
         stream.extend_from_slice(b"cccc blob 5\ngamma\n");
         let mut contents = Vec::new();
-        parse_batch(&stream[..], 3, |text| contents.push(text)).expect("stream batch");
+        parse_batch(&stream[..], 3, |content| contents.push(content)).expect("stream batch");
         assert_eq!(
             contents,
-            vec![Some("alpha".to_string()), None, Some("gamma".to_string())]
+            vec![
+                BlobContent::Text("alpha".to_string()),
+                BlobContent::Missing,
+                BlobContent::Text("gamma".to_string()),
+            ]
         );
     }
 
@@ -2436,11 +2749,14 @@ mod tests {
         stream.push(b'\n');
         stream.extend_from_slice(b"cccc blob 5\ngamma\n");
         let mut contents = Vec::new();
-        parse_batch(&stream[..], 2, |text| contents.push(text)).expect("stream batch");
+        parse_batch(&stream[..], 2, |content| contents.push(content)).expect("stream batch");
         assert_eq!(
             contents,
-            vec![Some(String::new()), Some("gamma".to_string())],
-            "an oversized blob parses to no task and the next blob keeps its content"
+            vec![
+                BlobContent::Oversized,
+                BlobContent::Text("gamma".to_string()),
+            ],
+            "an oversized blob carries its own reason and the next blob keeps its content"
         );
     }
 
@@ -2450,10 +2766,10 @@ mod tests {
         // No body behind the header: the drain must end at EOF instead of
         // reserving the announced size.
         let mut contents = Vec::new();
-        parse_batch(&stream[..], 1, |text| contents.push(text))
+        parse_batch(&stream[..], 1, |content| contents.push(content))
             .expect("a huge header with no body must not overflow the capacity");
         assert_eq!(contents.len(), 1, "at most one content per expression");
-        assert_eq!(contents[0], Some(String::new()));
+        assert_eq!(contents[0], BlobContent::Oversized);
     }
 
     fn batch_stream(contents: &[String]) -> Vec<u8> {
@@ -2484,8 +2800,10 @@ mod tests {
         let (reader, exhausted) = ChunkedReader::new(bounded_chunks(&stream, 9));
         let mut state = HarvestState::default();
         let mut first_arrival: Option<(String, bool, bool)> = None;
-        parse_batch(reader, 2, |text| {
-            let text = text.expect("present blob");
+        parse_batch(reader, 2, |content| {
+            let BlobContent::Text(text) = content else {
+                panic!("expected text, got {content:?}");
+            };
             let path = format!("tasks/scope_{}.md", state.tasks.len());
             state.harvest_file(&path, &text, false);
             if first_arrival.is_none() {
@@ -6796,6 +7114,32 @@ mod tests {
     }
 
     #[test]
+    fn drain_reader_returns_the_error_that_ends_the_drain() {
+        // A short read followed by an I/O error must surface that error, so a
+        // caller cannot chart a partial buffer as a complete listing.
+        struct ShortThenError {
+            reads: usize,
+        }
+
+        impl Read for ShortThenError {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.reads == 1 {
+                    let count = buffer.len().min(5);
+                    buffer[..count].copy_from_slice(b"short");
+                    Ok(count)
+                } else {
+                    Err(io::Error::other("simulated pipe failure"))
+                }
+            }
+        }
+
+        let error = drain_reader(ShortThenError { reads: 0 })
+            .expect_err("the drain must return the error that ended it");
+        assert_eq!(error.to_string(), "simulated pipe failure");
+    }
+
+    #[test]
     fn harvest_hanging_git_returns_a_scan_error() {
         let repo = scratch("harvest_hanging_git");
         git(
@@ -6874,6 +7218,167 @@ mod tests {
         let error = enclosing_prefix(&repo).expect_err("enclosing_prefix");
         assert!(matches!(error, GitFailure::Timeout(_)), "{error:?}");
 
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_cat_file_failure_reports_gits_stderr() {
+        // A `cat-file` whose output cannot be parsed must surface git's own
+        // stderr line, not the parser's generic truncated-header message.
+        let repo = scratch("harvest_cat_file_stderr");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "live task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // Keep only the committed copy, so the committed-blob reader runs.
+        fs::remove_file(repo.join("tasks/scope_live.md")).expect("remove worktree copy");
+        let bin = scratch("harvest_cat_file_stderr_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "case \"$*\" in\n  *\"cat-file --batch\"*) echo 'fatal: simulated cat-file failure' >&2; exit 128 ;;\n  *) exec {} \"$@\" ;;\nesac",
+                git_bin()
+            ),
+        );
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(5));
+
+        let error = harvest_repository(&repo).expect_err("a failed cat-file must fail the scan");
+        match error {
+            HarvestError::Git(message) => assert!(
+                message.contains("simulated cat-file failure"),
+                "the scan error must carry git's stderr: {message}"
+            ),
+            other => panic!("expected a Git error carrying git's stderr, got {other:?}"),
+        }
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    /// A folder outside git with one chartable task, for the enclosing-probe
+    /// tests.
+    fn outside_git_folder(name: &str) -> PathBuf {
+        let repo = scratch(name);
+        write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
+        repo
+    }
+
+    #[test]
+    fn harvest_fails_when_the_enclosing_probe_reports_another_error() {
+        // A `rev-parse` that exits nonzero for any reason other than the
+        // outside-git answer fails the scan with its stderr, while a folder
+        // outside git charts from its files and warns about nothing.
+        let repo = outside_git_folder("harvest_probe_other_error");
+        let bin = scratch("harvest_probe_other_error_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            "case \"$#\" in 0) exit 0 ;; esac\necho 'fatal: simulated probe failure' >&2\nexit 128",
+        );
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(5));
+
+        let error = harvest_repository(&repo).expect_err("the probe must fail the scan");
+        match error {
+            HarvestError::Git(message) => assert!(
+                message.contains("simulated probe failure"),
+                "the scan error must carry the probe's stderr: {message}"
+            ),
+            other => panic!("expected a Git error carrying the probe's stderr, got {other:?}"),
+        }
+        clear_fake_git(&repo);
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("a folder outside git charts from its files");
+        assert_eq!(tasks.len(), 1, "the task charts: {tasks:?}");
+        assert!(
+            captured.take().is_empty(),
+            "a folder outside git stays silent"
+        );
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_treats_the_older_not_a_repository_answer_as_outside_git() {
+        // The older capitalised spelling must stay silent too, matched
+        // case-insensitively.
+        let repo = outside_git_folder("harvest_probe_old_answer");
+        let bin = scratch("harvest_probe_old_answer_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            "case \"$#\" in 0) exit 0 ;; esac\necho 'Not a git repository (or any of the parent directories): .git' >&2\nexit 128",
+        );
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(5));
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("the outside-git answer must not fail the scan");
+        assert_eq!(tasks.len(), 1, "the task charts: {tasks:?}");
+        assert!(
+            captured.take().is_empty(),
+            "the outside-git answer stays silent"
+        );
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_fails_when_the_enclosing_probe_cannot_start() {
+        let repo = outside_git_folder("harvest_probe_cannot_start");
+        git_override::register(
+            &repo,
+            Some(PathBuf::from("/nonexistent/git-for-the-probe-test")),
+            Some(Duration::from_secs(5)),
+        );
+
+        let error =
+            harvest_repository(&repo).expect_err("a probe that cannot start fails the scan");
+        match error {
+            HarvestError::Git(message) => assert!(
+                message.contains("git did not start"),
+                "the scan error must carry the start error: {message}"
+            ),
+            other => panic!("expected a Git error carrying the start error, got {other:?}"),
+        }
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_fails_when_the_enclosing_probe_prints_too_few_lines() {
+        let repo = outside_git_folder("harvest_probe_short_output");
+        let bin = scratch("harvest_probe_short_output_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            "case \"$#\" in 0) exit 0 ;; esac\necho 'nested/'\nexit 0",
+        );
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(5));
+
+        let error = harvest_repository(&repo).expect_err("a short probe answer fails the scan");
+        match error {
+            HarvestError::Git(message) => assert!(
+                message.contains("fewer than three lines"),
+                "the scan error must name the short answer: {message}"
+            ),
+            other => panic!("expected a Git error naming the short answer, got {other:?}"),
+        }
         clear_fake_git(&repo);
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&bin);
@@ -7209,6 +7714,305 @@ mod tests {
         assert!(
             huge_bytes > MAX_TASK_FILE_BYTES,
             "the oversized file really is over the cap: {huge_bytes}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_warns_once_for_each_skipped_working_tree_task() {
+        // An oversized, a non-UTF-8, and an unreadable working-tree task each
+        // warn once with their path, their metadata byte count, and their own
+        // reason, and none contributes a row.
+        let repo = scratch("harvest_skip_warnings");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+
+        let mut huge = task_text("2026-05-01", "2026-05-01", "open");
+        huge.push_str(&"x".repeat(MAX_TASK_FILE_BYTES));
+        fs::write(repo.join("tasks/scope_huge.md"), &huge).expect("huge task");
+        let huge_bytes = fs::metadata(repo.join("tasks/scope_huge.md"))
+            .expect("huge metadata")
+            .len();
+
+        let mut binary = task_text("2026-05-01", "2026-05-01", "open").into_bytes();
+        binary.extend_from_slice(b"\xff\xfe not utf8\n");
+        fs::write(repo.join("tasks/scope_binary.md"), &binary).expect("binary task");
+        let binary_bytes = fs::metadata(repo.join("tasks/scope_binary.md"))
+            .expect("binary metadata")
+            .len();
+
+        // A directory named like a task opens but cannot be read as a file, on
+        // every platform and whatever user runs the test.
+        let unreadable = repo.join("tasks/scope_unreadable.md");
+        fs::create_dir(&unreadable).expect("unreadable directory");
+        let unreadable_bytes = fs::metadata(&unreadable)
+            .expect("unreadable metadata")
+            .len();
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("skipped files must not fail the harvest");
+        assert!(tasks.is_empty(), "no skipped file charts: {tasks:?}");
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 3, "one warning per skip: {warnings:?}");
+        let cases = [
+            (
+                "tasks/scope_huge.md",
+                huge_bytes,
+                "is larger than the 4 MiB cap",
+            ),
+            ("tasks/scope_binary.md", binary_bytes, "is not valid UTF-8"),
+            (
+                "tasks/scope_unreadable.md",
+                unreadable_bytes,
+                "could not be read",
+            ),
+        ];
+        for (path, bytes, reason) in cases {
+            let matching: Vec<_> = warnings
+                .iter()
+                .filter(|warning| warning.contains(path))
+                .collect();
+            assert_eq!(matching.len(), 1, "one warning names {path}: {warnings:?}");
+            assert!(
+                matching[0].contains(&format!("bytes={bytes}")),
+                "the warning names {path}'s metadata byte count: {matching:?}"
+            );
+            assert!(
+                matching[0].contains(reason),
+                "the warning names {path}'s reason: {matching:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_skipped_worktree_task_blocks_an_older_committed_copy() {
+        // A skipped working-tree row still claims its task name, so an older
+        // committed copy never charts under it and no second warning appears.
+        let repo = scratch("harvest_skip_blocks_commit");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        for path in [
+            "tasks/scope_huge.md",
+            "tasks/scope_binary.md",
+            "tasks/scope_unreadable.md",
+        ] {
+            write_task(&repo, path, "2026-05-01", "open");
+        }
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "committed tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+
+        let mut huge = task_text("2026-05-01", "2026-05-01", "open");
+        huge.push_str(&"x".repeat(MAX_TASK_FILE_BYTES));
+        fs::write(repo.join("tasks/scope_huge.md"), &huge).expect("huge task");
+        let mut binary = task_text("2026-05-01", "2026-05-01", "open").into_bytes();
+        binary.extend_from_slice(b"\xff not utf8\n");
+        fs::write(repo.join("tasks/scope_binary.md"), &binary).expect("binary task");
+        fs::remove_file(repo.join("tasks/scope_unreadable.md")).expect("remove readable copy");
+        fs::create_dir(repo.join("tasks/scope_unreadable.md")).expect("unreadable directory");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let blocked = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("skipped files must not fail the harvest");
+        assert!(
+            blocked.is_empty(),
+            "each skipped path blocks its committed copy: {blocked:?}"
+        );
+        let warnings = captured.take();
+        assert_eq!(
+            warnings.len(),
+            3,
+            "one warning per skipped path: {warnings:?}"
+        );
+
+        // Remove the skipped working-tree entries: the committed copies chart,
+        // proving the skipped rows blocked them rather than the blobs missing.
+        fs::remove_file(repo.join("tasks/scope_huge.md")).expect("remove huge");
+        fs::remove_file(repo.join("tasks/scope_binary.md")).expect("remove binary");
+        fs::remove_dir(repo.join("tasks/scope_unreadable.md")).expect("remove directory");
+        let committed = harvest_repository(&repo).expect("harvest the committed copies");
+        let mut paths: Vec<&str> = committed.iter().map(|task| task.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec![
+                "tasks/scope_binary.md",
+                "tasks/scope_huge.md",
+                "tasks/scope_unreadable.md",
+            ],
+            "the committed copies chart once the skipped rows are gone"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_worktree_cache_stays_within_the_budget_and_charts_every_task() {
+        // A `tasks/` tree larger than the 8 MiB cache budget evicts the rows
+        // past it. Every task still charts, inside git and outside it, and the
+        // peak retained text never exceeds the budget.
+        let padding = "x".repeat(1024 * 1024);
+        let task_count = 9;
+        let outside = scratch("harvest_cache_budget_outside");
+        fs::create_dir_all(outside.join("tasks")).expect("tasks");
+        for index in 0..task_count {
+            let mut text = task_text("2026-05-01", "2026-05-01", "open");
+            text.push_str(&padding);
+            fs::write(outside.join(format!("tasks/scope_{index}.md")), text).expect("task");
+        }
+        let outside_total: u64 = fs::read_dir(outside.join("tasks"))
+            .expect("read tasks")
+            .map(|entry| {
+                fs::metadata(entry.expect("entry").path())
+                    .expect("metadata")
+                    .len()
+            })
+            .sum();
+        assert!(
+            outside_total > MAX_WORKTREE_CACHE_BYTES as u64,
+            "the fixture must be larger than the cache budget: {outside_total}"
+        );
+
+        let tasks = harvest_repository(&outside).expect("harvest outside git");
+        assert_eq!(
+            tasks.len(),
+            task_count,
+            "every task outside git charts from its files"
+        );
+        let outside_peak = take_worktree_cache_peak(&outside);
+        assert!(
+            outside_peak <= MAX_WORKTREE_CACHE_BYTES,
+            "the outside-git cache peaked at {outside_peak} bytes"
+        );
+        assert!(outside_peak > 0, "the cache retained some text");
+
+        let repo = scratch("harvest_cache_budget_inside");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        for index in 0..task_count {
+            let mut text = task_text("2026-05-01", "2026-05-01", "open");
+            text.push_str(&padding);
+            fs::write(repo.join(format!("tasks/scope_{index}.md")), text).expect("task");
+        }
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "many tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest inside git");
+        assert_eq!(
+            tasks.len(),
+            task_count,
+            "every task inside git charts, including the evicted rows"
+        );
+        let inside_peak = take_worktree_cache_peak(&repo);
+        assert!(
+            inside_peak <= MAX_WORKTREE_CACHE_BYTES,
+            "the inside-git cache peaked at {inside_peak} bytes"
+        );
+        assert!(inside_peak > 0, "the cache retained some text");
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_warns_about_a_committed_blob_that_is_not_utf8() {
+        let repo = scratch("harvest_committed_not_utf8");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let mut binary = task_text("2026-05-01", "2026-05-01", "open").into_bytes();
+        binary.extend_from_slice(b"\xff\xfe not utf8\n");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(repo.join("tasks/scope_binary.md"), &binary).expect("binary task");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "binary task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // Keep only the committed copy, so the committed-blob reader supplies it.
+        fs::remove_file(repo.join("tasks/scope_binary.md")).expect("remove worktree copy");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("a non-UTF-8 blob must not fail the harvest");
+        assert!(tasks.is_empty(), "the blob charts no row: {tasks:?}");
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("tasks/scope_binary.md"),
+            "the warning names the path: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("not valid UTF-8"),
+            "the warning names the encoding reason: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("no frontmatter"),
+            "the warning must not claim absent frontmatter: {warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_warns_about_a_committed_blob_larger_than_the_cap() {
+        let repo = scratch("harvest_committed_oversized");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let mut huge = task_text("2026-05-01", "2026-05-01", "open");
+        huge.push_str(&"x".repeat(MAX_TASK_FILE_BYTES));
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(repo.join("tasks/scope_huge.md"), &huge).expect("huge task");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "huge task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::remove_file(repo.join("tasks/scope_huge.md")).expect("remove worktree copy");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("an oversized blob must not fail the harvest");
+        assert!(tasks.is_empty(), "the blob charts no row: {tasks:?}");
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("tasks/scope_huge.md"),
+            "the warning names the path: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("larger than"),
+            "the warning names the size reason: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("no frontmatter"),
+            "the warning must not claim absent frontmatter: {warnings:?}"
         );
         let _ = fs::remove_dir_all(&repo);
     }
