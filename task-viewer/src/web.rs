@@ -174,13 +174,27 @@ impl FlashStore {
     }
 
     /// Put a claimed banner back under its own token, so the next read shows
-    /// the same message. A restore is an insert, so it holds the same bound as
-    /// one: a slot put back past capacity evicts the oldest banner.
+    /// the same message. A restore holds the same bound as an insert, but it
+    /// never evicts the slot it just put back: a restored banner whose token is
+    /// the oldest one in the store survives, and the oldest banner other than
+    /// it is the one dropped.
     fn restore(&mut self, claimed: ClaimedBanner) {
         if let Some(key) = flash_token_key(&claimed.token) {
             self.slots.insert(key, (claimed.key, claimed.message));
             while self.slots.len() > FLASH_CAPACITY {
-                let _ = self.slots.pop_first();
+                let victim = self
+                    .slots
+                    .keys()
+                    .copied()
+                    .find(|candidate| *candidate != key);
+                match victim {
+                    Some(victim) => {
+                        let _ = self.slots.remove(&victim);
+                    }
+                    // Only the restored slot is left, so nothing can be evicted
+                    // without dropping the banner this restore exists for.
+                    None => break,
+                }
             }
         }
     }
@@ -4270,7 +4284,9 @@ mod tests {
     }
 
     /// Acceptance: a flash store at capacity plus one keeps its bound after
-    /// `restore`, evicting the oldest banner exactly as `insert` does.
+    /// `restore`, evicting the oldest banner exactly as `insert` does, and a
+    /// restore never drops the slot it puts back even when that slot is the
+    /// oldest banner in the store.
     #[test]
     fn web_flash_store_restore_keeps_the_capacity_bound() {
         let mut store = FlashStore::default();
@@ -4298,6 +4314,34 @@ mod tests {
             store.peek(&tokens[1]),
             Some(("notice", "banner 1")),
             "the restored banner survives while it is not the oldest"
+        );
+
+        // The same bound, with the restored banner as the oldest one: the
+        // eviction skips the slot the restore puts back and drops the
+        // next-oldest banner instead, so the restored banner stays readable.
+        let mut store = FlashStore::default();
+        let tokens = (0..FLASH_CAPACITY)
+            .map(|index| store.insert("notice", format!("banner {index}")))
+            .collect::<Vec<_>>();
+        let claimed = store
+            .claim(&tokens[0])
+            .expect("the oldest banner is claimable");
+        store.insert("notice", "newest".to_string());
+        store.restore(claimed);
+
+        assert_eq!(
+            store.slots.len(),
+            FLASH_CAPACITY,
+            "a restore of the oldest banner still holds the bound"
+        );
+        assert_eq!(
+            store.peek(&tokens[0]),
+            Some(("notice", "banner 0")),
+            "the restored banner survives even when it is the oldest"
+        );
+        assert!(
+            store.peek(&tokens[1]).is_none(),
+            "the next-oldest banner is the one that eviction drops"
         );
     }
 

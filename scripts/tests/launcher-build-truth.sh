@@ -176,6 +176,32 @@ case_icon_cache_failure_prints_no_checkmark() {
     fi
 }
 
+case_desktop_database_failure_prints_no_checkmark() {
+    local root="$TMP/installer-db" out status ok_out
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Linux\\n"\n' >"$root/bin/uname"
+    printf '#!/bin/bash\nexit 1\n' >"$root/bin/update-desktop-database"
+    chmod +x "$root/bin/uname" "$root/bin/update-desktop-database"
+    out=$(HOME="$root/home" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    printf '#!/bin/bash\nexit 0\n' >"$root/bin/update-desktop-database"
+    chmod +x "$root/bin/update-desktop-database"
+    ok_out=$(HOME="$root/home" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    if [ "$status" -eq 0 ] &&
+        printf '%s\n' "$out" | grep -q 'Desktop entry created' &&
+        printf '%s\n' "$out" | grep -q 'Desktop database refresh failed' &&
+        ! printf '%s\n' "$out" | grep -q 'Desktop database updated' &&
+        printf '%s\n' "$ok_out" | grep -q 'Desktop database updated'; then
+        pass "a failed desktop-database refresh prints no success checkmark"
+    else
+        fail "a failed desktop-database refresh prints no success checkmark (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
 case_detach_refuses_without_python3_or_setsid() {
     local root="$TMP/detach-refuse" out pidfile
     make_root "$root"
@@ -252,6 +278,7 @@ case_missing_cargo_fails
 case_rustup_cargo_wins
 case_toggle_builds_once
 case_icon_cache_failure_prints_no_checkmark
+case_desktop_database_failure_prints_no_checkmark
 case_detach_refuses_without_python3_or_setsid
 case_detach_uses_setsid
 case_toolchain_is_pinned

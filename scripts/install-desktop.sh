@@ -75,8 +75,11 @@ EOF
     echo "✓ Desktop entry created at $desktop_file"
 
     if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "$applications_dir" 2>/dev/null || true
-        echo "✓ Desktop database updated"
+        if update-desktop-database "$applications_dir" 2>/dev/null; then
+            echo "✓ Desktop database updated"
+        else
+            echo "⚠ Desktop database refresh failed; the menu entry may stay stale until you log in again."
+        fi
     fi
 
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
