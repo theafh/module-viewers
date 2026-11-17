@@ -480,35 +480,29 @@ fn loopback_origins() -> &'static [String; 3] {
 
 /// A request is same-origin when its `Origin` names a loopback origin. An opaque
 /// `Origin` of `null` and a request that carries no `Origin` both fall back to
-/// `Sec-Fetch-Site`, whose `cross-site` value is the only one rejected; older
-/// browsers send neither header. A browser sends `Origin: null` for a
-/// same-origin form post it cannot attribute to a serialisable origin, so
-/// rejecting that value outright breaks Update on such a browser.
+/// `Sec-Fetch-Site`, where a `same-site` or `cross-site` value is refused, so a
+/// page on another loopback port cannot forge a post; an absent `Sec-Fetch-Site`
+/// still passes, because older browsers send neither header. A browser sends
+/// `Origin: null` for a same-origin form post it cannot attribute to a
+/// serialisable origin, so rejecting that value outright breaks Update on such a
+/// browser.
 fn is_same_origin_post(headers: &HeaderMap) -> bool {
     match headers.get(header::ORIGIN) {
         Some(origin) => match origin.to_str() {
-            Ok("null") => !is_cross_site_fetch(headers),
+            Ok("null") => !is_sibling_site_fetch(headers),
             Ok(origin) => loopback_origins().iter().any(|allowed| allowed == origin),
             Err(_) => false,
         },
-        None => !is_cross_site_fetch(headers),
+        None => !is_sibling_site_fetch(headers),
     }
-}
-
-/// The only `Sec-Fetch-Site` value the origin fallback rejects.
-fn is_cross_site_fetch(headers: &HeaderMap) -> bool {
-    headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-        == Some("cross-site")
 }
 
 /// A dashboard read that names a flash token is accepted only from the page
 /// itself: a loopback `Origin`, or, when `Origin` is absent or the opaque value
 /// `null`, a `Sec-Fetch-Site` that is `same-origin`, `none`, or absent. A
-/// `same-site` or `cross-site` `Sec-Fetch-Site` refuses the read, which covers a
-/// no-`Origin` subresource load from another loopback port that the `POST`
-/// fallback would admit, while an older browser sends neither header and still
+/// `same-site` or `cross-site` `Sec-Fetch-Site` refuses the read, so a
+/// no-`Origin` subresource load from another loopback port is refused before the
+/// banner is taken, while an older browser sends neither header and still
 /// renders the navigation the scan redirect leaves.
 fn is_same_origin_flash_read(headers: &HeaderMap) -> bool {
     match headers.get(header::ORIGIN) {
@@ -2010,6 +2004,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn web_rejects_a_null_origin_same_site_form_post() {
+        let (state, path, folder, id) = state_with_repository("origin_null_same_site").await;
+        let response = send(
+            state.clone(),
+            form_post("/scan", Some("null"), Some("same-site")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_not_scanned(&state, id).await;
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rejects_a_same_site_post_without_an_origin() {
+        let (state, path, folder, id) = state_with_repository("origin_same_site").await;
+        let response = send(state.clone(), form_post("/scan", None, Some("same-site"))).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_not_scanned(&state, id).await;
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn web_rejects_a_cross_site_post_without_an_origin() {
         let (state, path, folder, id) = state_with_repository("fetch_site_reject").await;
         let response = send(state.clone(), form_post("/scan", None, Some("cross-site"))).await;
@@ -2229,8 +2247,8 @@ mod tests {
         );
 
         // A no-`Origin` subresource load from another loopback port is
-        // `same-site`, not `cross-site`, so the POST fallback alone would admit
-        // it. The banner read refuses that sibling site too.
+        // `same-site`, not `cross-site`, and the banner read refuses that
+        // sibling site before the token is taken.
         let sibling = Request::builder()
             .method(Method::GET)
             .uri(&location)

@@ -2,8 +2,8 @@
 description: "Make the two fixed five-second test deadlines immune to process-start latency under the parallel suite, with the margin measured rather than guessed."
 scope: task-viewer/src
 created: 2026-11-17T17:55:59Z
-updated: 2026-11-17T17:55:59Z
-status: open
+updated: 2026-11-17T18:13:24Z
+status: checked
 reported-by: Andreas Hoffmann
 ---
 
