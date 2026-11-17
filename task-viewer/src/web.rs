@@ -3917,6 +3917,11 @@ mod tests {
         let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).expect("chmod");
+        // The 5 s deadline is warmed and justified inside
+        // `harvest::register_test_git`: measured spawn-to-first-output worst
+        // case 72.69 ms at load average 17.59 over 900 samples across 3 loaded
+        // full-suite runs, so 5 s governs. Protocol:
+        // tasks/task-viewer_test-parallel-process-deadlines.md.
         harvest::register_test_git(&repo, &script, std::time::Duration::from_secs(5));
 
         let id = db::insert_repository(&pool, "vanished", &repo.to_string_lossy())

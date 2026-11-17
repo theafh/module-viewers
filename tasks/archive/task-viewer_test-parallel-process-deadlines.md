@@ -2,9 +2,11 @@
 description: "Make the two fixed five-second test deadlines immune to process-start latency under the parallel suite, with the margin measured rather than guessed."
 scope: task-viewer/src
 created: 2026-11-17T17:55:59Z
-updated: 2026-11-17T19:25:52Z
-status: ready
+updated: 2026-11-17T22:26:55Z
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Make the fixed test deadlines survive a loaded parallel suite
@@ -20,7 +22,7 @@ reported-by: Andreas Hoffmann
 - The observation: a review gate ran `make test` twice on 2026-11-17 on a machine at load average about 12 on 14 cores, and both runs reported `261 passed; 2 failed`, the two tests above. Both passed in isolation, and the suite passed with `--test-threads=1`.
 - The failed reproduction attempt: five consecutive full-suite runs with both deadlines at five seconds, under twelve synthetic CPU burners with load average rising from 5.66 to 28.48, each reported a passing suite. A single 256 KiB `head | tr` pipeline measured 10-30 ms. The trigger is therefore not established, and a larger constant is not yet justified by any measurement.
 - `harvest.rs` already holds two patterns for this class. `fn register_fake_git_with_deadline` starts the stand-in once at a 60-second warm-up deadline before registering a short one. `fn run_git_command_times_out_and_kills_the_child` doubles its deadline until the stand-in demonstrably records its pid, and its comment states that "no fixed value survives an arbitrarily loaded machine under a parallel test run".
-- Prior art: [task-viewer_harvest-timeout-flake.md](archive/task-viewer_harvest-timeout-flake.md) repaired this class for `harvest_timeout_does_not_retry_the_git_dir_fallback` and recorded the measurement that justified its margin: "A 2 s deadline failed 7 of 20 full-suite runs under parallel load, so the margin is 10 s", from a start-latency race where "the deadline starts when the child spawns".
+- Prior art: [task-viewer_harvest-timeout-flake.md](task-viewer_harvest-timeout-flake.md) repaired this class for `harvest_timeout_does_not_retry_the_git_dir_fallback` and recorded the measurement that justified its margin: "A 2 s deadline failed 7 of 20 full-suite runs under parallel load, so the margin is 10 s", from a start-latency race where "the deadline starts when the child spawns".
 
 ## Approach
 
@@ -31,6 +33,18 @@ reported-by: Andreas Hoffmann
 - The two tests keep proving what they prove today: the drain test asserts the 256 KiB stdout and stderr contents, and the vanished-blob test asserts the scan's recorded error names the path.
 
 **Out of scope:** The production deadline `GIT_COMMAND_TIMEOUT` and its parsing stay as they are, so this task changes only test fixtures. A suite-wide parallelism change, such as a shared semaphore over git-spawning tests, stays out as well, because the suite already passes under load and no measurement yet shows the scheduler is the cause.
+
+## Measurement
+
+Recorded 2026-11-17 on a 14-core macOS 26.6.2 machine.
+
+- Harness: 12 CPU burners (`yes > /dev/null`) held for the whole run, with a full `make test` in flight, while a probe spawned the drain test's stand-in script and timed it from `spawn()` returning to its first stdout byte. That is the span `run_git_command` charges against its deadline, because it sets `let started = Instant::now()` after `spawn()` returns and only then waits for stdout to close.
+- Run count: 3 loaded full-suite runs, 300 samples each, 900 samples total.
+- Load: 1-minute load average 14.95, 17.59, and 22.48 at the three measurement windows, up from an idle baseline of 4.17-6.48.
+- Worst case: 72.69 ms, from the run whose window read load average 17.59. Idle baseline over 300 samples was 41.57 ms.
+- Harness command: `measure-under-load.sh 300 12`, which holds the burners, starts `make test`, and runs `probe drain.sh 300` while the suite is in flight. The probe is a throwaway `rustc -O` binary and the script a copy of the drain test's stand-in, both kept outside the repo.
+- Derivation: `max(5 s, 5 x 72.69 ms = 363 ms)` is 5 s, so the 5 s floor still governs and neither deadline value changes. The warm-up is what removes the first-start cost the deadline would otherwise charge.
+- Ten-run protocol: 10 consecutive full `make test` runs under the same 12-burner harness each reported a passing suite, with no failure of either test.
 
 ## Acceptance
 

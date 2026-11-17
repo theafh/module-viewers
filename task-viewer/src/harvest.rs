@@ -1897,8 +1897,21 @@ mod git_override {
 
 /// Register a stand-in git for `repo` from a test outside this module, which
 /// cannot reach the private `git_override` registry.
+///
+/// The stand-in is warmed once at a generous deadline before its short one is
+/// registered, so a scan budgets its work and not the first process start. That
+/// warm-up passes no arguments, so a stand-in must answer a no-argument call at
+/// once: either it falls through to a catch-all arm that runs the real git, or
+/// it opens with a `case "$#" in 0) exit 0 ;; esac` guard.
+///
+/// Measured spawn-to-first output on the recorded harness (12 CPU burners on 14
+/// cores with a full `make test` in flight, 300 samples per run across 3 runs,
+/// 900 samples total): worst 72.69 ms at load average 17.59. The callers' 5 s
+/// deadline is max(5 s, 5 x 72.69 ms = 363 ms), so 5 s still governs. Protocol:
+/// tasks/task-viewer_test-parallel-process-deadlines.md.
 #[cfg(test)]
 pub(crate) fn register_test_git(repo: &Path, program: &Path, deadline: Duration) {
+    let _ = run_git_command(Command::new(program), None, Duration::from_secs(60));
     git_override::register(repo, Some(program.to_path_buf()), Some(deadline));
 }
 
@@ -7131,6 +7144,15 @@ mod tests {
             "big.sh",
             "head -c 262144 /dev/zero | tr '\\000' 'o'\nhead -c 262144 /dev/zero | tr '\\000' 'e' >&2",
         );
+        // Warm the stand-in once at a generous deadline, the same way
+        // `register_fake_git_with_deadline` does, so the deadline below budgets
+        // the drain and not the first process start. Measured spawn-to-first
+        // output on the recorded harness (12 CPU burners on 14 cores with a full
+        // `make test` in flight, 300 samples per run across 3 runs, 900 samples
+        // total): worst 72.69 ms at load average 17.59, so the 5 s floor is
+        // max(5 s, 5 x 72.69 ms = 363 ms) and 5 s still governs. Protocol:
+        // tasks/task-viewer_test-parallel-process-deadlines.md.
+        let _ = run_git_command(Command::new(&script), None, Duration::from_secs(60));
         let output = run_git_command(Command::new(&script), None, Duration::from_secs(5))
             .expect("large output must not time out");
         assert_eq!(output.stdout.len(), 262144);

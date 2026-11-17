@@ -7,6 +7,7 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 - Test observable behaviour: parsed rows, chart series, HTTP host checks, and database contents. Where the behaviour depends on process-wide state that a parallel-safe test must not change, such as the inherited git environment or the server's working directory, assert how harvest configures its `git` command instead.
 - Keep tests deterministic, isolated, offline, and parallel-safe. Every test owns its state through a per-test temp dir named `task-viewer_<name>_<pid>_<nanos>_<n>`, taken from `unique_temp_dir` in an inline test and from the process-level test's own helper, since `src/test_support.rs` opens `#![cfg(test)]` and `task-viewer` declares no lib target. Tests share no paths, no env overrides of the test process, and no execution-order assumptions, and a process-level test sets its child's environment per spawn. `cargo test` runs them in parallel.
 - Cover the success path and one failure path for a behaviour that can fail.
+- A test that passes a wall-clock deadline for process work carries the measured process-start latency that justifies it, and warms the stand-in or retries rather than guessing a constant; the measured worst case and the load it was taken under live beside the deadline.
 - Match a status, a variant, or a field. Avoid asserting a whole error string when a variant is enough, and assert the stored message when that message is the contract.
 
 ## Test Organization
