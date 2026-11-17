@@ -2,9 +2,11 @@
 description: "Log discarded scan-error writes, give zero-repository Update its own message, move banners to the flash store, and hold every banner to a closed code set."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-15T07:06:37Z
-status: ready
+updated: 2026-11-17T10:11:38Z
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Report web outcomes truthfully and keep banners off the URL
@@ -18,8 +20,8 @@ A failed `set_scan_error` write logs instead of vanishing. Update over zero repo
 - Build order: first on the banner channel. Ships before `task-viewer_web-add-robustness.md`, which adds three codes to the closed set this task creates.
 - `task-viewer/src/web.rs` discards the result of every `let _ = db::set_scan_error(...)` call, keys the Update outcome off an empty failure list, puts `STOPPED_ERROR` and the list failure in the redirect query, renders banner text straight from the query, and has a `FlashStore` whose `restore` skips the eviction loop.
 - `FEATURES.md` promises a banner is "shown once… a reload shows nothing".
-- Prior art: [task-viewer_update-response-transport.md](archive/task-viewer_update-response-transport.md) moved the failure list out of the URL; [task-viewer_scan-failure-reporting.md](archive/task-viewer_scan-failure-reporting.md) made Update report real failures.
-- This task lands first on the shared `/repositories` banner channel that `fn add_repository` and `fn redirect_repositories` carry: every message becomes a closed code here, and [task-viewer_web-add-robustness.md](task-viewer_web-add-robustness.md) then adds three codes, `picker-failed`, `folder-unreadable`, and `path-not-utf8`, and logs the picker's stderr text, so both changes hold one canonical banner rule.
+- Prior art: [task-viewer_update-response-transport.md](task-viewer_update-response-transport.md) moved the failure list out of the URL; [task-viewer_scan-failure-reporting.md](task-viewer_scan-failure-reporting.md) made Update report real failures.
+- This task lands first on the shared `/repositories` banner channel that `fn add_repository` and `fn redirect_repositories` carry: every message becomes a closed code here, and [task-viewer_web-add-robustness.md](../task-viewer_web-add-robustness.md) then adds three codes, `picker-failed`, `folder-unreadable`, and `path-not-utf8`, and logs the picker's stderr text, so both changes hold one canonical banner rule.
 
 ## Approach
 

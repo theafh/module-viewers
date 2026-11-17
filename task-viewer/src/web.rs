@@ -55,14 +55,14 @@ pub fn scan_worker_cap(raw: Option<&str>) -> usize {
     }
 }
 
-type PickerFn = dyn Fn() -> Result<Option<PathBuf>, &'static str> + Send + Sync;
+type PickerFn = dyn Fn() -> Result<Option<PathBuf>, Banner> + Send + Sync;
 
 /// The stage that runs immediately before one repository's harvest is spawned.
 /// Production passes a no-op; a test counts prior reads from a counter it owns.
 type PriorReadHookFn = dyn Fn(i64) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
 
 /// What one detached Update run reports to every request waiting on it.
-type ScanOutcome = Result<ScanReport, &'static str>;
+type ScanOutcome = Result<ScanReport, Banner>;
 
 /// The value a pending run publishes once it finishes: `None` until then.
 type PendingValue = Option<Arc<ScanOutcome>>;
@@ -174,10 +174,14 @@ impl FlashStore {
     }
 
     /// Put a claimed banner back under its own token, so the next read shows
-    /// the same message.
+    /// the same message. A restore is an insert, so it holds the same bound as
+    /// one: a slot put back past capacity evicts the oldest banner.
     fn restore(&mut self, claimed: ClaimedBanner) {
         if let Some(key) = flash_token_key(&claimed.token) {
             self.slots.insert(key, (claimed.key, claimed.message));
+            while self.slots.len() > FLASH_CAPACITY {
+                let _ = self.slots.pop_first();
+            }
         }
     }
 
@@ -521,6 +525,133 @@ fn is_local_host(host: &str) -> bool {
         || LOOPBACK_HOSTS.iter().any(|allowed| allowed == host)
 }
 
+/// Every banner a page request can name, keyed by the closed code a redirect
+/// carries. A value outside this set renders nothing, so a link can never place
+/// its own text on the dashboard or the Repositories page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Banner {
+    RepositoryAdded,
+    RepositoryRemoved,
+    ChartsUpdated,
+    NothingToUpdate,
+    RepositoryExists,
+    RepositoryListUnreadable,
+    RepositorySaveFailed,
+    RepositoryRemoveFailed,
+    RepositoryNotFound,
+    NoTasksDirectory,
+    SaveFailed,
+    GitUnreadable,
+    ScanUnreadable,
+    ScanStopped,
+    PickerUnsupported,
+    PickerNoSession,
+}
+
+impl Banner {
+    /// The code this banner is named by in a redirect query.
+    fn code(self) -> &'static str {
+        match self {
+            Self::RepositoryAdded => "repository-added",
+            Self::RepositoryRemoved => "repository-removed",
+            Self::ChartsUpdated => "charts-updated",
+            Self::NothingToUpdate => "nothing-to-update",
+            Self::RepositoryExists => "repository-exists",
+            Self::RepositoryListUnreadable => "repository-list-unreadable",
+            Self::RepositorySaveFailed => "repository-save-failed",
+            Self::RepositoryRemoveFailed => "repository-remove-failed",
+            Self::RepositoryNotFound => "repository-not-found",
+            Self::NoTasksDirectory => "no-tasks-directory",
+            Self::SaveFailed => "save-failed",
+            Self::GitUnreadable => "git-unreadable",
+            Self::ScanUnreadable => "scan-unreadable",
+            Self::ScanStopped => "scan-stopped",
+            Self::PickerUnsupported => "picker-unsupported",
+            Self::PickerNoSession => "picker-no-session",
+        }
+    }
+
+    /// The text this banner renders.
+    fn message(self) -> &'static str {
+        match self {
+            Self::RepositoryAdded => "Repository added.",
+            Self::RepositoryRemoved => "Repository removed.",
+            Self::ChartsUpdated => "Charts updated.",
+            Self::NothingToUpdate => "Nothing to update.",
+            Self::RepositoryExists => "That repository is already on the dashboard.",
+            Self::RepositoryListUnreadable => "The repository list could not be read.",
+            Self::RepositorySaveFailed => "The repository could not be saved.",
+            Self::RepositoryRemoveFailed => "The repository could not be removed.",
+            Self::RepositoryNotFound => "The repository was not found.",
+            Self::NoTasksDirectory => MISSING_TASKS_ERROR,
+            Self::SaveFailed => SAVE_ERROR,
+            Self::GitUnreadable => GIT_ERROR,
+            Self::ScanUnreadable => IO_ERROR,
+            Self::ScanStopped => STOPPED_ERROR,
+            Self::PickerUnsupported => "The folder picker is available on macOS and Linux.",
+            Self::PickerNoSession => "The folder picker needs a graphical session.",
+        }
+    }
+
+    /// Whether this banner is an error, so it renders in the error style and
+    /// only the `error` query field may name it.
+    fn is_error(self) -> bool {
+        !matches!(
+            self,
+            Self::RepositoryAdded
+                | Self::RepositoryRemoved
+                | Self::ChartsUpdated
+                | Self::NothingToUpdate
+        )
+    }
+
+    /// The query field this banner's code belongs in.
+    fn key(self) -> &'static str {
+        if self.is_error() { "error" } else { "notice" }
+    }
+
+    /// The banner `code` names, or `None` when this build does not know it.
+    fn from_code(code: &str) -> Option<Self> {
+        let banner = match code {
+            "repository-added" => Self::RepositoryAdded,
+            "repository-removed" => Self::RepositoryRemoved,
+            "charts-updated" => Self::ChartsUpdated,
+            "nothing-to-update" => Self::NothingToUpdate,
+            "repository-exists" => Self::RepositoryExists,
+            "repository-list-unreadable" => Self::RepositoryListUnreadable,
+            "repository-save-failed" => Self::RepositorySaveFailed,
+            "repository-remove-failed" => Self::RepositoryRemoveFailed,
+            "repository-not-found" => Self::RepositoryNotFound,
+            "no-tasks-directory" => Self::NoTasksDirectory,
+            "save-failed" => Self::SaveFailed,
+            "git-unreadable" => Self::GitUnreadable,
+            "scan-unreadable" => Self::ScanUnreadable,
+            "scan-stopped" => Self::ScanStopped,
+            "picker-unsupported" => Self::PickerUnsupported,
+            "picker-no-session" => Self::PickerNoSession,
+            _ => return None,
+        };
+        Some(banner)
+    }
+}
+
+/// The banner a page query names. A value the closed set does not hold, and a
+/// code placed in the wrong severity's field, name no banner at all.
+fn query_banner(notice: &str, error: &str) -> Option<Banner> {
+    Banner::from_code(notice)
+        .filter(|banner| !banner.is_error())
+        .or_else(|| Banner::from_code(error).filter(|banner| banner.is_error()))
+}
+
+/// Split one banner into the notice and error fields the templates render.
+fn split_banner(key: &str, message: String) -> (String, String) {
+    if key == "error" {
+        (String::new(), message)
+    } else {
+        (message, String::new())
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct HomeQuery {
     #[serde(default)]
@@ -595,22 +726,22 @@ async fn render_home(state: &AppState, query: &HomeQuery) -> anyhow::Result<Stri
 }
 
 /// The two banner fields the dashboard renders: the claimed flash slot when the
-/// read took one, otherwise the notice and error the query carries.
+/// read took one, otherwise the banner the query's code names. The Update banner
+/// keeps its per-repository failure text because the flash slot carries text,
+/// while a query can only name a code from the closed set.
 fn banner_text(claimed: Option<&ClaimedBanner>, query: &HomeQuery) -> (String, String) {
-    match claimed {
-        Some(ClaimedBanner {
-            key: "error",
-            message,
-            ..
-        }) => (String::new(), message.clone()),
-        Some(ClaimedBanner { message, .. }) => (message.clone(), String::new()),
-        None => (query.notice.clone(), query.error.clone()),
+    if let Some(claimed) = claimed {
+        return split_banner(claimed.key, claimed.message.clone());
+    }
+    match query_banner(&query.notice, &query.error) {
+        Some(banner) => split_banner(banner.key(), banner.message().to_string()),
+        None => (String::new(), String::new()),
     }
 }
 
 /// Claim the flash slot `?flash=` names for this request, or `None` when the
-/// query names no slot or names one that is already gone; the notice and error
-/// the query carries then stand in. The claim removes the slot under one lock
+/// query names no slot or names one that is already gone; the banner the query's
+/// code names then stands in. The claim removes the slot under one lock
 /// acquisition, so however many reads name one token, only the first renders
 /// it, and `render_home` puts the slot back when the render fails. The
 /// middleware rejects a cross-site read that names a slot before this runs, so
@@ -753,12 +884,16 @@ async fn render_dashboard(
 async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Result<String> {
     let repositories = db::list_repositories(&state.pool).await?;
     let projects = repositories.iter().map(project_view).collect::<Vec<_>>();
+    let (notice, error) = match query_banner(&query.notice, &query.error) {
+        Some(banner) => split_banner(banner.key(), banner.message().to_string()),
+        None => (String::new(), String::new()),
+    };
     let page = RepositoriesPage {
         version: state.static_version.clone(),
         page: "repositories",
         projects,
-        notice: query.notice.clone(),
-        error: query.error.clone(),
+        notice,
+        error,
         has_projects: !repositories.is_empty(),
     };
     let context = Context::from_serialize(page)?;
@@ -875,40 +1010,38 @@ async fn add_repository(State(state): State<AppState>) -> Response {
     let picker = Arc::clone(&state.picker);
     let picked = match tokio::task::spawn_blocking(move || picker()).await {
         Ok(Ok(picked)) => picked,
-        Ok(Err(message)) => return redirect_repositories("error", message),
-        Err(_) => {
-            return redirect_repositories("error", "The folder picker needs a graphical session.");
-        }
+        Ok(Err(banner)) => return redirect_repositories(banner),
+        Err(_) => return redirect_repositories(Banner::PickerNoSession),
     };
     let Some(picked) = picked else {
-        return redirect_repositories("notice", "");
+        return Redirect::to("/repositories").into_response();
     };
     let path = match std::fs::canonicalize(&picked) {
         Ok(path) if path.join("tasks").is_dir() => path,
-        _ => return redirect_repositories("error", "That folder has no tasks directory."),
+        _ => return redirect_repositories(Banner::NoTasksDirectory),
     };
     let _guard = state.scan.lock().await;
     match store_repository(&state, &path).await {
-        Ok(()) => redirect_repositories("notice", "Repository added."),
-        Err(message) => redirect_repositories("error", message),
+        Ok(()) => redirect_repositories(Banner::RepositoryAdded),
+        Err(banner) => redirect_repositories(banner),
     }
 }
 
 /// Store one already-chosen folder as a repository and refresh its rows. A
 /// failed first harvest keeps the repository and its scan error and returns
-/// that error's message, so Add can report the failure instead of a success.
+/// that error's banner, so Add can report the failure instead of a success.
 /// The caller holds the scan lock across this call.
-async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<(), &'static str> {
+async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<(), Banner> {
     let path_text = path.to_string_lossy().into_owned();
     if db::path_exists(&state.pool, &path_text)
         .await
-        .map_err(|_| "The repository list could not be read.")?
+        .map_err(|_| Banner::RepositoryListUnreadable)?
     {
-        return Err("That repository is already on the dashboard.");
+        return Err(Banner::RepositoryExists);
     }
     let existing = db::list_repositories(&state.pool)
         .await
-        .map_err(|_| "The repository list could not be read.")?;
+        .map_err(|_| Banner::RepositoryListUnreadable)?;
     let names = existing
         .into_iter()
         .map(|repo| repo.name)
@@ -916,9 +1049,9 @@ async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<()
     let name = db::unique_name(path, &names);
     let id = db::insert_repository(&state.pool, &name, &path_text)
         .await
-        .map_err(|_| "The repository could not be saved.")?;
+        .map_err(|_| Banner::RepositorySaveFailed)?;
     match refresh_one(&state.pool, &state.store_hook, id, path).await {
-        Some(message) => Err(message),
+        Some(banner) => Err(banner),
         None => Ok(()),
     }
 }
@@ -931,13 +1064,13 @@ async fn remove_repository(State(state): State<AppState>, Path(id): Path<i64>) -
         Ok(deleted) => deleted,
         Err(error) => {
             tracing::error!(%error, "delete failed");
-            return redirect_repositories("error", "The repository could not be removed.");
+            return redirect_repositories(Banner::RepositoryRemoveFailed);
         }
     };
     if deleted == 0 {
-        return redirect_repositories("error", "The repository was not found.");
+        return redirect_repositories(Banner::RepositoryNotFound);
     }
-    redirect_repositories("notice", "Repository removed.")
+    redirect_repositories(Banner::RepositoryRemoved)
 }
 
 async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) -> Response {
@@ -981,11 +1114,11 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
     match outcome {
         Some(outcome) => match outcome.as_ref() {
             Ok(report) => scan_response(&state, &project, report).await,
-            Err(message) => redirect(&project, "error", message),
+            Err(banner) => flash_banner(&state, &project, *banner).await,
         },
         None => {
             tracing::error!("the scan run stopped before reporting");
-            redirect(&project, "error", STOPPED_ERROR)
+            flash_banner(&state, &project, Banner::ScanStopped).await
         }
     }
 }
@@ -996,7 +1129,7 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
 /// the lock is the wait for a scan that already runs, and the pending-scan slot
 /// is emptied right after it, so a later click starts a new follow-up instead
 /// of joining a run that may already be reading files.
-async fn run_scan(state: AppState) -> Result<ScanReport, &'static str> {
+async fn run_scan(state: AppState) -> Result<ScanReport, Banner> {
     let _guard = state.scan.lock().await;
     {
         let mut slot = state.pending_scan.lock().await;
@@ -1006,7 +1139,7 @@ async fn run_scan(state: AppState) -> Result<ScanReport, &'static str> {
         Ok(repositories) => repositories,
         Err(error) => {
             tracing::error!(%error, "list failed");
-            return Err("The repository list could not be read.");
+            return Err(Banner::RepositoryListUnreadable);
         }
     };
     Ok(scan_core(
@@ -1026,7 +1159,7 @@ type HarvestFn =
 /// One repository whose scan left a scan error behind.
 struct ScanFailure {
     repository: String,
-    message: &'static str,
+    banner: Banner,
 }
 
 /// What one Update run did: how many repositories it attempted and which ones
@@ -1064,11 +1197,11 @@ async fn scan_core(
     while let Some(finished) = harvests.join_next().await {
         match finished {
             Ok((repository_id, outcome)) => {
-                if let Some(message) = store_outcome(pool, repository_id, outcome, store_hook).await
+                if let Some(banner) = store_outcome(pool, repository_id, outcome, store_hook).await
                 {
                     failures.push(ScanFailure {
                         repository: repository_name(repositories, repository_id),
-                        message,
+                        banner,
                     });
                 }
             }
@@ -1129,45 +1262,59 @@ const GIT_ERROR: &str = "Git could not read the history, so the rows were left a
 const IO_ERROR: &str = "The scan could not read the repository.";
 const STOPPED_ERROR: &str = "The scan stopped before it finished.";
 
+/// Record one repository's scan error. A write that fails is logged with the
+/// repository and the error, because the stored message is the only place the
+/// person sees the failure and a silent write would lose it.
+async fn record_scan_error(pool: &sqlx::SqlitePool, repository_id: i64, message: &'static str) {
+    if let Err(error) = db::set_scan_error(pool, repository_id, message).await {
+        tracing::error!(
+            %error,
+            repository_id,
+            scan_message = message,
+            "the scan error could not be stored"
+        );
+    }
+}
+
 /// Record one harvest outcome, whether it arrived through the parallel join loop
-/// or a single repository refresh, so both paths report the same messages. The
-/// message a failed outcome stored is returned for the run report.
+/// or a single repository refresh, so both paths report the same banners. The
+/// banner a failed outcome stored is returned for the run report.
 async fn store_outcome(
     pool: &sqlx::SqlitePool,
     repository_id: i64,
     outcome: HarvestOutcome,
     store_hook: &Arc<StoreHookFn>,
-) -> Option<&'static str> {
+) -> Option<Banner> {
     match outcome {
         Ok(Ok(tasks)) => {
             if let Err(error) =
                 db::replace_tasks(pool, repository_id, &tasks, store_hook.as_ref()).await
             {
                 tracing::error!(%error, repository_id, "replace failed");
-                let _ = db::set_scan_error(pool, repository_id, SAVE_ERROR).await;
-                Some(SAVE_ERROR)
+                record_scan_error(pool, repository_id, SAVE_ERROR).await;
+                Some(Banner::SaveFailed)
             } else {
                 None
             }
         }
         Ok(Err(HarvestError::MissingTasks)) => {
-            let _ = db::set_scan_error(pool, repository_id, MISSING_TASKS_ERROR).await;
-            Some(MISSING_TASKS_ERROR)
+            record_scan_error(pool, repository_id, MISSING_TASKS_ERROR).await;
+            Some(Banner::NoTasksDirectory)
         }
         Ok(Err(HarvestError::Git(reason))) => {
             tracing::error!(%reason, repository_id, "git could not read the history");
-            let _ = db::set_scan_error(pool, repository_id, GIT_ERROR).await;
-            Some(GIT_ERROR)
+            record_scan_error(pool, repository_id, GIT_ERROR).await;
+            Some(Banner::GitUnreadable)
         }
         Ok(Err(HarvestError::Io(error))) => {
             tracing::error!(%error, repository_id, "scan failed");
-            let _ = db::set_scan_error(pool, repository_id, IO_ERROR).await;
-            Some(IO_ERROR)
+            record_scan_error(pool, repository_id, IO_ERROR).await;
+            Some(Banner::ScanUnreadable)
         }
         Err(error) => {
             tracing::error!(%error, repository_id, "scan task stopped");
-            let _ = db::set_scan_error(pool, repository_id, STOPPED_ERROR).await;
-            Some(STOPPED_ERROR)
+            record_scan_error(pool, repository_id, STOPPED_ERROR).await;
+            Some(Banner::ScanStopped)
         }
     }
 }
@@ -1177,7 +1324,7 @@ async fn refresh_one(
     store_hook: &Arc<StoreHookFn>,
     repository_id: i64,
     path: &std::path::Path,
-) -> Option<&'static str> {
+) -> Option<Banner> {
     let owned = path.to_path_buf();
     let prior = match db::load_prior_tasks(pool, repository_id).await {
         Ok(prior) => prior,
@@ -1192,17 +1339,27 @@ async fn refresh_one(
     store_outcome(pool, repository_id, outcome, store_hook).await
 }
 
-/// The dashboard banner a scan run deserves: the success notice only when every
+/// The dashboard banner a scan run deserves: a distinct "nothing to update"
+/// notice when no repository exists, the success notice only when every
 /// repository harvested, and an error naming each failed repository otherwise.
 fn scan_flash(report: &ScanReport) -> (&'static str, String) {
+    if report.attempted == 0 {
+        return (
+            Banner::NothingToUpdate.key(),
+            Banner::NothingToUpdate.message().to_string(),
+        );
+    }
     if report.failures.is_empty() {
-        return ("notice", "Charts updated.".to_string());
+        return (
+            Banner::ChartsUpdated.key(),
+            Banner::ChartsUpdated.message().to_string(),
+        );
     }
     let clean = report.attempted.saturating_sub(report.failures.len());
     let failed = report
         .failures
         .iter()
-        .map(|failure| format!("{} ({})", failure.repository, failure.message))
+        .map(|failure| format!("{} ({})", failure.repository, failure.banner.message()))
         .collect::<Vec<_>>()
         .join(", ");
     (
@@ -1224,30 +1381,45 @@ async fn scan_response(state: &AppState, project: &str, report: &ScanReport) -> 
     .into_response()
 }
 
-fn pick_folder() -> Result<Option<PathBuf>, &'static str> {
+/// Put one code-bearing banner in the flash store and redirect the dashboard to
+/// it, so a stopped or list-failed Update shows once and is gone on reload.
+async fn flash_banner(state: &AppState, project: &str, banner: Banner) -> Response {
+    let token = state
+        .flash
+        .lock()
+        .await
+        .insert(banner.key(), banner.message().to_string());
+    Redirect::to(&format!(
+        "/?project={}&flash={token}",
+        safe_project(project)
+    ))
+    .into_response()
+}
+
+fn pick_folder() -> Result<Option<PathBuf>, Banner> {
     if cfg!(target_os = "macos") {
         return pick_osascript();
     }
     if cfg!(target_os = "linux") {
         return pick_zenity();
     }
-    Err("The folder picker is available on macOS and Linux.")
+    Err(Banner::PickerUnsupported)
 }
 
-fn pick_osascript() -> Result<Option<PathBuf>, &'static str> {
+fn pick_osascript() -> Result<Option<PathBuf>, Banner> {
     let output = Command::new("osascript")
         .args([
             "-e",
             "POSIX path of (choose folder with prompt \"Select a repository\")",
         ])
         .output()
-        .map_err(|_| "The folder picker needs a graphical session.")?;
+        .map_err(|_| Banner::PickerNoSession)?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).to_lowercase();
         if err.contains("cancel") {
             return Ok(None);
         }
-        return Err("The folder picker needs a graphical session.");
+        return Err(Banner::PickerNoSession);
     }
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if path.is_empty() {
@@ -1256,7 +1428,7 @@ fn pick_osascript() -> Result<Option<PathBuf>, &'static str> {
     Ok(Some(PathBuf::from(path)))
 }
 
-fn pick_zenity() -> Result<Option<PathBuf>, &'static str> {
+fn pick_zenity() -> Result<Option<PathBuf>, Banner> {
     let output = Command::new("zenity")
         .args([
             "--file-selection",
@@ -1264,7 +1436,7 @@ fn pick_zenity() -> Result<Option<PathBuf>, &'static str> {
             "--title=Select a repository",
         ])
         .output()
-        .map_err(|_| "The folder picker needs a graphical session.")?;
+        .map_err(|_| Banner::PickerNoSession)?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -1283,23 +1455,13 @@ fn safe_project(project: &str) -> String {
     }
 }
 
-fn redirect(project: &str, key: &str, message: &str) -> Response {
-    let project = safe_project(project);
-    if message.is_empty() {
-        return Redirect::to(&format!("/?project={project}")).into_response();
-    }
+fn redirect_repositories(banner: Banner) -> Response {
     Redirect::to(&format!(
-        "/?project={project}&{key}={}",
-        encode_query(message)
+        "/repositories?{}={}",
+        banner.key(),
+        encode_query(banner.code())
     ))
     .into_response()
-}
-
-fn redirect_repositories(key: &str, message: &str) -> Response {
-    if message.is_empty() {
-        return Redirect::to("/repositories").into_response();
-    }
-    Redirect::to(&format!("/repositories?{key}={}", encode_query(message))).into_response()
 }
 
 /// Percent-encode a message for a redirect query, writing into one `String`.
@@ -1328,9 +1490,10 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, FLASH_CAPACITY, FlashStore, HarvestFn, HomeQuery, MISSING_TASKS_ERROR, PickerFn,
-        PriorReadHookFn, ProjectForm, STOPPED_ERROR, ScanFailure, ScanReport, StoreHookFn,
-        add_repository, claim_banner, encode_query, init_templates, is_local_host, remaining,
+        AppState, Banner, FLASH_CAPACITY, FlashStore, GIT_ERROR, HarvestFn, HomeQuery,
+        MISSING_TASKS_ERROR, PickerFn, PriorReadHookFn, ProjectForm, STOPPED_ERROR, ScanFailure,
+        ScanReport, StoreHookFn, add_repository, claim_banner, encode_query, flash_banner,
+        init_templates, is_local_host, query_banner, record_scan_error, remaining,
         remove_repository, render_blocking_thread, render_home, router, scan_all, scan_core,
         scan_flash, scan_label, scan_response, scan_worker_cap, serve, static_version,
     };
@@ -1349,6 +1512,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use tower::ServiceExt;
+    use tracing_subscriber::layer::SubscriberExt;
 
     /// The production store hook: it resolves at once, so a scan stores without
     /// pausing inside the write transaction.
@@ -1459,6 +1623,48 @@ mod tests {
     fn cleanup(path: &Path) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    /// The fields of one captured log event, flattened so a test can assert the
+    /// repository id and the message the event carried.
+    struct LogFields(String);
+
+    impl tracing::field::Visit for LogFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    /// A layer that captures every event's fields, so a test can read the log
+    /// lines one path emits.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedLogs {
+        fn take(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .map(|mut lines| std::mem::take(&mut *lines))
+                .unwrap_or_default()
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CapturedLogs
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = LogFields(String::new());
+            event.record(&mut fields);
+            if let Ok(mut lines) = self.0.lock() {
+                lines.push(fields.0);
+            }
         }
     }
 
@@ -2837,7 +3043,7 @@ mod tests {
             .expect("Remove task joins");
         assert_eq!(
             redirect_location(&response),
-            "/repositories?notice=Repository%20removed."
+            "/repositories?notice=repository-removed"
         );
         let rows = db::load_tasks(&state.pool, Some(scanned_id))
             .await
@@ -3319,10 +3525,11 @@ mod tests {
                 .await
                 .expect("a joined Update finishes")
                 .expect("the joined request joins");
+            let token = flash_token(&redirect_location(&response), "all");
             assert_eq!(
-                redirect_location(&response),
-                format!("/?project=all&error={}", encode_query(STOPPED_ERROR)),
-                "a run that ends without a result reports the stopped banner"
+                state.flash.lock().await.take(&token),
+                Some(("error", STOPPED_ERROR.to_string())),
+                "a run that ends without a result reports the stopped banner through the flash store"
             );
         }
 
@@ -3754,8 +3961,9 @@ mod tests {
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].repository, "broken");
         assert_eq!(
-            report.failures[0].message,
-            "Git could not read the history, so the rows were left as they were."
+            report.failures[0].banner,
+            Banner::GitUnreadable,
+            "the failure names the git banner"
         );
         let _ = std::fs::remove_dir_all(clean);
         let _ = std::fs::remove_dir_all(broken);
@@ -3787,8 +3995,9 @@ mod tests {
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].repository, "stopped");
         assert_eq!(
-            report.failures[0].message,
-            "The scan stopped before it finished."
+            report.failures[0].banner,
+            Banner::ScanStopped,
+            "the failure names the stopped banner"
         );
         let after = db::list_repositories(&pool).await.expect("after");
         assert_eq!(
@@ -3806,11 +4015,11 @@ mod tests {
             failures: vec![
                 ScanFailure {
                     repository: "sysadmin".to_string(),
-                    message: "Git could not read the history, so the rows were left as they were.",
+                    banner: Banner::GitUnreadable,
                 },
                 ScanFailure {
                     repository: "notes".to_string(),
-                    message: "That folder has no tasks directory.",
+                    banner: Banner::NoTasksDirectory,
                 },
             ],
         };
@@ -3821,6 +4030,23 @@ mod tests {
             "Charts updated for 7 of 9 repositories. Failed: sysadmin (Git could not read the history, so the rows were left as they were.), notes (That folder has no tasks directory.)."
         );
         assert!(!message.ends_with("Charts updated."));
+    }
+
+    /// Acceptance: Update over zero repositories reports that nothing was
+    /// attempted instead of claiming a clean update.
+    #[test]
+    fn web_scan_banner_reports_nothing_to_update() {
+        let report = ScanReport {
+            attempted: 0,
+            failures: Vec::new(),
+        };
+        let (key, message) = scan_flash(&report);
+        assert_eq!(key, "notice");
+        assert_eq!(message, "Nothing to update.");
+        assert_ne!(
+            message, "Charts updated.",
+            "a run over zero repositories is not a clean update"
+        );
     }
 
     #[test]
@@ -3834,6 +4060,211 @@ mod tests {
         assert_eq!(message, "Charts updated.");
     }
 
+    /// Acceptance: Update over zero repositories shows a distinct "nothing to
+    /// update" message through the dashboard, not the clean-run notice.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_update_over_zero_repositories_shows_nothing_to_update() {
+        let (state, path) = app_state("scan_nothing_to_update").await;
+        let response = send(state.clone(), form_post("/scan", None, None)).await;
+        let location = redirect_location(&response);
+        flash_token(&location, "all");
+
+        let body =
+            body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
+        assert!(
+            body.contains("<p class=\"banner\">Nothing to update.</p>"),
+            "zero repositories render the distinct notice"
+        );
+        assert!(
+            !body.contains("Charts updated."),
+            "zero repositories never claim a clean update"
+        );
+        cleanup(&path);
+    }
+
+    /// Acceptance: a forced `set_scan_error` failure produces one log line
+    /// naming the repository. A closed pool makes every write fail, so the
+    /// helper's own path runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_failed_scan_error_write_logs_the_repository() {
+        let path = temp_database("scan_error_log");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let repository_id = db::insert_repository(&pool, "logging", "/tmp/logging")
+            .await
+            .expect("insert");
+        pool.close().await;
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        record_scan_error(&pool, repository_id, GIT_ERROR).await;
+        drop(_guard);
+
+        let lines = captured.take();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one failed write emits one log line: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(&format!("repository_id={repository_id}")),
+            "the log line names the repository: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(GIT_ERROR),
+            "the log line names the message that could not be stored: {lines:?}"
+        );
+        cleanup(&path);
+    }
+
+    /// Acceptance: a stopped Update renders its banner on the first read and
+    /// shows no banner on reload.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_stopped_update_banner_shows_once() {
+        let (state, path) = app_state("flash_stopped_once").await;
+        let location = redirect_location(&flash_banner(&state, "all", Banner::ScanStopped).await);
+
+        let first =
+            body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
+        assert!(
+            first.contains(
+                "<p class=\"banner banner-error\">The scan stopped before it finished.</p>"
+            ),
+            "the first read shows the stopped banner"
+        );
+
+        let reload =
+            body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
+        assert!(
+            !reload.contains("The scan stopped before it finished."),
+            "a reload shows no banner"
+        );
+        cleanup(&path);
+    }
+
+    /// Acceptance: a failed repository-list read renders its banner on the
+    /// first read and shows no banner on reload. The scan runs against a closed
+    /// pool while the page reads from the working one, so the list failure is
+    /// real rather than simulated.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_failed_list_banner_shows_once() {
+        let (state, path) = app_state("flash_list_failed_once").await;
+        let broken_path = temp_database("flash_list_failed_broken");
+        let broken_pool = db::init_at(&broken_path).await.expect("broken init");
+        broken_pool.close().await;
+        let broken = AppState {
+            pool: broken_pool,
+            ..state.clone()
+        };
+
+        let response = scan_all(State(broken), Form(ProjectForm::default())).await;
+        let location = redirect_location(&response);
+        flash_token(&location, "all");
+
+        let first =
+            body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
+        assert!(
+            first.contains("The repository list could not be read."),
+            "the first read shows the list-failure banner"
+        );
+
+        let reload =
+            body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
+        assert!(
+            !reload.contains("The repository list could not be read."),
+            "a reload shows no banner"
+        );
+        cleanup(&broken_path);
+        cleanup(&path);
+    }
+
+    /// Acceptance: a request carrying an unknown banner value renders no free
+    /// text on the dashboard or the Repositories page.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_unknown_banner_codes_render_no_free_text() {
+        let (state, path) = app_state("banner_unknown_codes").await;
+        let injected = "Injected free text.";
+
+        assert_eq!(
+            query_banner("repository-added", ""),
+            Some(Banner::RepositoryAdded)
+        );
+        assert_eq!(
+            query_banner("", "repository-added"),
+            None,
+            "a notice code in the error field names no banner"
+        );
+        assert_eq!(
+            query_banner("injected", "injected"),
+            None,
+            "an unknown code names no banner"
+        );
+
+        for uri in [
+            format!("/?notice={}", encode_query(injected)),
+            format!("/?error={}", encode_query(injected)),
+            format!("/repositories?notice={}", encode_query(injected)),
+            format!("/repositories?error={}", encode_query(injected)),
+        ] {
+            let body = body_text(send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await).await;
+            assert!(
+                !body.contains(injected),
+                "{uri} must not render the query's free text"
+            );
+            assert!(
+                !body.contains("banner-error"),
+                "{uri} renders no error banner"
+            );
+        }
+
+        let known = body_text(
+            send(
+                state.clone(),
+                get_page("/repositories?notice=repository-added", "127.0.0.1:7880"),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            known.contains("<p class=\"banner\">Repository added.</p>"),
+            "a known code still renders its fixed text"
+        );
+        cleanup(&path);
+    }
+
+    /// Acceptance: a flash store at capacity plus one keeps its bound after
+    /// `restore`, evicting the oldest banner exactly as `insert` does.
+    #[test]
+    fn web_flash_store_restore_keeps_the_capacity_bound() {
+        let mut store = FlashStore::default();
+        let tokens = (0..FLASH_CAPACITY)
+            .map(|index| store.insert("notice", format!("banner {index}")))
+            .collect::<Vec<_>>();
+        let claimed = store
+            .claim(&tokens[1])
+            .expect("the second banner is claimable");
+        // A new insert takes the store to capacity again, so the restore is the
+        // one that would push it past the bound.
+        store.insert("notice", "newest".to_string());
+        store.restore(claimed);
+
+        assert_eq!(
+            store.slots.len(),
+            FLASH_CAPACITY,
+            "restore holds the same capacity bound as insert"
+        );
+        assert!(
+            store.peek(&tokens[0]).is_none(),
+            "the oldest banner is evicted by the restore"
+        );
+        assert_eq!(
+            store.peek(&tokens[1]),
+            Some(("notice", "banner 1")),
+            "the restored banner survives while it is not the oldest"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn web_scan_response_redirects_with_the_true_outcome() {
         let (state, path) = app_state("scan_response_outcome").await;
@@ -3841,7 +4272,7 @@ mod tests {
             attempted: 2,
             failures: vec![ScanFailure {
                 repository: "sysadmin".to_string(),
-                message: "Git could not read the history, so the rows were left as they were.",
+                banner: Banner::GitUnreadable,
             }],
         };
         let failure_location = redirect_location(&scan_response(&state, "all", &failed).await);
@@ -4014,8 +4445,8 @@ mod tests {
     }
 
     /// Acceptance: a flash token is consumed by the first dashboard read, so a
-    /// reload and a reused or missing token show no banner, while the query
-    /// transport the other callers keep still renders.
+    /// reload and a reused or missing token show no banner, while a query
+    /// naming a known banner code still renders.
     #[tokio::test(flavor = "current_thread")]
     async fn web_flash_token_is_consumed_once() {
         let (state, path) = app_state("flash_consumed").await;
@@ -4055,14 +4486,14 @@ mod tests {
         let carried = body_text(
             send(
                 state.clone(),
-                get_page("/?project=all&error=Legacy%20message.", "127.0.0.1:7880"),
+                get_page("/?project=all&error=repository-not-found", "127.0.0.1:7880"),
             )
             .await,
         )
         .await;
         assert!(
-            carried.contains("Legacy message."),
-            "the query transport still renders"
+            carried.contains("The repository was not found."),
+            "the query transport renders a known banner code"
         );
         cleanup(&path);
     }
@@ -4248,7 +4679,7 @@ mod tests {
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
             redirect_location(&response),
-            "/repositories?notice=Repository%20added."
+            "/repositories?notice=repository-added"
         );
         let repositories = db::list_repositories(&state.pool).await.expect("list");
         assert_eq!(repositories.len(), 1);
@@ -4280,10 +4711,7 @@ mod tests {
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
             redirect_location(&response),
-            format!(
-                "/repositories?error={}",
-                encode_query("Git could not read the history, so the rows were left as they were.")
-            )
+            "/repositories?error=git-unreadable"
         );
         let repositories = db::list_repositories(&state.pool).await.expect("list");
         assert_eq!(repositories.len(), 1);
@@ -4335,7 +4763,7 @@ mod tests {
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
             redirect_location(&response),
-            "/repositories?notice=Repository%20added."
+            "/repositories?notice=repository-added"
         );
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
@@ -4344,15 +4772,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn web_add_reports_a_picker_error() {
         let (mut state, path) = app_state("add_picker_error").await;
-        state.picker = Arc::new(|| Err("No picker available."));
+        state.picker = Arc::new(|| Err(Banner::PickerNoSession));
 
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
             redirect_location(&response),
-            format!(
-                "/repositories?error={}",
-                encode_query("No picker available.")
-            )
+            "/repositories?error=picker-no-session"
         );
         let repositories = db::list_repositories(&state.pool).await.expect("list");
         assert!(repositories.is_empty());
@@ -4370,10 +4795,7 @@ mod tests {
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
             redirect_location(&response),
-            format!(
-                "/repositories?error={}",
-                encode_query("That folder has no tasks directory.")
-            )
+            "/repositories?error=no-tasks-directory"
         );
         let repositories = db::list_repositories(&state.pool).await.expect("list");
         assert!(repositories.is_empty());
@@ -4391,15 +4813,12 @@ mod tests {
         let first = add_repository(State(state.clone())).await;
         assert_eq!(
             redirect_location(&first),
-            "/repositories?notice=Repository%20added."
+            "/repositories?notice=repository-added"
         );
         let second = add_repository(State(state.clone())).await;
         assert_eq!(
             redirect_location(&second),
-            format!(
-                "/repositories?error={}",
-                encode_query("That repository is already on the dashboard.")
-            )
+            "/repositories?error=repository-exists"
         );
         let repositories = db::list_repositories(&state.pool).await.expect("list");
         assert_eq!(repositories.len(), 1);
@@ -4468,7 +4887,7 @@ mod tests {
             .expect("Remove task joins");
         assert_eq!(
             redirect_location(&response),
-            "/repositories?notice=Repository%20removed."
+            "/repositories?notice=repository-removed"
         );
 
         let after = db::list_repositories(&state.pool).await.expect("after");
@@ -4551,7 +4970,7 @@ mod tests {
             .expect("Remove task joins");
         assert_eq!(
             redirect_location(&response),
-            "/repositories?notice=Repository%20removed."
+            "/repositories?notice=repository-removed"
         );
         let after = db::list_repositories(&state.pool).await.expect("after");
         assert!(
@@ -4572,14 +4991,11 @@ mod tests {
         let response = remove_repository(State(state.clone()), UrlPath(9_999)).await;
         assert_eq!(
             redirect_location(&response),
-            format!(
-                "/repositories?error={}",
-                encode_query("The repository was not found.")
-            )
+            "/repositories?error=repository-not-found"
         );
         assert_ne!(
             redirect_location(&response),
-            "/repositories?notice=Repository%20removed."
+            "/repositories?notice=repository-removed"
         );
         cleanup(&path);
     }
@@ -4605,7 +5021,7 @@ mod tests {
         let response = remove_repository(State(state.clone()), UrlPath(removed_id)).await;
         assert_eq!(
             redirect_location(&response),
-            "/repositories?notice=Repository%20removed."
+            "/repositories?notice=repository-removed"
         );
         let after = db::list_repositories(&state.pool).await.expect("after");
         assert!(after.is_empty());

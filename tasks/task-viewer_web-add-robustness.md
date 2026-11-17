@@ -17,7 +17,7 @@ Add's first store completes after a client disconnect: the insert and the first 
 
 - Build order: second on the banner channel. Ships after `task-viewer_web-outcome-plumbing.md`, after `task-viewer_harvest-git-failure-cases.md`, which widens the same `add_repository` gate this task classifies, and after `task-viewer_web-pool-close-and-comments.md`, whose Acceptance pins the `fn run_scan` comment this task must refresh.
 - `task-viewer/src/web.rs` runs Add's first harvest inside the request future, maps every non-zero zenity exit to `Ok(None)`, matches the macOS cancel on the English word "cancel" and drops stderr, decodes the picker output lossily and trims it, and maps every `canonicalize` failure and every `tasks` `is_dir` probe that returns false to "That folder has no tasks directory."
-- The live task [task-viewer_web-outcome-plumbing.md](task-viewer_web-outcome-plumbing.md) lands first and closes every `/repositories` banner to a fixed code; this task then adds three codes to that set, `picker-failed`, `folder-unreadable`, and `path-not-utf8`, so one canonical banner rule holds.
+- The finished task [task-viewer_web-outcome-plumbing.md](archive/task-viewer_web-outcome-plumbing.md) landed first and closed every `/repositories` banner to a fixed code; this task then adds three codes to that set, `picker-failed`, `folder-unreadable`, and `path-not-utf8`, so one canonical banner rule holds.
 - The finished task [task-viewer_folder-picker-lock.md](archive/task-viewer_folder-picker-lock.md) moved the picker off the scan lock; these are the remaining failure and disconnect paths.
 
 ## Approach
