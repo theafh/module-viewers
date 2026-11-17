@@ -9,7 +9,9 @@
 #
 # Reachability is read from standard output rather than the exit status. In the
 # healthy state cargo writes `warning: nothing to print.` to standard error and
-# exits zero, so a captured `2>&1` would turn the healthy state red.
+# exits zero, so a captured `2>&1` would turn the healthy state red. A non-zero
+# exit is a failure of the check itself, not a reachability signal, so it fails
+# the check instead of passing it.
 #
 # Set CHECK_RSA_ROOT to run against a checkout other than this one.
 
@@ -21,7 +23,15 @@ if [ -z "$ROOT" ]; then
 fi
 cd "$ROOT" || exit 1
 
-listing=$(cargo tree -i rsa 2>/dev/null) || true
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "error: cargo is not on PATH, so rsa's reachability cannot be checked" >&2
+    exit 1
+fi
+
+if ! listing=$(cargo tree -i rsa 2>/dev/null); then
+    echo "error: cargo tree -i rsa failed, so rsa's reachability cannot be checked" >&2
+    exit 1
+fi
 
 if [ -n "$listing" ]; then
     echo "error: rsa is reachable from the build graph, so RUSTSEC-2023-0071's ignore in .cargo/audit.toml no longer holds:" >&2

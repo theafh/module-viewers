@@ -12,6 +12,7 @@ set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VENDOR_SCRIPT="$REPO/scripts/vendor-sqlx-sqlite-sha256.sh"
 RSA_SCRIPT="$REPO/scripts/check-rsa-reachability.sh"
+BASH_BIN="$(command -v bash)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/task-viewer-audit-gate.XXXXXX")"
 FAILURES=0
 
@@ -180,6 +181,19 @@ case_rsa_reachable_fails() {
     fi
 }
 
+case_rsa_no_cargo_fails() {
+    local root="$TMP/rsa-no-cargo" out status
+    make_root "$root"
+    out=$(CHECK_RSA_ROOT="$root" PATH="$root/bin" "$BASH_BIN" "$RSA_SCRIPT" 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ] && printf '%s\n' "$out" | grep -q 'cargo is not on PATH'; then
+        pass "the rsa check fails when cargo is not on PATH"
+    else
+        fail "the rsa check fails when cargo is not on PATH (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
 case_record_covers_tracked_files_in_order
 case_clean_tree_passes
 case_changed_byte_fails
@@ -188,6 +202,7 @@ case_missing_file_fails
 case_missing_record_fails
 case_rsa_outside_graph_passes
 case_rsa_reachable_fails
+case_rsa_no_cargo_fails
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "$FAILURES audit-gate test(s) failed"
