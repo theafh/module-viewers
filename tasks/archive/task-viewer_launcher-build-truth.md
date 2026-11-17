@@ -2,9 +2,11 @@
 description: "Fail when cargo is missing, build with --locked, prefer rustup's cargo, build once per restart, and print success only when it happened."
 scope: scripts
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:52:55Z
-status: ready
+updated: 2026-11-17T10:49:10Z
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Make the launcher build and install truthfully
@@ -21,8 +23,8 @@ A missing `cargo` fails the start with a clear message instead of launching a po
 - `scripts/install-desktop.sh` prints a checkmark after a `|| true` icon-cache refresh.
 - `rust-toolchain.toml` sets `channel = "stable"` with no version, so the compiler enforcing the deny-warnings gate can change without a commit. Its `[toolchain]` table is the only place a channel pin fits; `rust-version` is a Cargo `[package]` key, and `task-viewer/Cargo.toml` is the workspace's only package manifest because the root `Cargo.toml` is a `[workspace]` manifest with no `[package]` table.
 - `FEATURES.md` and `README.md` promise the launcher builds the checked-out code.
-- Order: this task ships first. [task-viewer_guardrail-doc-sync.md](task-viewer_guardrail-doc-sync.md) then states the pinned channel and the matching `rust-version` in its CHARTER and ARCHITECTURE toolchain passage, and [task-viewer_launcher-process-safety.md](task-viewer_launcher-process-safety.md) then locks the start/stop body and quotes the launcher's no-python3 branch, so shipping this task first leaves that sibling a settled call graph and a refreshed quote.
-- Prior art: [task-viewer_build-efficiency.md](archive/task-viewer_build-efficiency.md) (deferred) covers dependencies and profile; this task covers the launcher's build and install honesty.
+- Order: this task ships first. [task-viewer_guardrail-doc-sync.md](../task-viewer_guardrail-doc-sync.md) then states the pinned channel and the matching `rust-version` in its CHARTER and ARCHITECTURE toolchain passage, and [task-viewer_launcher-process-safety.md](../task-viewer_launcher-process-safety.md) then locks the start/stop body and quotes the launcher's no-python3 branch, so shipping this task first leaves that sibling a settled call graph and a refreshed quote.
+- Prior art: [task-viewer_build-efficiency.md](task-viewer_build-efficiency.md) (deferred) covers dependencies and profile; this task covers the launcher's build and install honesty.
 
 ## Approach
 

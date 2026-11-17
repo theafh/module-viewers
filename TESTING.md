@@ -34,5 +34,5 @@ How module-viewers is verified. `task-viewer` is a Rust binary on axum and sqlx.
 
 - `make format` runs rustfmt.
 - `make lint` runs clippy with warnings denied.
-- `make test` runs `cargo test` with warnings denied.
+- `make test` runs `cargo test` with warnings denied, then `scripts/tests/launcher-build-truth.sh`, which drives copies of the launcher and installer in throwaway roots and homes: the locked build command in the launcher and `make build`, the missing-cargo failure, rustup cargo winning over a Homebrew-first PATH, one build per toggle, the installer's icon-cache checkmark, the detach branch without python3, and the pinned toolchain.
 - `make audit` runs `cargo audit` when dependencies change.

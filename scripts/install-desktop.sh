@@ -80,8 +80,11 @@ EOF
     fi
 
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-        gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
-        echo "✓ Icon cache updated"
+        if gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null; then
+            echo "✓ Icon cache updated"
+        else
+            echo "⚠ Icon cache refresh failed; the menu icon may stay stale until you log in again."
+        fi
     fi
 
     echo ""

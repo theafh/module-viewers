@@ -7,7 +7,7 @@ LAUNCHER=./scripts/task-viewer.sh
 # CARGO_TARGET_DIR (Cursor agent sandboxes often do). The Dock launcher runs
 # $(CURDIR)/target/release/task-viewer only.
 build:
-	CARGO_TARGET_DIR="$(CURDIR)/target" cargo build --release -p task-viewer
+	CARGO_TARGET_DIR="$(CURDIR)/target" cargo build --release --locked -p task-viewer
 	@ls -la "$(CURDIR)/target/release/task-viewer"
 	@echo "Release binary: $(CURDIR)/target/release/task-viewer"
 
@@ -28,6 +28,7 @@ restart:
 
 test:
 	RUSTFLAGS="$(TEST_RUSTFLAGS)" CARGO_TARGET_DIR="$(CURDIR)/target" cargo test -p task-viewer
+	./scripts/tests/launcher-build-truth.sh
 
 lint:
 	CARGO_TARGET_DIR="$(CURDIR)/target" cargo clippy -p task-viewer --all-targets -- -D warnings

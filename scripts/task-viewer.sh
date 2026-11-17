@@ -41,7 +41,11 @@ if [ -f "$HOME/.cargo/env" ]; then
     # shellcheck source=/dev/null
     . "$HOME/.cargo/env"
 fi
-export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
+# rustup's cargo comes first so a Homebrew cargo ahead of it cannot select a
+# different toolchain. A test replaces the fallback directories through
+# TASK_VIEWER_PATH_FALLBACK to control which cargo the launcher resolves.
+PATH_FALLBACK="${TASK_VIEWER_PATH_FALLBACK:-/usr/local/bin:/opt/homebrew/bin}"
+export PATH="$HOME/.cargo/bin:$PATH_FALLBACK:$PATH"
 # Always build/run from this repo's target/, not a redirected agent cache.
 unset CARGO_TARGET_DIR
 export CARGO_TARGET_DIR="$PROJECT_DIR/target"
@@ -144,10 +148,7 @@ is_outdated() {
 # rather than whatever an earlier `make build` left behind.
 build_binary() {
     if ! command -v cargo >/dev/null 2>&1; then
-        if [ -x "$BINARY" ]; then
-            return 0
-        fi
-        echo "cargo not found; cannot build task-viewer."
+        echo "cargo not found; cannot build task-viewer. Run 'make build'."
         notify "task-viewer" "Build failed: cargo not found. Run 'make build' in the project."
         return 1
     fi
@@ -155,7 +156,7 @@ build_binary() {
         echo "Building task-viewer..."
         notify "task-viewer" "Building release binary (first run)…"
     fi
-    if ! cargo build --release -p task-viewer >"$BUILD_LOG" 2>&1; then
+    if ! cargo build --release --locked -p task-viewer >"$BUILD_LOG" 2>&1; then
         echo "Build failed. Check $BUILD_LOG"
         notify "task-viewer" "Build failed. See $BUILD_LOG"
         return 1
@@ -167,8 +168,9 @@ build_binary() {
     fi
 }
 
-do_start() {
-    build_binary || return 1
+# Start the server on the binary already built. The build stays with the
+# callers, so one Dock click builds once instead of once per call.
+start_binary() {
     if is_running && is_outdated; then
         echo "A newer task-viewer binary exists; restarting on it."
         do_stop
@@ -234,12 +236,26 @@ do_start() {
     fi
 }
 
+do_start() {
+    build_binary || return 1
+    start_binary
+}
+
 # Double-fork + setsid so the binary is not in the Dock launcher's process group.
 start_detached() {
     if ! command -v python3 >/dev/null 2>&1; then
-        nohup "$BINARY" >"$LOG_FILE" 2>&1 &
-        echo $! >"$PID_FILE"
-        return 0
+        # nohup alone stays in the Dock launcher's process group, which macOS
+        # tears down when the launcher exits. setsid leaves that group, so use
+        # it when present and refuse rather than start a server that dies.
+        if command -v setsid >/dev/null 2>&1; then
+            setsid nohup "$BINARY" >"$LOG_FILE" 2>&1 &
+            echo $! >"$PID_FILE"
+            return 0
+        fi
+        echo "Cannot detach task-viewer: neither python3 nor setsid is available."
+        echo "Install python3, or start the server by hand: nohup $BINARY &"
+        notify "task-viewer" "Cannot detach: install python3 or setsid"
+        return 1
     fi
     python3 - "$BINARY" "$LOG_FILE" "$PID_FILE" "$PROJECT_DIR" <<'PY'
 import os, sys
@@ -319,10 +335,10 @@ do_toggle() {
         do_start
         return
     fi
-    # Build first, so a click after a source change restarts the server on
-    # the new code instead of stopping it. A failed build still stops.
+    # Build once, so a click after a source change restarts the server on the
+    # new code instead of stopping it. A failed build still stops.
     if build_binary && is_outdated; then
-        do_start
+        start_binary
     else
         do_stop
     fi
