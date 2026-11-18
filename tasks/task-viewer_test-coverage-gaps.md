@@ -2,7 +2,7 @@
 description: "Add the promised quoted-date, oversized-blob, and in-flight and past-grace signal tests, and harden the graceful-shutdown test against port races, panics, and tautologies."
 scope: task-viewer/tests
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-15T07:17:56Z
+updated: 2026-11-18T21:01:10Z
 status: ready
 reported-by: Andreas Hoffmann
 ---
@@ -20,7 +20,7 @@ reported-by: Andreas Hoffmann
 - `task-viewer/tests/graceful_shutdown.rs` sends its signal before any scan exists, binds port 0 and drops the listener before the child binds, has no `Drop` guard, and measures elapsed time from a start taken before the signal while its wait window starts after it.
 - `task-viewer` declares no library target: `task-viewer/Cargo.toml` carries no `[lib]` and `task-viewer/src/main.rs` declares `mod web;`, so the process-level test reaches the binary only through `env!("CARGO_BIN_EXE_task-viewer")` and can neither name `web::SHUTDOWN_GRACE` nor install a `cfg(test)` hook in the child process.
 - `task-viewer/src/launcher_tests.rs` uses `std::os::unix::fs::PermissionsExt` but its module declaration is gated only on `test`, so a non-unix `cargo test` fails to compile. Further unix-only test sites share that gap: `task-viewer/src/harvest.rs`'s `#[cfg(test)] mod tests` imports `std::os::unix::ffi::OsStringExt` and `std::os::unix::fs::PermissionsExt` unconditionally, where `OsString::from_vec` sits in the `commit_non_utf8_named_task` helper and `PermissionsExt::set_mode` with `fs::set_permissions` sits in the `fake_git_script` helper beside the one test, `harvest_fails_on_an_unreadable_tasks_subdirectory`, that calls `fs::set_permissions` directly, and two `#[tokio::test]` functions in `task-viewer/src/web.rs` set file modes through `PermissionsExt`.
-- This task ships after [task-viewer_startup-diagnostics.md](task-viewer_startup-diagnostics.md), which logs `listener.local_addr()` only after a successful bind and rejects a zero port, so the shutdown test reads the bound port from that post-bind line.
+- This task ships after [task-viewer_startup-diagnostics.md](archive/task-viewer_startup-diagnostics.md), which logs `listener.local_addr()` only after a successful bind and rejects a zero port, so the shutdown test reads the bound port from that post-bind line.
 - Prior art: [task-viewer_graceful-shutdown.md](archive/task-viewer_graceful-shutdown.md) delivered the shutdown behavior; these are the test gaps that let it regress.
 
 ## Approach

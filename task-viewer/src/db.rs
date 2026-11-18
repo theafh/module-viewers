@@ -92,6 +92,28 @@ pub fn database_path(raw: Option<&OsStr>) -> Result<PathBuf> {
     Ok(PathBuf::from(trimmed))
 }
 
+/// Where a database path came from, so an error names `TASK_VIEWER_DB` only
+/// when that variable actually set the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathSource {
+    /// The default `~/.task-viewer` path, set by no environment variable.
+    Default,
+    /// The `TASK_VIEWER_DB` value.
+    Configured,
+}
+
+impl PathSource {
+    /// The subject an error message leads with: the variable when it set the
+    /// path, and the default path otherwise, so an unset variable is never
+    /// blamed for a failure it had no part in.
+    fn describe(self) -> &'static str {
+        match self {
+            PathSource::Default => "the default database path",
+            PathSource::Configured => "TASK_VIEWER_DB",
+        }
+    }
+}
+
 /// Open the database named by the configured `TASK_VIEWER_DB` value, or the
 /// default path when it is unset, and bring its schema to the latest version.
 pub async fn init() -> Result<Pool<Sqlite>> {
@@ -110,13 +132,22 @@ pub async fn init() -> Result<Pool<Sqlite>> {
 /// state.
 pub async fn init_with(raw: Option<&OsStr>) -> Result<Pool<Sqlite>> {
     let path = database_path(raw)?;
-    init_at(&path).await
+    match raw {
+        Some(_) => init_at_with_source(&path, PathSource::Configured).await,
+        None => init_at(&path).await,
+    }
 }
 
 /// Create the database directory when missing, open the database, apply the
 /// version-1 schema to a new file, and migrate it to the latest version.
 pub async fn init_at(path: &Path) -> Result<Pool<Sqlite>> {
-    let pool = connect(path).await?;
+    init_at_with_source(path, PathSource::Default).await
+}
+
+/// The sibling entry point that carries the path's source, so a directory
+/// error names `TASK_VIEWER_DB` only when that variable set the path.
+async fn init_at_with_source(path: &Path, source: PathSource) -> Result<Pool<Sqlite>> {
+    let pool = connect(path, source).await?;
     migrate(&pool, path).await?;
     Ok(pool)
 }
@@ -286,8 +317,8 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// both ask for `journal_mode = WAL`, and SQLite answers `SQLITE_BUSY` for that
 /// change without running the busy handler, so a start that loses the race
 /// retries instead of failing outright.
-async fn connect(path: &Path) -> Result<Pool<Sqlite>> {
-    create_parent_dir(path)?;
+async fn connect(path: &Path, source: PathSource) -> Result<Pool<Sqlite>> {
+    create_parent_dir(path, source)?;
     let mut attempts = 0;
     loop {
         match open_pool(path).await {
@@ -343,8 +374,9 @@ async fn open_pool(path: &Path) -> std::result::Result<Pool<Sqlite>, sqlx::Error
 }
 
 /// Create the parent directory of a configured database path when it is
-/// missing, naming `TASK_VIEWER_DB` and that path when creation fails.
-fn create_parent_dir(path: &Path) -> Result<()> {
+/// missing, naming the source that set the path and that path when creation
+/// fails.
+fn create_parent_dir(path: &Path, source: PathSource) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -353,7 +385,8 @@ fn create_parent_dir(path: &Path) -> Result<()> {
     }
     std::fs::create_dir_all(parent).with_context(|| {
         format!(
-            "TASK_VIEWER_DB could not create the directory for {}",
+            "{} could not create the directory for {}",
+            source.describe(),
             path.display()
         )
     })
@@ -733,10 +766,10 @@ pub(crate) mod test_worker_name {
 #[cfg(test)]
 mod tests {
     use super::{
-        SCHEMA, SCHEMA_VERSION, StoreHookFn, database_path, delete_repository, init, init_at,
-        init_with, is_locked, list_repositories, load_prior_tasks, load_tasks, migrate, now_stamp,
-        replace_tasks, set_scan_error, test_db, test_migration, test_version_read,
-        test_worker_name,
+        PathSource, SCHEMA, SCHEMA_VERSION, StoreHookFn, create_parent_dir, database_path,
+        delete_repository, init, init_at, init_with, is_locked, list_repositories,
+        load_prior_tasks, load_tasks, migrate, now_stamp, replace_tasks, set_scan_error, test_db,
+        test_migration, test_version_read, test_worker_name,
     };
     use crate::harvest::{ParsedTask, TaskKind};
     use crate::test_support::unique_temp_dir;
@@ -1599,6 +1632,26 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("TASK_VIEWER_DB"), "{message}");
         assert!(message.contains(raw), "{message}");
+        remove_scratch(&path);
+    }
+
+    /// Covers: with `TASK_VIEWER_DB` unset, a default-path directory failure
+    /// names the path and never the variable that had no part in it.
+    #[test]
+    fn db_default_path_directory_error_does_not_name_the_variable() {
+        let root = unique_temp_dir("db_default_parent_is_file");
+        std::fs::create_dir_all(&root).expect("db scratch");
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+        let path = blocker.join(".task-viewer");
+        let error = create_parent_dir(&path, PathSource::Default)
+            .expect_err("a parent that is a regular file must fail");
+        let message = format!("{error:#}");
+        assert!(
+            !message.contains("TASK_VIEWER_DB"),
+            "an unset variable is never blamed: {message}"
+        );
+        assert!(message.contains(&path.display().to_string()), "{message}");
         remove_scratch(&path);
     }
 
