@@ -23,7 +23,7 @@ make run
 Open <http://127.0.0.1:7880>.
 
 - **Dashboard** is the default tab and shows the charts. **Repositories** lists configured folders and is where Add repository lives.
-- **Add repository** opens a folder picker. The folder needs a `tasks/` directory.
+- **Add repository** opens a folder picker. A folder is accepted when its working tree has a `tasks/` directory, or when a branch of the repository that holds it lists a markdown task under `tasks/`.
 - **Project** filters every chart. All projects is the default. One project switches the radar charts from a spoke per project to a spoke per task scope.
 - **Update** scans every configured repository again.
 - **Light** and **Dark** switch the page appearance. The choice stays in the browser.
