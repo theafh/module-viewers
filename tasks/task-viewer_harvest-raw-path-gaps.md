@@ -19,7 +19,7 @@ Two non-UTF-8 file names that decode to one lossy path no longer fail the store 
 - `task-viewer/src/harvest.rs` builds `let pathspec = format!("{prefix}tasks")` and relies on a comment that git matches it literally; the `for-each-ref` listing passes the ref name to `ls-tree`; the union dedupes by commit, not by tree id; and `fn scrub_git_env` removes `GIT_DIR` and `GIT_WORK_TREE` but not `GIT_LITERAL_PATHSPECS` or `GIT_ICASE_PATHSPECS`.
 - `task-viewer/src/db.rs` enforces `UNIQUE (repository_id, path)` on the stored, lossy path, and `fn finish` clears a row's `content_hash` when the archived walk finds no commit, so a lossy path names no object and is walked again on every Update.
 - `ARCHITECTURE.md`'s Data Layout re-walk rule requires that walk today; [task-viewer_guardrail-doc-sync.md](task-viewer_guardrail-doc-sync.md) amends the rule to reuse a cached archived-path result for a path git cannot name until the bytes change, and lands after this task.
-- This task lands after [task-viewer_harvest-git-failure-cases.md](task-viewer_harvest-git-failure-cases.md), which rewrites the worktree candidate construction in `fn files_on_disk` and `fn union_files` that decides which rows the lossy-path dedupe sees.
+- This task lands after [task-viewer_harvest-git-failure-cases.md](archive/task-viewer_harvest-git-failure-cases.md), which rewrites the worktree candidate construction in `fn files_on_disk` and `fn union_files` that decides which rows the lossy-path dedupe sees.
 - Prior art: [task-viewer_raw-path-remaining-gaps.md](archive/task-viewer_raw-path-remaining-gaps.md) and [task-viewer_ref-union-dating.md](archive/task-viewer_ref-union-dating.md) closed earlier gaps; the tree-id dedupe remains.
 
 ## Approach

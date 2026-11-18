@@ -1045,7 +1045,10 @@ async fn add_repository(State(state): State<AppState>) -> Response {
         return Redirect::to("/repositories").into_response();
     };
     let path = match std::fs::canonicalize(&picked) {
-        Ok(path) if path.join("tasks").is_dir() => path,
+        // A folder whose working tree lacks `tasks/` is still accepted when a
+        // ref of the repository that holds it carries `tasks/`, matching what a
+        // scan charts. A folder with no tasks anywhere stays rejected.
+        Ok(path) if harvest::holds_tasks(&path) => path,
         _ => return redirect_repositories(Banner::NoTasksDirectory),
     };
     let _guard = state.scan.lock().await;
@@ -7177,6 +7180,314 @@ mod tests {
             Duration::ZERO,
             "a passed deadline leaves no remainder"
         );
+        cleanup(&path);
+    }
+
+    /// Seed `repository_id` with one stored row and a recorded scan error, so a
+    /// scan that charts nothing must clear both.
+    async fn seed_stored_row(pool: &sqlx::SqlitePool, repository_id: i64) {
+        sqlx::query(
+            "INSERT INTO tasks
+                (repository_id, path, scope, kind, created, updated, ship_date, leave_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(repository_id)
+        .bind("tasks/scope_old.md")
+        .bind("scope")
+        .bind("live")
+        .bind("2026-05-01")
+        .bind("2026-05-01")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(pool)
+        .await
+        .expect("stored row");
+        db::set_scan_error(pool, repository_id, MISSING_TASKS_ERROR)
+            .await
+            .expect("stored error");
+    }
+
+    /// Run one production scan over the repositories already listed.
+    async fn scan_listed(pool: &sqlx::SqlitePool) {
+        let repositories = db::list_repositories(pool).await.expect("list");
+        scan_core(
+            pool,
+            &repositories,
+            2,
+            Arc::new(harvest::harvest_repository_with_prior),
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+    }
+
+    /// The stored rows and recorded error of one repository.
+    async fn stored_state(pool: &sqlx::SqlitePool, repository_id: i64) -> (usize, Option<String>) {
+        let rows = db::load_tasks(pool, Some(repository_id))
+            .await
+            .expect("rows");
+        let repositories = db::list_repositories(pool).await.expect("list");
+        let error = repositories
+            .iter()
+            .find(|repository| repository.repository_id == repository_id)
+            .and_then(|repository| repository.last_error.clone());
+        (rows.len(), error)
+    }
+
+    /// Add accepts a folder whose working tree lacks `tasks/` but whose branch
+    /// holds it, and charts that branch's task.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_accepts_a_folder_whose_refs_hold_tasks() {
+        let (mut state, path) = app_state("add_ref_tasks").await;
+        let folder = unique_temp_dir("add_ref_tasks_repo");
+        std::fs::create_dir_all(&folder).expect("scratch");
+        git(
+            &folder,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::write(folder.join("README.md"), "# repo\n").expect("readme");
+        git(&folder, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &folder,
+            &["commit", "-m", "no tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &folder,
+            &["checkout", "-b", "feature"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::create_dir_all(folder.join("tasks")).expect("tasks");
+        std::fs::write(
+            folder.join("tasks/scope_feature.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Feature\n",
+        )
+        .expect("task");
+        git(&folder, &["add", "-A"], "2026-05-02T12:00:00+00:00");
+        git(
+            &folder,
+            &["commit", "-m", "feature task"],
+            "2026-05-02T12:00:00+00:00",
+        );
+        git(&folder, &["checkout", "main"], "2026-05-02T12:00:00+00:00");
+        assert!(
+            !folder.join("tasks").is_dir(),
+            "the checkout must not hold tasks/"
+        );
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=repository-added"
+        );
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert_eq!(repositories.len(), 1);
+        assert!(repositories[0].last_error.is_none());
+        let rows = db::load_tasks(&state.pool, Some(repositories[0].repository_id))
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "tasks/scope_feature.md");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_rejects_a_git_folder_with_no_tasks_anywhere() {
+        let (mut state, path) = app_state("add_no_tasks_anywhere").await;
+        let folder = unique_temp_dir("add_no_tasks_anywhere_repo");
+        std::fs::create_dir_all(&folder).expect("scratch");
+        git(
+            &folder,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::write(folder.join("README.md"), "# repo\n").expect("readme");
+        git(&folder, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &folder,
+            &["commit", "-m", "no tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?error=no-tasks-directory"
+        );
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert!(repositories.is_empty(), "nothing is inserted");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// A working tree whose `tasks/` holds no markdown file and no ref that
+    /// holds `tasks/` charts no rows and clears the repository's stored rows and
+    /// its recorded error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_clears_rows_when_the_tasks_tree_holds_no_markdown() {
+        let path = temp_database("scan_empty_tasks");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let folder = unique_temp_dir("scan_empty_tasks_repo");
+        std::fs::create_dir_all(&folder).expect("scratch");
+        git(
+            &folder,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::create_dir_all(folder.join("tasks")).expect("tasks");
+        std::fs::write(folder.join("tasks/README.txt"), "not a task\n").expect("readme");
+        git(&folder, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &folder,
+            &["commit", "-m", "no markdown task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let id = db::insert_repository(&pool, "empty", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        seed_stored_row(&pool, id).await;
+
+        scan_listed(&pool).await;
+        let (rows, error) = stored_state(&pool, id).await;
+        assert_eq!(rows, 0, "an empty tasks tree charts no rows");
+        assert_eq!(error, None, "a successful scan clears the recorded error");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// A working tree whose `tasks/` holds only files every skip reason rejects
+    /// charts no rows and clears the repository's stored rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_clears_rows_when_every_worktree_task_is_skipped() {
+        let path = temp_database("scan_all_skipped");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let folder = unique_temp_dir("scan_all_skipped_repo");
+        std::fs::create_dir_all(&folder).expect("scratch");
+        git(
+            &folder,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::create_dir_all(folder.join("tasks")).expect("tasks");
+        // A directory named like a task file cannot be read, so the walk skips
+        // it and charts nothing.
+        std::fs::create_dir(folder.join("tasks/scope_unreadable.md")).expect("unreadable");
+        std::fs::write(folder.join("tasks/scope_unreadable.md/keep.txt"), "x").expect("kept file");
+        git(&folder, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &folder,
+            &["commit", "-m", "unreadable task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let id = db::insert_repository(&pool, "skipped", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        seed_stored_row(&pool, id).await;
+
+        scan_listed(&pool).await;
+        let (rows, error) = stored_state(&pool, id).await;
+        assert_eq!(rows, 0, "a fully skipped tasks tree charts no rows");
+        assert_eq!(error, None, "a successful scan clears the recorded error");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// A folder whose working tree lacks `tasks/` and whose only ref holding it
+    /// lists a markdown file that cannot be charted charts no rows and clears
+    /// the repository's stored rows and recorded error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_clears_rows_when_the_only_ref_task_is_skipped() {
+        let path = temp_database("scan_skipped_ref");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let folder = unique_temp_dir("scan_skipped_ref_repo");
+        std::fs::create_dir_all(&folder).expect("scratch");
+        git(
+            &folder,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::create_dir_all(folder.join("tasks")).expect("tasks");
+        let mut binary = b"---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n".to_vec();
+        binary.extend_from_slice(b"\xff not utf8\n");
+        std::fs::write(folder.join("tasks/scope_binary.md"), &binary).expect("binary task");
+        git(&folder, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &folder,
+            &["commit", "-m", "binary task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // The ref holds `tasks/`, so the folder counts as holding it, but the
+        // committed blob is not UTF-8 and contributes no row.
+        std::fs::remove_dir_all(folder.join("tasks")).expect("remove worktree tasks");
+        assert!(!folder.join("tasks").is_dir());
+        let id = db::insert_repository(&pool, "binary", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        seed_stored_row(&pool, id).await;
+
+        scan_listed(&pool).await;
+        let (rows, error) = stored_state(&pool, id).await;
+        assert_eq!(rows, 0, "the only ref task is skipped");
+        assert_eq!(error, None, "a successful scan clears the recorded error");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// A git folder whose working tree and every ref lack `tasks/` keeps its
+    /// stored rows and records the missing-tasks error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_keeps_rows_when_neither_tree_nor_refs_hold_tasks() {
+        let path = temp_database("scan_no_tasks_anywhere");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let folder = unique_temp_dir("scan_no_tasks_anywhere_repo");
+        std::fs::create_dir_all(&folder).expect("scratch");
+        git(
+            &folder,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::write(folder.join("README.md"), "# repo\n").expect("readme");
+        git(&folder, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &folder,
+            &["commit", "-m", "no tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let id = db::insert_repository(&pool, "missing", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        sqlx::query(
+            "INSERT INTO tasks
+                (repository_id, path, scope, kind, created, updated, ship_date, leave_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("tasks/scope_old.md")
+        .bind("scope")
+        .bind("live")
+        .bind("2026-05-01")
+        .bind("2026-05-01")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("earlier rows");
+
+        scan_listed(&pool).await;
+        let (rows, error) = stored_state(&pool, id).await;
+        assert_eq!(rows, 1, "the stored row survives the missing-tasks error");
+        assert_eq!(error.as_deref(), Some(MISSING_TASKS_ERROR));
+        let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 }

@@ -131,10 +131,10 @@ pub fn harvest_repository_with_prior(
     prior: &[PriorTask],
 ) -> Result<Vec<ParsedTask>, HarvestError> {
     let repo = fs::canonicalize(repo)?;
-    let tasks_root = repo.join("tasks");
-    if !tasks_root.is_dir() {
-        return Err(HarvestError::MissingTasks);
-    }
+    // The working-tree half of the `tasks/` disjunction. The ref half arrives
+    // with the union listing below, so a folder whose checked-out branch has no
+    // `tasks/` still charts a branch that holds it.
+    let worktree_tasks = repo.join("tasks").is_dir();
 
     // A configured folder that a git repository holds is charted from every
     // version of its `tasks/` tree that the working tree or any ref holds, so a
@@ -152,11 +152,60 @@ pub fn harvest_repository_with_prior(
             if git.dir.is_some() {
                 git_read(&repo, dir, &["rev-parse", "--git-dir"]).map_err(HarvestError::Git)?;
             }
-            let (chosen, worktree) = union_files(&repo, root, dir, &git.prefix)?;
+            let (chosen, worktree, ref_holds_tasks) = union_files(&repo, root, dir, &git.prefix)?;
+            // Neither the working tree nor any ref holds `tasks/`, so the folder
+            // has no tasks directory. The error keeps the repository's stored
+            // rows instead of replacing them with an empty set.
+            if !tasks_present(worktree_tasks, ref_holds_tasks) {
+                return Err(HarvestError::MissingTasks);
+            }
             harvest_chosen(&repo, &git, root, dir, chosen, worktree, prior)
         }
-        None => harvest_files(&repo, &git, files_on_disk(&repo)?, prior),
+        None => {
+            // A folder outside git holds `tasks/` only when its working tree
+            // does, and its stored rows survive the same missing-directory error.
+            if !tasks_present(worktree_tasks, false) {
+                return Err(HarvestError::MissingTasks);
+            }
+            harvest_files(&repo, &git, files_on_disk(&repo)?, prior)
+        }
     }
+}
+
+/// Whether a folder holds a `tasks/` tree: its working tree has a `tasks/`
+/// directory, or a ref of the repository that holds it lists a markdown file
+/// under the folder's `tasks/`.
+///
+/// The ref half is decided from the union's pre-dedupe listed paths, so a tree
+/// whose every markdown file a later step skips still counts as present. The
+/// scan's `MissingTasks` error and the Add gate both read this one disjunction,
+/// so Add accepts a folder whose refs hold `tasks/` even when the checkout does
+/// not.
+fn tasks_present(worktree_tasks: bool, ref_holds_tasks: bool) -> bool {
+    worktree_tasks || ref_holds_tasks
+}
+
+/// Whether `folder` holds a `tasks/` tree anywhere: in its working tree or in a
+/// ref of the repository that holds it. A git failure answers `false`, because
+/// then no ref can be read; a folder that holds `tasks/` in its working tree
+/// answers `true` without touching git, so a `.git` that cannot be read is
+/// still accepted here and reports its error from the scan that follows.
+pub fn holds_tasks(folder: &Path) -> bool {
+    let Ok(folder) = fs::canonicalize(folder) else {
+        return false;
+    };
+    if tasks_present(folder.join("tasks").is_dir(), false) {
+        return true;
+    }
+    let Ok(git) = GitContext::resolve(&folder) else {
+        return false;
+    };
+    let Some((root, dir)) = git.repository() else {
+        return false;
+    };
+    ref_task_files(root, dir, &git.prefix)
+        .map(|listed| tasks_present(false, !listed.is_empty()))
+        .unwrap_or(false)
 }
 
 /// The git context resolved once per harvest: the folder's own `.git`, its
@@ -279,54 +328,26 @@ type WorktreeFiles = std::collections::HashMap<String, (String, bool)>;
 /// `read_blobs` in row order, and the working-tree contents come from the walk's
 /// retained cache, which holds at most `MAX_WORKTREE_CACHE_BYTES`. A working-tree
 /// row the cache evicted is re-read one file at a time when it is charted.
+/// The chosen rows and the retained working-tree cache, plus whether any ref
+/// lists a markdown file under the folder's `tasks/`.
 fn union_files(
     folder: &Path,
     root: &Path,
     dir: &Path,
     prefix: &str,
-) -> Result<(Vec<ChosenFile>, WorktreeFiles), HarvestError> {
-    // `ls-tree` and `git log` match this raw prefix literally, so it needs no
-    // `:(literal)` magic, unlike the per-file lookups below.
-    let pathspec = format!("{prefix}tasks");
-    let listing = git_read(
-        root,
-        dir,
-        &[
-            "for-each-ref",
-            "--format=%(objectname) %(refname)",
-            "refs/heads",
-            "refs/remotes",
-        ],
-    )
-    .map_err(HarvestError::Git)?;
+) -> Result<(Vec<ChosenFile>, WorktreeFiles, bool), HarvestError> {
     // Every (path, blob, lossy) triple, then the newest touch of each blob once.
     // Two refs at one commit list identical triples, so the second is skipped.
-    let mut found: Vec<(String, String, bool)> = Vec::new();
+    let found = ref_task_files(root, dir, prefix)?;
+    // Presence comes from the pre-dedupe listing, so a tree whose every
+    // markdown file the working tree later skips still counts as holding
+    // `tasks/`.
+    let ref_holds_tasks = !found.is_empty();
     let mut all_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut listed_commits: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for line in listing.lines() {
-        let Some((commit, reference)) = line.trim().split_once(' ') else {
-            continue;
-        };
-        if !listed_commits.insert(commit) {
-            continue;
-        }
-        let tree = git_read_bytes(
-            root,
-            dir,
-            &["ls-tree", "-r", "-z", reference, "--", &pathspec],
-        )
-        .map_err(HarvestError::Git)?;
-        let (paths, blobs, lossy) = markdown_blobs(&tree, prefix);
-        all_blobs.extend(blobs.iter().cloned());
-        found.extend(
-            paths
-                .into_iter()
-                .zip(blobs)
-                .zip(lossy)
-                .map(|((path, blob), path_is_lossy)| (path, blob, path_is_lossy)),
-        );
+    for (_, blob, _) in &found {
+        all_blobs.insert(blob.clone());
     }
+    let pathspec = format!("{prefix}tasks");
     let times = blob_days(root, dir, &all_blobs, &pathspec)?;
     // Rank a version by how much it should be trusted: the working tree first,
     // then an archived copy over a live one, then the newest commit. A task
@@ -379,7 +400,56 @@ fn union_files(
         .into_iter()
         .filter_map(|row| row.text.map(|text| (row.path, (text, row.lossy))))
         .collect();
-    Ok((chosen, worktree))
+    Ok((chosen, worktree, ref_holds_tasks))
+}
+
+/// Every `(path, blob, lossy)` triple the repository's refs list under the
+/// folder's `tasks/`, in ref order. Two refs at one commit list identical
+/// triples, so the second is skipped.
+fn ref_task_files(
+    root: &Path,
+    dir: &Path,
+    prefix: &str,
+) -> Result<Vec<(String, String, bool)>, HarvestError> {
+    // `ls-tree` and `git log` match this raw prefix literally, so it needs no
+    // `:(literal)` magic, unlike the per-file lookups below.
+    let pathspec = format!("{prefix}tasks");
+    let listing = git_read(
+        root,
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .map_err(HarvestError::Git)?;
+    let mut found: Vec<(String, String, bool)> = Vec::new();
+    let mut listed_commits: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for line in listing.lines() {
+        let Some((commit, reference)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        if !listed_commits.insert(commit) {
+            continue;
+        }
+        let tree = git_read_bytes(
+            root,
+            dir,
+            &["ls-tree", "-r", "-z", reference, "--", &pathspec],
+        )
+        .map_err(HarvestError::Git)?;
+        let (paths, blobs, lossy) = markdown_blobs(&tree, prefix);
+        found.extend(
+            paths
+                .into_iter()
+                .zip(blobs)
+                .zip(lossy)
+                .map(|((path, blob), path_is_lossy)| (path, blob, path_is_lossy)),
+        );
+    }
+    Ok(found)
 }
 
 /// Harvest the chosen rows as a consumer chain: walk them in order, take the
@@ -489,6 +559,10 @@ fn blob_days(
     blobs: &std::collections::HashSet<String>,
     pathspec: &str,
 ) -> Result<std::collections::HashMap<String, i64>, HarvestError> {
+    // No blobs means no day to look up, so the history walk is skipped.
+    if blobs.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
     let mut command = git_dir_command(root, dir);
     scrub_git_env(&mut command);
     command.args(blob_days_log_args(pathspec));
@@ -998,9 +1072,16 @@ fn parse_batch<R: BufRead>(
 /// `MAX_WORKTREE_CACHE_BYTES`; a row past that budget keeps its path and is
 /// re-read one file at a time when it is charted.
 fn files_on_disk(repo: &Path) -> Result<Vec<WorktreeRow>, HarvestError> {
+    // A folder whose working tree has no `tasks/` holds no working-tree row.
+    // The ref union still supplies the rows, and the caller's `tasks/` gate
+    // decides whether the folder has any tasks at all.
+    let tasks_root = repo.join("tasks");
+    if !tasks_root.is_dir() {
+        return Ok(Vec::new());
+    }
     let mut files = Vec::new();
     let mut retained = 0usize;
-    for entry in WalkDir::new(repo.join("tasks")) {
+    for entry in WalkDir::new(tasks_root) {
         let entry = entry.map_err(|error| HarvestError::Io(std::io::Error::other(error)))?;
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "md") {
@@ -1429,14 +1510,32 @@ fn git_path() -> std::ffi::OsString {
 /// `git_path()` instead of once per command.
 static GIT_PATH: LazyLock<std::ffi::OsString> = LazyLock::new(git_path);
 
+/// The folder's own git dir, when it has one.
+///
+/// A `.git` that exists but cannot be read or parsed still names a repository,
+/// so it returns its path and the caller's `rev-parse` probe fails the scan
+/// instead of charting frontmatter dates. Only a folder without a `.git` at all
+/// answers `None`.
 fn git_dir(repo: &Path) -> Option<PathBuf> {
     let dot = repo.join(".git");
     if dot.is_dir() {
         return Some(dot);
     }
-    let text = fs::read_to_string(&dot).ok()?;
-    let line = text.lines().find(|line| !line.trim().is_empty())?;
-    let raw = line.strip_prefix("gitdir:")?.trim();
+    let text = match fs::read_to_string(&dot) {
+        Ok(text) => text,
+        // An unreadable `.git` file still exists, so the probe reports it.
+        Err(_) if dot.exists() => return Some(dot),
+        Err(_) => return None,
+    };
+    let raw = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim);
+    // An empty or garbage `.git` file keeps the path, so `rev-parse` names it.
+    let Some(raw) = raw else {
+        return Some(dot);
+    };
     let path = PathBuf::from(raw);
     if path.is_absolute() {
         Some(path)
@@ -2142,8 +2241,10 @@ fn first_archived_commit_date(
         Ok(Some(day)) => Ok(Some(day)),
         Ok(None) => Ok(None),
         Err(GitFailure::Timeout(reason)) => Err(GitFailure::Timeout(reason)),
-        Err(reason) if git.dir.is_some() => Err(first_failure.unwrap_or(reason)),
-        Err(_) => Ok(None),
+        // A failed lookup inside a resolved enclosing repository is a scan
+        // error: a git failure is not the charter's "no such commit" condition,
+        // so the `updated`-day fallback must not absorb it.
+        Err(reason) => Err(first_failure.unwrap_or(reason)),
     }
 }
 
@@ -2508,12 +2609,11 @@ fn git_pickaxe(
         LogLookup::Found(day) => Ok(Some(day)),
         LogLookup::Miss => Ok(None),
         LogLookup::Failed(GitFailure::Timeout(reason)) => Err(GitFailure::Timeout(reason)),
-        // A folder with its own `.git` that git cannot read means git cannot
-        // run here (a sandbox, a broken install). Stop the scan rather than
-        // chart frontmatter dates as ship days.
-        LogLookup::Failed(reason) if git.dir.is_some() => Err(first_failure.unwrap_or(reason)),
-        // No `.git` and no enclosing repository: git has no commit to offer.
-        LogLookup::Failed(_) => Ok(None),
+        // A folder with its own `.git` that git cannot read, or a resolved
+        // enclosing repository whose lookup fails, means git cannot answer
+        // here. Stop the scan rather than chart the frontmatter `updated` day
+        // as a ship day.
+        LogLookup::Failed(reason) => Err(first_failure.unwrap_or(reason)),
     }
 }
 
@@ -7238,8 +7338,9 @@ mod tests {
         let error = git_read(&repo, &dir, &["rev-parse", "--git-dir"]).expect_err("git_read");
         assert!(error.contains("did not finish"), "{error}");
 
-        let error = blob_days(&repo, &dir, &std::collections::HashSet::new(), "tasks")
-            .expect_err("blob_days");
+        let mut blobs = std::collections::HashSet::new();
+        blobs.insert("abc".to_string());
+        let error = blob_days(&repo, &dir, &blobs, "tasks").expect_err("blob_days");
         assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
 
         let blobs = vec!["abc".to_string()];
@@ -8161,6 +8262,302 @@ mod tests {
         );
         clear_fake_git(&repo);
         let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    /// An empty and a garbage `.git` file each fail the scan with an error that
+    /// names the path, instead of charting frontmatter dates.
+    #[test]
+    fn harvest_fails_on_a_git_file_it_cannot_parse() {
+        for (name, contents) in [
+            ("empty", String::new()),
+            ("garbage", "not a gitdir line\n".to_string()),
+        ] {
+            let repo = scratch(&format!("harvest_git_file_{name}"));
+            write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
+            let dot = repo.join(".git");
+            fs::write(&dot, contents).expect("git file");
+
+            let error = harvest_repository(&repo).expect_err("an unparseable .git must fail");
+            match error {
+                HarvestError::Git(message) => assert!(
+                    message.contains(&dot.display().to_string()),
+                    "the error must name {dot:?}: {message}"
+                ),
+                other => panic!("expected a Git error, got {other:?}"),
+            }
+            let _ = fs::remove_dir_all(&repo);
+        }
+    }
+
+    #[test]
+    fn harvest_fails_on_an_unreadable_git_file() {
+        let repo = scratch("harvest_git_file_unreadable");
+        write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
+        let dot = repo.join(".git");
+        fs::write(&dot, "gitdir: /nonexistent\n").expect("git file");
+        let original = fs::metadata(&dot).expect("metadata").permissions();
+        fs::set_permissions(&dot, fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read_to_string(&dot).is_ok() {
+            // A process that can read the file anyway, such as root, cannot
+            // exercise this case.
+            fs::set_permissions(&dot, original).expect("restore");
+            let _ = fs::remove_dir_all(&repo);
+            return;
+        }
+
+        let error = harvest_repository(&repo).expect_err("an unreadable .git must fail");
+        fs::set_permissions(&dot, original).expect("restore");
+        match error {
+            HarvestError::Git(message) => assert!(
+                message.contains(&dot.display().to_string()),
+                "the error must name {dot:?}: {message}"
+            ),
+            other => panic!("expected a Git error, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_branch_that_holds_tasks_when_the_checkout_does_not() {
+        // The checked-out branch has no `tasks/`, but another branch does, so
+        // the ref union charts that branch's task instead of failing with the
+        // missing-tasks error.
+        let repo = scratch("harvest_union_tasks_gate");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::write(repo.join("README.md"), "# repo\n").expect("readme");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "no tasks on main"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "feature"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_feature.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-02T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "feature task"],
+            "2026-05-02T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-05-02T12:00:00+00:00");
+        assert!(
+            !repo.join("tasks").is_dir(),
+            "the checkout must not hold tasks/"
+        );
+
+        let tasks = harvest_repository(&repo).expect("the branch's tasks/ counts");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(paths, vec!["tasks/scope_feature.md"]);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_branch_beside_an_empty_working_tree_tasks() {
+        // An empty working-tree `tasks/` still runs the ref union, so a branch
+        // that holds a task charts it.
+        let repo = scratch("harvest_union_empty_worktree");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::write(repo.join("README.md"), "# repo\n").expect("readme");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "no tasks on main"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "feature"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_feature.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-02T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "feature task"],
+            "2026-05-02T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-05-02T12:00:00+00:00");
+        fs::create_dir_all(repo.join("tasks")).expect("empty tasks");
+        assert!(repo.join("tasks").is_dir());
+
+        let tasks = harvest_repository(&repo).expect("an empty working tree still unions refs");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(paths, vec!["tasks/scope_feature.md"]);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_rejects_a_repository_whose_tree_and_refs_lack_tasks() {
+        let repo = scratch("harvest_no_tasks_anywhere");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::write(repo.join("README.md"), "# repo\n").expect("readme");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "no tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+
+        let error = harvest_repository(&repo).expect_err("no tasks anywhere");
+        assert!(matches!(error, HarvestError::MissingTasks), "{error:?}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_ref_union_keeps_the_skipped_placeholder() {
+        // A skipped working-tree row still claims its task name after the ref
+        // union, so an older committed archived copy charts neither as a stale
+        // ship day nor as a second row.
+        let repo = scratch("harvest_union_skip_placeholder");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "older archived copy"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let path = repo.join("tasks/archive/scope_done.md");
+        fs::remove_file(&path).expect("remove readable copy");
+        fs::create_dir(&path).expect("unreadable directory");
+
+        let tasks = harvest_repository(&repo).expect("a skipped row must not fail the harvest");
+        assert!(
+            tasks.is_empty(),
+            "the skipped row blocks the older committed copy: {tasks:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_skips_blob_days_when_no_ref_lists_a_task() {
+        // A working-tree-only `tasks/` has no blob to date, so no `git log`
+        // may run for blob days. The stand-in fails every `log` while serving
+        // `for-each-ref` and `ls-tree` from the real git.
+        let repo = scratch("harvest_no_blob_days");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::write(repo.join("README.md"), "# repo\n").expect("readme");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "no tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
+        let bin = scratch("harvest_no_blob_days_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "case \"$*\" in\n  *\"log\"*) echo 'fatal: simulated log failure' >&2; exit 128 ;;\n  *) exec {} \"$@\" ;;\nesac",
+                git_bin()
+            ),
+        );
+        register_fake_git(&repo, &script);
+
+        let tasks = harvest_repository(&repo).expect("no blob-day walk may run");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(paths, vec!["tasks/scope_live.md"]);
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_nested_archive_lookup_failure_records_a_scan_error() {
+        // The enclosing repository resolves, but its leave-day lookup fails, so
+        // the archived task must not fall back to its `updated` day.
+        let parent = nested_enclosing_fixture("harvest_nested_archive_failure");
+        let bin = scratch("harvest_nested_archive_failure_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "case \"$*\" in\n  *--follow*) echo 'fatal: simulated archive log failure' >&2; exit 128 ;;\n  *) exec {} \"$@\" ;;\nesac",
+                git_bin()
+            ),
+        );
+        register_fake_git(&parent, &script);
+
+        let error = harvest_repository(&parent.join("nested"))
+            .expect_err("a failed enclosing leave-day lookup must stop the scan");
+        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        clear_fake_git(&parent);
+        let _ = fs::remove_dir_all(&parent);
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_nested_pickaxe_failure_records_a_scan_error() {
+        // An archived task whose status is neither finished nor deferred routes
+        // through `git_pickaxe`; a failed lookup inside the enclosing repository
+        // must not be flattened to a miss and charted from `updated`.
+        let parent = scratch("harvest_nested_pickaxe_failure");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&parent, "nested/tasks/scope_live.md", "2026-05-01", "open");
+        write_task(
+            &parent,
+            "nested/tasks/archive/scope_open.md",
+            "2026-05-01",
+            "open",
+        );
+        git(&parent, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &parent,
+            &["commit", "-m", "archived open nested task"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        let bin = scratch("harvest_nested_pickaxe_failure_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "case \"$*\" in\n  *--follow*) echo 'fatal: simulated pickaxe failure' >&2; exit 128 ;;\n  *) exec {} \"$@\" ;;\nesac",
+                git_bin()
+            ),
+        );
+        register_fake_git(&parent, &script);
+
+        let error = harvest_repository(&parent.join("nested"))
+            .expect_err("a failed enclosing pickaxe must stop the scan");
+        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        clear_fake_git(&parent);
+        let _ = fs::remove_dir_all(&parent);
         let _ = fs::remove_dir_all(&bin);
     }
 }
