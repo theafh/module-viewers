@@ -613,7 +613,7 @@ mod tests {
         }
     }
 
-    /// Acceptance: the sweep matches the pre-change loop on `avg_age`, `n`, and
+    /// Covers: the sweep matches the pre-change loop on `avg_age`, `n`, and
     /// `trend`, including a record whose leave day precedes `created` and one
     /// created and left on the same day.
     #[test]
@@ -676,7 +676,7 @@ mod tests {
         );
     }
 
-    /// Acceptance: the fixed 500-task set starting at the chart floor stays
+    /// Covers: the fixed 500-task set starting at the chart floor stays
     /// within the linear work-step bound for `today` 2026-11-06. The pre-change
     /// day-times-task loop would report about 10,000,000 steps here.
     #[test]
@@ -716,7 +716,7 @@ mod tests {
         );
     }
 
-    /// Acceptance: one mistyped year cannot stretch any series, because every
+    /// Covers: one mistyped year cannot stretch any series, because every
     /// walk starts at the chart floor.
     #[test]
     fn series_stays_bounded_when_a_task_year_is_mistyped() {
@@ -752,7 +752,7 @@ mod tests {
         );
     }
 
-    /// Acceptance: a task created before the floor folds into the first charted
+    /// Covers: a task created before the floor folds into the first charted
     /// day exactly once, and the radar and the counts still see it.
     #[test]
     fn series_backlog_folds_a_pre_floor_created_day_into_the_floor() {
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(board.counts.created_events, 2);
     }
 
-    /// Acceptance: ships before the floor fold into the first charted day and
+    /// Covers: ships before the floor fold into the first charted day and
     /// the line still ends at the shipped event count.
     #[test]
     fn series_cumulative_folds_a_pre_floor_ship_day_into_the_floor() {
@@ -824,7 +824,7 @@ mod tests {
         );
     }
 
-    /// Acceptance: a task created before the floor counts its real age on the
+    /// Covers: a task created before the floor counts its real age on the
     /// first charted day and leaves the average on its ship day.
     #[test]
     fn series_mean_age_folds_a_pre_floor_created_day_into_the_floor() {
@@ -1006,7 +1006,7 @@ mod tests {
         );
     }
 
-    /// Acceptance: a task created and shipped before the chart floor folds into
+    /// Covers: a task created and shipped before the chart floor folds into
     /// the first charted week, so the weekly sums still reach `counts`.
     #[test]
     fn series_weekly_folds_a_pre_floor_week_into_the_floor() {

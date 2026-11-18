@@ -1258,7 +1258,7 @@ mod tests {
         remove_scratch(&path);
     }
 
-    /// Acceptance: a database stamped below version 3 whose `tasks` table
+    /// Covers: a database stamped below version 3 whose `tasks` table
     /// already carries `content_hash` migrates to the latest version with one
     /// column and no error, because the `ALTER` runs only when the column is
     /// absent.
@@ -1303,7 +1303,7 @@ mod tests {
         remove_scratch(&path);
     }
 
-    /// Acceptance: a migration step that fails names its version and database
+    /// Covers: a migration step that fails names its version and database
     /// path, leaves the file at the version it already had, and a later start
     /// on that file succeeds.
     #[tokio::test(flavor = "current_thread")]
@@ -1357,7 +1357,7 @@ mod tests {
         remove_scratch(&path);
     }
 
-    /// Acceptance: two starts against one fresh file serialize their migration
+    /// Covers: two starts against one fresh file serialize their migration
     /// inside one exclusive transaction, so the file reaches the latest version
     /// with one `content_hash` column and a later start still succeeds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1394,7 +1394,7 @@ mod tests {
         remove_scratch(&path);
     }
 
-    /// Acceptance: the whole migration of a fresh file runs in one
+    /// Covers: the whole migration of a fresh file runs in one
     /// `BEGIN IMMEDIATE` transaction, with the schema-version read inside it and
     /// exactly one `COMMIT` after the last migration.
     #[tokio::test(flavor = "current_thread")]
@@ -1445,7 +1445,7 @@ mod tests {
         remove_scratch(&path);
     }
 
-    /// Acceptance: a read that fails makes start-up report that cause instead of
+    /// Covers: a read that fails makes start-up report that cause instead of
     /// treating the database as brand new.
     #[tokio::test(flavor = "current_thread")]
     async fn db_reports_a_schema_version_read_that_fails() {
@@ -1470,7 +1470,7 @@ mod tests {
         remove_scratch(&path);
     }
 
-    /// Acceptance: a schema version that cannot be read fails start-up with that
+    /// Covers: a schema version that cannot be read fails start-up with that
     /// cause, and the database file stays untouched and writable, so the next
     /// launch reads the version it already had instead of re-stamping the file
     /// as new.
@@ -1511,7 +1511,7 @@ mod tests {
         remove_scratch(&path);
     }
 
-    /// Acceptance: a database stamped above `SCHEMA_VERSION` is refused with
+    /// Covers: a database stamped above `SCHEMA_VERSION` is refused with
     /// both versions named, before any statement runs, and keeps its stamp.
     #[tokio::test(flavor = "current_thread")]
     async fn db_refuses_a_schema_version_newer_than_the_binary() {
@@ -1545,7 +1545,7 @@ mod tests {
         remove_scratch(&path);
     }
 
-    /// Acceptance: every store commits under `synchronous=NORMAL`, SQLite's 1.
+    /// Covers: every store commits under `synchronous=NORMAL`, SQLite's 1.
     #[tokio::test(flavor = "current_thread")]
     async fn db_commits_under_normal_synchronous() {
         let path = temp_database();
@@ -1611,7 +1611,7 @@ mod tests {
         assert!(error.to_string().contains("TASK_VIEWER_DB"));
     }
 
-    /// Acceptance: a `TASK_VIEWER_DB` that is not valid UTF-8 fails start-up
+    /// Covers: a `TASK_VIEWER_DB` that is not valid UTF-8 fails start-up
     /// with the variable named instead of opening a lossily decoded path.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
@@ -1628,7 +1628,7 @@ mod tests {
         assert!(message.contains("UTF-8"), "{message}");
     }
 
-    /// Acceptance: padding around `TASK_VIEWER_DB` names the same file as the
+    /// Covers: padding around `TASK_VIEWER_DB` names the same file as the
     /// unpadded path, so it never opens a second database.
     #[tokio::test(flavor = "current_thread")]
     async fn db_trims_padding_around_a_configured_path() {
@@ -1739,7 +1739,7 @@ mod tests {
         }
     }
 
-    /// Acceptance: a stored row whose `created` does not parse produces one
+    /// Covers: a stored row whose `created` does not parse produces one
     /// warning naming its repository, path, and value, and contributes no row.
     #[tokio::test(flavor = "current_thread")]
     async fn db_warns_once_about_a_stored_row_that_does_not_parse() {
@@ -1875,7 +1875,7 @@ mod tests {
         }
     }
 
-    /// Acceptance: a large repository stores in a handful of multi-row INSERT
+    /// Covers: a large repository stores in a handful of multi-row INSERT
     /// statements instead of one per task, and every row of that repository
     /// loads with the same project name through one shared handle.
     #[tokio::test(flavor = "current_thread")]
@@ -1932,7 +1932,7 @@ mod tests {
         remove_scratch(&path);
     }
 
-    /// Acceptance: a failed insert rolls the transaction back, so the rows the
+    /// Covers: a failed insert rolls the transaction back, so the rows the
     /// delete removed come back and none of the earlier inserted chunk stays.
     #[tokio::test(flavor = "current_thread")]
     async fn db_failed_insert_rolls_back_and_keeps_the_earlier_rows() {
@@ -1989,7 +1989,7 @@ mod tests {
         remove_scratch(&path);
     }
 
-    /// Acceptance: two repositories load in `r.name COLLATE NOCASE, t.path`
+    /// Covers: two repositories load in `r.name COLLATE NOCASE, t.path`
     /// order, each row carries its own repository's name through one handle per
     /// repository with no handle shared across them, and the multi-repository
     /// dashboard output stays the baseline held in `testdata/`.

@@ -42,10 +42,26 @@ digest_tree() {
     git ls-files -z "$@" -- "$TREE" | while IFS= read -r -d '' path; do
         hash_file "$path"
     done
+    # The pipeline's status is the loop's, so a failed listing would otherwise
+    # read as an empty tree. Propagate `git ls-files`'s own status instead.
+    local listing=${PIPESTATUS[0]}
+    return "$listing"
 }
 
 record() {
-    digest_tree >"$RECORD" || exit 1
+    local tmp mode
+    # `mktemp` creates 0600 and `mv` carries that mode onto the record, so the
+    # file would land less readable than the redirect this replaced left it.
+    # Capture the umask and give the temp file the mode a plain creation would.
+    mode=$(( 0666 & ~$(umask) ))
+    tmp=$(mktemp "${TMPDIR:-/tmp}/vendor-sqlx-sqlite.XXXXXX") || exit 1
+    if ! digest_tree >"$tmp"; then
+        rm -f "$tmp"
+        echo "error: could not list $TREE; $RECORD left unchanged" >&2
+        exit 1
+    fi
+    chmod "$(printf '%04o' "$mode")" "$tmp" || exit 1
+    mv "$tmp" "$RECORD" || exit 1
     echo "recorded $(wc -l <"$RECORD" | tr -d ' ') digests in $RECORD"
 }
 

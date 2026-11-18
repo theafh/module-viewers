@@ -134,7 +134,7 @@ fn run_and_stop(signal: &str) {
     );
 }
 
-/// Acceptance: SIGTERM and SIGINT each let the server exit on its own with a
+/// Covers: SIGTERM and SIGINT each let the server exit on its own with a
 /// success status inside the launcher's five-second window.
 #[test]
 fn task_viewer_exits_on_sigterm_and_sigint() {

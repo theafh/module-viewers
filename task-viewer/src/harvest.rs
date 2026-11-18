@@ -1907,8 +1907,7 @@ mod git_override {
 /// Measured spawn-to-first output on the recorded harness (12 CPU burners on 14
 /// cores with a full `make test` in flight, 300 samples per run across 3 runs,
 /// 900 samples total): worst 72.69 ms at load average 17.59. The callers' 5 s
-/// deadline is max(5 s, 5 x 72.69 ms = 363 ms), so 5 s still governs. Protocol:
-/// tasks/task-viewer_test-parallel-process-deadlines.md.
+/// deadline is max(5 s, 5 x 72.69 ms = 363 ms), so 5 s still governs.
 #[cfg(test)]
 pub(crate) fn register_test_git(repo: &Path, program: &Path, deadline: Duration) {
     let _ = run_git_command(Command::new(program), None, Duration::from_secs(60));
@@ -7150,8 +7149,7 @@ mod tests {
         // output on the recorded harness (12 CPU burners on 14 cores with a full
         // `make test` in flight, 300 samples per run across 3 runs, 900 samples
         // total): worst 72.69 ms at load average 17.59, so the 5 s floor is
-        // max(5 s, 5 x 72.69 ms = 363 ms) and 5 s still governs. Protocol:
-        // tasks/task-viewer_test-parallel-process-deadlines.md.
+        // max(5 s, 5 x 72.69 ms = 363 ms) and 5 s still governs.
         let _ = run_git_command(Command::new(&script), None, Duration::from_secs(60));
         let output = run_git_command(Command::new(&script), None, Duration::from_secs(5))
             .expect("large output must not time out");

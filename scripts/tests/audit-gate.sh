@@ -135,6 +135,35 @@ case_missing_record_fails() {
     fi
 }
 
+# A root outside every git work tree, so `git ls-files` fails there. No
+# `make_root` here: the point is the failed listing, and the git variables are
+# cleared so an inherited environment cannot make the listing succeed.
+case_listing_failure_fails() {
+    local root="$TMP/no-git" out status record
+    mkdir -p "$root/vendor"
+    record="$root/vendor/sqlx-sqlite.sha256"
+    if (unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; git -C "$root" rev-parse --show-toplevel >/dev/null 2>&1); then
+        fail "record and verify fail when the listing fails instead of reading an empty tree (root $root is inside a git work tree)"
+        return
+    fi
+    printf 'SENTINEL  vendor/sqlx-sqlite/keep\n' >"$record"
+    out=$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; VENDOR_SQLX_SQLITE_ROOT="$root" bash "$VENDOR_SCRIPT" record 2>&1)
+    status=$?
+    if [ "$status" -eq 0 ] || ! grep -q SENTINEL "$record"; then
+        fail "record fails and leaves the digest file unchanged when the listing fails (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        return
+    fi
+    out=$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; VENDOR_SQLX_SQLITE_ROOT="$root" bash "$VENDOR_SCRIPT" verify 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ] && ! printf '%s\n' "$out" | grep -q '^ok:'; then
+        pass "record and verify fail when the listing fails instead of reading an empty tree"
+    else
+        fail "record and verify fail when the listing fails instead of reading an empty tree (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
 # A fake cargo that prints the reverse listing on standard output.
 make_reachable_cargo() {
     cat >"$1/cargo" <<'EOS'
@@ -200,6 +229,7 @@ case_changed_byte_fails
 case_added_file_fails
 case_missing_file_fails
 case_missing_record_fails
+case_listing_failure_fails
 case_rsa_outside_graph_passes
 case_rsa_reachable_fails
 case_rsa_no_cargo_fails

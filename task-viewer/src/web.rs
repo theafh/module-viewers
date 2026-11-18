@@ -1699,7 +1699,7 @@ mod tests {
         }
     }
 
-    /// Acceptance: the host check accepts the three loopback names bare and
+    /// Covers: the host check accepts the three loopback names bare and
     /// with the listener's port, and rejects a non-canonical port spelling, a
     /// different port, and a foreign host.
     #[test]
@@ -2076,7 +2076,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a dashboard render moves the chart computation off the tokio
+    /// Covers: a dashboard render moves the chart computation off the tokio
     /// worker, and the page still carries the payload `series::dashboard` builds
     /// for the stored rows.
     #[tokio::test(flavor = "current_thread")]
@@ -2157,7 +2157,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: the embedded chart payload is the JSON serialized with every
+    /// Covers: the embedded chart payload is the JSON serialized with every
     /// `<` written as `\u003c` while the bytes pass, so a repository name that
     /// holds `</script><b>` cannot close the payload script element and the
     /// payload holds no raw `<`.
@@ -2424,7 +2424,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: both rendered pages carry the version the server computed
+    /// Covers: both rendered pages carry the version the server computed
     /// from its own `static/` directory, not the package version.
     #[tokio::test(flavor = "current_thread")]
     async fn web_pages_reference_the_servers_static_version() {
@@ -2445,7 +2445,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: the version function hashes every file under the directory
+    /// Covers: the version function hashes every file under the directory
     /// it is given, so changing a root asset or a nested one changes it.
     #[test]
     fn web_static_version_changes_with_either_file() {
@@ -2477,7 +2477,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Acceptance: `no-store` covers the page routes alone, while `/static`
+    /// Covers: `no-store` covers the page routes alone, while `/static`
     /// owns the immutable cache directive.
     #[tokio::test(flavor = "current_thread")]
     async fn web_scopes_cache_control_to_pages_and_static() {
@@ -2501,7 +2501,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: every `/static/...` URL the templates emit carries the
+    /// Covers: every `/static/...` URL the templates emit carries the
     /// content-derived version, so a reference without it fails.
     #[tokio::test(flavor = "current_thread")]
     async fn web_every_static_url_carries_the_content_version() {
@@ -2587,7 +2587,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: `encode_query` keeps the encoding the query transport had,
+    /// Covers: `encode_query` keeps the encoding the query transport had,
     /// for spaces, parentheses, and non-ASCII text, while writing one `String`.
     #[test]
     fn web_encode_query_matches_the_query_transport() {
@@ -2719,7 +2719,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a finished harvest is stored and dropped as soon as it
+    /// Covers: a finished harvest is stored and dropped as soon as it
     /// joins, so the number of completed but unstored results never exceeds the
     /// cap plus one however many repositories the run holds.
     #[tokio::test(flavor = "current_thread")]
@@ -2788,7 +2788,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: draining while spawning still stores every repository's
+    /// Covers: draining while spawning still stores every repository's
     /// rows and leaves the run report unchanged.
     #[tokio::test(flavor = "current_thread")]
     async fn web_scan_drains_and_stores_every_repository() {
@@ -2832,7 +2832,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: each repository's prior rows are read in their own stage just
+    /// Covers: each repository's prior rows are read in their own stage just
     /// before that repository's harvest is spawned, so at any harvest start the
     /// prior reads counted so far never exceed the harvests started plus one.
     #[tokio::test(flavor = "current_thread")]
@@ -2902,7 +2902,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: dropping the Update request leaves the scan task holding the
+    /// Covers: dropping the Update request leaves the scan task holding the
     /// scan lock until its stores finish, so a second Update's harvest never
     /// enters while the first blocking harvest is held.
     #[tokio::test(flavor = "current_thread")]
@@ -2974,7 +2974,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: the detached scan still stores the rows it harvested after
+    /// Covers: the detached scan still stores the rows it harvested after
     /// the request future is dropped.
     #[tokio::test(flavor = "current_thread")]
     async fn web_scan_stores_rows_after_the_request_is_dropped() {
@@ -3015,7 +3015,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a normal Update request still returns the same scan report,
+    /// Covers: a normal Update request still returns the same scan report,
     /// so the detached run changes only what a disconnect does.
     #[tokio::test(flavor = "current_thread")]
     async fn web_scan_request_still_reports_a_clean_run() {
@@ -3042,7 +3042,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: Remove waits for the detached scan, then runs once that scan
+    /// Covers: Remove waits for the detached scan, then runs once that scan
     /// has stored its rows, so a dropped request cannot let a delete overtake a
     /// still-running harvest.
     #[tokio::test(flavor = "current_thread")]
@@ -3120,7 +3120,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a second Update's store entry and response both wait for a
+    /// Covers: a second Update's store entry and response both wait for a
     /// held store from the first, detached run, and the peak concurrent store
     /// entries stays at one.
     #[tokio::test(flavor = "current_thread")]
@@ -3251,7 +3251,7 @@ mod tests {
             .expect("the store signalled");
     }
 
-    /// Acceptance: three Update clicks that arrive while a scan is queued share
+    /// Covers: three Update clicks that arrive while a scan is queued share
     /// one follow-up scan, so the run stores twice in total and every click
     /// still gets its own redirect and banner.
     #[tokio::test(flavor = "current_thread")]
@@ -3309,7 +3309,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: the one follow-up that three clicks share harvests a file
+    /// Covers: the one follow-up that three clicks share harvests a file
     /// written after the running scan harvested, so its store holds both rows.
     #[tokio::test(flavor = "current_thread")]
     async fn web_update_follow_up_harvests_a_file_written_after_the_running_scan() {
@@ -3368,7 +3368,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: the running scan and the one follow-up report different
+    /// Covers: the running scan and the one follow-up report different
     /// outcomes, and every joined click reports the follow-up's banner.
     #[tokio::test(flavor = "current_thread")]
     async fn web_update_follow_up_reports_its_own_outcome() {
@@ -3459,7 +3459,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a click that arrives after the follow-up has taken the scan
+    /// Covers: a click that arrives after the follow-up has taken the scan
     /// lock starts a scan of its own, so three runs store in total.
     #[tokio::test(flavor = "current_thread")]
     async fn web_update_after_the_follow_up_starts_runs_its_own_scan() {
@@ -3511,7 +3511,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: the follow-up still stores when every request that joined it
+    /// Covers: the follow-up still stores when every request that joined it
     /// disconnects, because the detached run owns the store loop.
     #[tokio::test(flavor = "current_thread")]
     async fn web_update_follow_up_still_stores_after_every_request_disconnects() {
@@ -3548,7 +3548,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a follow-up that ends without a result reports the stopped
+    /// Covers: a follow-up that ends without a result reports the stopped
     /// banner to every joined click, and the next click scans again.
     #[tokio::test(flavor = "current_thread")]
     async fn web_update_joined_clicks_report_a_stopped_follow_up() {
@@ -3920,8 +3920,7 @@ mod tests {
         // The 5 s deadline is warmed and justified inside
         // `harvest::register_test_git`: measured spawn-to-first-output worst
         // case 72.69 ms at load average 17.59 over 900 samples across 3 loaded
-        // full-suite runs, so 5 s governs. Protocol:
-        // tasks/task-viewer_test-parallel-process-deadlines.md.
+        // full-suite runs, so 5 s governs.
         harvest::register_test_git(&repo, &script, std::time::Duration::from_secs(5));
 
         let id = db::insert_repository(&pool, "vanished", &repo.to_string_lossy())
@@ -3986,7 +3985,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: an enclosing-repository probe that fails for a reason other
+    /// Covers: an enclosing-repository probe that fails for a reason other
     /// than the outside-git answer fails the scan, stores the fixed `GIT_ERROR`
     /// message, and keeps the repository's previous rows.
     #[tokio::test(flavor = "current_thread")]
@@ -4194,7 +4193,7 @@ mod tests {
         assert!(!message.ends_with("Charts updated."));
     }
 
-    /// Acceptance: Update over zero repositories reports that nothing was
+    /// Covers: Update over zero repositories reports that nothing was
     /// attempted instead of claiming a clean update.
     #[test]
     fn web_scan_banner_reports_nothing_to_update() {
@@ -4222,7 +4221,7 @@ mod tests {
         assert_eq!(message, "Charts updated.");
     }
 
-    /// Acceptance: Update over zero repositories shows a distinct "nothing to
+    /// Covers: Update over zero repositories shows a distinct "nothing to
     /// update" message through the dashboard, not the clean-run notice.
     #[tokio::test(flavor = "current_thread")]
     async fn web_update_over_zero_repositories_shows_nothing_to_update() {
@@ -4244,7 +4243,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a forced `set_scan_error` failure produces one log line
+    /// Covers: a forced `set_scan_error` failure produces one log line
     /// naming the repository. A closed pool makes every write fail, so the
     /// helper's own path runs.
     #[tokio::test(flavor = "current_thread")]
@@ -4280,7 +4279,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a stopped Update renders its banner on the first read and
+    /// Covers: a stopped Update renders its banner on the first read and
     /// shows no banner on reload.
     #[tokio::test(flavor = "current_thread")]
     async fn web_stopped_update_banner_shows_once() {
@@ -4305,7 +4304,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a failed repository-list read renders its banner on the
+    /// Covers: a failed repository-list read renders its banner on the
     /// first read and shows no banner on reload. The scan runs against a closed
     /// pool while the page reads from the working one, so the list failure is
     /// real rather than simulated.
@@ -4341,7 +4340,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a request carrying an unknown banner value renders no free
+    /// Covers: a request carrying an unknown banner value renders no free
     /// text on the dashboard or the Repositories page.
     #[tokio::test(flavor = "current_thread")]
     async fn web_unknown_banner_codes_render_no_free_text() {
@@ -4395,7 +4394,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: the sixteen codes the closed set names today round-trip
+    /// Covers: the sixteen codes the closed set names today round-trip
     /// through `Banner::from_code`, so a `code` arm that disagrees with its
     /// `from_code` arm fails here. `code` and `message` are exhaustive matches,
     /// so a new variant forces an arm in each; `from_code` and this `ALL` array
@@ -4431,7 +4430,7 @@ mod tests {
         }
     }
 
-    /// Acceptance: a flash store at capacity plus one keeps its bound after
+    /// Covers: a flash store at capacity plus one keeps its bound after
     /// `restore`, evicting the oldest banner exactly as `insert` does, and a
     /// restore never drops the slot it puts back even when that slot is the
     /// oldest banner in the store.
@@ -4527,7 +4526,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: 50 failed repositories cannot push the redirect past a URL
+    /// Covers: 50 failed repositories cannot push the redirect past a URL
     /// limit, and the dashboard still reports the run's failure count.
     #[tokio::test(flavor = "current_thread")]
     async fn web_many_failures_keep_the_redirect_short_and_the_banner_complete() {
@@ -4590,7 +4589,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: the flash store keeps at most `FLASH_CAPACITY` slots, evicts
+    /// Covers: the flash store keeps at most `FLASH_CAPACITY` slots, evicts
     /// the oldest tokens first, still serves the newest banner, and names no
     /// slot for a token that is not a plain decimal number.
     #[test]
@@ -4628,7 +4627,7 @@ mod tests {
         );
     }
 
-    /// Acceptance: a token is only read when it is spelled exactly as the
+    /// Covers: a token is only read when it is spelled exactly as the
     /// redirect carries it, so `0<token>` and the percent-encoded `+<token>`
     /// name no slot, while the canonical `flash=<token>` read still shows the
     /// banner.
@@ -4672,7 +4671,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a flash token is consumed by the first dashboard read, so a
+    /// Covers: a flash token is consumed by the first dashboard read, so a
     /// reload and a reused or missing token show no banner, while a query
     /// naming a known banner code still renders.
     #[tokio::test(flavor = "current_thread")]
@@ -5348,7 +5347,7 @@ mod tests {
         })
     }
 
-    /// browser-robustness Acceptance 1: a throwing `localStorage` still flips `data-theme`, keeps
+    /// Covers: a throwing `localStorage` still flips `data-theme`, keeps
     /// the button label in sync, recolors the charts through the theme event,
     /// and lets no exception escape the click handler.
     #[test]
@@ -5432,7 +5431,7 @@ mod tests {
         );
     }
 
-    /// browser-robustness Acceptance 2: a 120px SVG with a year of calendar rows draws no
+    /// Covers: a 120px SVG with a year of calendar rows draws no
     /// negative-width rect and no negative-radius circle.
     #[test]
     fn browser_narrow_viewport_draws_no_negative_geometry() {
@@ -5495,7 +5494,7 @@ mod tests {
             .collect()
     }
 
-    /// browser-robustness Acceptance 3: a malformed payload renders "Charts unavailable" on every
+    /// Covers: a malformed payload renders "Charts unavailable" on every
     /// chart card, and `dashboard.js` loads without throwing.
     #[test]
     fn browser_malformed_payload_renders_the_fallback_on_every_card() {
@@ -5544,7 +5543,7 @@ mod tests {
         }
     }
 
-    /// browser-robustness Acceptance 4: a parseable payload whose `counts` is absent and whose
+    /// Covers: a parseable payload whose `counts` is absent and whose
     /// `shipped_calendar` is not an array leaves only the throwing cards
     /// (weekly and shipped-calendar) on the fallback, while cumulative and
     /// radar render normally with no uncaught error.
@@ -5614,7 +5613,7 @@ mod tests {
         payload
     }
 
-    /// browser-stub-element-sizes Acceptance 3: the fallback centres on the frame, not on the chart's
+    /// Covers: the fallback centres on the frame, not on the chart's
     /// own seeded size. At a 1000px frame the calendar's seeded 884px width
     /// would centre at 442 and the radar's 212.8px at 106.4, so 500 is the
     /// value the frame-forcing line in `message()` alone produces.
@@ -5781,7 +5780,7 @@ mod tests {
         blocks
     }
 
-    /// narrow-chart-layout Acceptance 1: at a 120px frame the calendar's viewBox width is its
+    /// Covers: at a 120px frame the calendar's viewBox width is its
     /// natural content width, the SVG width attribute matches it so the chart
     /// renders at 1:1, every cell is 14x14, and every rect and month label
     /// lies inside the viewBox.
@@ -5853,7 +5852,7 @@ mod tests {
         assert_eq!(result["labelsOutside"].as_u64(), Some(0));
     }
 
-    /// narrow-chart-layout Acceptance 2 and Acceptance 5's stylesheet clause: the calendar and
+    /// Covers: the calendar and
     /// radar frames scroll a chart wider than the frame, and the base chart
     /// card shrinks below its chart's intrinsic width so the page never
     /// overflows.
@@ -5911,7 +5910,7 @@ mod tests {
         }
     }
 
-    /// narrow-chart-layout Acceptance 3: `.tooltip` is fixed to the viewport and `tipFor` places
+    /// Covers: `.tooltip` is fixed to the viewport and `tipFor` places
     /// it from the pointer's client coordinates with no frame offset, so the
     /// scrolling calendar frame neither clips nor shifts it.
     #[test]
@@ -5936,7 +5935,7 @@ mod tests {
         );
     }
 
-    /// narrow-chart-layout Acceptance 4: at a 120px frame the radar's radius is at least 31px and
+    /// Covers: at a 120px frame the radar's radius is at least 31px and
     /// every label's measured extent lies inside the viewBox on both axes, so
     /// the top label is not clipped by a frame-sized viewBox.
     #[test]
@@ -5988,7 +5987,7 @@ mod tests {
         );
     }
 
-    /// narrow-chart-layout Acceptance 5: at a 120px frame the radar's inline size is the ring's
+    /// Covers: at a 120px frame the radar's inline size is the ring's
     /// natural size and divides its viewBox to 1 in both axes, so the expanded
     /// chart renders at 1:1 instead of scaling into the frame.
     #[test]
@@ -6045,7 +6044,7 @@ mod tests {
         assert!((result["heightScale"].as_f64().expect("height scale") - 1.0).abs() < 1e-9);
     }
 
-    /// narrow-chart-layout Acceptance 5: at a 1000px frame the radar's ring fits, so the element
+    /// Covers: at a 1000px frame the radar's ring fits, so the element
     /// carries no inline size, the viewBox is the frame size, and the
     /// element's own client size divides the viewBox to 1 in both axes.
     #[test]
@@ -6086,7 +6085,7 @@ mod tests {
         assert!((result["heightScale"].as_f64().expect("height scale") - 1.0).abs() < 1e-9);
     }
 
-    /// browser-stub-element-sizes Acceptance 2: at a 1000px frame the radar element takes the
+    /// Covers: at a 1000px frame the radar element takes the
     /// stylesheet's 360px height, so its radius and viewBox follow the
     /// geometry the page produces.
     #[test]
@@ -6120,7 +6119,7 @@ mod tests {
         assert_eq!(result["viewBox"], "0 0 1000 360");
     }
 
-    /// narrow-chart-layout Acceptance 6: at a 1000px frame the calendar cell size is 14 and the
+    /// Covers: at a 1000px frame the calendar cell size is 14 and the
     /// radar radius and viewBox follow the 360px stylesheet height, so the
     /// normal-width layout is unchanged.
     #[test]
@@ -6163,7 +6162,7 @@ mod tests {
         assert_eq!(result["viewBox"], "0 0 1000 360");
     }
 
-    /// narrow-chart-layout Acceptance 7: an 800px frame, below the 884px threshold, still renders
+    /// Covers: an 800px frame, below the 884px threshold, still renders
     /// the calendar at its natural width and scrolls it, through the stub's
     /// numeric `config.width`. The element's client width is its own 884px
     /// natural width, not the narrower frame it sits in.
@@ -6199,7 +6198,7 @@ mod tests {
         assert_eq!(result["width"].as_f64(), Some(884.0));
     }
 
-    /// browser-stub-element-sizes Acceptance 1: at a 120px frame the calendar element keeps its own
+    /// Covers: at a 120px frame the calendar element keeps its own
     /// 884px natural client width, so the harness distinguishes the chart
     /// from the frame that scrolls it.
     #[test]
@@ -6234,7 +6233,7 @@ mod tests {
         );
     }
 
-    /// narrow-chart-layout follow-up: a frame narrower than the calendar's
+    /// Covers: a frame narrower than the calendar's
     /// natural width opens on the newest days, a frame that fits it stays at
     /// its left edge, and a theme redraw keeps the reader's scroll position.
     #[test]
@@ -6300,7 +6299,7 @@ mod tests {
         );
     }
 
-    /// narrow-chart-layout Acceptance 8: at a 120px frame the rendered month labels sit at least
+    /// Covers: at a 120px frame the rendered month labels sit at least
     /// 24px apart.
     #[test]
     fn browser_narrow_calendar_month_labels_are_spaced() {
@@ -6339,7 +6338,7 @@ mod tests {
         );
     }
 
-    /// narrow-chart-layout Acceptance 9: `dashboard.js` carries one comment stating the calendar's
+    /// Covers: `dashboard.js` carries one comment stating the calendar's
     /// layout strategy and its reason and one stating the radar's.
     #[test]
     fn dashboard_carries_the_chart_strategy_comments() {
@@ -6518,7 +6517,7 @@ mod tests {
   };
 })();"#;
 
-    /// draw-cost Acceptance 1: a 3,000-row draw parses one day per row and a
+    /// Covers: a 3,000-row draw parses one day per row and a
     /// hover parses none, tooltip text included.
     #[test]
     fn browser_line_draw_parses_each_row_once() {
@@ -6573,7 +6572,7 @@ mod tests {
         }
     }
 
-    /// draw-cost Acceptance 2: the hover picks the row the old linear scan
+    /// Covers: the hover picks the row the old linear scan
     /// picked at every probe, and the exact midpoint keeps the earlier row.
     #[test]
     fn browser_line_hover_picks_the_nearest_day() {
@@ -6663,7 +6662,7 @@ mod tests {
         }
     }
 
-    /// draw-cost Acceptance 3: one full render reads each theme colour once per
+    /// Covers: one full render reads each theme colour once per
     /// draw function, so the count is the same for a small payload and a
     /// 3,000-row one.
     #[test]
@@ -6694,7 +6693,7 @@ mod tests {
         );
     }
 
-    /// draw-cost Acceptance 4: a theme switch redraws the marks in the new
+    /// Covers: a theme switch redraws the marks in the new
     /// theme's colours.
     #[test]
     fn browser_theme_switch_recolors_the_second_draw() {
@@ -6765,7 +6764,7 @@ mod tests {
         );
     }
 
-    /// draw-cost Acceptance 5: a busiest week of 300 prints at most 11 y-axis
+    /// Covers: a busiest week of 300 prints at most 11 y-axis
     /// labels, and 18 keeps the labels the small step rule gives.
     #[test]
     fn browser_weekly_axis_labels_stay_readable() {
@@ -6801,7 +6800,7 @@ mod tests {
         );
     }
 
-    /// draw-cost Acceptance 6: every card's SVG markup matches the snapshot
+    /// Covers: every card's SVG markup matches the snapshot
     /// captured from the script before the change.
     #[test]
     fn browser_chart_markup_matches_the_pre_change_snapshots() {
@@ -6838,7 +6837,7 @@ mod tests {
         );
     }
 
-    /// draw-cost Acceptance 7: one extra weekly row costs exactly one more
+    /// Covers: one extra weekly row costs exactly one more
     /// date parse.
     #[test]
     fn browser_week_parse_rises_by_one_per_week() {
@@ -6863,7 +6862,7 @@ mod tests {
         assert_eq!(added, baseline + 1, "one extra week costs one more parse");
     }
 
-    /// draw-cost Acceptance 8: the weekly chart's second-week hit rect shows
+    /// Covers: the weekly chart's second-week hit rect shows
     /// that week's tooltip through the frame's own `.tooltip` node.
     #[test]
     fn browser_weekly_hover_reads_the_second_week() {
@@ -6921,7 +6920,7 @@ mod tests {
         })
     }
 
-    /// Acceptance: the serve function stops accepting while the drain waits for
+    /// Covers: the serve function stops accepting while the drain waits for
     /// a held `state.scan`, returns once that lock is released, and closes the
     /// pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6969,7 +6968,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a listener that ends before any shutdown signal still closes
+    /// Covers: a listener that ends before any shutdown signal still closes
     /// the pool, under a fresh grace budget rather than a spent one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn web_serve_closes_the_pool_when_the_listener_ends_early() {
@@ -6990,7 +6989,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a scan held past a short grace period returns within that
+    /// Covers: a scan held past a short grace period returns within that
     /// grace plus a small margin instead of waiting for the scan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn web_serve_returns_when_the_scan_outlives_the_grace() {
@@ -7020,7 +7019,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: a store held past a short grace period, signalled from
+    /// Covers: a store held past a short grace period, signalled from
     /// `state.store_hook`, lets the serve call return within that grace plus a
     /// small margin.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7074,7 +7073,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: an Update that stores through the hook inside the grace
+    /// Covers: an Update that stores through the hook inside the grace
     /// period keeps every row after the serve call returns.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn web_serve_lets_an_update_finish_storing_inside_the_grace() {
@@ -7137,7 +7136,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Acceptance: the returned deadline sits one grace period after the
+    /// Covers: the returned deadline sits one grace period after the
     /// signal, and `remaining` counts down and clamps at zero.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn web_serve_returns_the_drain_deadline_and_remaining_counts_down() {
