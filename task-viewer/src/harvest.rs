@@ -2100,12 +2100,18 @@ mod git_override {
         find(repo).and_then(|entry| entry.deadline)
     }
 
+    /// Register a stand-in git for `repo`. Only the unix-only stand-in tests
+    /// register one, so the function is compiled with them.
+    #[cfg(unix)]
     pub(super) fn register(repo: &Path, program: Option<PathBuf>, deadline: Option<Duration>) {
         if let Ok(mut entries) = entries().lock() {
             entries.insert(canonical(repo), Entry { program, deadline });
         }
     }
 
+    /// Clear the stand-in registered for `repo`, with the unix-only tests that
+    /// install one.
+    #[cfg(unix)]
     pub(super) fn clear(repo: &Path) {
         if let Ok(mut entries) = entries().lock() {
             entries.remove(&canonical(repo));
@@ -2126,14 +2132,14 @@ mod git_override {
 /// cores with a full `make test` in flight, 300 samples per run across 3 runs,
 /// 900 samples total): worst 72.69 ms at load average 17.59. The callers' 5 s
 /// deadline is max(5 s, 5 x 72.69 ms = 363 ms), so 5 s still governs.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn register_test_git(repo: &Path, program: &Path, deadline: Duration) {
     let _ = run_git_command(Command::new(program), None, Duration::from_secs(60));
     git_override::register(repo, Some(program.to_path_buf()), Some(deadline));
 }
 
 /// Clear the stand-in git registered for `repo`.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn clear_test_git(repo: &Path) {
     git_override::clear(repo);
 }
@@ -2810,13 +2816,15 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::git_override;
     use super::{
         BlobContent, CONTENT_HASH_REVISION, GIT_COMMAND_TIMEOUT, GitContext, GitFailure,
         HarvestError, HarvestState, LogLookup, MAX_TASK_FILE_BYTES, MAX_WORKTREE_CACHE_BYTES,
         ParsedTask, PriorTask, TaskKind, archive_log_args, archived_leave_lookup, blob_days,
         blob_days_log_args, content_hash, drain_reader, enclosing_prefix, escape_posix_ere,
         first_status_commit_date, fnv1a_digest, frontmatter, git_bin, git_deadline,
-        git_dir_command, git_log_args, git_override, git_path, git_program, git_read, git_timeout,
+        git_dir_command, git_log_args, git_path, git_program, git_read, git_timeout,
         harvest_repository, harvest_repository_with_prior, parse_archive_log, parse_batch,
         pickaxe_log_args, read_blobs, run_git_command, run_git_log, run_git_streaming,
         scan_log_dates, scrub_git_env, stream_blob_days, take_leave_walk_count,
@@ -2829,7 +2837,9 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::io::{self, BufRead, Read};
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -5018,6 +5028,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_lists_each_ref_commit_once() {
         // A second local branch, a remote-tracking ref, and a symbolic remote
@@ -5414,6 +5425,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_reuses_a_lossy_fallback_day_without_a_new_archive_walk() {
         // A lossy path names no git object, so no later commit can date it. Its
@@ -7167,6 +7179,7 @@ mod tests {
     /// macOS rejects such a name at the filesystem, so the path is written
     /// straight into a tree through the index, which is how a checkout on
     /// another platform could carry it. The file then exists only in history.
+    #[cfg(unix)]
     fn commit_non_utf8_named_task(
         repo: &Path,
         dir: &str,
@@ -7267,6 +7280,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_charts_a_non_utf8_named_task_and_warns_about_the_fallback_day() {
         // The name decodes lossily, so the committed listing yields one lossy
@@ -7731,6 +7745,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_fails_on_an_unreadable_tasks_subdirectory() {
         // A directory under `tasks/` that cannot be read must fail the scan so
@@ -7781,6 +7796,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     fn fake_git_script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake git");
@@ -7790,6 +7806,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn register_fake_git_with_deadline(repo: &Path, script: &Path, deadline: Duration) {
         // Start the stand-in once at a generous deadline so the production-site
         // deadline measures the hang, not the first process start under load.
@@ -7803,16 +7820,19 @@ mod tests {
         git_override::register(repo, Some(script.to_path_buf()), Some(deadline));
     }
 
+    #[cfg(unix)]
     fn register_fake_git(repo: &Path, script: &Path) {
         register_fake_git_with_deadline(repo, script, Duration::from_millis(100));
     }
 
+    #[cfg(unix)]
     fn clear_fake_git(repo: &Path) {
         git_override::clear(repo);
     }
 
     /// A wrapper that answers every call with the real git except the command
     /// form the given `case` arm matches, which hangs past the 100 ms deadline.
+    #[cfg(unix)]
     fn dispatch_script(hang_pattern: &str) -> String {
         format!(
             "case \"$*\" in\n  {hang_pattern}) exec sleep 10 ;;\n  *) exec {} \"$@\" ;;\nesac",
@@ -7890,6 +7910,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn git_runners_time_out_when_a_child_closes_stdout_and_keeps_running() {
         // A child that closes stdout but keeps running must still be killed at
@@ -7954,6 +7975,7 @@ mod tests {
             .filter(|pid| !pid.is_empty())
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_git_command_times_out_and_kills_the_child() {
         let dir = scratch("harvest_helper_timeout");
@@ -7996,6 +8018,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_git_command_drains_output_larger_than_a_pipe_buffer() {
         // 256 KiB on both pipes is more than a pipe buffer, so a helper that
@@ -8049,6 +8072,7 @@ mod tests {
         assert_eq!(error.to_string(), "simulated pipe failure");
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_hanging_git_returns_a_scan_error() {
         let repo = scratch("harvest_hanging_git");
@@ -8080,6 +8104,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_every_git_site_returns_at_the_deadline() {
         let repo = scratch("harvest_sites_timeout");
@@ -8134,6 +8159,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_cat_file_failure_reports_gits_stderr() {
         // A `cat-file` whose output cannot be parsed must surface git's own
@@ -8185,6 +8211,7 @@ mod tests {
         repo
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_fails_when_the_enclosing_probe_reports_another_error() {
         // A `rev-parse` that exits nonzero for any reason other than the
@@ -8222,6 +8249,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_treats_the_older_not_a_repository_answer_as_outside_git() {
         // The older capitalised spelling must stay silent too, matched
@@ -8249,6 +8277,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_fails_when_the_enclosing_probe_cannot_start() {
         let repo = outside_git_folder("harvest_probe_cannot_start");
@@ -8271,6 +8300,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_fails_when_the_enclosing_probe_prints_too_few_lines() {
         let repo = outside_git_folder("harvest_probe_short_output");
@@ -8319,6 +8349,7 @@ mod tests {
         parent
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_nested_archive_log_timeout_records_a_scan_error() {
         // The enclosing repository resolves, but the leave-day `git log
@@ -8337,6 +8368,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_nested_pickaxe_timeout_records_a_scan_error() {
         // An archived task whose status is not finished/deferred routes through
@@ -8372,6 +8404,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_nested_leave_day_batch_timeout_records_a_scan_error() {
         // The archive log answers, so the hang happens in the leave-day batch
@@ -8389,6 +8422,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_nested_hanging_rev_parse_records_a_scan_error() {
         let parent = nested_enclosing_fixture("harvest_nested_rev_parse_timeout");
@@ -8404,6 +8438,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_timeout_does_not_retry_the_git_dir_fallback() {
         let repo = scratch("harvest_no_retry");
@@ -8470,6 +8505,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_hanging_batch_read_records_a_scan_error() {
         let repo = scratch("harvest_batch_timeout");
@@ -8502,6 +8538,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_leave_day_walk_uses_one_cat_file_batch_and_no_batch_check() {
         let repo = scratch("harvest_one_batch_pass");
@@ -8928,6 +8965,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_ref_union_missing_blob_names_the_path() {
         let repo = scratch("harvest_ref_union_missing");
@@ -8971,6 +9009,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_ordinary_git_dir_failure_keeps_the_fallback() {
         let repo = scratch("harvest_git_dir_fallback");
@@ -9053,6 +9092,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_fails_on_an_unreadable_git_file() {
         let repo = scratch("harvest_git_file_unreadable");
@@ -9219,6 +9259,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_skips_blob_days_when_no_ref_lists_a_task() {
         // A working-tree-only `tasks/` has no blob to date, so no `git log`
@@ -9257,6 +9298,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_nested_archive_lookup_failure_records_a_scan_error() {
         // The enclosing repository resolves, but its leave-day lookup fails, so
@@ -9281,6 +9323,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_nested_pickaxe_failure_records_a_scan_error() {
         // An archived task whose status is neither finished nor deferred routes
@@ -9322,5 +9365,375 @@ mod tests {
         clear_fake_git(&parent);
         let _ = fs::remove_dir_all(&parent);
         let _ = fs::remove_dir_all(&bin);
+    }
+
+    /// Covers: a frontmatter `created` wrapped in one matching pair of single
+    /// quotes, and again in double quotes, charts on the day it names, exactly
+    /// like its bare spelling.
+    #[test]
+    fn harvest_charts_a_quoted_created_date_on_the_day_it_names() {
+        let repo = scratch("harvest_quoted_created");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        let bare = "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-02T10:00:00\nstatus: open\n---\n\n# Task\n";
+        let single = "---\ncreated: '2026-05-01T10:00:00'\nupdated: 2026-05-02T10:00:00\nstatus: open\n---\n\n# Task\n";
+        let double = "---\ncreated: \"2026-05-01T10:00:00\"\nupdated: 2026-05-02T10:00:00\nstatus: open\n---\n\n# Task\n";
+        fs::write(repo.join("tasks/scope_bare.md"), bare).expect("bare task");
+        fs::write(repo.join("tasks/scope_single.md"), single).expect("single-quoted task");
+        fs::write(repo.join("tasks/scope_double.md"), double).expect("double-quoted task");
+
+        let mut tasks = harvest_repository(&repo).expect("harvest");
+        tasks.sort_by(|left, right| left.path.cmp(&right.path));
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "tasks/scope_bare.md",
+                "tasks/scope_double.md",
+                "tasks/scope_single.md",
+            ],
+            "each spelling charts one row"
+        );
+        let created = NaiveDate::from_ymd_opt(2026, 5, 1).expect("day");
+        let updated = NaiveDate::from_ymd_opt(2026, 5, 2).expect("day");
+        for task in &tasks {
+            assert_eq!(
+                task.created, created,
+                "a quoted created charts on the day it names: {}",
+                task.path
+            );
+            assert_eq!(task.updated, updated, "the updated day stays put");
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a task file committed larger than `MAX_TASK_FILE_BYTES`
+    /// contributes no row, while a sibling task in the same commit still
+    /// charts.
+    #[test]
+    fn harvest_skips_a_committed_blob_over_the_cap_and_charts_its_neighbour() {
+        let repo = scratch("harvest_committed_oversized_neighbour");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_normal.md", "2026-05-01", "open");
+        let mut huge = task_text("2026-05-01", "2026-05-01", "open");
+        huge.push_str(&"x".repeat(MAX_TASK_FILE_BYTES));
+        fs::write(repo.join("tasks/scope_huge.md"), &huge).expect("huge task");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "one normal and one oversized task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // Keep only the committed copy, so the oversized blob reaches the
+        // harvest through the ref union rather than the working tree.
+        fs::remove_file(repo.join("tasks/scope_huge.md")).expect("remove worktree copy");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["tasks/scope_normal.md"],
+            "the oversized blob contributes no row while its sibling charts"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// The source files whose unix-only test sites must stay gated, read at
+    /// compile time so the scan sees exactly the text that is built.
+    const UNIX_GATE_SOURCES: [(&str, &str); 4] = [
+        ("main.rs", include_str!("main.rs")),
+        ("harvest.rs", include_str!("harvest.rs")),
+        ("web.rs", include_str!("web.rs")),
+        ("launcher_tests.rs", include_str!("launcher_tests.rs")),
+    ];
+
+    /// One function definition's name and the lines it spans.
+    struct FnSpan {
+        name: String,
+        first: usize,
+        last: usize,
+    }
+
+    /// The byte offset of `needle` in `haystack`.
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    /// `source` with every string literal, character literal, and comment
+    /// blanked to spaces, so brace matching sees only code. Line breaks stay,
+    /// so a line number still addresses the same line of `source`.
+    fn code_without_literals(source: &str) -> String {
+        let bytes = source.as_bytes();
+        let mut out = bytes.to_vec();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    let end = source[i..].find('\n').map_or(bytes.len(), |at| i + at);
+                    for byte in &mut out[i..end] {
+                        *byte = b' ';
+                    }
+                    i = end;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    let mut depth = 1;
+                    let mut end = i + 2;
+                    while end < bytes.len() && depth > 0 {
+                        if bytes[end..].starts_with(b"/*") {
+                            depth += 1;
+                            end += 2;
+                        } else if bytes[end..].starts_with(b"*/") {
+                            depth -= 1;
+                            end += 2;
+                        } else {
+                            end += 1;
+                        }
+                    }
+                    for byte in &mut out[i..end] {
+                        if *byte != b'\n' {
+                            *byte = b' ';
+                        }
+                    }
+                    i = end;
+                }
+                b'r' if bytes.get(i + 1) == Some(&b'"') || bytes.get(i + 1) == Some(&b'#') => {
+                    let mut hashes = 0;
+                    let mut open = i + 1;
+                    while bytes.get(open) == Some(&b'#') {
+                        hashes += 1;
+                        open += 1;
+                    }
+                    if bytes.get(open) != Some(&b'"') {
+                        i += 1;
+                        continue;
+                    }
+                    let terminator: Vec<u8> = std::iter::once(b'"')
+                        .chain(std::iter::repeat_n(b'#', hashes))
+                        .collect();
+                    let end = find_bytes(&bytes[open + 1..], &terminator)
+                        .map_or(bytes.len(), |at| open + 1 + at + terminator.len());
+                    for byte in &mut out[i..end] {
+                        if *byte != b'\n' {
+                            *byte = b' ';
+                        }
+                    }
+                    i = end;
+                }
+                b'"' => {
+                    let mut end = i + 1;
+                    while end < bytes.len() {
+                        if bytes[end] == b'\\' {
+                            end += 2;
+                            continue;
+                        }
+                        if bytes[end] == b'"' {
+                            end += 1;
+                            break;
+                        }
+                        end += 1;
+                    }
+                    for byte in &mut out[i..end] {
+                        if *byte != b'\n' {
+                            *byte = b' ';
+                        }
+                    }
+                    i = end;
+                }
+                b'\'' => {
+                    // A char literal closes on its own quote; a lifetime does
+                    // not, so it stays as code.
+                    let close = if bytes.get(i + 1) == Some(&b'\\') {
+                        bytes[i + 2..]
+                            .iter()
+                            .position(|byte| *byte == b'\'')
+                            .map(|at| i + 2 + at + 1)
+                    } else {
+                        (bytes.get(i + 2) == Some(&b'\'')).then_some(i + 3)
+                    };
+                    match close {
+                        Some(end) => {
+                            for byte in &mut out[i..end] {
+                                *byte = b' ';
+                            }
+                            i = end;
+                        }
+                        None => i += 1,
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        String::from_utf8(out).expect("blanking keeps the source valid UTF-8")
+    }
+
+    /// The line a byte offset sits on.
+    fn line_of(code: &str, offset: usize) -> usize {
+        code[..offset].bytes().filter(|byte| *byte == b'\n').count()
+    }
+
+    /// Every function definition in `code`, with the line range of its body.
+    fn function_spans(code: &str) -> Vec<FnSpan> {
+        let bytes = code.as_bytes();
+        let mut spans = Vec::new();
+        let mut cursor = 0;
+        while let Some(found) = code[cursor..].find("fn ") {
+            let at = cursor + found;
+            cursor = at + 3;
+            if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+                continue;
+            }
+            let rest = &code[at + 3..];
+            let name_len = rest
+                .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                .unwrap_or(rest.len());
+            if name_len == 0 {
+                continue;
+            }
+            let name = rest[..name_len].to_string();
+            let Some(brace) = code[at..].find('{') else {
+                continue;
+            };
+            let brace = at + brace;
+            let mut depth = 0i32;
+            let mut end = brace;
+            for (index, byte) in bytes[brace..].iter().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = brace + index;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            spans.push(FnSpan {
+                name,
+                first: line_of(code, at),
+                last: line_of(code, end),
+            });
+        }
+        spans
+    }
+
+    /// The innermost function whose body holds `line`.
+    fn enclosing_span(spans: &[FnSpan], line: usize) -> Option<&FnSpan> {
+        spans
+            .iter()
+            .filter(|span| span.first <= line && line <= span.last)
+            .max_by_key(|span| span.first)
+    }
+
+    /// Whether the attributes directly above `line` carry a `unix` cfg gate.
+    fn has_unix_gate(lines: &[&str], line: usize) -> bool {
+        let mut cursor = line;
+        while cursor > 0 {
+            let previous = lines[cursor - 1].trim();
+            if !previous.starts_with("#[") {
+                break;
+            }
+            if previous.contains("unix") {
+                return true;
+            }
+            cursor -= 1;
+        }
+        false
+    }
+
+    /// Covers: every unix-only test site across `main.rs`, `harvest.rs`,
+    /// `web.rs`, and `launcher_tests.rs` sits under a `unix` cfg gate, so a
+    /// non-unix `cargo test` build excludes it instead of failing to compile.
+    #[test]
+    fn unix_only_test_sites_carry_their_gate() {
+        // The scan's own body and helpers name the markers they search for, so
+        // they are the only functions excluded from the scan. The fixture
+        // helpers `fake_git_script` and `commit_non_utf8_named_task` stay in it.
+        const EXCLUDED: [&str; 6] = [
+            "unix_only_test_sites_carry_their_gate",
+            "code_without_literals",
+            "line_of",
+            "function_spans",
+            "enclosing_span",
+            "has_unix_gate",
+        ];
+        let call_markers = [
+            "fs::set_permissions",
+            ".set_mode(",
+            "OsString::from_vec",
+            "fake_git_script(",
+            "commit_non_utf8_named_task(",
+            "register_test_git(",
+            "clear_test_git(",
+            "register_fake_git(",
+            "register_fake_git_with_deadline(",
+            "dispatch_script(",
+            "clear_fake_git(",
+        ];
+        let gated_helpers = [
+            "register_test_git",
+            "clear_test_git",
+            "dispatch_script",
+            "register_fake_git",
+            "register_fake_git_with_deadline",
+            "clear_fake_git",
+        ];
+        let mut failures = Vec::new();
+        for (file, source) in UNIX_GATE_SOURCES {
+            let lines: Vec<&str> = source.lines().collect();
+            let spans = function_spans(&code_without_literals(source));
+            for (index, line) in lines.iter().enumerate() {
+                let enclosing = enclosing_span(&spans, index);
+                if enclosing.is_some_and(|span| EXCLUDED.contains(&span.name.as_str())) {
+                    continue;
+                }
+                let mut sites: Vec<&str> = Vec::new();
+                if line.contains("std::os::unix::") {
+                    sites.push("a std::os::unix import");
+                }
+                for marker in call_markers {
+                    if line.contains(marker) {
+                        sites.push(marker);
+                    }
+                }
+                let trimmed = line.trim();
+                if trimmed == "mod launcher_tests;" {
+                    sites.push("the launcher_tests module declaration");
+                }
+                if trimmed == "use super::git_override;" {
+                    sites.push("the git_override import");
+                }
+                for helper in gated_helpers {
+                    let declaration = format!("fn {helper}(");
+                    let public = format!("pub(crate) fn {helper}(");
+                    if trimmed.starts_with(&declaration) || trimmed.starts_with(&public) {
+                        sites.push("a unix-only fixture helper");
+                    }
+                }
+                if sites.is_empty() {
+                    continue;
+                }
+                let gated = has_unix_gate(&lines, index)
+                    || enclosing.is_some_and(|span| has_unix_gate(&lines, span.first));
+                if !gated {
+                    failures.push(format!(
+                        "{file}:{}: {} carries no unix gate",
+                        index + 1,
+                        sites.join(", ")
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "unix-only test sites need their gate:\n{}",
+            failures.join("\n")
+        );
     }
 }

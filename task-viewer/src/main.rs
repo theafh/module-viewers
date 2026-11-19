@@ -3,7 +3,7 @@
 mod dates;
 mod db;
 mod harvest;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod launcher_tests;
 mod series;
 #[cfg(test)]

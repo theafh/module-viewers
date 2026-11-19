@@ -108,6 +108,8 @@ pub struct AppState {
 impl AppState {
     pub fn new(pool: sqlx::SqlitePool, templates: Tera) -> anyhow::Result<Self> {
         let raw = std::env::var("TASK_VIEWER_SCAN_WORKERS").ok();
+        let store_pause = std::env::var("TASK_VIEWER_TEST_STORE_PAUSE_MS").ok();
+        let store_marker = std::env::var_os("TASK_VIEWER_TEST_STORE_MARKER").map(PathBuf::from);
         let static_version = static_version(&static_dir())?;
         Ok(Self {
             pool,
@@ -116,7 +118,7 @@ impl AppState {
             pending_scan: Arc::new(Mutex::new(None)),
             scan_workers: scan_worker_cap(raw.as_deref()),
             picker: Arc::new(pick_folder),
-            store_hook: Arc::new(|| Box::pin(ready(()))),
+            store_hook: store_hook_from(store_pause.as_deref(), store_marker),
             prior_read_hook: Arc::new(|_| Box::pin(ready(()))),
             offloaded_fs_calls: Arc::new(AtomicUsize::new(0)),
             harvest: Arc::new(harvest::harvest_repository_with_prior),
@@ -124,6 +126,48 @@ impl AppState {
             static_version,
         })
     }
+}
+
+/// The store hook `AppState::new` installs. Production gets the no-op hook.
+/// `TASK_VIEWER_TEST_STORE_PAUSE_MS` names a whole number of milliseconds, and
+/// then the hook writes the file `TASK_VIEWER_TEST_STORE_MARKER` names and
+/// sleeps that long inside `db::replace_tasks`, so a process-level test can
+/// send a stop signal while a store is open and prove the drain finished it or
+/// the open transaction rolled back. Both variables are test-only and unset
+/// everywhere else; a value that is not a whole number falls back to the no-op
+/// hook with a warning, so a stray value never turns the pause on.
+fn store_hook_from(pause: Option<&str>, marker: Option<PathBuf>) -> Arc<StoreHookFn> {
+    let pause_ms = match pause {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(pause_ms) => Some(pause_ms),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    "TASK_VIEWER_TEST_STORE_PAUSE_MS is not a whole number of milliseconds; using the default store hook"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let Some(pause_ms) = pause_ms else {
+        return Arc::new(|| Box::pin(ready(())));
+    };
+    Arc::new(move || {
+        let marker = marker.clone();
+        Box::pin(async move {
+            if let Some(marker) = marker
+                && let Err(error) = tokio::fs::write(&marker, b"store open\n").await
+            {
+                tracing::warn!(
+                    %error,
+                    path = %marker.display(),
+                    "the test store marker could not be written"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+        })
+    })
 }
 
 /// How many banners the flash store keeps. Eviction drops the oldest slot once
@@ -1714,7 +1758,7 @@ mod tests {
         flash_banner, init_templates, is_local_host, osascript_outcome, query_banner,
         record_scan_error, remaining, remove_repository, render_blocking_thread, render_home,
         router, scan_all, scan_core, scan_flash, scan_label, scan_response, scan_worker_cap, serve,
-        serve_until_stopped, static_version, zenity_outcome,
+        serve_until_stopped, static_version, store_hook_from, zenity_outcome,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -1743,6 +1787,54 @@ mod tests {
     /// so a scan that has no counter to keep does no extra work.
     fn immediate_prior_read_hook() -> Arc<PriorReadHookFn> {
         Arc::new(|_| Box::pin(ready(())))
+    }
+
+    /// Covers: `TASK_VIEWER_TEST_STORE_PAUSE_MS` installs a hook that writes
+    /// the file `TASK_VIEWER_TEST_STORE_MARKER` names once the pause begins and
+    /// holds the store for the named time, while an unset value or one that is
+    /// not a whole number leaves the no-op production hook in place.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_store_pause_hook_writes_its_marker_and_holds_the_store() {
+        let dir = unique_temp_dir("store_pause_hook");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let marker = dir.join("store-open");
+
+        let immediate = store_hook_from(None, Some(marker.clone()));
+        let started = Instant::now();
+        immediate().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an unset pause resolves at once"
+        );
+        assert!(!marker.exists(), "an unset pause writes no marker");
+
+        let paused = store_hook_from(Some("120"), Some(marker.clone()));
+        let started = Instant::now();
+        paused().await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(120),
+            "the hook holds the store for the named pause: {elapsed:?}"
+        );
+        assert!(
+            marker.exists(),
+            "the hook writes its marker once the pause begins"
+        );
+
+        let unusable = store_hook_from(Some("not a number"), Some(marker.clone()));
+        std::fs::remove_file(&marker).expect("remove the marker");
+        let started = Instant::now();
+        unusable().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a value that is not a whole number keeps the no-op hook"
+        );
+        assert!(
+            !marker.exists(),
+            "a value that is not a whole number writes no marker"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One parsed row, so a store actually inserts and can trip the foreign key
@@ -4077,6 +4169,7 @@ mod tests {
         cleanup(&path);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn web_scan_keeps_earlier_rows_when_a_tasks_subdirectory_is_unreadable() {
         // An unreadable directory under `tasks/` fails the repository's scan,
@@ -4157,6 +4250,7 @@ mod tests {
         cleanup(&path);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn web_scan_keeps_earlier_rows_when_a_ref_union_blob_vanishes() {
         // A listed blob that `cat-file --batch` answers `missing` must fail the
@@ -4271,6 +4365,7 @@ mod tests {
     /// Covers: an enclosing-repository probe that fails for a reason other
     /// than the outside-git answer fails the scan, stores the fixed `GIT_ERROR`
     /// message, and keeps the repository's previous rows.
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn web_scan_keeps_earlier_rows_when_the_enclosing_probe_fails() {
         use std::os::unix::fs::PermissionsExt;

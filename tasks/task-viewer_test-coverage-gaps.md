@@ -2,9 +2,11 @@
 description: "Add the promised quoted-date, oversized-blob, and in-flight and past-grace signal tests, and harden the graceful-shutdown test against port races, panics, and tautologies."
 scope: task-viewer/tests
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-18T21:01:10Z
-status: ready
+updated: 2026-11-19T20:24:57Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Close the promised test coverage gaps

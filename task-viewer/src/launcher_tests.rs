@@ -3,6 +3,7 @@
 
 use crate::test_support::unique_temp_dir;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -66,6 +67,7 @@ fn run_driver(dir: &Path, driver: &str, envs: &[(&str, &str)]) -> std::process::
     command.output().expect("run bash")
 }
 
+#[cfg(unix)]
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).expect("write script");
     let mut permissions = fs::metadata(path).expect("script metadata").permissions();
@@ -440,6 +442,7 @@ echo "server-alive"
 "#;
 
 /// Covers: a forced start timeout leaves no live server process.
+#[cfg(unix)]
 #[test]
 fn launcher_start_timeout_terminates_the_server() {
     let dir = unique_temp_dir("launcher_start_timeout");
