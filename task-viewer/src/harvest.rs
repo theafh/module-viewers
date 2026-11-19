@@ -404,8 +404,16 @@ fn union_files(
 }
 
 /// Every `(path, blob, lossy)` triple the repository's refs list under the
-/// folder's `tasks/`, in ref order. Two refs at one commit list identical
-/// triples, so the second is skipped.
+/// folder's `tasks/`, in ref order.
+///
+/// A ref is read by the commit id it names, never by its ref name: a ref name
+/// that is not valid UTF-8 decodes lossily and names no object git can resolve,
+/// while the commit it points at always does. Two refs at one commit list
+/// identical triples, so the second is skipped. So does a ref whose `tasks/`
+/// subtree id is one already listed, even when its commit differs, so two
+/// branches that touched other parts of the tree cost one recursive listing. A
+/// ref that holds no `tasks/` contributes nothing and is skipped before its
+/// recursive listing.
 fn ref_task_files(
     root: &Path,
     dir: &Path,
@@ -427,19 +435,29 @@ fn ref_task_files(
     .map_err(HarvestError::Git)?;
     let mut found: Vec<(String, String, bool)> = Vec::new();
     let mut listed_commits: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut listed_trees: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in listing.lines() {
-        let Some((commit, reference)) = line.trim().split_once(' ') else {
+        let Some((commit, _reference)) = line.trim().split_once(' ') else {
             continue;
         };
         if !listed_commits.insert(commit) {
             continue;
         }
-        let tree = git_read_bytes(
-            root,
-            dir,
-            &["ls-tree", "-r", "-z", reference, "--", &pathspec],
-        )
-        .map_err(HarvestError::Git)?;
+        // The `tasks/` subtree this commit holds, read without `-r` so the
+        // whole tree is not listed to find out. An empty answer means the ref
+        // holds no `tasks/`.
+        let entry = git_read_bytes(root, dir, &["ls-tree", "-z", commit, "--", &pathspec])
+            .map_err(HarvestError::Git)?;
+        let Some(subtree) = tasks_subtree(&entry) else {
+            continue;
+        };
+        if !listed_trees.insert(subtree) {
+            continue;
+        }
+        #[cfg(test)]
+        ls_tree_count::record(root);
+        let tree = git_read_bytes(root, dir, &["ls-tree", "-r", "-z", commit, "--", &pathspec])
+            .map_err(HarvestError::Git)?;
         let (paths, blobs, lossy) = markdown_blobs(&tree, prefix);
         found.extend(
             paths
@@ -450,6 +468,22 @@ fn ref_task_files(
         );
     }
     Ok(found)
+}
+
+/// The `tasks/` subtree id a `git ls-tree -z <commit> -- <pathspec>` entry
+/// names, or `None` when the commit holds no `tasks/` tree there.
+///
+/// `-z` separates records with NUL, so a path holding a non-ASCII byte or a
+/// double quote reaches us raw instead of C-quoted.
+fn tasks_subtree(entry: &[u8]) -> Option<String> {
+    let record = entry
+        .split(|byte| *byte == b'\0')
+        .find(|record| !record.is_empty())?;
+    let tab = record.iter().position(|byte| *byte == b'\t')?;
+    let meta = String::from_utf8_lossy(&record[..tab]);
+    let mut fields = meta.split_whitespace();
+    let (_mode, kind, sha) = (fields.next()?, fields.next()?, fields.next()?);
+    (kind == "tree").then(|| sha.to_string())
 }
 
 /// Harvest the chosen rows as a consumer chain: walk them in order, take the
@@ -753,6 +787,7 @@ impl HarvestState {
     ) -> Result<Vec<ParsedTask>, HarvestError> {
         let pending_len = self.pending.len();
         let mut from_git = 0usize;
+        let mut fallback_rows: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for (index, leave_day) in leave_dates(repo, git, &self.pending, prior)
             .map_err(|failure| HarvestError::Git(failure.to_string()))?
         {
@@ -768,24 +803,59 @@ impl HarvestState {
                     }
                 }
                 // No commit carries this archived status yet, so the day stays
-                // the `updated` fallback `dates_for` seeded. Leave the hash
-                // unset so the next Update re-walks this path and records the
-                // archive commit day once it lands, instead of reusing the
-                // fallback forever.
+                // the `updated` fallback `dates_for` seeded. A datable path
+                // leaves the hash unset so the next Update re-walks it and
+                // records the archive commit day once it lands, instead of
+                // reusing the fallback forever. A lossy path names no git
+                // object, so no later commit can date it: keep the hash so the
+                // next Update reuses this fallback day and runs no new walk.
                 None => {
-                    task.content_hash = None;
-                    // A name that is not valid UTF-8 decodes lossily, and that
-                    // lossy path names no git object, so its leave-day walk can
-                    // never hit. Chart the row anyway and name the lossy path
-                    // and the fallback day it keeps, so the gap is visible.
-                    if task.path_is_lossy {
-                        tracing::warn!(
-                            path = %task.path,
-                            fallback_day = %task.updated,
-                            "archived task name is not valid UTF-8; keeping the frontmatter updated day"
-                        );
+                    fallback_rows.insert(index);
+                    if !task.path_is_lossy {
+                        task.content_hash = None;
                     }
                 }
+            }
+        }
+        // Two file names that decode to one lossy path store one row, so the
+        // unique `(repository_id, path)` index holds. The rows arrive in rank
+        // order, so the first row of a path is the highest-ranked version and
+        // is the one kept.
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut fallback_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut kept: Vec<ParsedTask> = Vec::new();
+        for (index, task) in std::mem::take(&mut self.tasks).into_iter().enumerate() {
+            *counts.entry(task.path.clone()).or_insert(0) += 1;
+            if !seen.insert(task.path.clone()) {
+                continue;
+            }
+            if fallback_rows.contains(&index) {
+                fallback_paths.insert(task.path.clone());
+            }
+            kept.push(task);
+        }
+        self.tasks = kept;
+        // One line per stored path that needs it: a lossy path git cannot date
+        // names the path, how many names collapsed into it, and the fallback
+        // day it keeps; a datable path that collapsed warns once without a
+        // fallback day. A path that warned here never warns a second time.
+        for task in &self.tasks {
+            let collapsed = counts.get(&task.path).copied().unwrap_or(1);
+            if task.path_is_lossy && fallback_paths.contains(&task.path) {
+                tracing::warn!(
+                    path = %task.path,
+                    collapsed = collapsed,
+                    fallback_day = %task.updated,
+                    "archived task name is not valid UTF-8; keeping the frontmatter updated day"
+                );
+            } else if collapsed > 1 {
+                tracing::warn!(
+                    path = %task.path,
+                    collapsed = collapsed,
+                    "task file names decode to one stored path; keeping one row"
+                );
             }
         }
         // The chosen rows arrive in rank order, so restore the path order the
@@ -1590,7 +1660,12 @@ fn scrub_git_env(command: &mut Command) {
         // reading the repository's own history.
         .env_remove("GIT_REPLACE_REF_BASE")
         .env_remove("GIT_SHALLOW_FILE")
-        .env_remove("GIT_GRAFT_FILE");
+        .env_remove("GIT_GRAFT_FILE")
+        // The archive walk and the pickaxe pass `:(literal)` pathspecs, which
+        // an inherited `GIT_LITERAL_PATHSPECS` rejects and
+        // `GIT_ICASE_PATHSPECS` case-folds, so neither may reach the command.
+        .env_remove("GIT_LITERAL_PATHSPECS")
+        .env_remove("GIT_ICASE_PATHSPECS");
 }
 
 /// The arguments for every `git log` harvest runs: the output options that a
@@ -2054,6 +2129,44 @@ pub(crate) fn take_leave_walk_count(repo: &Path) -> usize {
     // Harvest canonicalizes its repository path, so key the lookup the same way.
     let repo = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     walk_count::take(&repo)
+}
+
+/// Test-only tally of recursive `ls-tree` launches, keyed by repository path so
+/// parallel tests and parallel repositories cannot see each other's counts. The
+/// per-ref subtree read is not recursive, so it never counts here.
+#[cfg(test)]
+mod ls_tree_count {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn counts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+        static COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+        COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn record(repo: &Path) {
+        if let Ok(mut counts) = counts().lock() {
+            *counts.entry(repo.to_path_buf()).or_insert(0) += 1;
+        }
+    }
+
+    pub(super) fn take(repo: &Path) -> usize {
+        counts()
+            .lock()
+            .ok()
+            .and_then(|mut counts| counts.remove(repo))
+            .unwrap_or(0)
+    }
+}
+
+/// The recursive `ls-tree` launches recorded for `repo` since the last call, for
+/// a test that asserts two refs sharing a `tasks/` subtree cost one listing.
+#[cfg(test)]
+pub(crate) fn take_recursive_ls_tree_count(repo: &Path) -> usize {
+    // Harvest canonicalizes its repository path, so key the lookup the same way.
+    let repo = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    ls_tree_count::take(&repo)
 }
 
 /// Test-only tally of working-tree `tasks/` markdown reads, keyed by repository
@@ -2647,7 +2760,8 @@ mod tests {
         harvest_repository, harvest_repository_with_prior, parse_archive_log, parse_batch,
         pickaxe_log_args, read_blobs, run_git_command, run_git_log, run_git_streaming,
         scan_log_dates, scrub_git_env, stream_blob_days, take_leave_walk_count,
-        take_worktree_cache_peak, take_worktree_read_bytes, take_worktree_read_count,
+        take_recursive_ls_tree_count, take_worktree_cache_peak, take_worktree_read_bytes,
+        take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -3135,6 +3249,8 @@ mod tests {
         command.env("GIT_REPLACE_REF_BASE", "refs/poisoned/");
         command.env("GIT_SHALLOW_FILE", "/tmp/poisoned-shallow");
         command.env("GIT_GRAFT_FILE", "/tmp/poisoned-grafts");
+        command.env("GIT_LITERAL_PATHSPECS", "1");
+        command.env("GIT_ICASE_PATHSPECS", "1");
         scrub_git_env(&mut command);
         for key in [
             "GIT_DIR",
@@ -3152,6 +3268,8 @@ mod tests {
             "GIT_REPLACE_REF_BASE",
             "GIT_SHALLOW_FILE",
             "GIT_GRAFT_FILE",
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
         ] {
             let cleared = command
                 .get_envs()
@@ -4881,8 +4999,13 @@ mod tests {
         let listing = fs::read_to_string(&calls).unwrap_or_default();
         assert_eq!(
             listing.lines().count(),
+            2,
+            "one subtree read plus one recursive ls-tree for the one distinct ref commit, got: {listing}"
+        );
+        assert_eq!(
+            take_recursive_ls_tree_count(&repo),
             1,
-            "one ls-tree per distinct ref commit, got: {listing}"
+            "the shared commit costs one recursive ls-tree"
         );
 
         // The same repository read with only `main` charts the same rows.
@@ -4907,6 +5030,124 @@ mod tests {
         assert_eq!(with_refs, main_only);
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn harvest_lists_one_recursive_ls_tree_per_shared_tasks_subtree() {
+        // Two branches at different commits whose root trees differ but whose
+        // `tasks/` subtrees are identical cost one recursive `ls-tree`, and a
+        // branch that holds no `tasks/` charts nothing without failing.
+        let repo = scratch("harvest_shared_tasks_subtree");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_shared.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let tasks_commit = git_stdout(&repo, &["rev-parse", "HEAD"], "2026-05-01T12:00:00+00:00");
+        // A second commit that changes the root tree and leaves `tasks/` alone.
+        fs::write(repo.join("README.md"), "# Root read me\n").expect("readme");
+        git(&repo, &["add", "-A"], "2026-05-02T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "root readme"],
+            "2026-05-02T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["branch", "other", &tasks_commit],
+            "2026-05-02T12:00:00+00:00",
+        );
+        // A branch that holds no `tasks/` at all.
+        git(
+            &repo,
+            &["checkout", "--orphan", "no-tasks"],
+            "2026-05-03T12:00:00+00:00",
+        );
+        git(&repo, &["rm", "-rf", "."], "2026-05-03T12:00:00+00:00");
+        fs::write(repo.join("README.md"), "# Nothing to harvest\n").expect("readme");
+        git(&repo, &["add", "-A"], "2026-05-03T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "no tasks"],
+            "2026-05-03T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-05-03T12:00:00+00:00");
+        let _ = take_recursive_ls_tree_count(&repo);
+
+        let tasks = harvest_repository(&repo).expect("a ref without tasks/ must not fail the scan");
+        assert_eq!(
+            take_recursive_ls_tree_count(&repo),
+            1,
+            "the two branches share one `tasks/` subtree, so one recursive ls-tree serves both"
+        );
+        let rows: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            rows,
+            vec!["tasks/scope_shared.md"],
+            "the branch without `tasks/` charts nothing: {tasks:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_ref_whose_name_is_not_utf8() {
+        // A ref name that is not valid UTF-8 decodes lossily, so it names no
+        // object git can resolve. The listing reads the commit id instead, so
+        // the branch still charts its task. macOS rejects such a name on the
+        // filesystem, so the ref arrives through `packed-refs`, which is how a
+        // repository written elsewhere can carry it.
+        let repo = scratch("harvest_non_utf8_ref");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_main.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "main task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "side"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_side.md", "2026-06-01", "open");
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "side task"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        let side = git_stdout(&repo, &["rev-parse", "HEAD"], "2026-06-01T12:00:00+00:00");
+        git(&repo, &["checkout", "main"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["branch", "-D", "side"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        let mut packed = b"# pack-refs with: peeled fully-peeled sorted \n".to_vec();
+        packed.extend_from_slice(side.as_bytes());
+        packed.extend_from_slice(b" refs/heads/bad\xff\n");
+        fs::write(repo.join(".git/packed-refs"), packed).expect("packed refs");
+
+        let tasks = harvest_repository(&repo).expect("a non-UTF-8 ref name must not fail the scan");
+        let rows: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            rows,
+            vec!["tasks/scope_main.md", "tasks/scope_side.md"],
+            "the branch behind the lossy ref name still charts its task: {tasks:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -5093,6 +5334,69 @@ mod tests {
             pending.content_hash.is_some(),
             "a day from a commit is cached for the next Update"
         );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_reuses_a_lossy_fallback_day_without_a_new_archive_walk() {
+        // A lossy path names no git object, so no later commit can date it. Its
+        // fallback day is cached against the unchanged bytes, so a second Update
+        // reuses it and runs no archive walk.
+        let repo = scratch("harvest_lossy_fallback_cached");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_valid.md", "2026-05-02", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "valid task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        commit_non_utf8_named_task(
+            &repo,
+            "tasks/archive",
+            b"scope_bad\xff.md",
+            "2026-05-01",
+            "2026-05-20",
+            "2026-06-10T12:00:00+00:00",
+        );
+        let lossy = "tasks/archive/scope_bad\u{FFFD}.md";
+        let fallback = NaiveDate::from_ymd_opt(2026, 5, 20).expect("day");
+
+        let first = harvest_repository(&repo).expect("first harvest");
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            1,
+            "the lossy path is walked once"
+        );
+        let row = first
+            .iter()
+            .find(|task| task.path == lossy)
+            .expect("the lossy path charts");
+        assert_eq!(row.leave_date, Some(fallback));
+        assert!(
+            row.content_hash.is_some(),
+            "a lossy fallback day is cached against the unchanged bytes"
+        );
+        let prior: Vec<PriorTask> = first
+            .iter()
+            .map(|task| PriorTask {
+                path: task.path.clone(),
+                leave_date: task.leave_date,
+                content_hash: task.content_hash.clone(),
+            })
+            .collect();
+
+        let second = harvest_repository_with_prior(&repo, &prior).expect("second harvest");
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            0,
+            "the cached lossy path runs no new archive walk"
+        );
+        assert_eq!(second, first, "the cached rows stay identical");
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -6744,6 +7048,167 @@ mod tests {
         assert_eq!(
             valid.updated,
             NaiveDate::from_ymd_opt(2026, 5, 2).expect("day")
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// One synthetic harvested row for the path-level dedupe, built without a
+    /// repository so the two names that decode to one lossy path can be fed in
+    /// side by side.
+    fn synthetic_row(path: &str, created: &str, updated: &str, kind: TaskKind) -> ParsedTask {
+        let created = NaiveDate::parse_from_str(created, "%Y-%m-%d").expect("created");
+        let updated = NaiveDate::parse_from_str(updated, "%Y-%m-%d").expect("updated");
+        let archived = matches!(kind, TaskKind::Finished | TaskKind::Deferred);
+        ParsedTask {
+            path: path.to_string(),
+            scope: "scope".to_string(),
+            kind,
+            created,
+            updated,
+            ship_date: archived.then_some(updated),
+            leave_date: archived.then_some(updated),
+            content_hash: Some("hash".to_string()),
+            path_is_lossy: path.contains('\u{FFFD}'),
+        }
+    }
+
+    #[test]
+    fn harvest_collapses_rows_that_share_a_lossy_path() {
+        // Two names that are not valid UTF-8 decode to one stored path. That
+        // path must chart as one row, because the database indexes it uniquely,
+        // and the one warning must name the path, the collapse count, and the
+        // fallback day. Two distinct paths still chart two rows.
+        let repo = scratch("harvest_lossy_collapse");
+        let lossy = "tasks/archive/scope_bad\u{FFFD}.md";
+        let git = GitContext {
+            dir: None,
+            prefix: String::new(),
+            inside_repository: false,
+            root: None,
+            repository_dir: None,
+        };
+        let mut state = HarvestState::default();
+        state.tasks.push(synthetic_row(
+            lossy,
+            "2026-05-01",
+            "2026-05-20",
+            TaskKind::Finished,
+        ));
+        state.tasks.push(synthetic_row(
+            lossy,
+            "2026-05-01",
+            "2026-06-01",
+            TaskKind::Finished,
+        ));
+        state.tasks.push(synthetic_row(
+            "tasks/scope_one.md",
+            "2026-05-02",
+            "2026-05-02",
+            TaskKind::Live,
+        ));
+        state.tasks.push(synthetic_row(
+            "tasks/scope_two.md",
+            "2026-05-03",
+            "2026-05-03",
+            TaskKind::Live,
+        ));
+        state.pending.push((
+            0,
+            lossy.to_string(),
+            "finished".to_string(),
+            "hash".to_string(),
+        ));
+        state.pending.push((
+            1,
+            lossy.to_string(),
+            "finished".to_string(),
+            "hash".to_string(),
+        ));
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks =
+            tracing::subscriber::with_default(subscriber, || state.finish(&repo, &git, &[]))
+                .expect("the synthetic rows finish");
+
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![lossy, "tasks/scope_one.md", "tasks/scope_two.md"],
+            "one row per stored path"
+        );
+        let kept = &tasks[0];
+        assert_eq!(
+            kept.updated,
+            NaiveDate::from_ymd_opt(2026, 5, 20).expect("day"),
+            "the highest-ranked row is the one kept"
+        );
+        assert_eq!(
+            kept.content_hash,
+            Some("hash".to_string()),
+            "a lossy path keeps its hash so the next Update reuses the fallback day"
+        );
+
+        let warnings = captured.take();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one warning for the collapsed path: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains(lossy),
+            "the warning must name the path: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("collapsed=2"),
+            "the warning must carry the collapse count: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("2026-05-20"),
+            "the warning must carry the fallback day: {warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_warns_once_for_a_datable_path_that_collapsed() {
+        // A live lossy path has no fallback day, so its collapse warning names
+        // the path and the count without one.
+        let repo = scratch("harvest_datable_collapse");
+        let lossy = "tasks/scope_bad\u{FFFD}.md";
+        let git = GitContext {
+            dir: None,
+            prefix: String::new(),
+            inside_repository: false,
+            root: None,
+            repository_dir: None,
+        };
+        let mut state = HarvestState::default();
+        state.tasks.push(synthetic_row(
+            lossy,
+            "2026-05-01",
+            "2026-05-01",
+            TaskKind::Live,
+        ));
+        state.tasks.push(synthetic_row(
+            lossy,
+            "2026-05-02",
+            "2026-05-02",
+            TaskKind::Live,
+        ));
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks =
+            tracing::subscriber::with_default(subscriber, || state.finish(&repo, &git, &[]))
+                .expect("the synthetic rows finish");
+
+        assert_eq!(tasks.len(), 1, "the two names chart one row: {tasks:?}");
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains(lossy) && warnings[0].contains("collapsed=2"),
+            "the warning must name the path and the count: {warnings:?}"
         );
         let _ = fs::remove_dir_all(&repo);
     }

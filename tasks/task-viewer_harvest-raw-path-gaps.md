@@ -2,9 +2,11 @@
 description: "Dedupe lossy names, read non-UTF-8 refs by commit id, and dedupe identical `tasks/` trees."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:52:55Z
-status: ready
+updated: 2026-11-19T12:25:52Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Close the remaining raw-path gaps
