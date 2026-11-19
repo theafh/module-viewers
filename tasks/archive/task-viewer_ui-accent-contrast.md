@@ -2,8 +2,8 @@
 description: "Give the primary button a per-theme --on-accent text colour that clears 4.5:1 on the light accent at rest and on hover, with the four measured ratios recorded beside the declaration."
 scope: task-viewer/static
 created: 2026-11-13T20:46:34Z
-updated: 2026-11-19T14:19:51Z
-status: implemented
+updated: 2026-11-19T14:21:22Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: false
@@ -23,7 +23,7 @@ The primary button's label reads against its accent background in both themes an
 - Only `task-viewer/templates/repositories.html`'s `Add repository` button carries `class="btn"` alone. The theme toggle, Update, and Remove buttons carry `class="btn btn-secondary"` and take their text colour from `.btn-secondary`'s `color: var(--text-primary)`, which outranks `.btn`'s colour by later position.
 - A `[data-theme="light"] .btn` override would outrank `.btn-secondary`'s class selector and turn those three secondary buttons light-theme ink, which is why the colour belongs in a per-theme variable instead.
 - No dark foreground clears 4.5:1 on either light accent background: the darker of the two caps dark-text contrast at 2.97:1, so the light theme's text colour has to be a light one, at relative luminance 0.89 or above to clear the rest state.
-- Split from [task-viewer_ui-labels-and-contrast.md](archive/task-viewer_ui-labels-and-contrast.md), which keeps the unscanned-repository label fix and edits `task-viewer/src/web.rs` and `task-viewer/templates/repositories.html`. This task edits only `task-viewer/static/style.css`, so neither waits on the other.
+- Split from [task-viewer_ui-labels-and-contrast.md](task-viewer_ui-labels-and-contrast.md), which keeps the unscanned-repository label fix and edits `task-viewer/src/web.rs` and `task-viewer/templates/repositories.html`. This task edits only `task-viewer/static/style.css`, so neither waits on the other.
 
 ## Approach
 

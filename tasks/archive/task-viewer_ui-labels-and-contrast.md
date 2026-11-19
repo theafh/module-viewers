@@ -28,7 +28,7 @@ An unscanned repository reads as "not scanned yet" rather than "scanned Not scan
 
 **Out of scope:**
 
-- The light-theme `--on-accent` button-contrast fix is owned by `tasks/task-viewer_ui-accent-contrast.md`.
+- The light-theme `--on-accent` button-contrast fix is owned by `task-viewer_ui-accent-contrast.md`.
 
 ## Acceptance
 
