@@ -2,9 +2,11 @@
 description: "Detach Add's first harvest, distinguish picker cancel from failure, keep picker paths byte-exact, and separate missing folders from other errors."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-15T07:35:53Z
-status: ready
+updated: 2026-11-19T19:00:03Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Make Add survive a disconnect and report real errors

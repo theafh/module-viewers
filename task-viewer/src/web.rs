@@ -16,6 +16,7 @@ use std::num::IntErrorKind;
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tera::{Context, Tera};
@@ -55,7 +56,18 @@ pub fn scan_worker_cap(raw: Option<&str>) -> usize {
     }
 }
 
-type PickerFn = dyn Fn() -> Result<Option<PathBuf>, Banner> + Send + Sync;
+type PickerFn = dyn Fn() -> Result<PickerResult, Banner> + Send + Sync;
+
+/// What one folder-picker run produced. A pick keeps the path as the raw bytes
+/// the picker wrote, so Add decodes it once instead of trimming a lossy string;
+/// a failure keeps the picker's stderr bytes, so the handler can log them
+/// without putting them in the redirect.
+#[derive(Debug, PartialEq, Eq)]
+enum PickerResult {
+    Picked(Vec<u8>),
+    Cancelled,
+    Failed(Vec<u8>),
+}
 
 /// The stage that runs immediately before one repository's harvest is spawned.
 /// Production passes a no-op; a test counts prior reads from a counter it owns.
@@ -84,6 +96,10 @@ pub struct AppState {
     picker: Arc<PickerFn>,
     store_hook: Arc<StoreHookFn>,
     prior_read_hook: Arc<PriorReadHookFn>,
+    /// Counts the filesystem calls Add hands to `spawn_blocking`, so a test can
+    /// prove that neither `canonicalize` nor the `tasks` probe runs on the
+    /// async worker. Production never reads it.
+    offloaded_fs_calls: Arc<AtomicUsize>,
     harvest: Arc<HarvestFn>,
     flash: Arc<Mutex<FlashStore>>,
     static_version: String,
@@ -102,6 +118,7 @@ impl AppState {
             picker: Arc::new(pick_folder),
             store_hook: Arc::new(|| Box::pin(ready(()))),
             prior_read_hook: Arc::new(|_| Box::pin(ready(()))),
+            offloaded_fs_calls: Arc::new(AtomicUsize::new(0)),
             harvest: Arc::new(harvest::harvest_repository_with_prior),
             flash: Arc::new(Mutex::new(FlashStore::default())),
             static_version,
@@ -574,6 +591,9 @@ enum Banner {
     ScanStopped,
     PickerUnsupported,
     PickerNoSession,
+    PickerFailed,
+    FolderUnreadable,
+    PathNotUtf8,
 }
 
 impl Banner {
@@ -596,6 +616,9 @@ impl Banner {
             Self::ScanStopped => "scan-stopped",
             Self::PickerUnsupported => "picker-unsupported",
             Self::PickerNoSession => "picker-no-session",
+            Self::PickerFailed => "picker-failed",
+            Self::FolderUnreadable => "folder-unreadable",
+            Self::PathNotUtf8 => "path-not-utf8",
         }
     }
 
@@ -618,6 +641,9 @@ impl Banner {
             Self::ScanStopped => STOPPED_ERROR,
             Self::PickerUnsupported => "The folder picker is available on macOS and Linux.",
             Self::PickerNoSession => "The folder picker needs a graphical session.",
+            Self::PickerFailed => "The folder picker failed.",
+            Self::FolderUnreadable => "That folder could not be read.",
+            Self::PathNotUtf8 => "The picked folder is not a valid UTF-8 path.",
         }
     }
 
@@ -657,6 +683,9 @@ impl Banner {
             "scan-stopped" => Self::ScanStopped,
             "picker-unsupported" => Self::PickerUnsupported,
             "picker-no-session" => Self::PickerNoSession,
+            "picker-failed" => Self::PickerFailed,
+            "folder-unreadable" => Self::FolderUnreadable,
+            "path-not-utf8" => Self::PathNotUtf8,
             _ => return None,
         };
         Some(banner)
@@ -1038,27 +1067,135 @@ async fn add_repository(State(state): State<AppState>) -> Response {
         Ok(Err(banner)) => return redirect_repositories(banner),
         Err(_) => return redirect_repositories(Banner::PickerNoSession),
     };
-    let Some(picked) = picked else {
-        return Redirect::to("/repositories").into_response();
+    let picked = match picked {
+        PickerResult::Cancelled => return Redirect::to("/repositories").into_response(),
+        // The picker's stderr belongs in the log, never in the redirect: the
+        // banner is one fixed code, so the query carries no free text.
+        PickerResult::Failed(stderr) => {
+            tracing::error!(
+                stderr = %String::from_utf8_lossy(&stderr),
+                "the folder picker failed"
+            );
+            return redirect_repositories(Banner::PickerFailed);
+        }
+        PickerResult::Picked(raw) => raw,
     };
-    let path = match std::fs::canonicalize(&picked) {
-        // A folder whose working tree lacks `tasks/` is still accepted when a
-        // ref of the repository that holds it carries `tasks/`, matching what a
-        // scan charts. A folder with no tasks anywhere stays rejected.
-        Ok(path) if harvest::holds_tasks(&path) => path,
-        _ => return redirect_repositories(Banner::NoTasksDirectory),
+    let picked = match decode_picked_path(&picked) {
+        Ok(picked) => picked,
+        Err(banner) => {
+            tracing::error!(
+                path = %String::from_utf8_lossy(&picked),
+                "the picked folder path is not valid UTF-8"
+            );
+            return redirect_repositories(banner);
+        }
     };
-    let _guard = state.scan.lock().await;
-    match store_repository(&state, &path).await {
-        Ok(()) => redirect_repositories(Banner::RepositoryAdded),
-        Err(banner) => redirect_repositories(banner),
+    // A picker that exits cleanly without naming a path produced no usable
+    // selection, which is the same failure as a picker error with no stderr.
+    if picked.is_empty() {
+        tracing::error!("the folder picker returned no path");
+        return redirect_repositories(Banner::PickerFailed);
     }
+    let picked = PathBuf::from(picked);
+
+    // `canonicalize` is a blocking filesystem call, so it runs on a blocking
+    // worker rather than the async one.
+    state.offloaded_fs_calls.fetch_add(1, Ordering::SeqCst);
+    let probe = picked.clone();
+    let canonical = match tokio::task::spawn_blocking(move || std::fs::canonicalize(&probe)).await {
+        Ok(Ok(path)) => path,
+        // A path that does not exist names no tasks directory; every other
+        // resolution failure is a folder this process cannot read.
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return redirect_repositories(Banner::NoTasksDirectory);
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                %error,
+                path = %picked.display(),
+                "the picked folder could not be resolved"
+            );
+            return redirect_repositories(Banner::FolderUnreadable);
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                path = %picked.display(),
+                "the picked folder probe stopped"
+            );
+            return redirect_repositories(Banner::FolderUnreadable);
+        }
+    };
+
+    // The working-tree half of the `tasks/` disjunction, probed off the async
+    // worker. A probe that fails for a reason other than a missing directory
+    // is an unreadable folder, not a missing tasks tree.
+    let tasks_dir = canonical.join("tasks");
+    state.offloaded_fs_calls.fetch_add(1, Ordering::SeqCst);
+    let probe = tasks_dir.clone();
+    let worktree_tasks = match tokio::task::spawn_blocking(move || std::fs::metadata(&probe)).await
+    {
+        Ok(Ok(metadata)) => metadata.is_dir(),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(Err(error)) => {
+            tracing::error!(
+                %error,
+                path = %tasks_dir.display(),
+                "the picked folder's tasks directory could not be read"
+            );
+            return redirect_repositories(Banner::FolderUnreadable);
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                path = %tasks_dir.display(),
+                "the tasks probe stopped"
+            );
+            return redirect_repositories(Banner::FolderUnreadable);
+        }
+    };
+    // A folder whose working tree lacks `tasks/` is still accepted when a ref of
+    // the repository that holds it carries `tasks/`, matching what a scan
+    // charts. A folder with no tasks anywhere stays rejected.
+    if !worktree_tasks && !harvest::holds_tasks(&canonical) {
+        return redirect_repositories(Banner::NoTasksDirectory);
+    }
+
+    // The insert and the first harvest run in their own task that takes the scan
+    // lock itself, so a request that disconnects drops only the handler: the
+    // store keeps the lock and finishes before the next Add, Update, or Remove
+    // can touch the same repository.
+    let store_state = state.clone();
+    let store_path = canonical;
+    let store = tokio::spawn(async move {
+        let _guard = store_state.scan.lock().await;
+        store_repository(&store_state, &store_path).await
+    });
+    match store.await {
+        Ok(Ok(())) => redirect_repositories(Banner::RepositoryAdded),
+        Ok(Err(banner)) => redirect_repositories(banner),
+        Err(error) => {
+            tracing::error!(%error, "the Add store task stopped");
+            redirect_repositories(Banner::RepositorySaveFailed)
+        }
+    }
+}
+
+/// The path a picker wrote as text. The bytes must be valid UTF-8, and only the
+/// line terminator the picker added is stripped, so every other byte a path
+/// holds survives into the stored repository.
+fn decode_picked_path(raw: &[u8]) -> Result<&str, Banner> {
+    let text = std::str::from_utf8(raw).map_err(|_| Banner::PathNotUtf8)?;
+    Ok(match text.strip_suffix('\n') {
+        Some(line) => line.strip_suffix('\r').unwrap_or(line),
+        None => text,
+    })
 }
 
 /// Store one already-chosen folder as a repository and refresh its rows. A
 /// failed first harvest keeps the repository and its scan error and returns
 /// that error's banner, so Add can report the failure instead of a success.
-/// The caller holds the scan lock across this call.
+/// The detached Add store task holds the scan lock across this call.
 async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<(), Banner> {
     let path_text = path.to_string_lossy().into_owned();
     if db::path_exists(&state.pool, &path_text)
@@ -1153,11 +1290,11 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
 
 /// List the repositories, harvest them, and store each result while holding the
 /// scan lock. The lock is held across the whole list-then-harvest-then-store
-/// sequence, `fn add_repository` and `fn remove_repository` take the same lock,
-/// and `scan_core` never takes it. Taking the lock is the wait for a scan that
-/// already runs, and the pending-scan slot is emptied right after it, so a later
-/// click starts a new follow-up instead of joining a run that may already be
-/// reading files.
+/// sequence, the detached Add store task and `fn remove_repository` take the
+/// same lock, and `scan_core` never takes it. Taking the lock is the wait for a
+/// scan that already runs, and the pending-scan slot is emptied right after it,
+/// so a later click starts a new follow-up instead of joining a run that may
+/// already be reading files.
 async fn run_scan(state: AppState) -> Result<ScanReport, Banner> {
     let _guard = state.scan.lock().await;
     {
@@ -1425,7 +1562,7 @@ async fn flash_banner(state: &AppState, project: &str, banner: Banner) -> Respon
     .into_response()
 }
 
-fn pick_folder() -> Result<Option<PathBuf>, Banner> {
+fn pick_folder() -> Result<PickerResult, Banner> {
     if cfg!(target_os = "macos") {
         return pick_osascript();
     }
@@ -1435,7 +1572,7 @@ fn pick_folder() -> Result<Option<PathBuf>, Banner> {
     Err(Banner::PickerUnsupported)
 }
 
-fn pick_osascript() -> Result<Option<PathBuf>, Banner> {
+fn pick_osascript() -> Result<PickerResult, Banner> {
     let output = Command::new("osascript")
         .args([
             "-e",
@@ -1443,21 +1580,14 @@ fn pick_osascript() -> Result<Option<PathBuf>, Banner> {
         ])
         .output()
         .map_err(|_| Banner::PickerNoSession)?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr).to_lowercase();
-        if err.contains("cancel") {
-            return Ok(None);
-        }
-        return Err(Banner::PickerNoSession);
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(PathBuf::from(path)))
+    Ok(osascript_outcome(
+        output.status.code(),
+        &output.stdout,
+        &output.stderr,
+    ))
 }
 
-fn pick_zenity() -> Result<Option<PathBuf>, Banner> {
+fn pick_zenity() -> Result<PickerResult, Banner> {
     let output = Command::new("zenity")
         .args([
             "--file-selection",
@@ -1466,14 +1596,46 @@ fn pick_zenity() -> Result<Option<PathBuf>, Banner> {
         ])
         .output()
         .map_err(|_| Banner::PickerNoSession)?;
-    if !output.status.success() {
-        return Ok(None);
+    Ok(zenity_outcome(
+        output.status.code(),
+        &output.stdout,
+        &output.stderr,
+    ))
+}
+
+/// Classify one zenity run from its exit code and raw output bytes. Zenity
+/// reports a cancelled dialog as exit status 1 with nothing on stderr, so that
+/// pair is the cancel; any other non-zero exit is a failure carrying the
+/// picker's stderr, and a clean exit that wrote no path is a failure too.
+fn zenity_outcome(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> PickerResult {
+    match exit_code {
+        Some(0) if !stdout.is_empty() => PickerResult::Picked(stdout.to_vec()),
+        Some(0) => PickerResult::Failed(Vec::new()),
+        Some(1) if stderr.is_empty() => PickerResult::Cancelled,
+        _ => PickerResult::Failed(stderr.to_vec()),
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return Ok(None);
+}
+
+/// Classify one osascript run from its exit code and raw output bytes. AppleScript
+/// reports a cancelled dialog as error number `-128` on stderr, so that number
+/// marks the cancel; the localized word "cancel" does not, because the message
+/// is translated.
+fn osascript_outcome(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> PickerResult {
+    match exit_code {
+        Some(0) if !stdout.is_empty() => PickerResult::Picked(stdout.to_vec()),
+        Some(0) => PickerResult::Failed(Vec::new()),
+        Some(1) if carries(stderr, b"-128") => PickerResult::Cancelled,
+        _ => PickerResult::Failed(stderr.to_vec()),
     }
-    Ok(Some(PathBuf::from(path)))
+}
+
+/// Whether `haystack` holds `needle` as a byte sequence, so a match stays exact
+/// whatever the surrounding bytes are.
+fn carries(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 fn safe_project(project: &str) -> String {
@@ -1521,12 +1683,12 @@ fn encode_query(value: &str) -> String {
 mod tests {
     use super::{
         AppState, Banner, FLASH_CAPACITY, FlashStore, GIT_ERROR, HarvestFn, HomeQuery,
-        MISSING_TASKS_ERROR, PickerFn, PriorReadHookFn, ProjectForm, STOPPED_ERROR, ScanFailure,
-        ScanReport, StoreHookFn, add_repository, claim_banner, encode_query, flash_banner,
-        init_templates, is_local_host, query_banner, record_scan_error, remaining,
-        remove_repository, render_blocking_thread, render_home, router, scan_all, scan_core,
-        scan_flash, scan_label, scan_response, scan_worker_cap, serve, serve_until_stopped,
-        static_version,
+        MISSING_TASKS_ERROR, PickerFn, PickerResult, PriorReadHookFn, ProjectForm, STOPPED_ERROR,
+        ScanFailure, ScanReport, StoreHookFn, add_repository, claim_banner, encode_query,
+        flash_banner, init_templates, is_local_host, osascript_outcome, query_banner,
+        record_scan_error, remaining, remove_repository, render_blocking_thread, render_home,
+        router, scan_all, scan_core, scan_flash, scan_label, scan_response, scan_worker_cap, serve,
+        serve_until_stopped, static_version, zenity_outcome,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -1588,6 +1750,12 @@ mod tests {
         )
         .expect("task");
         repo
+    }
+
+    /// The raw bytes a picker writes for `folder`, the shape both zenity and
+    /// osascript produce before Add decodes them.
+    fn picked_path(folder: &Path) -> PickerResult {
+        PickerResult::Picked(folder.to_string_lossy().into_owned().into_bytes())
     }
 
     /// A git repository holding `count` archived finished tasks, all committed
@@ -1954,7 +2122,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn web_rejects_a_cross_origin_add() {
         let (mut state, path) = app_state("origin_add_reject").await;
-        state.picker = Arc::new(|| Ok(None));
+        state.picker = Arc::new(|| Ok(PickerResult::Cancelled));
         let response = send(
             state.clone(),
             form_post("/repositories", Some("https://example.com"), None),
@@ -4445,14 +4613,14 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Covers: the sixteen codes the closed set names today round-trip
-    /// through `Banner::from_code`, so a `code` arm that disagrees with its
-    /// `from_code` arm fails here. `code` and `message` are exhaustive matches,
-    /// so a new variant forces an arm in each; `from_code` and this `ALL` array
-    /// are hand-written, so a new variant must be added to both.
+    /// Covers: every code the closed set names round-trips through
+    /// `Banner::from_code`, so a `code` arm that disagrees with its `from_code`
+    /// arm fails here. `code` and `message` are exhaustive matches, so a new
+    /// variant forces an arm in each; `from_code` and this `ALL` array are
+    /// hand-written, so a new variant must be added to both.
     #[test]
     fn web_banner_codes_round_trip() {
-        const ALL: [Banner; 16] = [
+        const ALL: [Banner; 19] = [
             Banner::RepositoryAdded,
             Banner::RepositoryRemoved,
             Banner::ChartsUpdated,
@@ -4469,6 +4637,9 @@ mod tests {
             Banner::ScanStopped,
             Banner::PickerUnsupported,
             Banner::PickerNoSession,
+            Banner::PickerFailed,
+            Banner::FolderUnreadable,
+            Banner::PathNotUtf8,
         ];
 
         for banner in ALL {
@@ -4919,7 +5090,7 @@ mod tests {
             if let Ok(release) = release_rx.lock() {
                 let _ = release.recv();
             }
-            Ok(None)
+            Ok(PickerResult::Cancelled)
         });
         state.picker = picker;
 
@@ -4952,7 +5123,7 @@ mod tests {
         let (mut state, path) = app_state("add_stores").await;
         let folder = live_repository("add_stores_repo");
         let picked = folder.clone();
-        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
 
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
@@ -4984,7 +5155,7 @@ mod tests {
         )
         .expect("gitfile");
         let picked = folder.clone();
-        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
 
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
@@ -5008,7 +5179,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn web_add_cancelled_picker_redirects_without_a_message() {
         let (mut state, path) = app_state("add_cancelled").await;
-        state.picker = Arc::new(|| Ok(None));
+        state.picker = Arc::new(|| Ok(PickerResult::Cancelled));
 
         let response = add_repository(State(state.clone())).await;
         assert_eq!(redirect_location(&response), "/repositories");
@@ -5017,48 +5188,320 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Add must hold the scan lock across the store phase, so its insert and
-    /// initial refresh cannot race Update's row writes.
+    /// Add's insert and first harvest run in a detached task that takes the scan
+    /// lock itself, so dropping the request future leaves the store running: the
+    /// repository and its rows are stored and the lock is free afterwards. A
+    /// second request waits on the lock while the store is parked.
     #[tokio::test(flavor = "current_thread")]
-    async fn web_add_holds_the_scan_lock_across_the_store() {
-        let (mut state, path) = app_state("add_holds_lock").await;
-        let folder = live_repository("add_holds_lock_repo");
+    async fn web_add_store_survives_a_dropped_request() {
+        let (mut state, path) = app_state("add_detached_store").await;
+        let folder = live_repository("add_detached_store_repo");
         let picked = folder.clone();
-        state.picker = Arc::new(move || Ok(Some(picked.clone())));
-        let guard = state.scan.lock().await;
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
 
-        let blocked = tokio::time::timeout(
-            Duration::from_millis(200),
-            add_repository(State(state.clone())),
-        )
-        .await;
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let store_hook: Arc<StoreHookFn> = Arc::new(move || {
+            let entered_tx = entered_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let _ = entered_tx.send(()).await;
+                let release = release_rx.lock().await.take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+            })
+        });
+        state.store_hook = store_hook;
+
+        let add = tokio::spawn(add_repository(State(state.clone())));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the detached store is entered")
+            .expect("the store signalled");
+        let repository_id =
+            db::list_repositories(&state.pool).await.expect("list")[0].repository_id;
+
+        // The client goes away while the store is parked inside its write.
+        drop_request(add).await;
+
+        let update = tokio::spawn(scan_all(State(state.clone()), Form(ProjectForm::default())));
         assert!(
-            blocked.is_err(),
-            "Add must wait for the scan lock before it stores"
+            tokio::time::timeout(Duration::from_millis(200), entered_rx.recv())
+                .await
+                .is_err(),
+            "a second request does not reach the store while the detached one holds the lock"
+        );
+        assert!(
+            !update.is_finished(),
+            "Update waits for the detached store instead of proceeding"
         );
 
-        drop(guard);
-        let response = add_repository(State(state.clone())).await;
+        release_tx.send(()).expect("release the detached store");
+        let rows = wait_for_rows(&state.pool, repository_id).await;
         assert_eq!(
-            redirect_location(&response),
-            "/repositories?notice=repository-added"
+            rows.len(),
+            1,
+            "the detached store keeps the rows after the request is dropped"
+        );
+
+        let response = tokio::time::timeout(Duration::from_secs(10), update)
+            .await
+            .expect("Update finishes after the store releases")
+            .expect("Update joins");
+        flash_token(&redirect_location(&response), "all");
+        assert!(
+            state.scan.try_lock().is_ok(),
+            "the scan lock is free after the detached store"
         );
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 
+    /// A picker failure reports one fixed code and logs the picker's own stderr,
+    /// so the redirect carries no picker text.
     #[tokio::test(flavor = "current_thread")]
     async fn web_add_reports_a_picker_error() {
         let (mut state, path) = app_state("add_picker_error").await;
-        state.picker = Arc::new(|| Err(Banner::PickerNoSession));
+        state.picker = Arc::new(|| Ok(PickerResult::Failed(b"Failed to open display".to_vec())));
+
+        let response = add_repository(State(state.clone())).await;
+        let location = redirect_location(&response);
+        assert_eq!(location, "/repositories?error=picker-failed");
+
+        let page = body_text(
+            send(
+                state.clone(),
+                get_page("/repositories?error=picker-failed", "127.0.0.1:7880"),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            page.contains("The folder picker failed."),
+            "the page renders the fixed text of the closed code set"
+        );
+        assert!(
+            !page.contains("Failed to open display"),
+            "no picker text reaches the page"
+        );
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert!(repositories.is_empty());
+        cleanup(&path);
+    }
+
+    /// A picker failure logs the picker's stderr once, in the async handler,
+    /// before the redirect is built.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_logs_a_picker_failure() {
+        let (mut state, path) = app_state("add_picker_log").await;
+        state.picker = Arc::new(|| Ok(PickerResult::Failed(b"Failed to open display".to_vec())));
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let response = add_repository(State(state.clone())).await;
+        let location = redirect_location(&response);
+        drop(_guard);
+
+        let lines = captured.take();
+        assert_eq!(lines.len(), 1, "one picker failure emits one log line");
+        assert!(
+            lines[0].contains("Failed to open display"),
+            "the log line carries the picker's stderr: {lines:?}"
+        );
+        assert_eq!(location, "/repositories?error=picker-failed");
+        cleanup(&path);
+    }
+
+    /// Zenity's cancel is exit status 1 with an empty stderr, while exit status
+    /// 1 carrying a message is a failure that returns that stderr.
+    #[test]
+    fn web_zenity_distinguishes_a_cancel_from_a_failure() {
+        assert_eq!(zenity_outcome(Some(1), b"", b""), PickerResult::Cancelled);
+        assert_eq!(
+            zenity_outcome(Some(1), b"", b"Failed to open display"),
+            PickerResult::Failed(b"Failed to open display".to_vec())
+        );
+        assert_eq!(
+            zenity_outcome(Some(0), b"/tmp/repo\n", b""),
+            PickerResult::Picked(b"/tmp/repo\n".to_vec())
+        );
+        assert_eq!(
+            zenity_outcome(Some(0), b"", b""),
+            PickerResult::Failed(Vec::new()),
+            "a clean exit that wrote no path is a failure, not a cancel"
+        );
+    }
+
+    /// Osascript's cancel is the AppleScript error number `-128` on stderr,
+    /// while any other stderr is a failure, whatever word it carries.
+    #[test]
+    fn web_osascript_distinguishes_a_cancel_from_a_failure() {
+        assert_eq!(
+            osascript_outcome(Some(1), b"", b"execution error: User canceled. (-128)"),
+            PickerResult::Cancelled
+        );
+        assert_eq!(
+            osascript_outcome(Some(1), b"", b"execution error: User canceled. (-1)"),
+            PickerResult::Failed(b"execution error: User canceled. (-1)".to_vec()),
+            "the localized word cancel does not mark a cancel without -128"
+        );
+        assert_eq!(
+            osascript_outcome(Some(1), b"", b"execution error: something else (-1)"),
+            PickerResult::Failed(b"execution error: something else (-1)".to_vec())
+        );
+    }
+
+    /// A successful pick whose raw stdout carries a trailing newline and a
+    /// non-ASCII path stores the repository at exactly that path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_stores_a_non_ascii_path_with_a_trailing_newline() {
+        let (mut state, path) = app_state("add_non_ascii").await;
+        let folder = unique_temp_dir("add_non_ascii_repo").join("Repo Ä space");
+        std::fs::create_dir_all(folder.join("tasks")).expect("tasks");
+        std::fs::write(
+            folder.join("tasks/scope_live.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Live\n",
+        )
+        .expect("task");
+        let mut raw = folder.to_string_lossy().into_owned().into_bytes();
+        raw.push(b'\n');
+        state.picker = Arc::new(move || Ok(PickerResult::Picked(raw.clone())));
 
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
             redirect_location(&response),
-            "/repositories?error=picker-no-session"
+            "/repositories?notice=repository-added"
         );
         let repositories = db::list_repositories(&state.pool).await.expect("list");
-        assert!(repositories.is_empty());
+        assert_eq!(repositories.len(), 1);
+        let canonical = std::fs::canonicalize(&folder).expect("canonical");
+        assert_eq!(
+            repositories[0].path,
+            canonical.to_string_lossy(),
+            "the trailing newline is stripped and every other byte kept"
+        );
+        assert!(
+            repositories[0].path.contains("Repo Ä space"),
+            "the non-ASCII and space bytes survive into the stored path"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// A picked path that is not valid UTF-8 is refused before any repository
+    /// row exists, and a later Update does not fail on it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_refuses_a_non_utf8_picked_path() {
+        let (mut state, path) = app_state("add_non_utf8").await;
+        let folder = live_repository("add_non_utf8_repo");
+        let mut raw = folder.to_string_lossy().into_owned().into_bytes();
+        raw.push(0xFF);
+        state.picker = Arc::new(move || Ok(PickerResult::Picked(raw.clone())));
+
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?error=path-not-utf8"
+        );
+        assert!(
+            db::list_repositories(&state.pool)
+                .await
+                .expect("list")
+                .is_empty(),
+            "no repository row exists for the refused path"
+        );
+
+        let update = scan_all(State(state.clone()), Form(ProjectForm::default())).await;
+        flash_token(&redirect_location(&update), "all");
+        assert!(
+            db::list_repositories(&state.pool)
+                .await
+                .expect("list")
+                .is_empty(),
+            "a later Update does not fail on the refused path"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// A folder that exists but cannot be read reports the folder-unreadable
+    /// code and logs the real error, while a missing folder reports the
+    /// no-tasks-directory code.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_reports_an_unreadable_folder() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut state, path) = app_state("add_unreadable").await;
+        let folder = live_repository("add_unreadable_repo");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let response = add_repository(State(state.clone())).await;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        drop(_guard);
+
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?error=folder-unreadable"
+        );
+        let lines = captured.take();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("os error 13") || line.contains("Permission denied")),
+            "the handler logs the real error: {lines:?}"
+        );
+        assert!(
+            db::list_repositories(&state.pool)
+                .await
+                .expect("list")
+                .is_empty(),
+            "an unreadable folder inserts no repository"
+        );
+
+        let missing = unique_temp_dir("add_missing_repo");
+        let picked = missing.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?error=no-tasks-directory",
+            "a missing folder reports no tasks directory"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// The async handler hands `canonicalize` and the `tasks` probe to blocking
+    /// workers: the counter on `AppState` reads two after the redirect, so
+    /// either call returning to the handler fails this test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_offloads_the_folder_probe() {
+        let (mut state, path) = app_state("add_offload").await;
+        let folder = live_repository("add_offload_repo");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        assert_eq!(state.offloaded_fs_calls.load(Ordering::SeqCst), 0);
+
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=repository-added"
+        );
+        assert_eq!(
+            state.offloaded_fs_calls.load(Ordering::SeqCst),
+            2,
+            "canonicalize and the tasks probe each run off the async worker"
+        );
+        let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 
@@ -5068,7 +5511,7 @@ mod tests {
         let folder = unique_temp_dir("add_no_tasks_repo");
         std::fs::create_dir_all(&folder).expect("scratch");
         let picked = folder.clone();
-        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
 
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
@@ -5086,7 +5529,7 @@ mod tests {
         let (mut state, path) = app_state("add_duplicate").await;
         let folder = live_repository("add_duplicate_repo");
         let picked = folder.clone();
-        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
 
         let first = add_repository(State(state.clone())).await;
         assert_eq!(
@@ -7993,7 +8436,7 @@ mod tests {
             "the checkout must not hold tasks/"
         );
         let picked = folder.clone();
-        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
 
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
@@ -8030,7 +8473,7 @@ mod tests {
             "2026-05-01T12:00:00+00:00",
         );
         let picked = folder.clone();
-        state.picker = Arc::new(move || Ok(Some(picked.clone())));
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
 
         let response = add_repository(State(state.clone())).await;
         assert_eq!(
