@@ -2,8 +2,8 @@
 description: "Align CHARTER, ARCHITECTURE, FEATURES, TESTING, and README with the code: ref scope, Add's write path, toolchain, layout, worker cap, and drifted comments."
 scope: .
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-19T19:29:58Z
-status: implemented
+updated: 2026-11-19T19:32:52Z
+status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: false
 reported-by: Andreas Hoffmann
@@ -24,10 +24,10 @@ Every guardrail claim that the code contradicts is rewritten to the behavior the
 - `FEATURES.md` promises `Z` stamps that legacy rows lack and omits the worker range; `README.md` omits it too. The repositories template prints `project.created_at` and `project.scanned_at` as stored, and `db::now_stamp` writes `Z` only for the rows this build inserts, so a row stored by an older build keeps its own spelling.
 - `TESTING.md` has no place for `task-viewer/src/launcher_tests.rs`.
 - Three comments in `task-viewer/src/harvest.rs` describe behavior the code no longer has: the doc comment on `type Candidate` ("Every task file the working tree or any ref holds, one row per task"), the comment in `harvest_repository_with_prior` above `GitContext::resolve` ("that the working tree or any ref holds"), and the arm comment in `fn git_pickaxe` ("No `.git` and no enclosing repository: git has no commit to offer"), which also serves a resolved enclosing repository because `git.dir` is `None` there.
-- The git-failure rules depend on [task-viewer_harvest-git-failure-cases.md](archive/task-viewer_harvest-git-failure-cases.md), which shipped the enclosing-repository arms that propagate an ordinary failure and the empty worktree walk a resolved repository with no working-tree `tasks/` takes. The shipped tree now returns that failure from `first_archived_commit_date` and from `git_pickaxe`'s `git.dir: None` arm, while `ARCHITECTURE.md`'s git-fallback paragraph still describes the old fallback.
-- The failed-enclosing-probe rules depend on [task-viewer_harvest-skip-visibility.md](archive/task-viewer_harvest-skip-visibility.md), which makes an enclosing-repository probe that fails for a reason other than git's not-a-repository answer fail the scan with git's first stderr line. This task lands after that one as well.
-- The Data Layout re-walk rule and [task-viewer_harvest-raw-path-gaps.md](archive/task-viewer_harvest-raw-path-gaps.md) no longer disagree: that work amended `ARCHITECTURE.md`'s re-walk rule so a fallback day on a lossy path is reused until the file's bytes change, so this task owes no re-walk amendment.
-- The pinned toolchain belongs to [task-viewer_launcher-build-truth.md](archive/task-viewer_launcher-build-truth.md), which pins `channel` in `rust-toolchain.toml` and adds the matching `rust-version` in `Cargo.toml` without touching a guardrail doc, so this task states the pin and lands after it.
+- The git-failure rules depend on [task-viewer_harvest-git-failure-cases.md](task-viewer_harvest-git-failure-cases.md), which shipped the enclosing-repository arms that propagate an ordinary failure and the empty worktree walk a resolved repository with no working-tree `tasks/` takes. The shipped tree now returns that failure from `first_archived_commit_date` and from `git_pickaxe`'s `git.dir: None` arm, while `ARCHITECTURE.md`'s git-fallback paragraph still describes the old fallback.
+- The failed-enclosing-probe rules depend on [task-viewer_harvest-skip-visibility.md](task-viewer_harvest-skip-visibility.md), which makes an enclosing-repository probe that fails for a reason other than git's not-a-repository answer fail the scan with git's first stderr line. This task lands after that one as well.
+- The Data Layout re-walk rule and [task-viewer_harvest-raw-path-gaps.md](task-viewer_harvest-raw-path-gaps.md) no longer disagree: that work amended `ARCHITECTURE.md`'s re-walk rule so a fallback day on a lossy path is reused until the file's bytes change, so this task owes no re-walk amendment.
+- The pinned toolchain belongs to [task-viewer_launcher-build-truth.md](task-viewer_launcher-build-truth.md), which pins `channel` in `rust-toolchain.toml` and adds the matching `rust-version` in `Cargo.toml` without touching a guardrail doc, so this task states the pin and lands after it.
 - `FEATURES.md` reports a scan error for a git history it cannot read but never names the enclosing-repository probe: a `rev-parse` that fails for a reason other than git's not-a-repository answer fails the scan with git's first stderr line in the message.
 - Resolved by the user's standing instruction to follow the audit recommendation for the three charter-bound forks: narrow the ref promise to the listed branches (matching `ARCHITECTURE.md` and the deliberate `refs/heads` + `refs/remotes` read), name `bash` and `python3` as launcher tooling rather than rewriting the scripts, and keep the deferred-date rule as the first archived-path commit. The harvest-core and ops-docs rulings settle the rest: the git-fallback rule lands here for the finished/deferred archive walk and for the pickaxe lookup, the missing-`tasks/` and failed-enclosing-probe rules land here, and the pinned toolchain lands here.
 
