@@ -247,7 +247,10 @@ fn send_signal(pid: u32, signal: &str) {
         .arg(pid.to_string())
         .status()
         .expect("run kill");
-    assert!(status.success(), "kill -{signal} {pid} succeeded");
+    assert!(
+        status.success(),
+        "kill -{signal} {pid} failed with {status:?}"
+    );
 }
 
 /// Wait for the store hook's marker, so the signal provably arrives while a
