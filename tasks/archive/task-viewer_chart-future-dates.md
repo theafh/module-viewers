@@ -2,8 +2,8 @@
 description: "Fold after-today created and ship events into the last charted point so series and counts agree, and warn once on each."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-19T16:52:27Z
-status: implemented
+updated: 2026-11-19T16:56:30Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: true
@@ -21,7 +21,7 @@ The dashboard's series and its headline counts agree when a task carries a date 
 - `task-viewer/src/series.rs` builds `created_c` and `shipped_c` without a date filter, and `counts.created_events` / `counts.shipped_events` are their full sums. `fn weekly_points`, `fn cumulative_points`, `fn live_points`, and `fn age_points_counted` all stop at `today`.
 - `dates::today()` is UTC, so a date-only value written just after Berlin midnight is one UTC day ahead for a short window; a mistyped year is permanent.
 - `task-viewer/static/js/dashboard.js` prints `counts.*_events` in the weekly card summary.
-- Prior art: [task-viewer_chart-date-anomalies.md](archive/task-viewer_chart-date-anomalies.md) handled out-of-order dates, not after-today dates.
+- Prior art: [task-viewer_chart-date-anomalies.md](task-viewer_chart-date-anomalies.md) handled out-of-order dates, not after-today dates.
 - Resolved by the user's standing instruction to follow the audit recommendation: fold and warn rather than clamp and drop, because dropping would re-create the silent-drop class this backlog already treats as a defect.
 
 ## Approach
@@ -29,7 +29,7 @@ The dashboard's series and its headline counts agree when a task carries a date 
 - In `fn weekly_points`, fold only the events whose Monday is after `monday(today)` into the last row. An event dated after `today` but inside today's week is already counted in that week's row, so leave it where it sits instead of adding it twice. In `fn cumulative_points`, fold every ship event dated after `today` into the last row, because that series plots the shipped count and has one row per day, so it carries no future day. Each series then ends at its last row and its total equals the matching `counts.*_events` sum.
 - In `fn live_points`, keep a task created after `today` out of the rows through `today` rather than folding it into today's row, and leave a leave day after `today` where it is: a task that leaves after `today` stays in the backlog through today and drops out on its own leave day, the way `ARCHITECTURE.md`'s live-backlog rule states.
 - Clamp each walk's `start` to that walk's own last row day, `today` for the daily walks and `monday(today)` for `weekly_points`, so a series whose only event is after today still yields one row.
-- Add the matching clause to `ARCHITECTURE.md`'s **Extraction Rules** day-range sentence, which today says the charts run "from the later of their first day and 1970-01-01 through today": state that the start also caps at today, or today's Monday for the weekly chart, when the first event lies after today. Apply it to the sentence as it stands, so whichever of this task and [task-viewer_chart-empty-backlog-mean-age.md](archive/task-viewer_chart-empty-backlog-mean-age.md) ships second carries it.
+- Add the matching clause to `ARCHITECTURE.md`'s **Extraction Rules** day-range sentence, which today says the charts run "from the later of their first day and 1970-01-01 through today": state that the start also caps at today, or today's Monday for the weekly chart, when the first event lies after today. Apply it to the sentence as it stands, so whichever of this task and [task-viewer_chart-empty-backlog-mean-age.md](task-viewer_chart-empty-backlog-mean-age.md) ships second carries it.
 - Emit one `tracing::warn!` per after-today event naming the repository, path, and date, from a single site in `fn dashboard` where the fold is decided, so a ship folded into both series is warned once rather than once per series. The `path` field already reaches the warning site through `TaskRecord`, `TaskRow`, both `SELECT` lists in `fn load_tasks`, and `fn row_to_record`, and the six-argument `task()` test helper fills it, so the warning reads it as it stands instead of re-adding it.
 - In `fn age_points_counted`, keep a task created after `today` out of the rows through `today` rather than folding it into today's row at age 0, matching `ARCHITECTURE.md`'s definition of mean age over tasks that exist and are unfinished at the end of the day; the running total `count * cur.num_days_from_ce() - sum_created` then never subtracts a future day.
 - Pass the already-built `created_c` and `shipped_c` maps into `fn weekly_points` instead of re-keying every task a second time.
