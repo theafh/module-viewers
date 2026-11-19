@@ -137,10 +137,10 @@ pub fn harvest_repository_with_prior(
     let worktree_tasks = repo.join("tasks").is_dir();
 
     // A configured folder that a git repository holds is charted from every
-    // version of its `tasks/` tree that the working tree or any ref holds, so a
-    // task stays visible whichever branch is checked out. The repository that
-    // holds it is the folder's own `.git` or an enclosing one. A folder outside
-    // git is charted from its files.
+    // version of its `tasks/` tree that the working tree or any local or
+    // remote-tracking ref holds, so a task stays visible whichever branch is
+    // checked out. The repository that holds it is the folder's own `.git` or
+    // an enclosing one. A folder outside git is charted from its files.
     let git =
         GitContext::resolve(&repo).map_err(|failure| HarvestError::Git(failure.to_string()))?;
     match git.repository() {
@@ -262,7 +262,8 @@ impl GitContext {
     }
 }
 
-/// Every task file the working tree or any ref holds, one row per task.
+/// Every task file the working tree or any local or remote-tracking ref holds,
+/// one row per task.
 ///
 /// A task's identity is its file name, so the same task counts once when one
 /// branch still holds it live while another has archived it. The newest

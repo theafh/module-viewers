@@ -2,8 +2,10 @@
 description: "Align CHARTER, ARCHITECTURE, FEATURES, TESTING, and README with the code: ref scope, Add's write path, toolchain, layout, worker cap, and drifted comments."
 scope: .
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-19T13:20:00Z
-status: ready
+updated: 2026-11-19T19:29:58Z
+status: implemented
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 reported-by: Andreas Hoffmann
 ---
 

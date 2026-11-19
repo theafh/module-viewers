@@ -24,14 +24,14 @@ module-viewers ships small local tools that read repositories a person already h
 ## Key Invariants
 
 - The source of a chart is the parsed rows in `~/.task-viewer` for the repositories that person configured.
-- A configured repository that has a git history is charted from every version of its `tasks/` tree that its working tree or any of its refs holds, so a task stays on the charts whichever branch happens to be checked out.
-- Update replaces those rows from the current files and git history. It is the only refresh path.
+- A configured repository that has a git history is charted from every version of its `tasks/` tree that its working tree or any local or remote-tracking ref holds, so a task stays on the charts whichever branch happens to be checked out.
+- Update replaces those rows from the current files and git history, and Add harvests and stores a newly added repository's rows as it inserts it. Those two are the only refresh paths.
 - A shipped task is an archived task whose status is `finished`. Its ship day is the commit that first archived it as `finished`, or as `implemented` when `implemented` was the archived spelling that a later commit renamed, or the frontmatter `updated` day when git has no such commit or when the task's path cannot be named in a git command.
-- A deferred archived task counts as created and never as shipped. Its leave day is the commit that first introduced its archived status, or the frontmatter `updated` day when git has no such commit or when the task's path cannot be named in a git command. Mean age includes it from `created` until that leave day.
+- A deferred archived task counts as created and never as shipped. Its leave day is the first commit whose path lies under an `archive` directory and whose content carries `status: deferred`, or the frontmatter `updated` day when git has no such commit or when the task's path cannot be named in a git command. Mean age includes it from `created` until that leave day.
 - All projects is the default filter. Its radar charts count tasks per configured repository. A single-project filter counts tasks per filename scope.
 
 ## Intentional Constraints
 
-- The toolchain is Rust, Make, and the crates declared in `Cargo.lock`.
+- The toolchain is Rust at the channel `1.98.1` pinned in `rust-toolchain.toml`, with the matching `rust-version` in `task-viewer/Cargo.toml`, plus Make, `bash` and `python3` for the launcher, and the crates declared in `Cargo.lock`.
 - Appearance is a light theme and a dark theme, chosen in the browser.
 - Further viewers arrive as sibling crates on this same local stack.
