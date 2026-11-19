@@ -2,9 +2,11 @@
 description: "Drop the mean-age point for a day with an empty backlog, rewrite ARCHITECTURE.md's mean-age day range, update the three age tests, and clamp the trend at zero."
 scope: task-viewer
 created: 2026-11-13T20:46:16Z
-updated: 2026-11-14T23:52:55Z
-status: ready
+updated: 2026-11-19T16:21:55Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Omit the mean-age point for a day with an empty backlog

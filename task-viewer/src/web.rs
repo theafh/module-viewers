@@ -7063,6 +7063,61 @@ mod tests {
         }
     }
 
+    /// Covers: a least-squares trend that dips below zero is clamped to the
+    /// zero axis instead of being drawn under it.
+    #[test]
+    fn browser_line_trend_never_draws_below_the_zero_axis() {
+        let mut payload = fixture_payload();
+        payload["cumulative"] = serde_json::json!([
+            {"date": "2026-01-05", "cumulative": 0, "shipped": 0, "trend": -2.0},
+            {"date": "2026-01-06", "cumulative": 0, "shipped": 0, "trend": -1.0},
+            {"date": "2026-01-07", "cumulative": 0, "shipped": 0, "trend": -0.5}
+        ]);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var svg = globalThis.__env.cards["cumulative"].querySelector("svg");
+  var dashed = svg.children.filter(function (node) {
+    return node.name === "path" && node.attrs["stroke-dasharray"] === "6 5";
+  })[0];
+  if (!dashed) return JSON.stringify({ error: "no trend path" });
+  // The frame is 280px tall with a 32px bottom margin, so zero sits at y=248.
+  var zero = 248;
+  // Each point reads "<M|L><x> <y>", so the odd tokens are the y values.
+  var tokens = dashed.attrs.d.trim().split(/\s+/);
+  var points = [];
+  for (var index = 1; index < tokens.length; index += 2) {
+    points.push(Number(tokens[index]));
+  }
+  return JSON.stringify({
+    zero: zero,
+    below: points.filter(function (y) { return y < zero; }),
+    points: points
+  });
+})()"#,
+        );
+        assert_eq!(result["error"], serde_json::Value::Null);
+        assert_eq!(
+            result["below"],
+            serde_json::json!([]),
+            "no trend point sits below the zero axis"
+        );
+        for y in result["points"].as_array().expect("trend points") {
+            assert_eq!(
+                y.as_f64(),
+                Some(248.0),
+                "each clamped trend point sits on the zero axis"
+            );
+        }
+    }
+
     /// Covers: one full render reads each theme colour once per
     /// draw function, so the count is the same for a small payload and a
     /// 3,000-row one.

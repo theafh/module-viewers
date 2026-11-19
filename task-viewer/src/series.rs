@@ -319,6 +319,10 @@ fn age_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<AgePoint> {
 /// added and removed on the same day and counts on no day. The running total is
 /// `count * day - sum_created`, which equals the sum of `day - created` over the
 /// active tasks without touching each task on each day.
+///
+/// Only a day that holds at least one unfinished task emits a point, so an
+/// empty backlog leaves the series short instead of reporting an average of 0,
+/// and the trend is fitted to exactly the days the payload carries.
 fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>, usize) {
     if tasks.is_empty() {
         return (Vec::new(), 0);
@@ -371,13 +375,15 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
             sum_created -= removed_sum;
             steps += *removed as usize;
         }
-        let avg = if count == 0 {
-            0.0
-        } else {
+        // A day whose backlog is empty carries no average, so it emits no point
+        // and the trend is fitted only to the days that do. The running count
+        // and created-day sum still advance on every day, empty ones included,
+        // so the linear work bound is unchanged.
+        if count > 0 {
             let total = count * i64::from(cur.num_days_from_ce()) - sum_created;
-            total as f64 / count as f64
-        };
-        rows.push((cur, avg, count as usize));
+            let avg = total as f64 / count as f64;
+            rows.push((cur, avg, count as usize));
+        }
         match cur.checked_add_days(Days::new(1)) {
             Some(next) => cur = next,
             None => break,
@@ -566,12 +572,11 @@ mod tests {
                 total += (cur - task.created).num_days();
                 count += 1;
             }
-            let avg = if count == 0 {
-                0.0
-            } else {
-                total as f64 / count as f64
-            };
-            rows.push((cur, avg, count));
+            // The sweep emits no point for an empty backlog, so the reference
+            // loop skips that day too.
+            if count > 0 {
+                rows.push((cur, total as f64 / count as f64, count));
+            }
             match cur.checked_add_days(Days::new(1)) {
                 Some(next) => cur = next,
                 None => break,
@@ -614,19 +619,22 @@ mod tests {
     }
 
     /// Covers: the sweep matches the pre-change loop on `avg_age`, `n`, and
-    /// `trend`, including a record whose leave day precedes `created` and one
-    /// created and left on the same day.
+    /// `trend`, including a record whose leave day precedes `created`, one
+    /// created and left on the same day, and an empty-backlog day the sweep
+    /// omits.
     #[test]
     fn series_age_sweep_matches_the_day_times_task_loop() {
         let today = day(2026, 6, 10);
         let tasks = vec![
+            // Leaves on the day both remaining tasks leave, so the next day
+            // holds no unfinished task.
             task(
                 "alpha",
                 "scope",
-                TaskKind::Live,
+                TaskKind::Deferred,
                 day(2026, 6, 1),
                 None,
-                None,
+                Some(day(2026, 6, 8)),
             ),
             task(
                 "alpha",
@@ -662,10 +670,27 @@ mod tests {
                 Some(day(2026, 6, 4)),
                 Some(day(2026, 6, 4)),
             ),
+            // Created after the empty day, so 2026-06-09 carries a point again.
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Live,
+                day(2026, 6, 9),
+                None,
+                None,
+            ),
         ];
         let sweep = age_points(&tasks, today);
         let legacy = age_points_by_day_and_task(&tasks, today);
         assert_same_age_points(&sweep, &legacy);
+        assert!(
+            sweep.iter().all(|point| point.n > 0),
+            "no emitted point carries an empty backlog"
+        );
+        assert!(
+            !sweep.iter().any(|point| point.date == "2026-06-08"),
+            "the empty-backlog day emits no point"
+        );
         let out_of_order = sweep
             .iter()
             .find(|point| point.date == "2026-06-06")
@@ -709,10 +734,17 @@ mod tests {
             "the sweep reported {steps} work steps for {days} days and {} tasks, above the linear bound of {bound}",
             tasks.len()
         );
+        // Every window holds 30 unfinished days and the windows start 41 days
+        // apart, so each task contributes its own 30 points and no day is
+        // shared.
         assert_eq!(
-            points.len() as i64,
-            days,
-            "the sweep still emits one point per day"
+            points.len(),
+            tasks.len() * 30,
+            "the sweep emits one point per unfinished day"
+        );
+        assert!(
+            points.iter().all(|point| point.n > 0),
+            "no emitted point carries an empty backlog"
         );
     }
 
@@ -849,12 +881,94 @@ mod tests {
             expected.to_bits(),
             "the first row keeps the task's real age"
         );
-        let ship = board
-            .mean_age
-            .iter()
-            .find(|point| point.date == "2026-06-01")
-            .expect("ship day");
-        assert_eq!(ship.n, 0);
+        assert!(
+            !board
+                .mean_age
+                .iter()
+                .any(|point| point.date == "2026-06-01"),
+            "the ship day leaves the backlog, so it carries no point"
+        );
+        assert_eq!(
+            board.mean_age.last().expect("last point").date,
+            "2026-05-31",
+            "the series ends on the last day that holds the task"
+        );
+    }
+
+    /// Covers: a day with an empty backlog emits no point, so the series runs
+    /// from the created day of the only task through its leave day and stops
+    /// there instead of reporting an average of 0 for the rest of the range.
+    #[test]
+    fn series_mean_age_omits_a_day_with_an_empty_backlog() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![task(
+            "alpha",
+            "scope",
+            TaskKind::Finished,
+            day(2026, 6, 1),
+            Some(day(2026, 6, 2)),
+            Some(day(2026, 6, 2)),
+        )];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        assert_eq!(
+            board.mean_age.len(),
+            1,
+            "only the one unfinished day emits a point"
+        );
+        let only = board.mean_age.first().expect("the only point");
+        assert_eq!(only.date, "2026-06-01");
+        assert_eq!(only.n, 1);
+    }
+
+    /// Covers: the gap between one task's leave day and a task created two days
+    /// later holds no mean-age point, while a point sits on each side of it.
+    #[test]
+    fn series_mean_age_leaves_the_gap_between_a_leave_day_and_a_later_created_day_empty() {
+        let today = day(2026, 6, 8);
+        let tasks = vec![
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Finished,
+                day(2026, 6, 1),
+                Some(day(2026, 6, 3)),
+                Some(day(2026, 6, 3)),
+            ),
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Live,
+                day(2026, 6, 5),
+                None,
+                None,
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        assert!(
+            !board
+                .mean_age
+                .iter()
+                .any(|point| point.date == "2026-06-03" || point.date == "2026-06-04"),
+            "neither gap day carries a point"
+        );
+        assert!(
+            board.mean_age.iter().all(|point| point.n >= 1),
+            "every emitted point holds at least one unfinished task"
+        );
+        assert!(
+            board
+                .mean_age
+                .iter()
+                .any(|point| point.date == "2026-06-02"),
+            "the day before the gap carries a point"
+        );
+        assert!(
+            board
+                .mean_age
+                .iter()
+                .any(|point| point.date == "2026-06-05"),
+            "the day after the gap carries a point"
+        );
     }
 
     #[test]

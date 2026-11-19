@@ -267,7 +267,10 @@
     el(svg, "path", { d: area, fill: color, opacity: "0.16" });
     el(svg, "path", { d: line, fill: "none", stroke: color, "stroke-width": "2" });
     if (rows[0].trend !== undefined) {
-      var trend = pathFor(function (row) { return row.trend; });
+      // The y scale puts zero on `frame.bottom`, so a negative least-squares
+      // value would draw below the zero axis. Clamp each trend point at zero
+      // rather than widening the domain downward.
+      var trend = pathFor(function (row) { return Math.max(0, row.trend); });
       el(svg, "path", {
         d: trend, fill: "none", stroke: color, "stroke-width": "1.5",
         "stroke-dasharray": "6 5", opacity: "0.55"
