@@ -2,7 +2,7 @@
 description: "Name the chart SVGs for assistive tech, hoist the number formatter, recolour on theme change without redrawing, and guard the fallback logger."
 scope: task-viewer/static/js
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-16T14:19:14Z
+updated: 2026-11-19T16:17:27Z
 status: ready
 reported-by: Andreas Hoffmann
 ---
@@ -15,7 +15,7 @@ Each chart SVG carries an accessible name and description. Formatting a number a
 
 ## Context
 
-- Build order: after `task-viewer_harvest-timeout-flake.md`. No required order against `task-viewer_chart-geometry-and-labels.md`; both edit `dashboard.js`, so land them one at a time. Other live tasks that also edit `dashboard.js` are `task-viewer_chart-empty-backlog-mean-age.md` and `task-viewer_chart-future-dates.md`.
+- Build order: after `task-viewer_harvest-timeout-flake.md`. The split sibling `task-viewer_chart-geometry-and-labels.md` shipped and now lives in `archive/`, so no live task orders itself against this one; the other live tasks that also edit `dashboard.js` are `task-viewer_chart-empty-backlog-mean-age.md` and `task-viewer_chart-future-dates.md`, so land them one at a time.
 - `task-viewer/templates/dashboard.html` renders each chart with `role="img"` and no name.
 - `task-viewer/static/js/dashboard.js` calls `new Intl.NumberFormat("en-US").format(value)` per value, listens with `window.addEventListener("task-viewer-theme", renderAll)`, swallows the chart error in its fallback, and prints the mean-age subtitle.
 - The rquickjs test harness that loads `dashboard.js` defines no `console`, so an unguarded helper would throw there.

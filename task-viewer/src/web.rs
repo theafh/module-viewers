@@ -7287,8 +7287,10 @@ mod tests {
   for (var index = 1; index < labels.length; index += 1) {
     var previous = labels[index - 1];
     var current = labels[index];
-    var previousRight = previous.x + String(previous.text).length * 6.6 / 2;
-    var currentLeft = current.x - String(current.text).length * 6.6 / 2;
+    // Month labels carry no text-anchor, so each renders rightward from its
+    // anchor and only the earlier label's width stands between the anchors.
+    var previousRight = previous.x + String(previous.text).length * 6.6;
+    var currentLeft = current.x;
     if (currentLeft < previousRight) overlaps += 1;
   }
   return JSON.stringify({ labels: labels, overlaps: overlaps });

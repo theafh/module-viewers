@@ -518,8 +518,10 @@
     if (!candidates.length) {
       return;
     }
-    function halfWidth(text) {
-      return (text.length * 6.6) / 2;
+    // Month labels set no text-anchor, so each renders rightward from its
+    // anchor and occupies [px, px + text.length * 6.6].
+    function textWidth(text) {
+      return text.length * 6.6;
     }
     function labelFor(candidate, withYear) {
       return monthName(candidate.date) + (withYear ? " " + candidate.date.getFullYear() : "");
@@ -537,23 +539,22 @@
       // A year on the first label is worth printing only when it clears the
       // January that follows it; otherwise that January carries the year.
       firstCarriesYear = !nextJanuary ||
-        Math.abs(first.px - nextJanuary.px) >=
-          halfWidth(labelFor(first, true)) + halfWidth(labelFor(nextJanuary, true));
+        nextJanuary.px - first.px >= textWidth(labelFor(first, true));
     }
     var placed = [];
     candidates.forEach(function (candidate, position) {
       var january = candidate.date.getMonth() === 0;
       var text = labelFor(candidate, january || (position === 0 && firstCarriesYear));
-      var half = halfWidth(text);
+      var width = textWidth(text);
       if (!january) {
         var previous = placed[placed.length - 1];
-        if (previous && Math.abs(candidate.px - previous.px) < half + previous.half) {
+        if (previous && candidate.px - previous.px < previous.width) {
           return;
         }
       } else {
         while (placed.length) {
           var last = placed[placed.length - 1];
-          if (Math.abs(candidate.px - last.px) >= half + last.half) {
+          if (candidate.px - last.px >= last.width) {
             break;
           }
           svg.removeChild(last.node);
@@ -564,7 +565,7 @@
         x: candidate.px, y: y, fill: muted, "font-size": "11"
       });
       node.textContent = text;
-      placed.push({ px: candidate.px, half: half, node: node });
+      placed.push({ px: candidate.px, width: width, node: node });
     });
   }
 
