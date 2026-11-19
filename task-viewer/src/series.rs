@@ -120,7 +120,34 @@ pub fn dashboard(
         }
     }
 
-    let weekly = weekly_points(tasks, today);
+    // One warning per after-today event, emitted from the single site that
+    // decides the fold, so a ship folded into both the weekly and the
+    // cumulative series is named once instead of once per series. The event is
+    // still counted in the last charted point, so a mistyped future year stays
+    // visible instead of vanishing.
+    for task in tasks {
+        if task.created > today {
+            tracing::warn!(
+                repository = %task.project,
+                path = %task.path,
+                date = %crate::dates::format_date(task.created),
+                "task created after today; counted in the last charted point"
+            );
+        }
+        if task.kind == TaskKind::Finished
+            && let Some(day) = task.ship_date
+            && day > today
+        {
+            tracing::warn!(
+                repository = %task.project,
+                path = %task.path,
+                date = %crate::dates::format_date(day),
+                "task shipped after today; counted in the last charted point"
+            );
+        }
+    }
+
+    let weekly = weekly_points(&created_c, &shipped_c, today);
     let cumulative = cumulative_points(&shipped_c, today);
     let (shipped_calendar, calendar_peak_shipped) = calendar(&shipped_c, today);
     let (created_calendar, calendar_peak_created) = calendar(&created_c, today);
@@ -165,34 +192,55 @@ pub fn dashboard(
     }
 }
 
-fn weekly_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<WeekPoint> {
-    let mut created: BTreeMap<NaiveDate, i64> = BTreeMap::new();
-    let mut shipped: BTreeMap<NaiveDate, i64> = BTreeMap::new();
-    for task in tasks {
-        *created.entry(monday(task.created)).or_insert(0) += 1;
-        if task.kind == TaskKind::Finished
-            && let Some(day) = task.ship_date
-        {
-            *shipped.entry(monday(day)).or_insert(0) += 1;
-        }
+fn weekly_points(
+    created: &BTreeMap<NaiveDate, i64>,
+    shipped: &BTreeMap<NaiveDate, i64>,
+    today: NaiveDate,
+) -> Vec<WeekPoint> {
+    let end = monday(today);
+    // Fold every event whose Monday is after today's Monday into today's week,
+    // so a future-dated event still reaches the bars. An event after today but
+    // inside today's week already lands in that week's row, so it stays where
+    // it is instead of counting twice.
+    let mut created_weeks: BTreeMap<NaiveDate, i64> = BTreeMap::new();
+    for (&day, &count) in created {
+        *created_weeks.entry(monday(day).min(end)).or_insert(0) += count;
     }
-    let Some(first) = created.keys().chain(shipped.keys()).min().copied() else {
+    let mut shipped_weeks: BTreeMap<NaiveDate, i64> = BTreeMap::new();
+    for (&day, &count) in shipped {
+        *shipped_weeks.entry(monday(day).min(end)).or_insert(0) += count;
+    }
+    let Some(first) = created_weeks
+        .keys()
+        .chain(shipped_weeks.keys())
+        .min()
+        .copied()
+    else {
         return Vec::new();
     };
-    let end = monday(today);
-    let start = first.max(monday(SERIES_FLOOR));
+    // The start caps at today's Monday too, so a series whose only event lies
+    // after today still yields one row.
+    let start = first.max(monday(SERIES_FLOOR)).min(end);
     let mut points = Vec::new();
     // Weeks before the first charted week fold into that week's row, the way
     // `cumulative_points` seeds its running total, so the weekly sums still
     // reach `counts`.
-    let mut carry_created = created.range(..start).map(|(_, count)| *count).sum::<i64>();
-    let mut carry_shipped = shipped.range(..start).map(|(_, count)| *count).sum::<i64>();
+    let mut carry_created = created_weeks
+        .range(..start)
+        .map(|(_, count)| *count)
+        .sum::<i64>();
+    let mut carry_shipped = shipped_weeks
+        .range(..start)
+        .map(|(_, count)| *count)
+        .sum::<i64>();
     let mut cur = start;
     while cur <= end {
         points.push(WeekPoint {
             week: crate::dates::format_date(cur),
-            created: std::mem::take(&mut carry_created) + created.get(&cur).copied().unwrap_or(0),
-            shipped: std::mem::take(&mut carry_shipped) + shipped.get(&cur).copied().unwrap_or(0),
+            created: std::mem::take(&mut carry_created)
+                + created_weeks.get(&cur).copied().unwrap_or(0),
+            shipped: std::mem::take(&mut carry_shipped)
+                + shipped_weeks.get(&cur).copied().unwrap_or(0),
         });
         match cur.checked_add_days(Days::new(7)) {
             Some(next) => cur = next,
@@ -203,17 +251,29 @@ fn weekly_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<WeekPoint> {
 }
 
 fn cumulative_points(shipped: &BTreeMap<NaiveDate, i64>, today: NaiveDate) -> Vec<CumPoint> {
-    let Some((&first, _)) = shipped.iter().next() else {
+    if shipped.is_empty() {
+        return Vec::new();
+    }
+    // Fold every ship dated after today into today's row, because this series
+    // plots the shipped count and has one row per day, so it carries no future
+    // day. The line then ends at `counts.shipped_events`.
+    let mut folded: BTreeMap<NaiveDate, i64> = BTreeMap::new();
+    for (&day, &count) in shipped {
+        *folded.entry(day.min(today)).or_insert(0) += count;
+    }
+    let Some((&first, _)) = folded.iter().next() else {
         return Vec::new();
     };
-    let start = first.max(SERIES_FLOOR);
+    // The start caps at today, so a series whose only ship lies after today
+    // still yields one row dated today.
+    let start = first.max(SERIES_FLOOR).min(today);
     let mut rows = Vec::new();
     // Ships before the first charted day fold into that day's level, so the
     // line still ends at `counts.shipped_events`.
-    let mut total = shipped.range(..start).map(|(_, count)| *count).sum::<i64>();
+    let mut total = folded.range(..start).map(|(_, count)| *count).sum::<i64>();
     let mut cur = start;
     while cur <= today {
-        let day = shipped.get(&cur).copied().unwrap_or(0);
+        let day = folded.get(&cur).copied().unwrap_or(0);
         total += day;
         rows.push((cur, day, total));
         match cur.checked_add_days(Days::new(1)) {
@@ -269,7 +329,11 @@ fn live_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<LivePoint> {
         }
     }
     let start = tasks.iter().map(|task| task.created).min().unwrap_or(today);
-    let start = start.max(SERIES_FLOOR);
+    // The start caps at today, so a task created after today stays out of the
+    // rows through today while a series whose every task lies after today
+    // still yields today's row. Its created day is never reached, so the walk
+    // never adds it.
+    let start = start.max(SERIES_FLOOR).min(today);
     let mut rows = Vec::new();
     // Tasks created before the first charted day and still open on it are
     // already in the backlog, so they seed the first row instead of a walk
@@ -344,7 +408,12 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
         }
     }
     let start = tasks.iter().map(|task| task.created).min().unwrap_or(today);
-    let start = start.max(SERIES_FLOOR);
+    // The start caps at today, so a task created after today is never added on
+    // its future created day: it stays out of today's row and today's average,
+    // and the running total never subtracts a future day. A series whose every
+    // task lies after today walks only today, where the zero-count rule below
+    // emits no point.
+    let start = start.max(SERIES_FLOOR).min(today);
     let mut rows = Vec::new();
     let mut steps = 0_usize;
     // Tasks created before the first charted day and still open on it seed the
@@ -538,12 +607,15 @@ fn round_to(value: f64, places: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgePoint, RadarMode, TaskRecord, age_points, age_points_counted, dashboard, monday,
+        AgePoint, RadarMode, TaskRecord, age_points, age_points_counted, cumulative_points,
+        dashboard, monday, weekly_points,
     };
     use crate::dates::SERIES_FLOOR;
     use crate::harvest::TaskKind;
     use chrono::{Datelike, Days, NaiveDate};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
+    use tracing_subscriber::layer::SubscriberExt;
 
     fn day(year: i32, month: u32, date: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, date).expect("valid date")
@@ -1192,6 +1264,310 @@ mod tests {
         assert_eq!(
             board.weekly.iter().map(|point| point.shipped).sum::<i64>(),
             board.counts.shipped_events as i64
+        );
+    }
+
+    /// The fields of one captured warning, flattened so a test can hold the
+    /// warning to the values it must name.
+    #[derive(Default)]
+    struct WarningFields {
+        message: Option<String>,
+        repository: Option<String>,
+        path: Option<String>,
+        date: Option<String>,
+    }
+
+    impl WarningFields {
+        /// One line carrying every field the warning named.
+        fn rendered(&self) -> String {
+            let mut line = self.message.clone().unwrap_or_default();
+            for (name, value) in [
+                ("repository", &self.repository),
+                ("path", &self.path),
+                ("date", &self.date),
+            ] {
+                if let Some(value) = value {
+                    line.push(' ');
+                    line.push_str(name);
+                    line.push('=');
+                    line.push_str(value);
+                }
+            }
+            line
+        }
+
+        fn set(&mut self, name: &str, value: &str) {
+            let slot = match name {
+                "message" => &mut self.message,
+                "repository" => &mut self.repository,
+                "path" => &mut self.path,
+                "date" => &mut self.date,
+                _ => return,
+            };
+            *slot = Some(value.to_string());
+        }
+    }
+
+    impl tracing::field::Visit for WarningFields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.set(field.name(), value);
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.set(field.name(), &format!("{value:?}"));
+        }
+    }
+
+    /// A thread-scoped layer that captures the warnings `series` logs, so a
+    /// test reads them without installing a process-wide subscriber. Each test
+    /// runs on its own thread, so the capture stays parallel-safe.
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedWarnings {
+        fn take(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .map(|mut lines| std::mem::take(&mut *lines))
+                .unwrap_or_default()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN
+                || event.metadata().target() != "task_viewer::series"
+            {
+                return;
+            }
+            let mut fields = WarningFields::default();
+            event.record(&mut fields);
+            if let Ok(mut lines) = self.0.lock() {
+                lines.push(fields.rendered());
+            }
+        }
+    }
+
+    /// Covers: one created date and one ship date after today still reach the
+    /// last charted row, so the cumulative line ends at `counts.shipped_events`
+    /// and the weekly bars sum to both event counts.
+    #[test]
+    fn series_folds_after_today_events_into_the_last_charted_point() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![
+            task("alpha", "old", TaskKind::Live, day(2026, 6, 1), None, None),
+            task(
+                "alpha",
+                "shipped",
+                TaskKind::Finished,
+                day(2026, 6, 2),
+                Some(day(2026, 6, 20)),
+                Some(day(2026, 6, 20)),
+            ),
+            task(
+                "alpha",
+                "future",
+                TaskKind::Live,
+                day(2026, 6, 15),
+                None,
+                None,
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let last = board.cumulative.last().expect("the last cumulative point");
+        assert_eq!(last.date, "2026-06-10");
+        assert_eq!(
+            last.cumulative, board.counts.shipped_events as i64,
+            "the folded ship still reaches the line's end"
+        );
+        assert_eq!(
+            board.weekly.iter().map(|point| point.created).sum::<i64>(),
+            board.counts.created_events as i64,
+            "the weekly created bars reach the created count"
+        );
+        assert_eq!(
+            board.weekly.iter().map(|point| point.shipped).sum::<i64>(),
+            board.counts.shipped_events as i64,
+            "the weekly shipped bars reach the shipped count"
+        );
+        let last_week = board.weekly.last().expect("the last charted week");
+        assert_eq!(last_week.week, crate::dates::format_date(monday(today)));
+        assert_eq!(
+            last_week.created, 1,
+            "the after-today created event lands in today's week"
+        );
+        assert_eq!(
+            last_week.shipped, 1,
+            "the after-today ship lands in today's week"
+        );
+    }
+
+    /// Covers: each after-today event is warned about once, naming the
+    /// repository, path, and date, and a ship folded into both the weekly and
+    /// cumulative series is still warned about once.
+    #[test]
+    fn series_warns_once_per_after_today_event() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![
+            task(
+                "alpha",
+                "future",
+                TaskKind::Live,
+                day(2027, 1, 5),
+                None,
+                None,
+            ),
+            task(
+                "alpha",
+                "late",
+                TaskKind::Finished,
+                day(2026, 6, 1),
+                Some(day(2027, 1, 6)),
+                Some(day(2027, 1, 6)),
+            ),
+        ];
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let _board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        drop(guard);
+        let warnings = captured.take();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "one warning per after-today event, not one per series: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("repository=alpha")
+                    && warning.contains("path=tasks/alpha_future.md")
+                    && warning.contains("date=2027-01-05")),
+            "the created event names its repository, path, and date: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("repository=alpha")
+                    && warning.contains("path=tasks/alpha_late.md")
+                    && warning.contains("date=2027-01-06")),
+            "the ship event names its repository, path, and date: {warnings:?}"
+        );
+    }
+
+    /// Covers: a series whose only event is a ship date after today still
+    /// yields one row, dated today for the cumulative walk and today's Monday
+    /// for the weekly walk.
+    #[test]
+    fn series_after_today_only_ship_yields_one_row() {
+        let today = day(2026, 6, 10);
+        let mut shipped: BTreeMap<NaiveDate, i64> = BTreeMap::new();
+        shipped.insert(day(2026, 7, 1), 1);
+        let cumulative = cumulative_points(&shipped, today);
+        assert_eq!(cumulative.len(), 1, "the cumulative walk yields one row");
+        assert_eq!(cumulative[0].date, "2026-06-10");
+        assert_eq!(cumulative[0].cumulative, 1);
+        let created: BTreeMap<NaiveDate, i64> = BTreeMap::new();
+        let weekly = weekly_points(&created, &shipped, today);
+        assert_eq!(weekly.len(), 1, "the weekly walk yields one row");
+        assert_eq!(weekly[0].week, "2026-06-08", "today's Monday");
+        assert_eq!(weekly[0].shipped, 1);
+        assert_eq!(weekly[0].created, 0);
+    }
+
+    /// Covers: a task created after today stays out of today's backlog row and
+    /// today's mean age, the backlog series ends at today, and the mean-age
+    /// series carries no point after today and no negative average.
+    #[test]
+    fn series_keeps_after_today_created_out_of_the_backlog_and_mean_age() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![
+            task("alpha", "old", TaskKind::Live, day(2026, 6, 1), None, None),
+            task(
+                "alpha",
+                "future",
+                TaskKind::Live,
+                day(2026, 6, 20),
+                None,
+                None,
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let last = board.live_backlog.last().expect("the last backlog row");
+        assert_eq!(last.date, "2026-06-10", "the backlog ends at today");
+        assert_eq!(
+            last.live, 1,
+            "the after-today task stays out of today's row"
+        );
+        assert!(
+            board
+                .mean_age
+                .iter()
+                .all(|point| point.date.as_str() <= "2026-06-10"),
+            "no mean-age point is dated after today"
+        );
+        assert!(
+            board.mean_age.iter().all(|point| point.avg_age >= 0.0),
+            "no mean-age average is negative"
+        );
+        let today_age = board
+            .mean_age
+            .iter()
+            .find(|point| point.date == "2026-06-10")
+            .expect("today's mean-age point");
+        assert_eq!(
+            today_age.n, 1,
+            "the after-today task stays out of today's average"
+        );
+
+        let only_future = dashboard(&tasks[1..], today, RadarMode::Scope, "alpha");
+        assert_eq!(
+            only_future.live_backlog.len(),
+            1,
+            "a series whose every task lies after today still yields today's row"
+        );
+        assert_eq!(only_future.live_backlog[0].date, "2026-06-10");
+        assert_eq!(only_future.live_backlog[0].live, 0);
+        assert!(
+            only_future
+                .mean_age
+                .iter()
+                .all(|point| point.date.as_str() <= "2026-06-10" && point.n > 0),
+            "the future-only fixture carries no point after today"
+        );
+    }
+
+    /// Covers: a leave day after today keeps its task in today's backlog row
+    /// and in today's mean age, so the task drops out on its own leave day.
+    #[test]
+    fn series_keeps_a_task_leaving_after_today_in_todays_backlog_and_mean_age() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![task(
+            "alpha",
+            "scope",
+            TaskKind::Finished,
+            day(2026, 6, 1),
+            Some(day(2026, 6, 20)),
+            Some(day(2026, 6, 20)),
+        )];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let last = board.live_backlog.last().expect("the last backlog row");
+        assert_eq!(last.date, "2026-06-10");
+        assert_eq!(last.live, 1, "the task stays in the backlog through today");
+        let today_age = board
+            .mean_age
+            .iter()
+            .find(|point| point.date == "2026-06-10")
+            .expect("today's mean-age point");
+        assert_eq!(today_age.n, 1);
+        assert_eq!(
+            today_age.avg_age.to_bits(),
+            9.0_f64.to_bits(),
+            "the task is nine days old on today"
         );
     }
 
