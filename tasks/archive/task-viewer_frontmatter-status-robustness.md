@@ -2,8 +2,8 @@
 description: "Accept a whitespace-padded opener, trim quoted status values in the archive walk, skip an empty status, and warn on an unparseable updated date."
 scope: task-viewer
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-19T13:50:51Z
-status: implemented
+updated: 2026-11-19T13:54:40Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: false
@@ -19,7 +19,7 @@ A frontmatter block that opens with `---` plus trailing whitespace parses like a
 
 - Build order: independent of the harvest cluster. It edits different `FEATURES.md` and `TESTING.md` sentences than `task-viewer_guardrail-doc-sync.md`, so the two need no order.
 - `task-viewer/src/harvest.rs` reads the frontmatter opener, classifies the status, and walks `tasks/archive/` for the archived commit. The opener check is stricter than the closer check, `fn has_archived_status` compares the raw value without trimming, and the empty-status path yields `Some("")`.
-- The finished task [task-viewer_harvest-silent-drops.md](archive/task-viewer_harvest-silent-drops.md) made dropped files log a reason. These are the remaining inconsistent paths.
+- The finished task [task-viewer_harvest-silent-drops.md](task-viewer_harvest-silent-drops.md) made dropped files log a reason. These are the remaining inconsistent paths.
 - `ARCHITECTURE.md` names a content-hash revision that must move when parsing changes, so stored rows re-parse.
 
 ## Approach
