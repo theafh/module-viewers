@@ -45,7 +45,21 @@
     if (!match) {
       throw new Error("Unparseable day: " + value);
     }
-    return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12, 0, 0);
+    var year = Number(match[1]);
+    var month = Number(match[2]);
+    var day = Number(match[3]);
+    var date = new Date(year, month - 1, day, 12, 0, 0);
+    // The Date constructor normalises an impossible day such as 2024-13-45
+    // into a real one, so verify the round-trip and throw instead of charting
+    // a day the payload never named.
+    if (
+      date.getFullYear() !== year ||
+      date.getMonth() !== month - 1 ||
+      date.getDate() !== day
+    ) {
+      throw new Error("Impossible day: " + value);
+    }
+    return date;
   }
 
   function fmt(value) {
@@ -180,6 +194,10 @@
     });
     var slot = (frame.right - frame.left) / rows.length;
     var band = Math.max(3, Math.min(16, slot - 4));
+    // The hit rect never reaches past its own column: a fixed 18px minimum
+    // would overlap the next column once the pitch drops below it, and the
+    // later rect would report the neighbour's bar.
+    var hitWidth = Math.min(Math.max(band, 18), slot);
     var tip = tipFor(root.querySelector(".chart-frame"));
     rows.forEach(function (row, index) {
       var dx = x(dates[index].getTime());
@@ -193,7 +211,7 @@
         fill: createColor
       });
       var hit = el(svg, "rect", {
-        x: dx - Math.max(band, 18) / 2, y: frame.top, width: Math.max(band, 18), height: frame.bottom - frame.top,
+        x: dx - hitWidth / 2, y: frame.top, width: hitWidth, height: frame.bottom - frame.top,
         fill: "transparent"
       });
       var text = "Week of " + dateLabel(dates[index]) + " · shipped " + fmt(row.shipped) + " · created " + fmt(row.created);
@@ -227,13 +245,16 @@
     // The row positions ascend with the rows, so the path, the area, and the
     // hover all read one array instead of parsing each date again.
     var xs = dates.map(function (date) { return x(date.getTime()); });
-    for (var tick = 0; tick <= 4; tick += 1) {
-      var value = (maxY / 4) * tick;
+    // A fixed quarter of the range rounds neighbouring ticks alike on a small
+    // range, so the step comes from the range itself and every tick lands on
+    // its own integer value.
+    var step = yStep(maxY);
+    for (var value = 0; value <= maxY; value += step) {
       var py = y(value);
       el(svg, "line", { x1: frame.left, x2: frame.right, y1: py, y2: py, stroke: grid });
       el(svg, "text", {
         x: frame.left - 6, y: py + 4, "text-anchor": "end", fill: muted, "font-size": "11"
-      }).textContent = fmt(Math.round(value));
+      }).textContent = fmt(value);
     }
     function pathFor(reader) {
       return rows.map(function (row, index) {
@@ -387,19 +408,6 @@
     // the shipped formula reaches in a 190px-tall frame, so it binds only below
     // that width and never raises the normal-width radius.
     var radius = Math.max(31, Math.min(width, height) / 2 - 64);
-    var ringWidth = 2 * radius + 150.8;
-    var ringHeight = 2 * radius + 49.6;
-    if (ringWidth <= width && ringHeight <= height) {
-      svg.setAttribute("viewBox", "0 0 " + width + " " + height);
-    } else {
-      // Centre the ring's bounds on the same cx/cy the labels are drawn around,
-      // so the expanded viewBox keeps every label inside it.
-      var minX = cx - ringWidth / 2;
-      var minY = cy - ringHeight / 2;
-      svg.setAttribute("viewBox", minX + " " + minY + " " + ringWidth + " " + ringHeight);
-      svg.style.width = ringWidth + "px";
-      svg.style.height = ringHeight + "px";
-    }
     var max = 1;
     rows.forEach(function (row) { max = Math.max(max, row.count); });
     for (var ring = 1; ring <= 4; ring += 1) {
@@ -408,7 +416,15 @@
       });
     }
     var points = [];
+    var dots = [];
     var tip = tipFor(root.querySelector(".chart-frame"));
+    // The drawing box starts at the ring and grows to the measured label
+    // extents, so a nudged label is never clipped by a frame-sized viewBox.
+    var minX = cx - radius;
+    var maxX = cx + radius;
+    var minY = cy - radius;
+    var maxY = cy + radius;
+    var placed = [];
     rows.forEach(function (row, index) {
       var angle = -Math.PI / 2 + (index * 2 * Math.PI) / rows.length;
       var px = cx + Math.cos(angle) * radius;
@@ -418,33 +434,138 @@
       var vx = cx + Math.cos(angle) * valueR;
       var vy = cy + Math.sin(angle) * valueR;
       points.push(vx + "," + vy);
-      var labelR = radius + 16;
-      var lx = cx + Math.cos(angle) * labelR;
-      var ly = cy + Math.sin(angle) * labelR;
-      var label = row.label.length > 18 ? row.label.slice(0, 17) + "…" : row.label;
-      el(svg, "text", {
-        x: lx, y: ly, "text-anchor": "middle", fill: labelColor, "font-size": "11"
-      }).textContent = label;
-      var dot = el(svg, "circle", { cx: vx, cy: vy, r: "4", fill: color });
+      // Truncating by code point keeps a surrogate pair whole at the cut.
+      var codePoints = Array.from(row.label);
+      var label = codePoints.length > 18
+        ? codePoints.slice(0, 17).join("") + "…"
+        : row.label;
+      var half = (label.length * 6.6) / 2;
+      var lx = 0;
+      var ly = 0;
+      var nudge = 0;
+      for (; nudge <= 6; nudge += 1) {
+        var labelR = radius + 16 + nudge * 12;
+        lx = cx + Math.cos(angle) * labelR;
+        ly = cy + Math.sin(angle) * labelR;
+        var clears = placed.every(function (extent) {
+          return lx + half <= extent.left || lx - half >= extent.right ||
+            ly + 8.8 <= extent.top || ly - 8.8 >= extent.bottom;
+        });
+        if (clears) {
+          break;
+        }
+      }
+      // A label that still collides at the six-step cap is left out instead
+      // of drawn over its neighbour.
+      if (nudge <= 6) {
+        el(svg, "text", {
+          x: lx, y: ly, "text-anchor": "middle", fill: labelColor, "font-size": "11"
+        }).textContent = label;
+        placed.push({
+          left: lx - half, right: lx + half, top: ly - 8.8, bottom: ly + 8.8
+        });
+        minX = Math.min(minX, lx - half);
+        maxX = Math.max(maxX, lx + half);
+        minY = Math.min(minY, ly - 8.8);
+        maxY = Math.max(maxY, ly + 8.8);
+      }
+      // The tooltip text and its count formatting stay outside the zero-count
+      // guard, so a count that is not a number still throws into the fallback.
       var text = row.label + " · " + fmt(row.count) + " " + noun;
-      dot.addEventListener("mousemove", function (event) { tip.show(event, text); });
-      dot.addEventListener("mouseleave", tip.hide);
+      if (row.count !== 0) {
+        dots.push({ vx: vx, vy: vy, text: text });
+      }
     });
+    // The polygon paints before its dots, so each dot sits above the shape.
     el(svg, "polygon", {
       points: points.join(" "), fill: color, opacity: "0.22", stroke: color, "stroke-width": "1.5"
     });
+    dots.forEach(function (dot) {
+      var node = el(svg, "circle", { cx: dot.vx, cy: dot.vy, r: "4", fill: color });
+      node.addEventListener("mousemove", function (event) { tip.show(event, dot.text); });
+      node.addEventListener("mouseleave", tip.hide);
+    });
+    // Adopt the grown box whenever the frame does not contain the measured
+    // extents, so the labels and the ring all stay inside the viewBox.
+    if (minX >= 0 && maxX <= width && minY >= 0 && maxY <= height) {
+      svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    } else {
+      var boxWidth = maxX - minX;
+      var boxHeight = maxY - minY;
+      svg.setAttribute("viewBox", minX + " " + minY + " " + boxWidth + " " + boxHeight);
+      svg.style.width = boxWidth + "px";
+      svg.style.height = boxHeight + "px";
+    }
   }
 
+  // Month labels carry the year at each January, and on the first label when
+  // it clears the next January, so a chart that spans years stays unambiguous
+  // without repeating the year on every month. A label yields to the next one
+  // whose measured extent would overlap it, and a year-bearing January always
+  // draws, so the label before it yields instead.
   function monthTicks(svg, start, end, x, y, muted) {
+    var candidates = [];
     var cursor = new Date(start.getFullYear(), start.getMonth(), 1);
     while (cursor <= end) {
-      if (cursor >= start) {
-        el(svg, "text", {
-          x: x(cursor.getTime()), y: y, fill: muted, "font-size": "11"
-        }).textContent = monthName(cursor);
-      }
+      // The first month starts before the chart's own first day, so its label
+      // anchors at the chart's left edge instead of off-canvas.
+      candidates.push({
+        date: new Date(cursor.getTime()),
+        px: x(Math.max(cursor.getTime(), start.getTime()))
+      });
       cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
     }
+    if (!candidates.length) {
+      return;
+    }
+    function halfWidth(text) {
+      return (text.length * 6.6) / 2;
+    }
+    function labelFor(candidate, withYear) {
+      return monthName(candidate.date) + (withYear ? " " + candidate.date.getFullYear() : "");
+    }
+    var first = candidates[0];
+    var nextJanuary = null;
+    for (var index = 1; index < candidates.length; index += 1) {
+      if (candidates[index].date.getMonth() === 0) {
+        nextJanuary = candidates[index];
+        break;
+      }
+    }
+    var firstCarriesYear = first.date.getMonth() === 0;
+    if (!firstCarriesYear) {
+      // A year on the first label is worth printing only when it clears the
+      // January that follows it; otherwise that January carries the year.
+      firstCarriesYear = !nextJanuary ||
+        Math.abs(first.px - nextJanuary.px) >=
+          halfWidth(labelFor(first, true)) + halfWidth(labelFor(nextJanuary, true));
+    }
+    var placed = [];
+    candidates.forEach(function (candidate, position) {
+      var january = candidate.date.getMonth() === 0;
+      var text = labelFor(candidate, january || (position === 0 && firstCarriesYear));
+      var half = halfWidth(text);
+      if (!january) {
+        var previous = placed[placed.length - 1];
+        if (previous && Math.abs(candidate.px - previous.px) < half + previous.half) {
+          return;
+        }
+      } else {
+        while (placed.length) {
+          var last = placed[placed.length - 1];
+          if (Math.abs(candidate.px - last.px) >= half + last.half) {
+            break;
+          }
+          svg.removeChild(last.node);
+          placed.pop();
+        }
+      }
+      var node = el(svg, "text", {
+        x: candidate.px, y: y, fill: muted, "font-size": "11"
+      });
+      node.textContent = text;
+      placed.push({ px: candidate.px, half: half, node: node });
+    });
   }
 
   // The 1-2-5 step that keeps at most five intervals above the 50 the small
@@ -469,7 +590,7 @@
     for (var value = Math.ceil(min / step) * step; value <= max; value += step) {
       el(svg, "text", {
         x: x - 6, y: y(value) + 4, "text-anchor": "end", fill: muted, "font-size": "11"
-      }).textContent = fmt(Math.abs(value));
+      }).textContent = fmt(value);
     }
   }
 

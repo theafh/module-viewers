@@ -5655,6 +5655,71 @@ mod tests {
         assert_eq!(result["radarMarks"], true);
     }
 
+    /// Covers: an impossible date such as `2024-13-45` throws in `parseDay`
+    /// and renders the fallback instead of a day the Date constructor
+    /// normalised into, while a missing `shipped` field keeps its fallback.
+    #[test]
+    fn browser_impossible_day_shows_the_fallback() {
+        let assertion = r#"(function () {
+  var env = globalThis.__env;
+  function hasFallback(name) {
+    return env.cards[name].querySelector("svg").children.some(function (node) {
+      return node.name === "text" && node.textContent === "Charts unavailable";
+    });
+  }
+  return JSON.stringify({
+    weekly: hasFallback("weekly"),
+    cumulative: hasFallback("cumulative"),
+    backlog: hasFallback("backlog")
+  });
+})()"#;
+
+        let mut impossible = fixture_payload();
+        impossible["weekly"] =
+            serde_json::json!([{"week": "2024-13-45", "shipped": 1, "created": 1}]);
+        impossible["cumulative"] =
+            serde_json::json!([{"date": "2024-13-45", "cumulative": 1, "shipped": 1, "trend": 1}]);
+        let impossible_text = impossible.to_string();
+        let impossible_config = browser_config(
+            false,
+            false,
+            Some(&impossible_text),
+            serde_json::json!("#123456"),
+        );
+        let impossible_result = run_browser(&impossible_config, assertion);
+        assert_eq!(
+            impossible_result["weekly"], true,
+            "an impossible week shows the fallback"
+        );
+        assert_eq!(
+            impossible_result["cumulative"], true,
+            "an impossible day shows the fallback"
+        );
+        assert_eq!(
+            impossible_result["backlog"], false,
+            "a valid card still renders"
+        );
+
+        let mut missing = fixture_payload();
+        missing["weekly"] = serde_json::json!([{"week": "2026-01-05", "created": 1}]);
+        let missing_text = missing.to_string();
+        let missing_config = browser_config(
+            false,
+            false,
+            Some(&missing_text),
+            serde_json::json!("#123456"),
+        );
+        let missing_result = run_browser(&missing_config, assertion);
+        assert_eq!(
+            missing_result["weekly"], true,
+            "a missing shipped field keeps the fallback"
+        );
+        assert_eq!(
+            missing_result["cumulative"], false,
+            "the valid cumulative card still renders"
+        );
+    }
+
     /// A payload whose shipped calendar and radar carry a non-numeric count,
     /// so both draws throw and `renderCard` paints "Charts unavailable".
     fn payload_with_non_numeric_counts() -> serde_json::Value {
@@ -6038,9 +6103,9 @@ mod tests {
         );
     }
 
-    /// Covers: at a 120px frame the radar's inline size is the ring's
-    /// natural size and divides its viewBox to 1 in both axes, so the expanded
-    /// chart renders at 1:1 instead of scaling into the frame.
+    /// Covers: at a 120px frame the radar's inline size is the measured
+    /// label extent box and divides its viewBox to 1 in both axes, so the
+    /// expanded chart renders at 1:1 instead of scaling into the frame.
     #[test]
     fn browser_narrow_radar_renders_at_one_to_one() {
         let payload = payload_with_long_radar_labels();
@@ -6059,14 +6124,42 @@ mod tests {
   var parts = String(svg.getAttribute("viewBox")).trim().split(/\s+/).map(Number);
   var box = { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
   var radius = 0;
+  var cx = null;
+  var cy = null;
+  var left = null;
+  var right = null;
+  var top = null;
+  var bottom = null;
+  function grow(x, y) {
+    var half = String(x.textContent).length * 6.6 / 2;
+    left = left === null ? Number(x.attrs.x) - half : Math.min(left, Number(x.attrs.x) - half);
+    right = right === null ? Number(x.attrs.x) + half : Math.max(right, Number(x.attrs.x) + half);
+    top = top === null ? Number(x.attrs.y) - 8.8 : Math.min(top, Number(x.attrs.y) - 8.8);
+    bottom = bottom === null ? Number(x.attrs.y) + 8.8 : Math.max(bottom, Number(x.attrs.y) + 8.8);
+  }
   svg.children.forEach(function (node) {
-    if (node.name === "circle") radius = Math.max(radius, Number(node.attrs.r));
+    if (node.name === "circle") {
+      var r = Number(node.attrs.r);
+      radius = Math.max(radius, r);
+      if (node.attrs.fill === "none") {
+        cx = Number(node.attrs.cx);
+        cy = Number(node.attrs.cy);
+      }
+    }
   });
+  svg.children.forEach(function (node) {
+    if (node.name === "text") grow(node);
+  });
+  left = Math.min(left, cx - radius);
+  right = Math.max(right, cx + radius);
+  top = Math.min(top, cy - radius);
+  bottom = Math.max(bottom, cy + radius);
   var styleWidth = parseFloat(svg.style.width);
   var styleHeight = parseFloat(svg.style.height);
   return JSON.stringify({
     box: box,
     radius: radius,
+    expected: { x: left, y: top, width: right - left, height: bottom - top },
     styleWidth: styleWidth,
     styleHeight: styleHeight,
     widthScale: styleWidth / box.width,
@@ -6075,24 +6168,281 @@ mod tests {
 })()"#,
         );
         let radius = result["radius"].as_f64().expect("radar radius");
-        let ring_width = 2.0 * radius + 150.8;
-        let ring_height = 2.0 * radius + 49.6;
+        let width = result["expected"]["width"]
+            .as_f64()
+            .expect("measured width");
+        let height = result["expected"]["height"]
+            .as_f64()
+            .expect("measured height");
         assert!(
-            (result["styleWidth"].as_f64().expect("inline width") - ring_width).abs() < 1e-6,
-            "the inline width is the ring's natural width"
+            (result["box"]["x"].as_f64().expect("viewBox x")
+                - result["expected"]["x"].as_f64().expect("measured x"))
+            .abs()
+                < 1e-6
         );
         assert!(
-            (result["styleHeight"].as_f64().expect("inline height") - ring_height).abs() < 1e-6,
-            "the inline height is the ring's natural height"
+            (result["box"]["y"].as_f64().expect("viewBox y")
+                - result["expected"]["y"].as_f64().expect("measured y"))
+            .abs()
+                < 1e-6
         );
         assert!(
-            (result["box"]["width"].as_f64().expect("viewBox width") - ring_width).abs() < 1e-6
+            (result["styleWidth"].as_f64().expect("inline width") - width).abs() < 1e-6,
+            "the inline width is the measured label extent width"
         );
         assert!(
-            (result["box"]["height"].as_f64().expect("viewBox height") - ring_height).abs() < 1e-6
+            (result["styleHeight"].as_f64().expect("inline height") - height).abs() < 1e-6,
+            "the inline height is the measured label extent height"
+        );
+        assert!((result["box"]["width"].as_f64().expect("viewBox width") - width).abs() < 1e-6);
+        assert!((result["box"]["height"].as_f64().expect("viewBox height") - height).abs() < 1e-6);
+        assert!(
+            (width - (2.0 * radius + 150.8)).abs() > 1.0,
+            "the box comes from the label extents, not the fixed ring constants"
         );
         assert!((result["widthScale"].as_f64().expect("width scale") - 1.0).abs() < 1e-9);
         assert!((result["heightScale"].as_f64().expect("height scale") - 1.0).abs() < 1e-9);
+    }
+
+    /// Covers: a zero-count scope draws no dot at the centre, and every dot
+    /// paints after the polygon so it sits above the shape.
+    #[test]
+    fn browser_radar_draws_dots_above_the_polygon() {
+        let mut payload = fixture_payload();
+        payload["radar_shipped"] = serde_json::json!([
+            {"label": "zero", "count": 0},
+            {"label": "two", "count": 2},
+            {"label": "one", "count": 1}
+        ]);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["radar-shipped"].querySelector("svg");
+  var polygon = -1;
+  var dots = [];
+  var centreDots = 0;
+  svg.children.forEach(function (node, index) {
+    if (node.name === "polygon") polygon = index;
+    if (node.name === "circle" && node.attrs.fill !== "none") {
+      dots.push({ index: index, cx: Number(node.attrs.cx), cy: Number(node.attrs.cy) });
+      if (Number(node.attrs.cx) === 500 && Number(node.attrs.cy) === 184) centreDots += 1;
+    }
+  });
+  return JSON.stringify({ polygon: polygon, dots: dots, centreDots: centreDots });
+})()"#,
+        );
+        assert!(
+            result["polygon"].as_i64().expect("polygon index") >= 0,
+            "the radar drew its polygon"
+        );
+        assert_eq!(
+            result["dots"].as_array().expect("radar dots").len(),
+            2,
+            "the zero-count scope draws no dot"
+        );
+        assert_eq!(
+            result["centreDots"].as_u64(),
+            Some(0),
+            "no dot sits at the centre point"
+        );
+        let polygon = result["polygon"].as_i64().expect("polygon index");
+        for dot in result["dots"].as_array().expect("radar dots") {
+            assert!(
+                dot["index"].as_i64().expect("dot index") > polygon,
+                "every dot paints after the polygon"
+            );
+        }
+    }
+
+    /// A radar label whose surrogate pair straddles the 17-code-unit cut, so a
+    /// truncation by code unit would leave half a pair behind.
+    fn surrogate_radar_rows() -> serde_json::Value {
+        serde_json::json!([{
+            "label": format!("{}{}bcdef", "a".repeat(16), "\u{1F600}"),
+            "count": 1
+        }])
+    }
+
+    /// Covers: truncation keeps a surrogate pair whole and ends in the
+    /// ellipsis.
+    #[test]
+    fn browser_radar_label_truncation_keeps_surrogate_pairs() {
+        let mut payload = fixture_payload();
+        payload["radar_shipped"] = surrogate_radar_rows();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var svg = globalThis.__env.cards["radar-shipped"].querySelector("svg");
+  var label = svg.children.filter(function (node) { return node.name === "text"; })[0];
+  var text = String(label.textContent);
+  return JSON.stringify({
+    text: text,
+    codePoints: Array.from(text).length,
+    codeUnits: text.length,
+    emojiAt: Array.from(text).indexOf("\u{1F600}"),
+    endsWithEllipsis: text.slice(-1) === "\u2026",
+    loneSurrogate: /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text)
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["codePoints"].as_u64(),
+            Some(18),
+            "17 code points plus the ellipsis"
+        );
+        assert_eq!(result["codeUnits"].as_u64(), Some(19));
+        assert_eq!(
+            result["emojiAt"].as_u64(),
+            Some(16),
+            "the emoji stays whole at its code point"
+        );
+        assert_eq!(result["endsWithEllipsis"], true);
+        assert_eq!(
+            result["loneSurrogate"], false,
+            "no half of a surrogate pair survives the cut"
+        );
+    }
+
+    /// Covers: a radar count that is not a number reaches the fallback
+    /// instead of drawing NaN coordinates.
+    #[test]
+    fn browser_radar_with_a_non_numeric_count_shows_the_fallback() {
+        let payload = payload_with_non_numeric_counts();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var svg = globalThis.__env.cards["radar-shipped"].querySelector("svg");
+  return JSON.stringify({
+    fallback: svg.children.some(function (node) {
+      return node.name === "text" && node.textContent === "Charts unavailable";
+    }),
+    marks: svg.children.some(function (node) {
+      return node.name === "polygon" || (node.name === "circle" && node.attrs.fill !== "none");
+    })
+  });
+})()"#,
+        );
+        assert_eq!(result["fallback"], true, "the radar shows the fallback");
+        assert_eq!(result["marks"], false, "no NaN mark is drawn");
+    }
+
+    /// Forty-six 18-character spokes, the label length `radar_rows` uses, so
+    /// the label anchors at `radius + 16` sit 18.0px apart at the shipped
+    /// 360px height while each label measures 118.8px wide.
+    fn dense_radar_rows() -> serde_json::Value {
+        serde_json::Value::Array(
+            (0..46)
+                .map(|index| {
+                    serde_json::json!({
+                        "label": format!("scope-{index:012}"),
+                        "count": index % 4 + 1
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Covers: at a 1000px-wide, 360px-tall radar a 46-spoke fixture with
+    /// 18-character labels draws no two labels whose measured extents overlap,
+    /// and every placed label lies inside the grown viewBox.
+    #[test]
+    fn browser_dense_radar_labels_do_not_overlap() {
+        let mut payload = fixture_payload();
+        payload["radar_shipped"] = dense_radar_rows();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser_with(
+            "globalThis.__env.chartHeights.radar = 360;",
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["radar-shipped"].querySelector("svg");
+  var parts = String(svg.getAttribute("viewBox")).trim().split(/\s+/).map(Number);
+  var box = { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
+  var eps = 1e-6;
+  var extents = svg.children
+    .filter(function (node) { return node.name === "text"; })
+    .map(function (node) {
+      var x = Number(node.attrs.x);
+      var y = Number(node.attrs.y);
+      var half = String(node.textContent).length * 6.6 / 2;
+      return {
+        text: node.textContent,
+        left: x - half,
+        right: x + half,
+        top: y - 8.8,
+        bottom: y + 8.8
+      };
+    });
+  var overlaps = 0;
+  for (var left = 0; left < extents.length; left += 1) {
+    for (var right = left + 1; right < extents.length; right += 1) {
+      var a = extents[left];
+      var b = extents[right];
+      if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom) {
+        overlaps += 1;
+      }
+    }
+  }
+  var outside = extents.filter(function (extent) {
+    return extent.left < box.x - eps || extent.right > box.x + box.width + eps ||
+      extent.top < box.y - eps || extent.bottom > box.y + box.height + eps;
+  }).length;
+  return JSON.stringify({
+    viewBox: box,
+    labels: extents.length,
+    overlaps: overlaps,
+    outside: outside,
+    frameWidth: env.cards["radar-shipped"].querySelector(".chart-frame").clientWidth
+  });
+})()"#,
+        );
+        assert!(
+            result["labels"].as_u64().expect("placed labels") > 0,
+            "the dense radar places at least one label"
+        );
+        assert_eq!(
+            result["overlaps"].as_u64(),
+            Some(0),
+            "no two placed labels' extents overlap"
+        );
+        assert_eq!(
+            result["outside"].as_u64(),
+            Some(0),
+            "every placed label's extent lies inside the viewBox"
+        );
+        assert_eq!(
+            result["frameWidth"].as_f64(),
+            Some(1000.0),
+            "the frame is the 1000px-wide radar"
+        );
     }
 
     /// Covers: at a 1000px frame the radar's ring fits, so the element
@@ -6816,7 +7166,8 @@ mod tests {
     }
 
     /// Covers: a busiest week of 300 prints at most 11 y-axis
-    /// labels, and 18 keeps the labels the small step rule gives.
+    /// labels, and 18 keeps the labels the small step rule gives, signed on
+    /// each side of zero instead of repeating the same positive labels.
     #[test]
     fn browser_weekly_axis_labels_stay_readable() {
         let assertion = r#"(function () {
@@ -6840,14 +7191,275 @@ mod tests {
             big_labels.iter().any(|label| label.as_str() == Some("300")),
             "the 300 label is drawn"
         );
+        let mut distinct = big_labels.clone();
+        distinct.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            big_labels.len(),
+            "no two 300-scale labels read alike"
+        );
 
         let small = weekly_payload(18).to_string();
         let small_config = browser_config(false, false, Some(&small), serde_json::json!("#123456"));
         let small_result = run_browser(&small_config, assertion);
         assert_eq!(
             small_result["labels"],
-            serde_json::json!(["15", "10", "5", "0", "5", "10", "15"]),
-            "a busiest week of 18 keeps the step-5 labels"
+            serde_json::json!(["-15", "-10", "-5", "0", "5", "10", "15"]),
+            "a busiest week of 18 keeps the step-5 labels, signed below zero"
+        );
+    }
+
+    /// Covers: every line chart prints each y-axis label once, so a small
+    /// range no longer rounds two neighbouring ticks to the same value.
+    #[test]
+    fn browser_line_axis_labels_never_repeat() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var labels = {};
+  ["cumulative", "backlog", "age"].forEach(function (name) {
+    labels[name] = env.cards[name].querySelector("svg").children
+      .filter(function (node) {
+        return node.name === "text" && node.attrs["text-anchor"] === "end";
+      })
+      .map(function (node) { return node.textContent; });
+  });
+  return JSON.stringify({ labels: labels });
+})()"#,
+        );
+        for name in ["cumulative", "backlog", "age"] {
+            let labels = result["labels"][name]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} y labels"));
+            assert!(!labels.is_empty(), "{name} draws y-axis labels");
+            let mut distinct = labels.clone();
+            distinct.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                labels.len(),
+                "{name} prints every y-axis label once: {labels:?}"
+            );
+        }
+    }
+
+    /// A monthly line fixture from `start` for `months` months, so the month
+    /// labels span several years at the 1000px frame's ~26px pitch.
+    fn monthly_line_payload(start: (i32, u32), months: u32) -> serde_json::Value {
+        let mut payload = fixture_payload();
+        let mut year = start.0;
+        let mut month = start.1;
+        let mut rows = Vec::new();
+        for index in 0..months {
+            rows.push(serde_json::json!({
+                "date": format!("{year:04}-{month:02}-01"),
+                "cumulative": index,
+                "shipped": 1,
+                "trend": index
+            }));
+            month += 1;
+            if month > 12 {
+                month = 1;
+                year += 1;
+            }
+        }
+        payload["cumulative"] = serde_json::Value::Array(rows);
+        payload
+    }
+
+    /// Covers: a multi-year chart puts the year on each January it spans and
+    /// on its own first label when that clears the next January, and no two
+    /// placed month labels' measured extents overlap.
+    #[test]
+    fn browser_month_labels_carry_the_year_without_overlap() {
+        let assertion = r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["cumulative"].querySelector("svg");
+  var labels = svg.children
+    .filter(function (node) { return node.name === "text" && Number(node.attrs.y) > 255; })
+    .map(function (node) {
+      return { text: node.textContent, x: Number(node.attrs.x) };
+    });
+  var overlaps = 0;
+  for (var index = 1; index < labels.length; index += 1) {
+    var previous = labels[index - 1];
+    var current = labels[index];
+    var previousRight = previous.x + String(previous.text).length * 6.6 / 2;
+    var currentLeft = current.x - String(current.text).length * 6.6 / 2;
+    if (currentLeft < previousRight) overlaps += 1;
+  }
+  return JSON.stringify({ labels: labels, overlaps: overlaps });
+})()"#;
+        let march = monthly_line_payload((2024, 3), 36).to_string();
+        let march_config = browser_config(false, false, Some(&march), serde_json::json!("#123456"));
+        let march_result = run_browser(&march_config, assertion);
+        let march_labels = march_result["labels"].as_array().expect("month labels");
+        let march_texts: Vec<&str> = march_labels
+            .iter()
+            .map(|label| label["text"].as_str().expect("label text"))
+            .collect();
+        assert_eq!(
+            march_texts.first().copied(),
+            Some("Mar 2024"),
+            "the first label carries the year when it clears the next January"
+        );
+        for january in ["Jan 2025", "Jan 2026", "Jan 2027"] {
+            assert!(
+                march_texts.contains(&january),
+                "each January the chart spans carries its year: {march_texts:?}"
+            );
+        }
+        assert_eq!(
+            march_result["overlaps"].as_u64(),
+            Some(0),
+            "no two placed month labels overlap"
+        );
+
+        // At a 40-month span the pitch is ~24px, so the November label no
+        // longer clears the following January and that January carries the
+        // only year in the row.
+        let november = monthly_line_payload((2024, 11), 40).to_string();
+        let november_config =
+            browser_config(false, false, Some(&november), serde_json::json!("#123456"));
+        let november_result = run_browser(&november_config, assertion);
+        let november_labels = november_result["labels"].as_array().expect("month labels");
+        let november_texts: Vec<&str> = november_labels
+            .iter()
+            .map(|label| label["text"].as_str().expect("label text"))
+            .collect();
+        assert_eq!(
+            november_texts.first().copied(),
+            Some("Nov"),
+            "a first label that collides with the next January drops its year"
+        );
+        assert!(
+            november_texts.contains(&"Jan 2025"),
+            "the January after the first label carries the year: {november_texts:?}"
+        );
+        assert_eq!(
+            november_result["overlaps"].as_u64(),
+            Some(0),
+            "no two placed month labels overlap"
+        );
+    }
+
+    /// Fifty-four Monday weeks, so the 17.5px slot pitch falls below the 18px
+    /// minimum bar width and a hit rect that ignores the pitch covers its
+    /// neighbour's column.
+    fn many_week_payload() -> serde_json::Value {
+        let start = chrono::NaiveDate::from_ymd_opt(2025, 1, 6).expect("start date");
+        let mut payload = fixture_payload();
+        payload["weekly"] = serde_json::Value::Array(
+            (0..54)
+                .map(|offset| {
+                    let week = start + chrono::Duration::weeks(offset);
+                    serde_json::json!({
+                        "week": week.format("%Y-%m-%d").to_string(),
+                        "shipped": offset % 3 + 1,
+                        "created": offset % 2 + 1
+                    })
+                })
+                .collect(),
+        );
+        payload
+    }
+
+    /// Covers: at a 54-week payload every hit rect's width is the slot pitch,
+    /// and hovering the right edge of a bar's own column reports that bar
+    /// rather than the neighbour drawn over it.
+    #[test]
+    fn browser_weekly_hit_rects_stay_within_their_own_column() {
+        let payload = many_week_payload();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var rows = JSON.parse(globalThis.__config.payloadText).weekly;
+  var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function label(text) {
+    var parts = text.split("-").map(Number);
+    return months[parts[1] - 1] + " " + parts[2] + ", " + parts[0];
+  }
+  var svg = env.cards["weekly"].querySelector("svg");
+  var hits = svg.children.filter(function (node) {
+    return node.name === "rect" && node.attrs.fill === "transparent";
+  });
+  var tip = env.cards["weekly"].querySelector(".chart-frame").querySelector(".tooltip");
+  var slot = (984 - 40) / rows.length;
+  var widths = hits.map(function (node) { return Number(node.attrs.width); });
+  var mismatches = [];
+  var probes = 0;
+  var skipped = 0;
+  hits.forEach(function (node, index) {
+    // The right edge of this bar's own column, just inside the rect.
+    var centre = Number(node.attrs.x) + Number(node.attrs.width) / 2;
+    var px = centre + slot / 2 - 0.01;
+    var next = hits[index + 1];
+    // A daylight-saving week is an hour shorter than the slot pitch, so its
+    // column ends before the probe; that one column has no right edge to test.
+    if (next && px >= Number(next.attrs.x)) {
+      skipped += 1;
+      return;
+    }
+    // The topmost rect at the probe wins, as the browser's hit test does.
+    var target = null;
+    hits.forEach(function (candidate) {
+      var left = Number(candidate.attrs.x);
+      if (px >= left && px <= left + Number(candidate.attrs.width)) target = candidate;
+    });
+    target.listeners.mousemove[0]({ type: "mousemove", clientX: px, clientY: 100 });
+    probes += 1;
+    var row = rows[index];
+    var expected = "Week of " + label(row.week) + " · shipped " + row.shipped +
+      " · created " + row.created;
+    if (tip.textContent !== expected) {
+      mismatches.push({ index: index, expected: expected, actual: tip.textContent });
+    }
+  });
+  return JSON.stringify({
+    hits: hits.length,
+    slot: slot,
+    widths: widths,
+    probes: probes,
+    skipped: skipped,
+    mismatches: mismatches
+  });
+})()"#,
+        );
+        assert_eq!(result["hits"].as_u64(), Some(54));
+        assert!(
+            result["probes"].as_u64().expect("probes") >= 50,
+            "nearly every column's right edge is probed"
+        );
+        assert!(
+            result["skipped"].as_u64().expect("skipped columns") <= 2,
+            "only a daylight-saving column has no right edge to probe"
+        );
+        let slot = result["slot"].as_f64().expect("slot pitch");
+        assert!(
+            slot < 18.0,
+            "the fixture's pitch is below the minimum width"
+        );
+        for width in result["widths"].as_array().expect("hit widths") {
+            assert!(
+                (width.as_f64().expect("hit width") - slot).abs() < 1e-6,
+                "every hit rect's width is the slot pitch"
+            );
+        }
+        assert_eq!(
+            result["mismatches"],
+            serde_json::json!([]),
+            "the right edge of a column reports that column's bar"
         );
     }
 

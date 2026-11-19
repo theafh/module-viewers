@@ -2,9 +2,11 @@
 description: "Fix hover hit-rects, repeated y labels, multi-year month labels, radar draw order and collisions, surrogate-pair truncation, and impossible-date fallback."
 scope: task-viewer
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-16T14:19:14Z
-status: ready
+updated: 2026-11-19T15:50:46Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Correct chart geometry, labels, and date parsing
