@@ -2,8 +2,8 @@
 description: "Name the chart SVGs for assistive tech, hoist the number formatter, recolour on theme change without redrawing, and guard the fallback logger."
 scope: task-viewer/static/js
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-19T19:47:33Z
-status: implemented
+updated: 2026-11-19T19:51:48Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: false
@@ -21,7 +21,7 @@ Each chart SVG carries an accessible name and description. Formatting a number a
 - `task-viewer/templates/dashboard.html` renders each chart with `role="img"` and no name.
 - `task-viewer/static/js/dashboard.js` calls `new Intl.NumberFormat("en-US").format(value)` per value, listens with `window.addEventListener("task-viewer-theme", renderAll)`, swallows the chart error in its fallback, and prints the mean-age subtitle.
 - The rquickjs test harness that loads `dashboard.js` defines no `console`, so an unguarded helper would throw there.
-- Prior art: [task-viewer_browser-robustness.md](archive/task-viewer_browser-robustness.md) guarded theme storage and rendering; this covers naming, cost, and the fallback logger.
+- Prior art: [task-viewer_browser-robustness.md](task-viewer_browser-robustness.md) guarded theme storage and rendering; this covers naming, cost, and the fallback logger.
 
 ## Approach
 
