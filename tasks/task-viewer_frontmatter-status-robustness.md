@@ -2,9 +2,11 @@
 description: "Accept a whitespace-padded opener, trim quoted status values in the archive walk, skip an empty status, and warn on an unparseable updated date."
 scope: task-viewer
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:52:55Z
-status: ready
+updated: 2026-11-19T13:50:51Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Make frontmatter status and date handling consistent

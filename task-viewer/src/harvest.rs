@@ -727,26 +727,65 @@ impl HarvestState {
                 return;
             }
         };
-        let Some(status) = fields.get("status").map(|value| value.trim().to_string()) else {
-            if has_task_name_shape(rel) {
-                tracing::warn!(
-                    path = %rel,
-                    field = "status",
-                    "task file has no status value; skipping it"
-                );
-            } else {
-                tracing::debug!(
-                    path = %rel,
-                    field = "status",
-                    "file under tasks/ has no status value; skipping it"
-                );
+        let status = match fields.get("status").map(|value| value.trim().to_string()) {
+            Some(status) if !status.is_empty() => status,
+            Some(_) => {
+                if has_task_name_shape(rel) {
+                    tracing::warn!(
+                        path = %rel,
+                        field = "status",
+                        "task file has an empty status value; skipping it"
+                    );
+                } else {
+                    tracing::debug!(
+                        path = %rel,
+                        field = "status",
+                        "file under tasks/ has an empty status value; skipping it"
+                    );
+                }
+                return;
             }
-            return;
+            None => {
+                if has_task_name_shape(rel) {
+                    tracing::warn!(
+                        path = %rel,
+                        field = "status",
+                        "task file has no status value; skipping it"
+                    );
+                } else {
+                    tracing::debug!(
+                        path = %rel,
+                        field = "status",
+                        "file under tasks/ has no status value; skipping it"
+                    );
+                }
+                return;
+            }
         };
-        let updated = fields
-            .get("updated")
-            .and_then(|value| parse_iso_date(value))
-            .unwrap_or(created);
+        let updated = match fields.get("updated") {
+            Some(value) => match parse_iso_date(value) {
+                Some(updated) => updated,
+                None => {
+                    if has_task_name_shape(rel) {
+                        tracing::warn!(
+                            path = %rel,
+                            field = "updated",
+                            value = %value,
+                            "task file has an unparseable updated value; charting its created day"
+                        );
+                    } else {
+                        tracing::debug!(
+                            path = %rel,
+                            field = "updated",
+                            value = %value,
+                            "file under tasks/ has an unparseable updated value; charting its created day"
+                        );
+                    }
+                    created
+                }
+            },
+            None => created,
+        };
         let in_archive = rel.split('/').any(|part| part == "archive");
         let kind = classify(in_archive, &status);
         let name = rel.rsplit('/').next().unwrap_or_default();
@@ -1439,9 +1478,13 @@ fn frontmatter(text: &str) -> Option<std::collections::HashMap<String, String>> 
     {
         text = rest;
     }
-    let rest = text
-        .strip_prefix("---\n")
-        .or_else(|| text.strip_prefix("---\r\n"))?;
+    // Compare the first line rather than the raw prefix, so an opener that
+    // carries trailing whitespace (`---   `) reads like a plain `---`.
+    let (first_line, rest) = text.split_once('\n')?;
+    let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
+    if first_line.trim_end() != "---" {
+        return None;
+    }
     let end = frontmatter_end(rest)?;
     let mut fields = std::collections::HashMap::new();
     for line in rest[..end].lines() {
@@ -2537,8 +2580,11 @@ fn is_not_a_repository_answer(line: &str) -> bool {
 ///
 /// r2 strips a trailing `#` comment from a value and closes the block only on a
 /// bare `---` line. r3 reads a timestamp as an instant and charts its UTC day,
-/// so a row stored by r2 must not keep the Berlin wall-time leave day.
-const CONTENT_HASH_REVISION: &str = "r3";
+/// so a row stored by r2 must not keep the Berlin wall-time leave day. r4 reads
+/// an opener with trailing whitespace, trims a quoted status before it
+/// classifies and before the archive walk matches it, skips an empty status,
+/// and warns on an unparseable `updated` instead of dropping it silently.
+const CONTENT_HASH_REVISION: &str = "r4";
 
 /// The bare 64-bit FNV-1a digest of `text`. Only equality matters: a changed
 /// file changes the digest.
@@ -2567,8 +2613,13 @@ fn has_archived_status(text: &str, expected: &str) -> bool {
     frontmatter(text)
         .and_then(|fields| fields.get("status").cloned())
         .is_some_and(|status| match expected {
-            "finished" => status == "finished" || status == "implemented",
-            other => status == other,
+            // Trim here too, so a quoted status padded with spaces compares as
+            // the same value the classification path reads.
+            "finished" => {
+                let status = status.trim();
+                status == "finished" || status == "implemented"
+            }
+            other => status.trim() == other,
         })
 }
 
@@ -3841,7 +3892,7 @@ mod tests {
     }
 
     #[test]
-    fn harvest_keeps_the_created_skip_and_the_updated_fallback() {
+    fn harvest_keeps_the_created_skip_and_warns_about_an_unparseable_updated() {
         let repo = scratch("harvest_utc_skip_fallback");
         fs::create_dir_all(repo.join("tasks")).expect("tasks");
         fs::write(
@@ -3855,7 +3906,10 @@ mod tests {
         )
         .expect("unparseable updated task");
 
-        let tasks = harvest_repository(&repo).expect("harvest");
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("harvest");
         assert_eq!(
             tasks.len(),
             1,
@@ -3869,14 +3923,24 @@ mod tests {
             row.updated, created,
             "an unparseable updated value still falls back to created"
         );
+
+        let warnings = captured.take();
+        let updated_warning = warnings
+            .iter()
+            .find(|warning| warning.contains("scope_bad_updated.md"))
+            .unwrap_or_else(|| panic!("the unparseable updated must warn: {warnings:?}"));
+        assert!(
+            updated_warning.contains("not-a-date"),
+            "the warning must name the raw value: {updated_warning}"
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn harvest_rewalks_a_prior_row_whose_hash_predates_the_utc_reader() {
         // A row stored by the r2 reader carries `r2:` plus the file digest. The
-        // r3 reader reads timestamps as instants, so that row mismatches once
-        // and the archive walk stores the UTC leave day.
+        // current r4 reader reads timestamps as instants, so that row mismatches
+        // once and the archive walk stores the UTC leave day.
         let repo = scratch("harvest_hash_utc_revision");
         git(
             &repo,
@@ -3935,8 +3999,12 @@ mod tests {
             "the archive commit day replaces the stale prior day"
         );
         let stored = done.content_hash.as_deref().expect("the row stores a hash");
+        assert_ne!(
+            CONTENT_HASH_REVISION, "r3",
+            "the reader revision must move past r3 so stored rows re-parse"
+        );
         assert!(
-            stored.starts_with("r3:"),
+            stored.starts_with("r4:"),
             "the stored hash carries the current reader revision: {stored}"
         );
         assert_eq!(done.content_hash, Some(content_hash(&text)));
@@ -5741,6 +5809,111 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
         );
         assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_task_whose_opener_has_trailing_whitespace() {
+        let repo = scratch("harvest_padded_opener");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_padded.md"),
+            "---   \ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Padded\n",
+        )
+        .expect("task with a padded opener");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks
+            .iter()
+            .find(|task| task.path == "tasks/scope_padded.md")
+            .expect("a padded opener charts like a plain one");
+        assert_eq!(task.kind, TaskKind::Live);
+        assert_eq!(
+            task.created,
+            NaiveDate::from_ymd_opt(2026, 5, 1).expect("day")
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_padded_quoted_status_from_its_archive_commit() {
+        // A quoted status padded with spaces must classify as finished and
+        // match the archive walk, so its ship day is the archived commit rather
+        // than the earlier `updated` day.
+        let repo = scratch("harvest_padded_quoted_ship");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_padded.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive open"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_padded.md",
+            "2026-05-01",
+            "2026-06-01",
+            "\" finished \"",
+        );
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "finish padded quoted"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day"))
+        );
+        assert_ne!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_skips_an_empty_status_with_one_warning() {
+        let repo = scratch("harvest_empty_status");
+        fs::create_dir_all(repo.join("tasks/archive")).expect("tasks tree");
+        fs::write(
+            repo.join("tasks/archive/scope_empty.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus:\n---\n",
+        )
+        .expect("task with an empty status");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("an empty status must not fail the harvest");
+        assert!(tasks.is_empty(), "an empty status charts no row: {tasks:?}");
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("tasks/archive/scope_empty.md"),
+            "the warning must name the path: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("empty status"),
+            "the warning must name the empty status: {warnings:?}"
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 
