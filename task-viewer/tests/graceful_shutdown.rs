@@ -406,6 +406,13 @@ fn task_viewer_finishes_an_in_flight_store_and_rolls_back_one_held_past_the_grac
         elapsed < GRACE,
         "the in-flight store outlived the {GRACE:?} grace: {elapsed:?}"
     );
+    // The store was still open when the signal landed, so the drain had to wait
+    // for it. A run that exited before the pause could elapse would leave the
+    // same committed rows yet prove nothing about the drain.
+    assert!(
+        elapsed >= Duration::from_millis(1_000),
+        "the drain did not wait for the in-flight store: exited after {elapsed:?}"
+    );
     drop(inside);
 
     let committed = read_tasks(&db);

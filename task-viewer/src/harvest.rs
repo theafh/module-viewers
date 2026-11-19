@@ -9443,10 +9443,11 @@ mod tests {
 
     /// The source files whose unix-only test sites must stay gated, read at
     /// compile time so the scan sees exactly the text that is built.
-    const UNIX_GATE_SOURCES: [(&str, &str); 4] = [
+    const UNIX_GATE_SOURCES: [(&str, &str); 5] = [
         ("main.rs", include_str!("main.rs")),
         ("harvest.rs", include_str!("harvest.rs")),
         ("web.rs", include_str!("web.rs")),
+        ("db.rs", include_str!("db.rs")),
         ("launcher_tests.rs", include_str!("launcher_tests.rs")),
     ];
 
@@ -9647,9 +9648,36 @@ mod tests {
         false
     }
 
+    /// True when the enclosing block that holds `line` is gated on `unix`.
+    ///
+    /// A `#[cfg(unix)]` on a bare block gates every line inside it without
+    /// sitting above the line or above the enclosing `fn`, which is how
+    /// `main.rs` guards its signal handler. Walking out to the block opener
+    /// catches that shape, so the scan sees it instead of reporting nothing.
+    fn block_unix_gate(lines: &[&str], line: usize) -> bool {
+        let indent = lines[line].len() - lines[line].trim_start().len();
+        let mut cursor = line;
+        while cursor > 0 {
+            cursor -= 1;
+            let candidate = lines[cursor];
+            let candidate_indent = candidate.len() - candidate.trim_start().len();
+            if candidate.trim().is_empty() {
+                continue;
+            }
+            if candidate_indent >= indent {
+                continue;
+            }
+            let opens_block = candidate.trim_end().ends_with('{');
+            return opens_block && has_unix_gate(lines, cursor);
+        }
+        false
+    }
+
     /// Covers: every unix-only test site across `main.rs`, `harvest.rs`,
-    /// `web.rs`, and `launcher_tests.rs` sits under a `unix` cfg gate, so a
-    /// non-unix `cargo test` build excludes it instead of failing to compile.
+    /// `web.rs`, `db.rs`, and `launcher_tests.rs` sits under a `unix` cfg gate,
+    /// whether that gate is on the line, on the enclosing `fn`, or on an
+    /// enclosing block, so a non-unix `cargo test` build excludes it instead of
+    /// failing to compile.
     #[test]
     fn unix_only_test_sites_carry_their_gate() {
         // The scan's own body and helpers name the markers they search for, so
@@ -9667,6 +9695,10 @@ mod tests {
             "fs::set_permissions",
             ".set_mode(",
             "OsString::from_vec",
+            "signal::unix::",
+            "OsStrExt::",
+            "symlink(",
+            "fs::symlink",
             "fake_git_script(",
             "commit_non_utf8_named_task(",
             "register_test_git(",
@@ -9720,6 +9752,7 @@ mod tests {
                     continue;
                 }
                 let gated = has_unix_gate(&lines, index)
+                    || block_unix_gate(&lines, index)
                     || enclosing.is_some_and(|span| has_unix_gate(&lines, span.first));
                 if !gated {
                     failures.push(format!(
