@@ -2,8 +2,8 @@
 description: "Serialize launcher invocations, compare canonical paths, guard every kill, and never report a stop that did not take."
 scope: scripts
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-19T17:11:46Z
-status: implemented
+updated: 2026-11-19T17:21:35Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: false
@@ -19,10 +19,10 @@ Two launcher invocations cannot race the PID file: the exclusive lock spans the 
 
 - Build order: second of the launcher pair. Ships after `task-viewer_launcher-build-truth.md`.
 - `scripts/task-viewer.sh` writes `echo "$candidate" >"$PID_FILE"` with no lock around the check, compares the whole `ps -o args=` line to `$BINARY` in `is_ours` (so a relative path, a bare name, or a trailing argument reads as foreign), runs `kill "$pid" 2>/dev/null || true` unguarded, prints `task-viewer stopped` after `kill -9` with no re-test, and starts the server with `nohup "$BINARY"` on the no-python3 path. `is_running` and both `do_start` failure paths also delete the PID file, and `do_stop` deletes it after a stop.
-- Shared surface and ordering: [task-viewer_launcher-build-truth.md](archive/task-viewer_launcher-build-truth.md) rewrites `do_start`, `do_toggle`, and the `start_detached` no-python3 branch of the same file and ships first, replacing that `nohup "$BINARY"` line with a `setsid`-or-refuse branch; this task takes the launcher as that task leaves it, re-reads the detach branch before quoting it, and keeps every guard here working under whatever detach it leaves.
+- Shared surface and ordering: [task-viewer_launcher-build-truth.md](task-viewer_launcher-build-truth.md) rewrites `do_start`, `do_toggle`, and the `start_detached` no-python3 branch of the same file and ships first, replacing that `nohup "$BINARY"` line with a `setsid`-or-refuse branch; this task takes the launcher as that task leaves it, re-reads the detach branch before quoting it, and keeps every guard here working under whatever detach it leaves.
 - The launcher's `PORT=7880` reaches only its own probes and printed URLs: `port_pid` asks `lsof`/`ss` about `:"$PORT"` and `port_answers` opens `/dev/tcp/127.0.0.1/$PORT`, while the server binds `TASK_VIEWER_PORT` or `web::PORT` (`7880`) from `task-viewer/src/main.rs` and `start_detached` passes it neither an argument nor that variable. `TESTING.md` requires deterministic, isolated, parallel-safe tests, so the concurrency test needs a launcher copy that moves the server's bind port, not only the probes.
 - `SECURITY.md` requires process checks before signalling.
-- Prior art: [task-viewer_launcher-ps-portability.md](archive/task-viewer_launcher-ps-portability.md) fixed `ps` truncation; [task-viewer_desktop-launcher.md](archive/task-viewer_desktop-launcher.md) built the launcher.
+- Prior art: [task-viewer_launcher-ps-portability.md](task-viewer_launcher-ps-portability.md) fixed `ps` truncation; [task-viewer_desktop-launcher.md](task-viewer_desktop-launcher.md) built the launcher.
 
 ## Approach
 
