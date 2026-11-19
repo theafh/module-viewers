@@ -946,10 +946,7 @@ fn project_view(repo: &Repository) -> ProjectView {
         name: repo.name.clone(),
         path: repo.path.clone(),
         created_at: repo.created_at.clone(),
-        scanned_at: repo
-            .scanned_at
-            .clone()
-            .unwrap_or_else(|| "Not scanned yet".to_string()),
+        scanned_at: repo.scanned_at.clone(),
         last_error: repo.last_error.clone().unwrap_or_default(),
     }
 }
@@ -1030,7 +1027,7 @@ struct ProjectView {
     name: String,
     path: String,
     created_at: String,
-    scanned_at: String,
+    scanned_at: Option<String>,
     last_error: String,
 }
 
@@ -2529,6 +2526,57 @@ mod tests {
                 );
             }
         }
+        cleanup(&path);
+    }
+
+    /// Covers: an unscanned repository renders "not scanned yet" once, with no
+    /// doubled "scanned Not scanned yet", while a scanned repository still
+    /// renders its timestamp.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_repositories_page_renders_the_scan_label_once() {
+        let (state, path) = app_state("repo_scan_label").await;
+        let unscanned = live_repository("repo_scan_label_unscanned");
+        db::insert_repository(&state.pool, "unscanned", &unscanned.to_string_lossy())
+            .await
+            .expect("insert unscanned");
+        let scanned = live_repository("repo_scan_label_scanned");
+        let scanned_id = db::insert_repository(&state.pool, "scanned", &scanned.to_string_lossy())
+            .await
+            .expect("insert scanned");
+        db::replace_tasks(
+            &state.pool,
+            scanned_id,
+            &[],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("record a scan");
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        let stamp = repositories
+            .iter()
+            .find(|repository| repository.repository_id == scanned_id)
+            .and_then(|repository| repository.scanned_at.clone())
+            .expect("the scanned repository carries a stamp");
+
+        let body =
+            body_text(send(state.clone(), get_page("/repositories", "127.0.0.1:7880")).await).await;
+
+        assert_eq!(
+            body.matches("not scanned yet").count(),
+            1,
+            "the unscanned repository names its state once"
+        );
+        assert!(
+            !body.contains("scanned not scanned yet") && !body.contains("scanned Not scanned yet"),
+            "the unscanned repository never doubles the scanned phrase"
+        );
+        assert!(
+            body.contains(&format!("scanned {stamp}")),
+            "the scanned repository still renders its timestamp"
+        );
+
+        let _ = std::fs::remove_dir_all(unscanned);
+        let _ = std::fs::remove_dir_all(scanned);
         cleanup(&path);
     }
 

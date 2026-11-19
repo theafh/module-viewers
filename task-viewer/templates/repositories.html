@@ -27,7 +27,7 @@
             <div>
                 <strong>{{ project.name }}</strong>
                 <span class="muted">{{ project.path }}</span>
-                <span class="muted">Added {{ project.created_at }} · scanned {{ project.scanned_at }}</span>
+                <span class="muted">Added {{ project.created_at }} · {% if project.scanned_at %}scanned {{ project.scanned_at }}{% else %}not scanned yet{% endif %}</span>
                 {% if project.last_error %}
                 <span class="error-text">{{ project.last_error }}</span>
                 {% endif %}

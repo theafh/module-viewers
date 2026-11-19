@@ -2,9 +2,11 @@
 description: "Fix the unscanned-repository label so an unscanned repository reads \"not scanned yet\" once instead of the doubled \"scanned Not scanned yet\"."
 scope: task-viewer
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-16T14:19:14Z
-status: ready
+updated: 2026-11-19T12:00:00Z
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Fix the unscanned repository label
