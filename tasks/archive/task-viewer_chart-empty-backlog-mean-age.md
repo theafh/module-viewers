@@ -2,8 +2,8 @@
 description: "Drop the mean-age point for a day with an empty backlog, rewrite ARCHITECTURE.md's mean-age day range, update the three age tests, and clamp the trend at zero."
 scope: task-viewer
 created: 2026-11-13T20:46:16Z
-updated: 2026-11-19T16:21:55Z
-status: implemented
+updated: 2026-11-19T16:26:18Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: true
@@ -22,8 +22,8 @@ A day on which no task is unfinished carries no mean-age point, so the chart nev
 - `drawLine` in `task-viewer/static/js/dashboard.js` draws the rows it receives and `pathFor` joins them with `M` and `L`; a day the payload omits costs no mark, and the x scale still spans the first and last dates. `renderCard("age", ...)` passes `payload.mean_age` and reads `row.avg_age` and `row.n`.
 - `ARCHITECTURE.md` under **Extraction Rules** states one sentence for the three day-ranged charts: "The cumulative, backlog, and mean-age charts include every calendar day from the later of their first day and 1970-01-01 through today, with earlier events counted on that first day; the weekly chart starts at the Monday of that week. A day with no event keeps the previous level." Its mean-age rule already defines the average over tasks "that exist and are unfinished at the end of that day", so only the day-range sentence needs the rewrite.
 - `TESTING.md`'s **Series** bullet and `FEATURES.md`'s mean-age line name no day range, so they stay as they are.
-- Split from [task-viewer_chart-future-dates.md](task-viewer_chart-future-dates.md): that task owns the after-today fold, the per-event warning, the `path` plumbing, and the per-walk start clamp, and keeps a task created after today out of the rows through today. It left this empty-day rule out of scope because the rule reverses a shipped decision and needs its own `ARCHITECTURE.md` rewrite and test updates. Both tasks edit `fn age_points_counted`; their rules compose (that task decides which days hold a task, this one drops a day whose count is zero), and the second to ship keeps the first's rule in place.
-- The shipped [task-viewer_chart-span-floor.md](archive/task-viewer_chart-span-floor.md) asserted the ship-day mean-age point with `n` 0 on purpose; this task reverses that one decision while keeping the floor, the fold into the first charted day, and the real age on that first row.
+- Split from [task-viewer_chart-future-dates.md](../task-viewer_chart-future-dates.md): that task owns the after-today fold, the per-event warning, the `path` plumbing, and the per-walk start clamp, and keeps a task created after today out of the rows through today. It left this empty-day rule out of scope because the rule reverses a shipped decision and needs its own `ARCHITECTURE.md` rewrite and test updates. Both tasks edit `fn age_points_counted`; their rules compose (that task decides which days hold a task, this one drops a day whose count is zero), and the second to ship keeps the first's rule in place.
+- The shipped [task-viewer_chart-span-floor.md](task-viewer_chart-span-floor.md) asserted the ship-day mean-age point with `n` 0 on purpose; this task reverses that one decision while keeping the floor, the fold into the first charted day, and the real age on that first row.
 - Tests the current rule leaves false: `series_age_sweep_matches_the_day_times_task_loop` and its test-only legacy loop `age_points_by_day_and_task`, `series_age_sweep_stays_linear_for_an_old_task_set`, and `series_mean_age_folds_a_pre_floor_created_day_into_the_floor`, all in `task-viewer/src/series.rs`.
 
 ## Approach
