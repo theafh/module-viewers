@@ -33,7 +33,7 @@ A `.git` that exists but cannot be read or parsed fails the scan rather than cha
 - Keep the `tasks/` gate on the no-repository branch too: a folder outside git whose `tasks/` is absent still returns `HarvestError::MissingTasks` rather than taking the new empty-walk path, so its stored rows survive.
 - Return early from `fn blob_days` when the blob set is empty, and change `harvest_every_git_site_returns_at_the_deadline`'s blob set to a non-empty one so its timeout assertion keeps covering the walk.
 
-**Out of scope:** Aligning `ARCHITECTURE.md`'s Data Layout and Extraction Rules sentences with the ref-union and scan-error behaviour, owned by [task-viewer_guardrail-doc-sync.md](../task-viewer_guardrail-doc-sync.md), which lands after this task; that includes `FEATURES.md` §3's "A folder is accepted when it contains `tasks/`.", which the widened Add gate falsifies. The per-ref `tasks/` subtree-id read that would distinguish a `tasks/` directory holding no markdown from an absent one belongs to [task-viewer_harvest-raw-path-gaps.md](../task-viewer_harvest-raw-path-gaps.md).
+**Out of scope:** Aligning `ARCHITECTURE.md`'s Data Layout and Extraction Rules sentences with the ref-union and scan-error behaviour, owned by [task-viewer_guardrail-doc-sync.md](../task-viewer_guardrail-doc-sync.md), which lands after this task; that includes `FEATURES.md` §3's "A folder is accepted when it contains `tasks/`.", which the widened Add gate falsifies. The per-ref `tasks/` subtree-id read that would distinguish a `tasks/` directory holding no markdown from an absent one belongs to [task-viewer_harvest-raw-path-gaps.md](task-viewer_harvest-raw-path-gaps.md).
 
 ## Acceptance
 
