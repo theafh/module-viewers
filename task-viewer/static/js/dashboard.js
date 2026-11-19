@@ -594,6 +594,11 @@
             break;
           }
           svg.removeChild(last.node);
+          // The label left the SVG, so its registry entries go with it: a
+          // later recolour must not reach for a node no longer in the chart.
+          painted[name] = painted[name].filter(function (entry) {
+            return entry.node !== last.node;
+          });
           placed.pop();
         }
       }

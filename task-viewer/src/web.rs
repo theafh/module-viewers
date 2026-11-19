@@ -7197,7 +7197,8 @@ mod tests {
 
     /// Covers: a frame narrower than the calendar's
     /// natural width opens on the newest days, a frame that fits it stays at
-    /// its left edge, and a theme redraw keeps the reader's scroll position.
+    /// its left edge, and a theme switch leaves the reader's scroll position
+    /// alone.
     #[test]
     fn browser_calendar_opens_on_the_newest_days() {
         let payload = year_of_calendar_rows();
@@ -7242,7 +7243,7 @@ mod tests {
         assert_eq!(
             narrow_result["afterRedraw"].as_f64(),
             Some(0.0),
-            "a theme redraw keeps the reader's scroll position"
+            "a theme switch leaves the reader's scroll position alone"
         );
         // At 1000px the frame has no scroll range, so a browser clamps any
         // assignment to zero. Assert the range rather than the clamped value,
