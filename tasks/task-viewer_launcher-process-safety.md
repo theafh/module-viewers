@@ -2,9 +2,11 @@
 description: "Serialize launcher invocations, compare canonical paths, guard every kill, and never report a stop that did not take."
 scope: scripts
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:52:55Z
-status: ready
+updated: 2026-11-19T17:11:46Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Make the launcher's process handling race-free and truthful

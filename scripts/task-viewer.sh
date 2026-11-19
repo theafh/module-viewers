@@ -4,9 +4,16 @@
 # Default (Dock): toggle — start if stopped, stop if running
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+# Resolve the checkout once, so a checkout reached through a symlink compares
+# equal to the path `ps` prints for the binary it starts.
+PROJECT_DIR="$(cd "$(dirname "$SCRIPT_DIR")" && pwd -P)"
 BINARY="$PROJECT_DIR/target/release/task-viewer"
 PORT=7880
+# PORT alone picks the bind port. The server reads TASK_VIEWER_PORT, so drop any
+# inherited value and hand it this launcher's own port; an exported
+# TASK_VIEWER_PORT from a shell or a test then changes nothing.
+unset TASK_VIEWER_PORT
+export TASK_VIEWER_PORT="$PORT"
 
 # Runtime state lives outside the checkout: the log records repository paths.
 case "$(uname -s)" in
@@ -17,6 +24,7 @@ PID_FILE="$STATE_DIR/task-viewer.pid"
 LOG_FILE="$STATE_DIR/task-viewer.log"
 BUILD_LOG="$STATE_DIR/build.log"
 STAMP_FILE="$STATE_DIR/task-viewer.binary"
+LOCK_DIR="$STATE_DIR/task-viewer.lock"
 
 # Files this launcher creates are private to the person who runs it.
 umask 077
@@ -35,6 +43,60 @@ fi
 rm -f "$PROJECT_DIR/.task-viewer.log"
 # umask only covers new files; repair modes left by older launchers.
 chmod 600 "$PID_FILE" "$LOG_FILE" "$BUILD_LOG" "$STAMP_FILE" 2>/dev/null
+
+# One command at a time. The lock is a directory because `mkdir` is atomic on
+# macOS and Linux, and `flock` is absent on macOS. The PID recorded inside
+# names the holder, so a holder that died is reclaimed instead of wedging the
+# launcher forever.
+LOCK_HELD=0
+
+release_lock() {
+    [ "$LOCK_HELD" = 1 ] || return 0
+    LOCK_HELD=0
+    # Remove only the directory that still records this shell: a reclaimed lock
+    # can have been renamed away and replaced by another holder's.
+    if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+        rm -rf "$LOCK_DIR"
+    fi
+}
+
+# Reclaim a stale lock by renaming it aside first: exactly one waiter wins the
+# rename, and a check-then-delete would let two waiters both act on one stale
+# observation and the loser delete the fresh lock the winner just created. The
+# renamed directory is then checked against the dead PID that justified the
+# reclaim, so a waiter slow enough to rename a fresh lock the winner already
+# created puts that lock back instead of deleting it.
+acquire_lock() {
+    local holder stale missing_retries=0
+    while :; do
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            LOCK_HELD=1
+            printf '%s\n' "$$" >"$LOCK_DIR/pid"
+            return 0
+        fi
+        holder=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+        if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+            sleep 0.1
+            continue
+        fi
+        # No recorded PID is the short window between `mkdir` and the write, so
+        # give the holder a moment before treating the directory as stale.
+        if [ -z "$holder" ] && [ "$missing_retries" -lt 50 ]; then
+            missing_retries=$((missing_retries + 1))
+            sleep 0.1
+            continue
+        fi
+        missing_retries=0
+        stale="$LOCK_DIR.stale.$$.$RANDOM"
+        if mv "$LOCK_DIR" "$stale" 2>/dev/null; then
+            if [ "$(cat "$stale/pid" 2>/dev/null)" = "$holder" ]; then
+                rm -rf "$stale"
+            else
+                mv "$stale" "$LOCK_DIR" 2>/dev/null || rm -rf "$stale"
+            fi
+        fi
+    done
+}
 
 # Dock / GUI launches have a minimal PATH; pull in rustup cargo when needed.
 if [ -f "$HOME/.cargo/env" ]; then
@@ -71,15 +133,30 @@ notify() {
 }
 
 # True when the PID is this checkout's release binary. A live PID alone is not
-# enough: PIDs are reused, and another program may own the port.
+# enough: PIDs are reused, and another program may own the port. `ps` prints the
+# argv the process was started with, so compare its first token: an absolute
+# path as written, a path holding a `/` resolved against this checkout (every
+# launcher-started server inherits it as its working directory), or a bare name
+# resolved on PATH. A trailing argument is allowed, and a token that resolves
+# to nothing is not ours.
 is_ours() {
     local candidate="$1"
     [ -n "$candidate" ] || return 1
-    local args
+    local args token resolved dir
     # -ww keeps procps from truncating a long command line to the terminal
     # width, so Linux reads the same full path macOS prints.
-    args=$(ps -ww -p "$candidate" -o args= 2>/dev/null | sed 's/[[:space:]]*$//')
-    [ "$args" = "$BINARY" ]
+    args=$(ps -ww -p "$candidate" -o args= 2>/dev/null) || return 1
+    token=${args%%[[:space:]]*}
+    [ -n "$token" ] || return 1
+    case "$token" in
+        /*) resolved="$token" ;;
+        */*)
+            dir=$(cd "$PROJECT_DIR/$(dirname "$token")" 2>/dev/null && pwd -P) || return 1
+            resolved="$dir/$(basename "$token")"
+            ;;
+        *) resolved=$(command -v "$token" 2>/dev/null) || return 1 ;;
+    esac
+    [ "$resolved" = "$BINARY" ]
 }
 
 # The PID listening on the port, from lsof or else ss (minimal Linux installs
@@ -229,6 +306,23 @@ start_binary() {
             Linux)  xdg-open "http://127.0.0.1:$PORT" >/dev/null 2>&1 || true ;;
         esac
     else
+        # The server never took the port but is still running: stop the one this
+        # start launched before reporting the failure, so a timeout leaves no
+        # live server behind.
+        local started_pid
+        started_pid=$(get_pid)
+        if is_ours "$started_pid"; then
+            kill "$started_pid" 2>/dev/null || true
+            for _ in {1..10}; do
+                if ! is_ours "$started_pid"; then
+                    break
+                fi
+                sleep 0.5
+            done
+            if is_ours "$started_pid"; then
+                kill -9 "$started_pid" 2>/dev/null || true
+            fi
+        fi
         echo "Failed to start task-viewer. Check $LOG_FILE"
         notify "task-viewer" "Failed to start. See $LOG_FILE"
         rm -f "$PID_FILE"
@@ -298,9 +392,13 @@ do_stop() {
         return 0
     fi
 
+    # Read the PID once: a signal must reach the server this stop found, never a
+    # PID that exited and was reused between the check and the kill.
     pid=$(get_pid)
     echo "Stopping task-viewer (PID: $pid)..."
-    kill "$pid" 2>/dev/null || true
+    if is_ours "$pid"; then
+        kill "$pid" 2>/dev/null || true
+    fi
 
     for _ in {1..10}; do
         if ! is_running; then
@@ -315,6 +413,18 @@ do_stop() {
     echo "Force stopping..."
     if is_ours "$pid"; then
         kill -9 "$pid" 2>/dev/null || true
+    fi
+    # A kill that did not take is not a stop: re-test before claiming one.
+    for _ in {1..10}; do
+        if ! is_ours "$pid"; then
+            break
+        fi
+        sleep 0.1
+    done
+    if is_ours "$pid"; then
+        echo "task-viewer did not stop (PID: $pid is still running)"
+        notify "task-viewer" "Stop failed: the server survived"
+        return 1
     fi
     rm -f "$PID_FILE" "$STAMP_FILE"
     echo "task-viewer stopped"
@@ -347,6 +457,12 @@ do_toggle() {
 # Dispatch only when executed, so a test can source this file to reach the
 # helpers without starting or stopping a server.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    # The whole command runs under one lock: `status` reaches is_running, which
+    # writes and deletes the PID file, and `restart` runs a stop and a start as
+    # one command. The helpers take no lock of their own, so do_start's restart
+    # path runs inside this one instead of nesting on it.
+    acquire_lock
+    trap release_lock EXIT
     case "${1:-toggle}" in
         start)   do_start ;;
         stop)    do_stop ;;

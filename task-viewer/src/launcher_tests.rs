@@ -5,7 +5,8 @@ use crate::test_support::unique_temp_dir;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// The git variables a test process may inherit; the launcher probes must not
 /// see them, so every run clears them explicitly.
@@ -24,6 +25,45 @@ fn repo_launcher() -> PathBuf {
         .parent()
         .expect("task-viewer sits inside the workspace root");
     repo.join("scripts/task-viewer.sh")
+}
+
+/// Copy the launcher under a test root, so `PROJECT_DIR` is that root and every
+/// state, log, PID, stamp, and lock file lands under the test's own home.
+fn stage_launcher(dir: &Path) -> PathBuf {
+    let launcher = dir.join("scripts").join("task-viewer.sh");
+    fs::create_dir_all(launcher.parent().expect("launcher parent")).expect("launcher scripts dir");
+    fs::copy(repo_launcher(), &launcher).expect("copy launcher into temp dir");
+    launcher
+}
+
+/// The launcher's state directory for a given home, mirroring its own rule.
+fn state_dir(home: &Path, xdg: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Logs/task-viewer")
+    } else {
+        xdg.join("task-viewer")
+    }
+}
+
+/// Run a bash driver that sources the staged launcher.
+fn run_driver(dir: &Path, driver: &str, envs: &[(&str, &str)]) -> std::process::Output {
+    let path = dir.join("driver.sh");
+    write_executable(&path, driver);
+    let mut command = Command::new("bash");
+    command
+        .arg("--noprofile")
+        .arg("--norc")
+        .arg(&path)
+        // Keep the launcher's state and log files out of the live directories.
+        .env("HOME", dir.join("home"))
+        .env("XDG_STATE_HOME", dir.join("state"));
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    for name in GIT_ENV {
+        command.env_remove(name);
+    }
+    command.output().expect("run bash")
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -131,4 +171,390 @@ fn launcher_is_ours_reads_the_full_command_line() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Stage a checkout-shaped root with an executable `target/release/task-viewer`
+/// and return its launcher copy.
+fn stage_root(dir: &Path) -> PathBuf {
+    fs::create_dir_all(dir.join("target/release")).expect("release dir");
+    write_executable(
+        &dir.join("target/release/task-viewer"),
+        "#!/bin/bash\nexit 0\n",
+    );
+    stage_launcher(dir)
+}
+
+/// Drive `is_ours` with a staged `ps` line for every printed form.
+const IS_OURS_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+ps() {
+    case " $* " in
+        *" -ww "*) printf '%s\n' "$FAKE_PS_ARGS" ;;
+    esac
+}
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+PATH="$PROJECT_DIR/target/release:$PATH"
+check() {
+    local name="$1" expected="$2"
+    FAKE_PS_ARGS="$3"
+    if is_ours 4242; then
+        got=yes
+    else
+        got=no
+    fi
+    if [ "$got" = "$expected" ]; then
+        printf '%s-ok\n' "$name"
+    else
+        printf '%s-FAIL (got %s)\n' "$name" "$got"
+    fi
+}
+check absolute yes "$BINARY"
+check absolute-arg yes "$BINARY --serve"
+check relative yes "./target/release/task-viewer"
+check relative-plain yes "target/release/task-viewer"
+check bare yes "task-viewer"
+check foreign-absolute no "/somewhere/else/task-viewer"
+check foreign-relative no "../elsewhere/task-viewer"
+check empty no ""
+"#;
+
+/// Covers: `is_ours` accepts a staged `ps` line printing the binary as
+/// `./target/release/task-viewer`, one printing the absolute binary followed by
+/// an argument, and one printing a bare `task-viewer` name resolved on `PATH`,
+/// and rejects a path outside the checkout.
+#[test]
+fn launcher_is_ours_resolves_every_printed_form() {
+    let dir = unique_temp_dir("launcher_is_ours");
+    let launcher = stage_root(&dir);
+
+    let output = run_driver(
+        &dir,
+        IS_OURS_DRIVER,
+        &[(
+            "SCRIPT_PATH",
+            launcher.to_str().expect("the temp path is valid UTF-8"),
+        )],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    for marker in [
+        "absolute-ok",
+        "absolute-arg-ok",
+        "relative-ok",
+        "relative-plain-ok",
+        "bare-ok",
+        "foreign-absolute-ok",
+        "foreign-relative-ok",
+        "empty-ok",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == marker),
+            "missing {marker} in: {stdout}",
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Aim a stop at a live unrelated process and record every signal the launcher
+/// sends. The real `kill` stays available for the liveness check.
+const FOREIGN_STOP_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+port_pid() { :; }
+ps() {
+    case " $* " in
+        *" -ww "*) printf '%s\n' "/bin/sleep 60" ;;
+    esac
+}
+sleep 60 &
+foreign=$!
+echo "$foreign" >"$PID_FILE"
+kill() {
+    printf '%s\n' "$*" >>"$KILL_LOG"
+    return 0
+}
+do_stop
+echo "status=$?"
+unset -f kill
+if kill -0 "$foreign" 2>/dev/null; then
+    echo "foreign-alive"
+else
+    echo "foreign-dead"
+fi
+kill -9 "$foreign" 2>/dev/null || true
+wait "$foreign" 2>/dev/null || true
+"#;
+
+/// Covers: a stop aimed at a PID belonging to an unrelated program sends it no
+/// signal, so neither the graceful `kill` nor the `kill -9` fires.
+#[test]
+fn launcher_stop_leaves_a_foreign_process_alone() {
+    let dir = unique_temp_dir("launcher_foreign_stop");
+    let launcher = stage_root(&dir);
+    let kill_log = dir.join("kills.log");
+
+    let output = run_driver(
+        &dir,
+        FOREIGN_STOP_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            (
+                "KILL_LOG",
+                kill_log.to_str().expect("the temp path is valid UTF-8"),
+            ),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.contains("task-viewer is not running"),
+        "a foreign PID must read as not running: {stdout}",
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=0"),
+        "the stop must report success: {stdout}",
+    );
+    assert!(
+        stdout.lines().any(|line| line == "foreign-alive"),
+        "the unrelated process must survive: {stdout}",
+    );
+    let signals = fs::read_to_string(&kill_log).unwrap_or_default();
+    assert!(
+        signals.is_empty(),
+        "no signal may reach the unrelated process, logged: {signals}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Hold a PID the launcher must read as its own server while its kill does
+/// nothing, so the stop has to report a survivor.
+const SURVIVOR_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+sleep() { :; }
+ps() {
+    case " $* " in
+        *" -ww "*) printf '%s\n' "$BINARY" ;;
+    esac
+}
+kill() { return 0; }
+echo 4242 >"$PID_FILE"
+do_stop
+echo "status=$?"
+"#;
+
+/// Covers: a stop whose process survives `kill -9` exits non-zero and does not
+/// print "stopped".
+#[test]
+fn launcher_stop_reports_a_survivor() {
+    let dir = unique_temp_dir("launcher_survivor");
+    let launcher = stage_root(&dir);
+
+    let output = run_driver(
+        &dir,
+        SURVIVOR_DRIVER,
+        &[(
+            "SCRIPT_PATH",
+            launcher.to_str().expect("the temp path is valid UTF-8"),
+        )],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=1"),
+        "a survivor must exit non-zero: {stdout}",
+    );
+    assert!(
+        stdout.contains("did not stop"),
+        "the survivor must be reported: {stdout}",
+    );
+    assert!(
+        !stdout.contains("task-viewer stopped"),
+        "a survivor must not read as stopped: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Launch a real process the launcher reads as its own server, then force the
+/// start's listen probe to fail so the timeout cleanup runs.
+const START_TIMEOUT_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+sleep() { :; }
+port_pid() { :; }
+port_answers() { return 1; }
+is_listening() { return 1; }
+start_detached() {
+    "$BINARY" 300 >/dev/null 2>&1 &
+    echo $! >"$PID_FILE"
+    echo $! >"$PID_LOG"
+    return 0
+}
+start_binary
+echo "status=$?"
+# The stubbed sleep made the probe loops instant; restore the real one so the
+# reap can be observed.
+unset -f sleep
+server=$(cat "$PID_LOG" 2>/dev/null)
+for _ in {1..40}; do
+    if ! kill -0 "$server" 2>/dev/null; then
+        echo "server-dead"
+        exit 0
+    fi
+    sleep 0.05
+done
+echo "server-alive"
+"#;
+
+/// Covers: a forced start timeout leaves no live server process.
+#[test]
+fn launcher_start_timeout_terminates_the_server() {
+    let dir = unique_temp_dir("launcher_start_timeout");
+    let launcher = stage_root(&dir);
+    // A binary that blocks without arguments, so the timeout has a live process
+    // to clean up. `ps` prints the argv path, which is what `is_ours` reads.
+    let sleep_binary = ["/bin/sleep", "/usr/bin/sleep"]
+        .iter()
+        .find(|path| Path::new(path).exists())
+        .expect("a system sleep binary");
+    fs::remove_file(dir.join("target/release/task-viewer")).expect("replace the staged binary");
+    std::os::unix::fs::symlink(sleep_binary, dir.join("target/release/task-viewer"))
+        .expect("stage a blocking binary");
+
+    let pid_log = dir.join("pid.log");
+    let output = run_driver(
+        &dir,
+        START_TIMEOUT_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            (
+                "PID_LOG",
+                pid_log.to_str().expect("the temp path is valid UTF-8"),
+            ),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=1"),
+        "a timed-out start must fail: {stdout}",
+    );
+    assert!(
+        stdout.contains("Failed to start"),
+        "the timeout must be reported: {stdout}",
+    );
+    assert!(
+        stdout.lines().any(|line| line == "server-dead"),
+        "the timed-out server must be gone: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Covers: a `status` invocation run while another invocation holds the lock
+/// waits for the holder to release it before reading the PID file, so it never
+/// reads a concurrent start's half-written file.
+#[test]
+fn launcher_status_waits_for_the_lock_holder() {
+    let dir = unique_temp_dir("launcher_lock_wait");
+    let launcher = stage_root(&dir);
+    let home = dir.join("home");
+    let xdg = dir.join("state");
+    let lock = state_dir(&home, &xdg).join("task-viewer.lock");
+    fs::create_dir_all(&lock).expect("hold the lock");
+    fs::write(lock.join("pid"), format!("{}\n", std::process::id())).expect("holder pid");
+
+    let mut child = Command::new("bash")
+        .arg("--noprofile")
+        .arg("--norc")
+        .arg(&launcher)
+        .arg("status")
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &xdg)
+        .env_remove("TASK_VIEWER_PORT")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn status");
+
+    // A status that ignored the lock would finish in well under this window.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll status") {
+            panic!("status finished while another invocation held the lock: {status:?}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    fs::remove_dir_all(&lock).expect("release the lock");
+    let output = wait_for_output(child, Duration::from_secs(10));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "status failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.contains("task-viewer is not running"),
+        "status must read the released PID file: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Wait for a child to finish, then collect its output, failing the test if it
+/// overruns the window instead of hanging the suite.
+fn wait_for_output(mut child: Child, window: Duration) -> std::process::Output {
+    let deadline = Instant::now() + window;
+    while Instant::now() < deadline {
+        if child.try_wait().expect("poll the child").is_some() {
+            return child.wait_with_output().expect("collect the output");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("the child did not finish inside {window:?}");
 }
