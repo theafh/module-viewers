@@ -49,6 +49,21 @@ chmod 600 "$PID_FILE" "$LOG_FILE" "$BUILD_LOG" "$STAMP_FILE" 2>/dev/null
 # names the holder, so a holder that died is reclaimed instead of wedging the
 # launcher forever.
 LOCK_HELD=0
+# The name this launcher runs under. A holder records its command line beside the
+# lock PID, and a waiter requires that line to carry this name before waiting, so
+# a live PID the system reused is reclaimed instead of waited for forever.
+LAUNCHER_NAME=$(basename "${BASH_SOURCE[0]}")
+
+# True when a recorded holder command line names this launcher. A live PID alone
+# is not a holder: PIDs are reused, and a reused one must be reclaimed rather
+# than waited for forever.
+holder_is_launcher() {
+    [ -n "$1" ] || return 1
+    case "$1" in
+        *"$LAUNCHER_NAME"*) return 0 ;;
+    esac
+    return 1
+}
 
 release_lock() {
     [ "$LOCK_HELD" = 1 ] || return 0
@@ -60,6 +75,17 @@ release_lock() {
     fi
 }
 
+# Enter the critical section only while `$LOCK_DIR/pid` still names this shell. A
+# waiter that read a stale PID before this shell recorded its own can rename the
+# directory aside in the gap between `mkdir` and the writes, so ownership is
+# re-acquired here instead of running beside the holder that took the name.
+require_lock_ownership() {
+    while [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" != "$$" ]; do
+        LOCK_HELD=0
+        acquire_lock
+    done
+}
+
 # Reclaim a stale lock by renaming it aside first: exactly one waiter wins the
 # rename, and a check-then-delete would let two waiters both act on one stale
 # observation and the loser delete the fresh lock the winner just created. The
@@ -67,21 +93,33 @@ release_lock() {
 # reclaim, so a waiter slow enough to rename a fresh lock the winner already
 # created puts that lock back instead of deleting it.
 acquire_lock() {
-    local holder stale missing_retries=0
+    local holder holder_cmd self_cmd stale missing_retries=0
     while :; do
         if mkdir "$LOCK_DIR" 2>/dev/null; then
             LOCK_HELD=1
             printf '%s\n' "$$" >"$LOCK_DIR/pid"
+            # Record the command line beside the PID, so a waiter can tell this
+            # launcher's holder from a live PID the system reused. `ps` can fail on
+            # a restricted system; the invoked path still names this launcher.
+            self_cmd=$(ps -ww -p $$ -o args= 2>/dev/null)
+            [ -n "$self_cmd" ] || self_cmd="$0"
+            printf '%s\n' "$self_cmd" >"$LOCK_DIR/cmd"
             return 0
         fi
         holder=$(cat "$LOCK_DIR/pid" 2>/dev/null)
-        if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+        holder_cmd=$(cat "$LOCK_DIR/cmd" 2>/dev/null)
+        # A live PID is a holder only when its recorded command line names this
+        # launcher; otherwise the PID was reused by an unrelated program, and
+        # waiting on it would wedge the launcher forever.
+        if [ -n "$holder" ] && holder_is_launcher "$holder_cmd" &&
+            kill -0 "$holder" 2>/dev/null; then
             sleep 0.1
             continue
         fi
-        # No recorded PID is the short window between `mkdir` and the write, so
-        # give the holder a moment before treating the directory as stale.
-        if [ -z "$holder" ] && [ "$missing_retries" -lt 50 ]; then
+        # No recorded PID or command line is the short window between `mkdir` and
+        # the writes, so give the holder a moment before treating it as stale.
+        if { [ -z "$holder" ] || [ -z "$holder_cmd" ]; } &&
+            [ "$missing_retries" -lt 50 ]; then
             missing_retries=$((missing_retries + 1))
             sleep 0.1
             continue
@@ -91,8 +129,12 @@ acquire_lock() {
         if mv "$LOCK_DIR" "$stale" 2>/dev/null; then
             if [ "$(cat "$stale/pid" 2>/dev/null)" = "$holder" ]; then
                 rm -rf "$stale"
-            else
+            elif [ ! -e "$LOCK_DIR" ]; then
                 mv "$stale" "$LOCK_DIR" 2>/dev/null || rm -rf "$stale"
+            else
+                # A fresh holder took the name in the gap. Its lock stands, so the
+                # renamed copy is discarded rather than nested inside it.
+                rm -rf "$stale"
             fi
         fi
     done
@@ -289,6 +331,17 @@ start_binary() {
         rm -f "$PID_FILE"
         return 1
     fi
+    # Capture the PID of the server this start launched once, before the probe
+    # loop: `is_running` deletes the PID file when it reads the recorded PID as
+    # foreign, which is exactly what the detacher's record-then-exec gap produces,
+    # so a cleanup that re-read the file would have no handle on the process it
+    # started.
+    local started_pid=""
+    for _ in {1..20}; do
+        started_pid=$(get_pid)
+        [ -n "$started_pid" ] && break
+        sleep 0.1
+    done
     # Wait for our process to own the port; a bind failure ends it instead.
     for _ in {1..20}; do
         if is_listening; then
@@ -309,8 +362,6 @@ start_binary() {
         # The server never took the port but is still running: stop the one this
         # start launched before reporting the failure, so a timeout leaves no
         # live server behind.
-        local started_pid
-        started_pid=$(get_pid)
         if is_ours "$started_pid"; then
             kill "$started_pid" 2>/dev/null || true
             for _ in {1..10}; do
@@ -462,6 +513,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     # one command. The helpers take no lock of their own, so do_start's restart
     # path runs inside this one instead of nesting on it.
     acquire_lock
+    require_lock_ownership
     trap release_lock EXIT
     case "${1:-toggle}" in
         start)   do_start ;;

@@ -1,5 +1,7 @@
 //! Process-level launcher tests: two invocations racing one launcher copy, a
-//! stale lock left by a dead holder, and the launcher's own bind port.
+//! stale lock left by a dead holder, a lock held by a live process that is not
+//! this launcher, a lock renamed away before its holder entered the critical
+//! section, and the launcher's own bind port.
 //!
 //! Each test stages a checkout-shaped root: a `scripts/task-viewer.sh` copy, a
 //! `target/release/task-viewer` symlink to `env!("CARGO_BIN_EXE_task-viewer")`,
@@ -26,6 +28,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// its server to own the port, and the loser waits out the winner's lock first.
 const COMMAND_WINDOW: Duration = Duration::from_secs(60);
 const SERVER_WINDOW: Duration = Duration::from_secs(15);
+/// How long a lock reclaim may take. A waiter that reads the holder's recorded
+/// command line reclaims at once; one that waits on the live PID instead never
+/// returns, which this window turns into a failure rather than a hung suite.
+const RECLAIM_WINDOW: Duration = Duration::from_secs(20);
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -128,11 +134,16 @@ impl Root {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new("bash");
+        let mut command = self.staged_env("bash");
+        command.arg("--noprofile").arg("--norc").arg(&self.launcher);
         command
-            .arg("--noprofile")
-            .arg("--norc")
-            .arg(&self.launcher)
+    }
+
+    /// `bash` in this root's staged environment, with the launcher's `HOME`,
+    /// `XDG_STATE_HOME`, and cleared overrides already in place.
+    fn staged_env(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command
             .env("HOME", &self.home)
             .env("XDG_STATE_HOME", &self.xdg)
             // The launcher owns its port and its database path; an inherited
@@ -142,6 +153,21 @@ impl Root {
             .env("RUST_LOG", "warn")
             .current_dir(&self.dir)
             .stdin(Stdio::null());
+        command
+    }
+
+    /// `bash` running `script` with the launcher copy reachable as `$1`. Sourcing
+    /// it skips the dispatcher, so a test drives the lock helpers without
+    /// starting or stopping a server.
+    fn source_command(&self, script: &str) -> Command {
+        let mut command = self.staged_env("bash");
+        command
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("-c")
+            .arg(script)
+            .arg("bash")
+            .arg(&self.launcher);
         command
     }
 
@@ -183,7 +209,11 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// One `GET /` carrying the loopback `Host` a same-machine browser sends.
+/// One `GET /` carrying the bare loopback `Host`, which is the form the server's
+/// allowlist accepts: it is built from the compile-time 7880, so the
+/// `Host: 127.0.0.1:<port>` a browser sends on the port this test binds is
+/// refused. The helper therefore proves the server answers, not that a browser
+/// can load the page.
 fn root_status(port: u16) -> Option<u16> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
@@ -348,6 +378,182 @@ fn a_stale_lock_is_reclaimed_once() {
         "the reclaimed lock directory must be gone once the holder releases",
     );
     stop_and_assert(&root, pid);
+
+    let _ = fs::remove_dir_all(&root.dir);
+}
+
+/// Covers: a lock whose recorded PID belongs to a live process that is not this
+/// launcher is reclaimed instead of waited for. The recorded command line is what
+/// separates a reused PID from a real holder, so a waiter that tested only
+/// `kill -0` would hold the command on the unrelated process until the window
+/// expires, and this test fails on that timeout.
+#[test]
+fn a_reused_pid_lock_is_reclaimed() {
+    let port = free_loopback_port();
+    let root = Root::new("launcher_reused_pid", port);
+
+    // A live process that is certainly not this launcher, standing in for a PID
+    // the system reused, with its own command line recorded in the lock.
+    let mut squatter = Command::new("sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn the unrelated live process");
+    fs::create_dir_all(root.lock_dir()).expect("stage the reused-PID lock");
+    fs::write(root.lock_dir().join("pid"), format!("{}\n", squatter.id()))
+        .expect("record the live PID");
+    fs::write(root.lock_dir().join("cmd"), "sleep 120\n")
+        .expect("record the unrelated command line");
+
+    let status = wait_output(root.spawn("status"), RECLAIM_WINDOW);
+    let _ = squatter.kill();
+    let _ = squatter.wait();
+
+    assert!(
+        status.status.success(),
+        "status failed: {}\n{}",
+        stdout(&status),
+        stderr(&status),
+    );
+    assert!(
+        stdout(&status).contains("task-viewer is not running"),
+        "the reclaimed lock must let status read the launcher's own state: {}",
+        stdout(&status),
+    );
+    assert!(
+        !root.lock_dir().exists(),
+        "the reclaimed lock must be released once the command finishes",
+    );
+
+    let _ = fs::remove_dir_all(&root.dir);
+}
+
+/// Covers: a holder whose lock was renamed away before it entered the critical
+/// section re-acquires it instead of running beside the new holder. The script
+/// takes the lock, simulates a waiter renaming it aside and a fresh holder taking
+/// the name, then requires the ownership re-check to make the lock this shell's
+/// again; without that re-check the lock stays the other holder's and the script
+/// exits non-zero. It also asserts the launcher's own dispatcher calls the
+/// re-check after taking the lock, because a sourced copy skips the dispatcher:
+/// without that half, deleting the dispatcher's call leaves this test green.
+#[test]
+fn a_lock_renamed_away_before_entry_is_reacquired() {
+    let port = free_loopback_port();
+    let root = Root::new("launcher_ownership", port);
+    let stale_pid = dead_pid();
+
+    // The structural half: read the dispatcher's code lines, so a comment or an
+    // indentation change does not matter but a missing or reordered call does. A
+    // trailing comment and a widened token gap are noise too, so each compared
+    // line drops a trailing comment and collapses its runs of whitespace.
+    fn strip_comment(line: &str) -> &str {
+        let mut single = false;
+        let mut double = false;
+        let mut escaped = false;
+        for (index, ch) in line.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' if double => escaped = true,
+                '\'' if !double => single = !single,
+                '"' if !single => double = !double,
+                '#' if !single && !double => return &line[..index],
+                _ => {}
+            }
+        }
+        line
+    }
+
+    fn normalize_line(line: &str) -> String {
+        strip_comment(line)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    let source = fs::read_to_string(repo_launcher()).expect("read the launcher");
+    let dispatcher_code = |text: &str| -> Vec<String> {
+        let guard = normalize_line(r#"if [ "${BASH_SOURCE[0]}" = "$0" ]; then"#);
+        let mut inside = false;
+        let mut nested = 0;
+        let mut code = Vec::new();
+        for line in text.lines() {
+            let line = normalize_line(line);
+            if !inside {
+                inside = line == guard;
+                continue;
+            }
+            if line == "fi" {
+                if nested == 0 {
+                    break;
+                }
+                nested -= 1;
+                continue;
+            }
+            if line.starts_with("if ") && line.ends_with("then") {
+                nested += 1;
+            }
+            if !line.is_empty() && !line.starts_with('#') {
+                code.push(line);
+            }
+        }
+        code
+    };
+    let dispatcher = dispatcher_code(&source);
+    let acquire = dispatcher.iter().position(|line| line == "acquire_lock");
+    let ownership = dispatcher
+        .iter()
+        .position(|line| line == "require_lock_ownership");
+    assert!(
+        matches!((acquire, ownership), (Some(acquired), Some(rechecked)) if acquired < rechecked),
+        "the dispatcher must call acquire_lock and then require_lock_ownership, so a \
+         command re-acquires a lock a waiter renamed away before entry; its code reads:\n{}",
+        dispatcher.join("\n"),
+    );
+
+    let script = r#"
+source "$1"
+acquire_lock
+# A waiter renamed this shell's lock aside and a fresh holder took the name.
+mv "$LOCK_DIR" "$LOCK_DIR.displaced" || exit 3
+mkdir "$LOCK_DIR" || exit 3
+printf '%s\n' "$2" >"$LOCK_DIR/pid"
+printf '%s\n' "sleep 1" >"$LOCK_DIR/cmd"
+require_lock_ownership
+if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" != "$$" ]; then
+    echo "the lock is not this shell's after the re-check" >&2
+    exit 1
+fi
+printf 'owned %s\n' "$$"
+release_lock
+"#;
+
+    let output = wait_output(
+        root.source_command(script)
+            .arg(stale_pid.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the sourced launcher"),
+        RECLAIM_WINDOW,
+    );
+
+    assert!(
+        output.status.success(),
+        "the ownership re-check did not make the lock this shell's: {}\n{}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert!(
+        stdout(&output).contains("owned"),
+        "the re-check must leave this shell holding the lock: {}",
+        stdout(&output),
+    );
+    assert!(
+        !root.lock_dir().exists(),
+        "the re-acquired lock must be released at the end of the script",
+    );
 
     let _ = fs::remove_dir_all(&root.dir);
 }
