@@ -2,7 +2,7 @@
 description: "Align CHARTER, ARCHITECTURE, FEATURES, TESTING, and README with the code: ref scope, Add's write path, toolchain, layout, worker cap, and drifted comments."
 scope: .
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-18T16:42:28Z
+updated: 2026-11-19T13:20:00Z
 status: ready
 reported-by: Andreas Hoffmann
 ---
@@ -11,7 +11,7 @@ reported-by: Andreas Hoffmann
 
 ## Goal
 
-Every guardrail claim that the code contradicts is rewritten to the behavior the code implements, and every behavior the docs promise but omit is documented. After this task, `CHARTER.md`, `ARCHITECTURE.md`, `FEATURES.md`, `TESTING.md`, and `README.md` agree with the shipped code on ref scope, the write paths, the pinned toolchain, the database layout, the worker cap, and the git-failure rule, and the docs carry the missing-`tasks/`, fallback re-walk, and failed-enclosing-probe outcomes the harvest work establishes.
+Every guardrail claim that the code contradicts is rewritten to the behavior the code implements, and every behavior the docs promise but omit is documented. After this task, `CHARTER.md`, `ARCHITECTURE.md`, `FEATURES.md`, `TESTING.md`, and `README.md` agree with the shipped code on ref scope, the write paths, the pinned toolchain, the database layout, the worker cap, and the git-failure rule, and the docs carry the missing-`tasks/` and failed-enclosing-probe outcomes the harvest work establishes.
 
 ## Context
 
@@ -27,7 +27,7 @@ Every guardrail claim that the code contradicts is rewritten to the behavior the
 - The Data Layout re-walk rule and [task-viewer_harvest-raw-path-gaps.md](archive/task-viewer_harvest-raw-path-gaps.md) no longer disagree: that work amended `ARCHITECTURE.md`'s re-walk rule so a fallback day on a lossy path is reused until the file's bytes change, so this task owes no re-walk amendment.
 - The pinned toolchain belongs to [task-viewer_launcher-build-truth.md](archive/task-viewer_launcher-build-truth.md), which pins `channel` in `rust-toolchain.toml` and adds the matching `rust-version` in `Cargo.toml` without touching a guardrail doc, so this task states the pin and lands after it.
 - `FEATURES.md` reports a scan error for a git history it cannot read but never names the enclosing-repository probe: a `rev-parse` that fails for a reason other than git's not-a-repository answer fails the scan with git's first stderr line in the message.
-- Resolved by the user's standing instruction to follow the audit recommendation for the three charter-bound forks: narrow the ref promise to the listed branches (matching `ARCHITECTURE.md` and the deliberate `refs/heads` + `refs/remotes` read), name `bash` and `python3` as launcher tooling rather than rewriting the scripts, and keep the deferred-date rule as the first archived-path commit. The harvest-core and ops-docs rulings settle the rest: the git-fallback rule lands here for the finished/deferred archive walk and for the pickaxe lookup, the missing-`tasks/`, fallback re-walk, and failed-enclosing-probe rules land here, and the pinned toolchain lands here.
+- Resolved by the user's standing instruction to follow the audit recommendation for the three charter-bound forks: narrow the ref promise to the listed branches (matching `ARCHITECTURE.md` and the deliberate `refs/heads` + `refs/remotes` read), name `bash` and `python3` as launcher tooling rather than rewriting the scripts, and keep the deferred-date rule as the first archived-path commit. The harvest-core and ops-docs rulings settle the rest: the git-fallback rule lands here for the finished/deferred archive walk and for the pickaxe lookup, the missing-`tasks/` and failed-enclosing-probe rules land here, and the pinned toolchain lands here.
 
 ## Approach
 
