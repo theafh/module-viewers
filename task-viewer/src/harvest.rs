@@ -2639,6 +2639,11 @@ fn escape_posix_ere(value: &str) -> String {
     escaped
 }
 
+/// The committer day of the earliest commit that introduces `status` on `rel`.
+///
+/// The three `-S` literals match the exact spellings first. The anchored `-G`
+/// pattern then widens the search to a status quoted with padding inside its
+/// quotes, which the frontmatter reader trims before it reaches this lookup.
 fn first_status_commit_date(
     repo: &Path,
     git: &GitContext,
@@ -2653,17 +2658,20 @@ fn first_status_commit_date(
     // the whole repository's harvest.
     let escaped = escape_posix_ere(status);
     // A quoted frontmatter value is common, so the unquoted status must match
-    // the commit that introduced either spelling. The bare alternative keeps
-    // the old prefix match, which is what dates a tight `status:deferred[`
-    // line; each quoted alternative requires the closing quote, so a lookup
-    // for `open` never answers `status: "openx"`.
+    // the commit that introduced either spelling, including one padded with
+    // spaces inside its quotes. The bare alternative keeps the old prefix
+    // match, which is what dates a tight `status:deferred[` line; each quoted
+    // alternative keeps both quotes, so a lookup for `open` never answers
+    // `status: "openx"`.
     let patterns = [
         ("-S", format!("status: {status}")),
         ("-S", format!("status: \"{status}\"")),
         ("-S", format!("status: '{status}'")),
         (
             "-G",
-            format!(r#"^status:[[:space:]]*("{escaped}"|'{escaped}'|{escaped})"#),
+            format!(
+                r#"^status:[[:space:]]*("[[:space:]]*{escaped}[[:space:]]*"|'[[:space:]]*{escaped}[[:space:]]*'|{escaped})"#
+            ),
         ),
     ];
     for (flag, pattern) in patterns {
@@ -5977,6 +5985,122 @@ mod tests {
         assert_eq!(
             day,
             Some(NaiveDate::from_ymd_opt(2026, 6, 15).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Commit one archived task whose status carries `status_text` verbatim on
+    /// 2026-05-10, with an `updated` day a month later so a fallback is visible.
+    fn archive_status_fixture(name: &str, status_text: &str) -> std::path::PathBuf {
+        let repo = scratch(name);
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_padded.md",
+            "2026-05-01",
+            "2026-06-01",
+            status_text,
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive padded open"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        repo
+    }
+
+    #[test]
+    fn harvest_dates_a_padded_double_quoted_status_from_its_archive_commit() {
+        // The frontmatter reader trims the value, so `open` reaches the lookup
+        // while the commit bytes carry the padding inside the quotes. The
+        // widened `-G` pattern is what dates this commit.
+        let repo = archive_status_fixture("harvest_padded_double_quoted_status", "\" open \"");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day")),
+            "the archive commit day replaces the updated fallback"
+        );
+        assert_ne!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_padded_single_quoted_status_from_its_archive_commit() {
+        let repo = archive_status_fixture("harvest_padded_single_quoted_status", "' open '");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day")),
+            "the archive commit day replaces the updated fallback"
+        );
+        assert_ne!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_first_status_commit_rejects_a_padded_quoted_prefix() {
+        // Both quoted alternatives keep the closing quote, so the widened
+        // padding tolerance never answers a longer status such as `openx`.
+        for (name, status_text) in [("double", "\"openx\""), ("single", "' openx'")] {
+            let repo = archive_status_fixture(
+                &format!("harvest_padded_quoted_prefix_{name}"),
+                status_text,
+            );
+
+            let git = GitContext::resolve(&repo).expect("git context");
+            let day =
+                first_status_commit_date(&repo, &git, "tasks/archive/scope_padded.md", "open")
+                    .expect("lookup");
+            assert_eq!(day, None, "`open` must not answer `{status_text}`");
+            let _ = fs::remove_dir_all(&repo);
+        }
+    }
+
+    #[test]
+    fn harvest_keeps_the_content_hash_of_a_padded_quoted_status() {
+        // A row dated from its commit keeps its hash, so the next Update reuses
+        // the corrected day instead of re-walking the history.
+        let repo = archive_status_fixture("harvest_padded_quoted_status_hash", "\" open \"");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert!(
+            task.content_hash.is_some(),
+            "a commit-dated row keeps its content hash: {task:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_plain_status_from_its_archive_commit() {
+        // The bare spelling the widened pattern keeps matching still dates
+        // from its own commit.
+        let repo = archive_status_fixture("harvest_plain_status_archive", "open");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
         );
         let _ = fs::remove_dir_all(&repo);
     }

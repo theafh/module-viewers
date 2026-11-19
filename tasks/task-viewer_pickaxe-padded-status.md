@@ -2,9 +2,11 @@
 description: "Match a status quoted with padding inside the quotes in the archived pickaxe lookup, so a non-finished archived task dates from its archive commit instead of the updated fallback."
 scope: task-viewer/src
 created: 2026-11-19T14:15:38Z
-updated: 2026-11-19T15:26:44Z
-status: ready
+updated: 2026-11-19T15:30:25Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Date an archived non-finished task from a padded quoted status commit
