@@ -7,6 +7,9 @@
     --text-secondary: #a0a0a0;
     --accent: #c4a35a;
     --accent-hover: #d4b56e;
+    /* Primary-button ink on #c4a35a measures 7.61:1 at rest and 9.27:1 on the
+       #d4b56e hover, both clearing the 4.5:1 floor for the 600-weight label. */
+    --on-accent: #1a1408;
     --border: #333;
     --danger: #cf6679;
     --input-bg: #121212;
@@ -32,6 +35,9 @@
     --text-secondary: #5c584f;
     --accent: #8a6a2f;
     --accent-hover: #6f5424;
+    /* Primary-button ink on #8a6a2f measures 5.02:1 at rest and 7.07:1 on the
+       #6f5424 hover, both clearing the 4.5:1 floor for the 600-weight label. */
+    --on-accent: #ffffff;
     --border: #ddd6c8;
     --danger: #a33b4d;
     --input-bg: #fff;
@@ -141,7 +147,7 @@ select {
 .btn {
     display: inline-block;
     background: var(--accent);
-    color: #1a1408;
+    color: var(--on-accent);
     border: none;
     border-radius: 6px;
     padding: 0.45rem 0.9rem;
