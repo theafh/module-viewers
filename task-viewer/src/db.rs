@@ -1652,7 +1652,7 @@ mod tests {
             "an unset variable is never blamed: {message}"
         );
         assert!(message.contains(&path.display().to_string()), "{message}");
-        remove_scratch(&path);
+        std::fs::remove_dir_all(&root).expect("remove the db scratch root");
     }
 
     #[test]

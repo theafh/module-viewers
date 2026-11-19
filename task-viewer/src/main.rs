@@ -11,6 +11,7 @@ mod test_support;
 mod web;
 
 use anyhow::Context as _;
+use std::ffi::OsStr;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -53,7 +54,7 @@ async fn serve_until_stopped() -> anyhow::Result<Instant> {
     // loopback port beside a running dashboard. The host allowlist, the
     // same-origin `Origin` check, and every documented `7880` stay derived
     // from `web::PORT`, so what a browser reaches stays unchanged.
-    let port = configured_port(std::env::var("TASK_VIEWER_PORT").ok().as_deref())?;
+    let port = configured_port(std::env::var_os("TASK_VIEWER_PORT").as_deref())?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = bind_and_log(addr).await?;
     let deadline = web::serve(
@@ -69,14 +70,22 @@ async fn serve_until_stopped() -> anyhow::Result<Instant> {
 }
 
 /// The listen port named by the configured `TASK_VIEWER_PORT` value, or
-/// `web::PORT` when no value is set. A malformed value is a start-up failure
-/// rather than a silent fall back to the documented port, because a test that
-/// named a port must never reach the dashboard's own.
-fn configured_port(raw: Option<&str>) -> anyhow::Result<u16> {
-    match raw {
-        Some(raw) => parse_port(raw),
-        None => Ok(web::PORT),
-    }
+/// `web::PORT` when no value is set. A value that is set but not valid UTF-8 is
+/// a start-up failure naming the variable, the same way `database_path` refuses
+/// a non-Unicode `TASK_VIEWER_DB`, so `None` here means only that the variable
+/// is unset. A malformed value is likewise a start-up failure rather than a
+/// silent fall back to the documented port, because a test that named a port
+/// must never reach the dashboard's own.
+fn configured_port(raw: Option<&OsStr>) -> anyhow::Result<u16> {
+    let Some(raw) = raw else {
+        return Ok(web::PORT);
+    };
+    let raw = raw.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "TASK_VIEWER_PORT is not valid UTF-8; set it to a port between 1 and 65535 or unset it"
+        )
+    })?;
+    parse_port(raw)
 }
 
 /// Parse the configured `TASK_VIEWER_PORT` value into a listen port. Zero is
@@ -164,6 +173,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{bind_and_log, configured_port, parse_port, shutdown_signal};
+    use std::ffi::OsStr;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tracing_subscriber::layer::SubscriberExt;
@@ -222,7 +232,7 @@ mod tests {
             crate::web::PORT
         );
         assert_eq!(
-            configured_port(Some("8080")).expect("a configured port"),
+            configured_port(Some(OsStr::new("8080"))).expect("a configured port"),
             8080
         );
     }
@@ -235,7 +245,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains('0'), "{message}");
         assert!(
-            configured_port(Some(" 0 ")).is_err(),
+            configured_port(Some(OsStr::new(" 0 "))).is_err(),
             "a padded zero is rejected too"
         );
     }
@@ -256,9 +266,25 @@ mod tests {
         assert!(error.to_string().contains("abc"), "{error}");
         assert!(parse_port("").is_err(), "an empty value must be rejected");
         assert!(
-            configured_port(Some("abc")).is_err(),
+            configured_port(Some(OsStr::new("abc"))).is_err(),
             "the caller fails start-up instead of falling back"
         );
+    }
+
+    /// Covers: a `TASK_VIEWER_PORT` that is set but not valid UTF-8 fails
+    /// start-up naming the variable instead of falling back to the documented
+    /// port, the same way a non-Unicode `TASK_VIEWER_DB` is refused.
+    #[cfg(unix)]
+    #[test]
+    fn configured_port_rejects_a_non_unicode_value() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = OsStr::from_bytes(b"80\xff80");
+        let error =
+            configured_port(Some(raw)).expect_err("a non-Unicode value must not reach the parser");
+        let message = format!("{error:#}");
+        assert!(message.contains("TASK_VIEWER_PORT"), "{message}");
+        assert!(message.contains("UTF-8"), "{message}");
     }
 
     /// Covers: the listening line is emitted only after a successful bind and
