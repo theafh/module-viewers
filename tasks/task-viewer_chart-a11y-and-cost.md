@@ -2,9 +2,11 @@
 description: "Name the chart SVGs for assistive tech, hoist the number formatter, recolour on theme change without redrawing, and guard the fallback logger."
 scope: task-viewer/static/js
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-19T16:56:41Z
-status: ready
+updated: 2026-11-19T19:47:33Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Give the charts accessible names and cut per-draw cost

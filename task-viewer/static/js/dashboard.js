@@ -12,12 +12,34 @@
   var CARD_NAMES = ["weekly", "cumulative", "shipped-calendar", "created-calendar", "backlog", "age", "radar-shipped", "radar-live"];
   var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   // Calendars whose initial scroll position is already chosen, so a redraw on
-  // a theme change or a resize keeps the reader's scroll position instead of
-  // snapping the frame back to the newest days.
+  // a resize keeps the reader's scroll position instead of snapping the frame
+  // back to the newest days.
   var calendarOpened = {};
+
+  // Each draw records the marks it coloured with a theme colour, together with
+  // the custom property it read, so a theme switch rewrites those attributes
+  // instead of rebuilding all eight charts.
+  var painted = {};
 
   function cssVar(name) {
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+
+  // A mark is a node whose `fill` or `stroke` came from a theme colour, keyed
+  // by the card it belongs to. The caller has already written the value, so
+  // recording reads nothing: a draw keeps its one `getComputedStyle` read per
+  // colour, and the drawn markup keeps its concrete hex values.
+  function mark(name, node, attrs) {
+    Object.keys(attrs).forEach(function (attr) {
+      painted[name].push({ node: node, attr: attr, name: attrs[attr] });
+    });
+    return node;
+  }
+
+  // A draw that clears its chart owns a fresh list: the previous marks left the
+  // DOM with the clear, so a later recolour must not reach for them.
+  function resetMarks(name) {
+    painted[name] = [];
   }
 
   function el(parent, name, attrs) {
@@ -62,11 +84,15 @@
     return date;
   }
 
+  // One formatter for the page: a draw formats hundreds of values, and a
+  // formatter built per call allocates a locale object per value.
+  var NUMBER_FORMAT = new Intl.NumberFormat("en-US");
+
   function fmt(value) {
     if (typeof value !== "number" || !isFinite(value)) {
       throw new Error("Not a number: " + value);
     }
-    return new Intl.NumberFormat("en-US").format(value);
+    return NUMBER_FORMAT.format(value);
   }
 
   function monthName(date) {
@@ -101,7 +127,8 @@
     };
   }
 
-  function message(svg, text) {
+  function message(name, svg, text) {
+    resetMarks(name);
     clear(svg);
     // A fallback belongs to the frame, not to the chart's own laid-out size: the
     // calendar's `width: auto` keeps it at its natural width and the radar may
@@ -111,13 +138,13 @@
     var width = svg.clientWidth || 640;
     var height = svg.clientHeight || 280;
     svg.setAttribute("viewBox", "0 0 " + width + " " + height);
-    el(svg, "text", {
+    mark(name, el(svg, "text", {
       x: width / 2,
       y: height / 2,
       "text-anchor": "middle",
       fill: cssVar("--chart-muted"),
       "font-size": "14"
-    }).textContent = text;
+    }), { fill: "--chart-muted" }).textContent = text;
   }
 
   function frameOf(svg, margin) {
@@ -171,10 +198,11 @@
       fmt(payload.counts.shipped_events) + " shipped · " + fmt(payload.counts.created_events) + " created · Monday weeks"
     );
     if (!rows.length) {
-      message(svg, "No weeks yet");
+      message("weekly", svg, "No weeks yet");
       return;
     }
     clear(svg);
+    resetMarks("weekly");
     var zeroColor = cssVar("--chart-zero");
     var shipColor = cssVar("--chart-ship");
     var createColor = cssVar("--chart-create");
@@ -188,10 +216,10 @@
     var x = scale(dates[0].getTime(), dates[dates.length - 1].getTime() + 7 * 86400000, frame.left, frame.right);
     var y = scale(-maxAbs, maxAbs, frame.bottom, frame.top);
     var zero = y(0);
-    el(svg, "line", {
+    mark("weekly", el(svg, "line", {
       x1: frame.left, x2: frame.right, y1: zero, y2: zero,
       stroke: zeroColor, "stroke-width": "1.5"
-    });
+    }), { stroke: "--chart-zero" });
     var slot = (frame.right - frame.left) / rows.length;
     var band = Math.max(3, Math.min(16, slot - 4));
     // The hit rect never reaches past its own column: a fixed 18px minimum
@@ -202,14 +230,14 @@
     rows.forEach(function (row, index) {
       var dx = x(dates[index].getTime());
       var shipY = y(row.shipped);
-      el(svg, "rect", {
+      mark("weekly", el(svg, "rect", {
         x: dx - band / 2, y: shipY, width: band, height: Math.max(0, zero - shipY),
         fill: shipColor
-      });
-      el(svg, "rect", {
+      }), { fill: "--chart-ship" });
+      mark("weekly", el(svg, "rect", {
         x: dx - band / 2, y: zero, width: band, height: Math.max(0, y(-row.created) - zero),
         fill: createColor
-      });
+      }), { fill: "--chart-create" });
       var hit = el(svg, "rect", {
         x: dx - hitWidth / 2, y: frame.top, width: hitWidth, height: frame.bottom - frame.top,
         fill: "transparent"
@@ -218,8 +246,8 @@
       hit.addEventListener("mousemove", function (event) { tip.show(event, text); });
       hit.addEventListener("mouseleave", tip.hide);
     });
-    monthTicks(svg, dates[0], dates[dates.length - 1], x, frame.bottom + 16, muted);
-    yTicks(svg, -maxAbs, maxAbs, y, frame.left, muted);
+    monthTicks("weekly", svg, dates[0], dates[dates.length - 1], x, frame.bottom + 16, muted);
+    yTicks("weekly", svg, -maxAbs, maxAbs, y, frame.left, muted);
   }
 
   function drawLine(name, rows, colorName, yOf, tipText, subtitle) {
@@ -227,10 +255,11 @@
     var svg = root.querySelector("svg");
     summary(name, subtitle);
     if (!rows.length) {
-      message(svg, "No series yet");
+      message(name, svg, "No series yet");
       return;
     }
     clear(svg);
+    resetMarks(name);
     var color = cssVar(colorName);
     var grid = cssVar("--chart-grid");
     var muted = cssVar("--chart-muted");
@@ -251,10 +280,10 @@
     var step = yStep(maxY);
     for (var value = 0; value <= maxY; value += step) {
       var py = y(value);
-      el(svg, "line", { x1: frame.left, x2: frame.right, y1: py, y2: py, stroke: grid });
-      el(svg, "text", {
+      mark(name, el(svg, "line", { x1: frame.left, x2: frame.right, y1: py, y2: py, stroke: grid }), { stroke: "--chart-grid" });
+      mark(name, el(svg, "text", {
         x: frame.left - 6, y: py + 4, "text-anchor": "end", fill: muted, "font-size": "11"
-      }).textContent = fmt(value);
+      }), { fill: "--chart-muted" }).textContent = fmt(value);
     }
     function pathFor(reader) {
       return rows.map(function (row, index) {
@@ -264,19 +293,19 @@
     }
     var line = pathFor(yOf);
     var area = line + " L" + xs[xs.length - 1] + " " + frame.bottom + " L" + xs[0] + " " + frame.bottom + " Z";
-    el(svg, "path", { d: area, fill: color, opacity: "0.16" });
-    el(svg, "path", { d: line, fill: "none", stroke: color, "stroke-width": "2" });
+    mark(name, el(svg, "path", { d: area, fill: color, opacity: "0.16" }), { fill: colorName });
+    mark(name, el(svg, "path", { d: line, fill: "none", stroke: color, "stroke-width": "2" }), { stroke: colorName });
     if (rows[0].trend !== undefined) {
       // The y scale puts zero on `frame.bottom`, so a negative least-squares
       // value would draw below the zero axis. Clamp each trend point at zero
       // rather than widening the domain downward.
       var trend = pathFor(function (row) { return Math.max(0, row.trend); });
-      el(svg, "path", {
+      mark(name, el(svg, "path", {
         d: trend, fill: "none", stroke: color, "stroke-width": "1.5",
         "stroke-dasharray": "6 5", opacity: "0.55"
-      });
+      }), { stroke: colorName });
     }
-    monthTicks(svg, dates[0], dates[dates.length - 1], x, frame.bottom + 16, muted);
+    monthTicks(name, svg, dates[0], dates[dates.length - 1], x, frame.bottom + 16, muted);
     var tip = tipFor(root.querySelector(".chart-frame"));
     var overlay = el(svg, "rect", {
       x: frame.left, y: frame.top, width: frame.right - frame.left, height: frame.bottom - frame.top, fill: "transparent"
@@ -298,10 +327,11 @@
     svg.style.width = "";
     summary(name, fmt(rows.reduce(function (sum, row) { return sum + row.count; }, 0)) + " " + noun + " · peak " + fmt(peak) + " · colour log1p(count)");
     if (!rows.length) {
-      message(svg, "No days yet");
+      message(name, svg, "No days yet");
       return;
     }
     clear(svg);
+    resetMarks(name);
     var color = cssVar(colorName);
     var track = cssVar("--chart-track");
     var muted = cssVar("--chart-muted");
@@ -335,9 +365,9 @@
         // layout already spaces month starts 64px or more apart, so this guard
         // is defensive and only binds if a payload packs month starts closer.
         if (lastLabelX === null || labelX - lastLabelX >= 24) {
-          el(svg, "text", {
+          mark(name, el(svg, "text", {
             x: labelX, y: 12, fill: muted, "font-size": "11"
-          }).textContent = monthName(first.date);
+          }), { fill: "--chart-muted" }).textContent = monthName(first.date);
           lastLabelX = labelX;
         }
       }
@@ -357,6 +387,7 @@
           fill: item.count > 0 ? color : track,
           opacity: item.count > 0 ? String(opacity) : "1"
         });
+        mark(name, rect, { fill: item.count > 0 ? colorName : "--chart-track" });
         var text = dateLabel(item.date) + " · " + fmt(item.count) + (item.count === 1 ? " task " : " tasks ") + noun;
         rect.addEventListener("mousemove", function (event) {
           tip.show(event, event.currentTarget.getAttribute("data-tip"));
@@ -387,18 +418,19 @@
     // Radar: fit the frame by expanding the viewBox rather than shrinking the
     // 64px label margin, and render the expanded chart at 1:1 so the 11px
     // labels keep their size. The inline size is cleared first because
-    // renderAll reruns on resize and theme change, so a stale inline width or
-    // height would feed back into the next measurement.
+    // renderAll reruns on resize, so a stale inline width or height would feed
+    // back into the next measurement.
     svg.style.width = "";
     svg.style.height = "";
     var slice = mode === "project" ? "project" : "scope";
     var total = rows.reduce(function (sum, row) { return sum + row.count; }, 0);
     summary(name, fmt(total) + " " + noun + " · one spoke per " + slice);
     if (!rows.length) {
-      message(svg, "No " + slice + "s yet");
+      message(name, svg, "No " + slice + "s yet");
       return;
     }
     clear(svg);
+    resetMarks(name);
     var color = cssVar(colorName);
     var grid = cssVar("--chart-grid");
     var labelColor = cssVar("--chart-label");
@@ -414,9 +446,9 @@
     var max = 1;
     rows.forEach(function (row) { max = Math.max(max, row.count); });
     for (var ring = 1; ring <= 4; ring += 1) {
-      el(svg, "circle", {
+      mark(name, el(svg, "circle", {
         cx: cx, cy: cy, r: (radius * ring) / 4, fill: "none", stroke: grid
-      });
+      }), { stroke: "--chart-grid" });
     }
     var points = [];
     var dots = [];
@@ -432,7 +464,7 @@
       var angle = -Math.PI / 2 + (index * 2 * Math.PI) / rows.length;
       var px = cx + Math.cos(angle) * radius;
       var py = cy + Math.sin(angle) * radius;
-      el(svg, "line", { x1: cx, y1: cy, x2: px, y2: py, stroke: grid });
+      mark(name, el(svg, "line", { x1: cx, y1: cy, x2: px, y2: py, stroke: grid }), { stroke: "--chart-grid" });
       var valueR = (row.count / max) * radius;
       var vx = cx + Math.cos(angle) * valueR;
       var vy = cy + Math.sin(angle) * valueR;
@@ -461,9 +493,9 @@
       // A label that still collides at the six-step cap is left out instead
       // of drawn over its neighbour.
       if (nudge <= 6) {
-        el(svg, "text", {
+        mark(name, el(svg, "text", {
           x: lx, y: ly, "text-anchor": "middle", fill: labelColor, "font-size": "11"
-        }).textContent = label;
+        }), { fill: "--chart-label" }).textContent = label;
         placed.push({
           left: lx - half, right: lx + half, top: ly - 8.8, bottom: ly + 8.8
         });
@@ -480,11 +512,12 @@
       }
     });
     // The polygon paints before its dots, so each dot sits above the shape.
-    el(svg, "polygon", {
+    mark(name, el(svg, "polygon", {
       points: points.join(" "), fill: color, opacity: "0.22", stroke: color, "stroke-width": "1.5"
-    });
+    }), { fill: colorName, stroke: colorName });
     dots.forEach(function (dot) {
       var node = el(svg, "circle", { cx: dot.vx, cy: dot.vy, r: "4", fill: color });
+      mark(name, node, { fill: colorName });
       node.addEventListener("mousemove", function (event) { tip.show(event, dot.text); });
       node.addEventListener("mouseleave", tip.hide);
     });
@@ -506,7 +539,7 @@
   // without repeating the year on every month. A label yields to the next one
   // whose measured extent would overlap it, and a year-bearing January always
   // draws, so the label before it yields instead.
-  function monthTicks(svg, start, end, x, y, muted) {
+  function monthTicks(name, svg, start, end, x, y, muted) {
     var candidates = [];
     var cursor = new Date(start.getFullYear(), start.getMonth(), 1);
     while (cursor <= end) {
@@ -564,9 +597,9 @@
           placed.pop();
         }
       }
-      var node = el(svg, "text", {
+      var node = mark(name, el(svg, "text", {
         x: candidate.px, y: y, fill: muted, "font-size": "11"
-      });
+      }), { fill: "--chart-muted" });
       node.textContent = text;
       placed.push({ px: candidate.px, width: width, node: node });
     });
@@ -589,13 +622,23 @@
     return step;
   }
 
-  function yTicks(svg, min, max, y, x, muted) {
+  function yTicks(name, svg, min, max, y, x, muted) {
     var step = yStep(max);
     for (var value = Math.ceil(min / step) * step; value <= max; value += step) {
-      el(svg, "text", {
+      mark(name, el(svg, "text", {
         x: x - 6, y: y(value) + 4, "text-anchor": "end", fill: muted, "font-size": "11"
-      }).textContent = fmt(value);
+      }), { fill: "--chart-muted" }).textContent = fmt(value);
     }
+  }
+
+  // The rquickjs harness and a page whose script may run without one both can
+  // lack a `console`, so the fallback reports through one guarded helper
+  // instead of an unguarded call that would throw there.
+  function logError(error) {
+    if (typeof console === "undefined" || !console || typeof console.error !== "function") {
+      return;
+    }
+    console.error(error);
   }
 
   function renderUnavailable(name) {
@@ -603,16 +646,34 @@
     if (!root) return;
     var svg = root.querySelector("svg");
     if (svg) {
-      message(svg, "Charts unavailable");
+      message(name, svg, "Charts unavailable");
     }
+    // The card's summary is the SVG's description, so a fallback fills it too
+    // instead of leaving the description empty.
+    summary(name, "Charts unavailable");
   }
 
   function renderCard(name, draw) {
     try {
       draw();
     } catch (error) {
+      logError(error);
       renderUnavailable(name);
     }
+  }
+
+  // A theme switch rewrites the colours of the marks already drawn, reading
+  // each property once for the whole pass, so it costs no redraw.
+  function recolor() {
+    Object.keys(painted).forEach(function (name) {
+      var values = {};
+      painted[name].forEach(function (entry) {
+        if (!Object.prototype.hasOwnProperty.call(values, entry.name)) {
+          values[entry.name] = cssVar(entry.name);
+        }
+        entry.node.setAttribute(entry.attr, values[entry.name]);
+      });
+    });
   }
 
   function renderAll() {
@@ -654,7 +715,7 @@
         "--chart-age",
         function (row) { return row.avg_age; },
         function (row, date) { return dateLabel(date) + " · mean age " + fmt(row.avg_age) + " days · " + fmt(row.n) + " tasks"; },
-        "Mean age in days of the unfinished backlog · deferred tasks excluded"
+        "Mean age in days of the unfinished backlog · deferred tasks age until their leave day"
       );
     });
     renderCard("radar-shipped", function () {
@@ -665,7 +726,7 @@
     });
   }
 
-  window.addEventListener("task-viewer-theme", renderAll);
+  window.addEventListener("task-viewer-theme", recolor);
   renderAll();
   var resizeTimer = 0;
   window.addEventListener("resize", function () {

@@ -8118,6 +8118,312 @@ mod tests {
         );
     }
 
+    /// Covers: one page load builds at most one `Intl.NumberFormat`, and the
+    /// hoisted formatter still formats every value.
+    #[test]
+    fn browser_render_builds_one_number_formatter() {
+        const COUNTING_NUMBER_FORMAT: &str = r#"(function () {
+  globalThis.__numberFormatBuilds = 0;
+  var real = globalThis.Intl.NumberFormat;
+  globalThis.Intl.NumberFormat = function (locale) {
+    globalThis.__numberFormatBuilds += 1;
+    return new real(locale);
+  };
+})();"#;
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser_with(
+            COUNTING_NUMBER_FORMAT,
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  return JSON.stringify({
+    builds: globalThis.__numberFormatBuilds,
+    weekly: env.cards["weekly"].querySelector(".summary").textContent,
+    calendar: env.cards["shipped-calendar"].querySelector(".summary").textContent
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["builds"], 1,
+            "one formatter serves the whole page instead of one per value"
+        );
+        assert_eq!(
+            result["weekly"], "3 shipped · 5 created · Monday weeks",
+            "the hoisted formatter still formats the weekly summary"
+        );
+        assert_eq!(
+            result["calendar"], "1 shipped · peak 1 · colour log1p(count)",
+            "the hoisted formatter still formats the calendar summary"
+        );
+    }
+
+    /// Covers: a theme switch rewrites the drawn marks in place, so the node
+    /// count and node identities survive and no chart is rebuilt.
+    #[test]
+    fn browser_theme_switch_recolors_without_redrawing() {
+        let config = browser_config(
+            false,
+            false,
+            None,
+            serde_json::json!({"dark": "#111111", "light": "#eeeeee"}),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["weekly"].querySelector("svg");
+  function fills(node) {
+    return node.children
+      .filter(function (child) { return child.name === "rect"; })
+      .map(function (child) { return child.attrs.fill; })
+      .filter(function (fill) { return fill !== "transparent"; });
+  }
+  var before = svg.children.slice();
+  var beforeFills = fills(svg);
+  env.themeButton.click();
+  var after = svg.children;
+  var sameNodes = before.length === after.length && before.every(function (node, index) {
+    return node === after[index];
+  });
+  return JSON.stringify({
+    sameNodes: sameNodes,
+    beforeCount: before.length,
+    afterCount: after.length,
+    beforeFills: beforeFills,
+    afterFills: fills(svg)
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["sameNodes"], true,
+            "the theme switch recolours the drawn nodes instead of replacing them"
+        );
+        assert_eq!(
+            result["afterCount"], result["beforeCount"],
+            "the node count is unchanged"
+        );
+        assert!(
+            result["beforeFills"]
+                .as_array()
+                .expect("before fills")
+                .iter()
+                .all(|fill| fill.as_str() == Some("#111111")),
+            "the dark theme drew the bars"
+        );
+        assert!(
+            result["afterFills"]
+                .as_array()
+                .expect("after fills")
+                .iter()
+                .any(|fill| fill.as_str() == Some("#eeeeee")),
+            "the same nodes carry the light theme"
+        );
+    }
+
+    /// Covers: the guarded helper reports the caught draw error to a
+    /// `console` that exists, and the fallback fills the card's summary.
+    #[test]
+    fn browser_fallback_logs_the_caught_error_through_the_guarded_helper() {
+        const RECORDING_CONSOLE: &str = r#"(function () {
+  globalThis.__logged = [];
+  globalThis.console = {
+    error: function (value) {
+      globalThis.__logged.push(value && value.message ? value.message : String(value));
+    }
+  };
+})();"#;
+        let mut payload = fixture_payload();
+        payload["weekly"] = serde_json::json!([{"week": "2024-13-45", "shipped": 1, "created": 1}]);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser_with(
+            RECORDING_CONSOLE,
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  return JSON.stringify({
+    logged: globalThis.__logged,
+    summary: env.cards["weekly"].querySelector(".summary").textContent,
+    otherSummary: env.cards["cumulative"].querySelector(".summary").textContent
+  });
+})()"#,
+        );
+        let logged = result["logged"].as_array().expect("logged errors");
+        assert_eq!(logged.len(), 1, "the caught draw error is logged once");
+        assert!(
+            logged[0]
+                .as_str()
+                .expect("an error message")
+                .starts_with("Impossible day: 2024-13-45"),
+            "the log carries the error the draw threw: {logged:?}"
+        );
+        assert_eq!(
+            result["summary"], "Charts unavailable",
+            "the fallback describes itself in the card's summary"
+        );
+        assert_eq!(
+            result["otherSummary"], "Running total · dashed line is the linear trend",
+            "a card that drew keeps its own description"
+        );
+    }
+
+    /// Covers: the console-less harness still shows "Charts unavailable" in
+    /// the chart and its summary without throwing.
+    #[test]
+    fn browser_fallback_without_console_describes_itself() {
+        let mut payload = fixture_payload();
+        payload["weekly"] = serde_json::json!([{"week": "2024-13-45", "shipped": 1, "created": 1}]);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["weekly"].querySelector("svg");
+  return JSON.stringify({
+    hasConsole: typeof console !== "undefined",
+    chart: svg.children.some(function (node) {
+      return node.name === "text" && node.textContent === "Charts unavailable";
+    }),
+    summary: env.cards["weekly"].querySelector(".summary").textContent
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["hasConsole"], false,
+            "the harness installs no console"
+        );
+        assert_eq!(result["chart"], true, "the chart shows the fallback");
+        assert_eq!(
+            result["summary"], "Charts unavailable",
+            "the description never dangles empty"
+        );
+    }
+
+    /// Covers: every drawn card's summary is a non-empty description, which
+    /// is what each SVG's `aria-describedby` points at.
+    #[test]
+    fn browser_every_card_summary_describes_its_series() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var empty = [];
+  var summaries = {};
+  env.cardNames.forEach(function (name) {
+    var text = env.cards[name].querySelector(".summary").textContent;
+    summaries[name] = text;
+    if (!text) empty.push(name);
+  });
+  return JSON.stringify({ empty: empty, summaries: summaries });
+})()"#,
+        );
+        assert_eq!(
+            result["empty"],
+            serde_json::json!([]),
+            "every card describes the series it draws"
+        );
+    }
+
+    /// Covers: the mean-age subtitle states that deferred tasks are aged until
+    /// their leave day instead of claiming they are excluded.
+    #[test]
+    fn browser_age_subtitle_states_deferred_aging() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"JSON.stringify({ text: globalThis.__env.cards["age"].querySelector(".summary").textContent })"#,
+        );
+        let text = result["text"].as_str().expect("the age summary");
+        assert!(
+            !text.contains("excluded"),
+            "the subtitle no longer claims deferred tasks are excluded: {text}"
+        );
+        assert!(
+            text.contains("deferred") && text.contains("leave day"),
+            "the subtitle says deferred tasks age until their leave day: {text}"
+        );
+    }
+
+    /// Covers: every chart card's SVG names itself from its heading and
+    /// describes itself from the summary line the draw fills.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_dashboard_chart_svgs_carry_accessible_names() {
+        fn attribute(tag: &str, name: &str) -> Option<String> {
+            let marker = format!("{name}=\"");
+            let start = tag.find(&marker)? + marker.len();
+            let rest = &tag[start..];
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        }
+        fn tag_of<'a>(block: &'a str, opener: &str) -> &'a str {
+            let start = block.find(opener).expect("the element");
+            let rest = &block[start..];
+            let end = rest.find('>').expect("the element closes") + 1;
+            &rest[..end]
+        }
+
+        let (state, path) = app_state("chart_a11y").await;
+        let html = render_home(&state, &HomeQuery::default())
+            .await
+            .expect("render");
+
+        let mut checked = 0;
+        for block in html.split("<article class=\"chart-card").skip(1) {
+            let block = block.split("</article>").next().expect("an article body");
+            let heading = tag_of(block, "<h2");
+            let name_id = attribute(heading, "id").expect("the heading carries an id");
+            let heading_text = block[block.find("<h2").expect("heading")..]
+                .split("</h2>")
+                .next()
+                .expect("heading text");
+            let heading_text = heading_text[heading_text.find('>').expect("tag end") + 1..].trim();
+            assert!(!heading_text.is_empty(), "the heading names the chart");
+
+            let summary = tag_of(block, "<p class=\"muted summary\"");
+            let summary_id = attribute(summary, "id").expect("the summary carries an id");
+
+            let svg = tag_of(block, "<svg");
+            assert_eq!(attribute(svg, "role").as_deref(), Some("img"));
+            assert_eq!(
+                attribute(svg, "aria-labelledby").as_deref(),
+                Some(name_id.as_str()),
+                "the SVG is named by its card's heading"
+            );
+            assert_eq!(
+                attribute(svg, "aria-describedby").as_deref(),
+                Some(summary_id.as_str()),
+                "the SVG is described by its card's summary"
+            );
+
+            for id in [&name_id, &summary_id] {
+                assert_eq!(
+                    html.matches(&format!("id=\"{id}\"")).count(),
+                    1,
+                    "{id} is exactly one element's id"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            template_card_names().len(),
+            "every chart card was checked"
+        );
+        cleanup(&path);
+    }
+
     /// Covers: one extra weekly row costs exactly one more
     /// date parse.
     #[test]

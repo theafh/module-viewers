@@ -39,6 +39,6 @@ The dashboard shows eight charts from the stored rows, for all configured reposi
 - Shipped radar.
 - Live radar.
 
-Hovering a mark shows the count for that week, day, or spoke. With all projects selected, each radar spoke is one repository. With one project selected, each spoke is one task scope, the filename prefix before the first underscore.
+Hovering a mark shows the count for that week, day, or spoke. With all projects selected, each radar spoke is one repository. With one project selected, each spoke is one task scope, the filename prefix before the first underscore. Each chart is named by its card heading and described by its summary line. A theme switch recolours the drawn charts in place.
 
-A card whose chart cannot be drawn shows Charts unavailable in place of the chart, and the other cards still render.
+A card whose chart cannot be drawn shows Charts unavailable in place of the chart and in its summary line, and the other cards still render.
