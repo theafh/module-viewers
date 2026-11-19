@@ -390,7 +390,18 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
         }
     }
     let values: Vec<f64> = rows.iter().map(|(_, avg, _)| *avg).collect();
-    let trend = linreg(&values);
+    // The rows skip the days whose backlog is empty, so an index step is not a
+    // day. Fit against each point's day offset from the first emitted point, so
+    // the dashed line stays the least-squares fit in the date space it is drawn
+    // in and a gap does not kink its slope.
+    let offsets: Vec<f64> = match rows.first() {
+        Some((first, _, _)) => rows
+            .iter()
+            .map(|(date, _, _)| f64::from(date.num_days_from_ce() - first.num_days_from_ce()))
+            .collect(),
+        None => Vec::new(),
+    };
+    let trend = linreg_at(&offsets, &values);
     let points = rows
         .into_iter()
         .zip(trend)
@@ -481,7 +492,19 @@ fn monday(date: NaiveDate) -> NaiveDate {
     date.checked_sub_days(Days::new(offset)).unwrap_or(date)
 }
 
+/// The least-squares fit against the array index, returned at each index. The
+/// cumulative and backlog charts use it because their rows are one per calendar
+/// day, so one index step is one day.
 fn linreg(values: &[f64]) -> Vec<f64> {
+    let xs: Vec<f64> = (0..values.len()).map(|index| index as f64).collect();
+    linreg_at(&xs, values)
+}
+
+/// The least-squares fit of `values` against their own x positions, returned at
+/// each position. The mean-age chart skips the days whose backlog is empty, so
+/// it fits against each point's day offset from the first charted day and the
+/// slope stays a per-day rate in the date space the chart draws.
+fn linreg_at(xs: &[f64], values: &[f64]) -> Vec<f64> {
     let count = values.len();
     if count == 0 {
         return Vec::new();
@@ -490,23 +513,21 @@ fn linreg(values: &[f64]) -> Vec<f64> {
         return vec![values[0]];
     }
     let length = count as f64;
-    let mean_x = (length - 1.0) / 2.0;
+    let mean_x = xs.iter().sum::<f64>() / length;
     let mean_y = values.iter().sum::<f64>() / length;
     let mut numerator = 0.0;
     let mut denominator = 0.0;
-    for (index, value) in values.iter().enumerate() {
-        let x = index as f64 - mean_x;
-        numerator += x * (value - mean_y);
-        denominator += x * x;
+    for (x, value) in xs.iter().zip(values) {
+        let offset = x - mean_x;
+        numerator += offset * (value - mean_y);
+        denominator += offset * offset;
     }
     if denominator.abs() < f64::EPSILON {
         denominator = 1.0;
     }
     let slope = numerator / denominator;
     let intercept = mean_y - slope * mean_x;
-    (0..count)
-        .map(|index| intercept + slope * index as f64)
-        .collect()
+    xs.iter().map(|x| intercept + slope * x).collect()
 }
 
 fn round_to(value: f64, places: i32) -> f64 {
@@ -521,7 +542,7 @@ mod tests {
     };
     use crate::dates::SERIES_FLOOR;
     use crate::harvest::TaskKind;
-    use chrono::{Days, NaiveDate};
+    use chrono::{Datelike, Days, NaiveDate};
     use std::sync::Arc;
 
     fn day(year: i32, month: u32, date: u32) -> NaiveDate {
@@ -583,7 +604,17 @@ mod tests {
             }
         }
         let values: Vec<f64> = rows.iter().map(|(_, avg, _)| *avg).collect();
-        let trend = super::linreg(&values);
+        // The sweep fits the trend against each point's day offset from the
+        // first emitted point, so the reference loop does the same and the two
+        // still compare field by field.
+        let offsets: Vec<f64> = match rows.first() {
+            Some((first, _, _)) => rows
+                .iter()
+                .map(|(date, _, _)| f64::from(date.num_days_from_ce() - first.num_days_from_ce()))
+                .collect(),
+            None => Vec::new(),
+        };
+        let trend = super::linreg_at(&offsets, &values);
         rows.into_iter()
             .zip(trend)
             .map(|((date, avg, n), trend)| AgePoint {

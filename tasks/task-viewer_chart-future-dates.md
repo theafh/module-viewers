@@ -2,7 +2,7 @@
 description: "Fold after-today created and ship events into the last charted point so series and counts agree, and warn once on each."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-14T23:52:55Z
+updated: 2026-11-19T16:46:05Z
 status: ready
 reported-by: Andreas Hoffmann
 ---
@@ -15,7 +15,7 @@ The dashboard's series and its headline counts agree when a task carries a date 
 
 ## Context
 
-- Build order: no required order against `task-viewer_chart-empty-backlog-mean-age.md` or `task-viewer_db-migration-and-integrity.md`. Each pair shares a surface, the `ARCHITECTURE.md` day-range sentence and the `path` field respectively, and both sides carry order-independent instructions so either may ship first.
+- Build order: `task-viewer_chart-empty-backlog-mean-age.md` and `task-viewer_db-migration-and-integrity.md` have both shipped, so this task now ships on its own. It still shares the `ARCHITECTURE.md` day-range sentence with the archived mean-age task, and the `path` field with the archived database task, and each pair carries order-independent instructions, so either side may have shipped first.
 - `task-viewer/src/series.rs` builds `created_c` and `shipped_c` without a date filter, and `counts.created_events` / `counts.shipped_events` are their full sums. `fn weekly_points`, `fn cumulative_points`, `fn live_points`, and `fn age_points_counted` all stop at `today`.
 - `dates::today()` is UTC, so a date-only value written just after Berlin midnight is one UTC day ahead for a short window; a mistyped year is permanent.
 - `task-viewer/static/js/dashboard.js` prints `counts.*_events` in the weekly card summary.
