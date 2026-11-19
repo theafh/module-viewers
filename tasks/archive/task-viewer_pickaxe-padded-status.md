@@ -2,8 +2,8 @@
 description: "Match a status quoted with padding inside the quotes in the archived pickaxe lookup, so a non-finished archived task dates from its archive commit instead of the updated fallback."
 scope: task-viewer/src
 created: 2026-11-19T14:15:38Z
-updated: 2026-11-19T15:30:25Z
-status: implemented
+updated: 2026-11-19T15:33:19Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -21,7 +21,7 @@ An archived task whose status is neither `finished` nor `deferred` takes its lea
 - The value reaching that lookup is already trimmed: the frontmatter reader unquotes a value and the classification arm `fields.get("status").map(|value| value.trim().to_string())` trims it, so the padded commit text `status: " open "` arrives as `open` and the padding sits inside the quotes in the committed bytes, not in the lookup argument. `fn has_archived_status` trims its own copy for the same reason.
 - Reproduced in a scratch repository whose one archive commit carries `status: " open "` on 2026-05-10 with `updated: 2026-06-01`: the `-S` literals `status: open`, `status: "open"`, and `status: 'open'` each print no commit, the anchored ERE prints no commit, and a `-G` pattern naming the padded spelling prints that commit's day. The archived task therefore charts 2026-06-01 while the same task written `status: open` charts 2026-05-10.
 - `ARCHITECTURE.md` names this lookup as the one that governs the case, in the leave-day bullet that states "an archived status other than `finished` or `deferred` still dates from the pickaxe that introduces it". `FEATURES.md` already promises the padded spelling charts like its plain form ("a quoted status padded with spaces inside its quotes"), so the pickaxe path is the remaining break of a shipped promise.
-- Precedent: [task-viewer_frontmatter-status-robustness.md](archive/task-viewer_frontmatter-status-robustness.md) trimmed the value on the classification and archive-walk paths and bumped `CONTENT_HASH_REVISION` to `r4`; it left the pickaxe argument alone because that argument is already trimmed. [task-viewer_harvest-input-robustness.md](archive/task-viewer_harvest-input-robustness.md) added the quoted pickaxe spellings and their two tests, which is why only the padded form remains open.
+- Precedent: [task-viewer_frontmatter-status-robustness.md](task-viewer_frontmatter-status-robustness.md) trimmed the value on the classification and archive-walk paths and bumped `CONTENT_HASH_REVISION` to `r4`; it left the pickaxe argument alone because that argument is already trimmed. [task-viewer_harvest-input-robustness.md](task-viewer_harvest-input-robustness.md) added the quoted pickaxe spellings and their two tests, which is why only the padded form remains open.
 - This task adds a different `TESTING.md` sentence than the live `task-viewer_guardrail-doc-sync.md`, so the two need no order.
 
 ## Approach
