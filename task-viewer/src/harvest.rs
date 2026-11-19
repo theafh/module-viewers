@@ -838,9 +838,9 @@ impl HarvestState {
         }
         self.tasks = kept;
         // One line per stored path that needs it: a lossy path git cannot date
-        // names the path, how many names collapsed into it, and the fallback
-        // day it keeps; a datable path that collapsed warns once without a
-        // fallback day. A path that warned here never warns a second time.
+        // names the path, how many harvested rows shared that path, and the
+        // fallback day it keeps; a datable path that collapsed warns once
+        // without a fallback day. A path that warned here never warns a second time.
         for task in &self.tasks {
             let collapsed = counts.get(&task.path).copied().unwrap_or(1);
             if task.path_is_lossy && fallback_paths.contains(&task.path) {
