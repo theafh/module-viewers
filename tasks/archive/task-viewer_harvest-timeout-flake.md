@@ -2,7 +2,7 @@
 description: "Make the intermittent harvest git-timeout non-retry test deterministic, and drop the gate carve-outs that name it."
 scope: task-viewer/src
 created: 2026-11-13T20:47:07Z
-updated: 2026-11-16T15:06:07Z
+updated: 2026-11-19T15:56:29Z
 status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
@@ -24,7 +24,7 @@ design-extended: false
 - The sibling timeout tests register the same 100 ms deadline and assert only that the scan fails, which a stand-in killed before its first line still satisfies, so the race reaches only this counting test.
 - `fn git_timeout_failure` builds `GitFailure::Timeout` with the message `git did not finish within {} ms`, and `fn git_pickaxe` returns that reason through `LogLookup::Failed`; `HarvestError::Git` carries only that string, so the message is the one surface that separates a deadline expiry from an ordinary git failure.
 - `TESTING.md` requires deterministic, isolated, offline, and parallel-safe tests.
-- The live tasks whose gate item names this test, found at implementation time by `grep -l harvest_timeout_does_not_retry_the_git_dir_fallback tasks/task-viewer_*.md`, each carry the gate exemption this task retires. Today the selector matches [task-viewer_chart-a11y-and-cost.md](../task-viewer_chart-a11y-and-cost.md) and [task-viewer_chart-geometry-and-labels.md](../task-viewer_chart-geometry-and-labels.md), which link here as the flake's owner, and `tasks/task-viewer_ui-labels-and-contrast.md`, which names the test without linking here, so this task ships before each of them is implemented.
+- The live tasks whose gate item names this test, found at implementation time by `grep -l harvest_timeout_does_not_retry_the_git_dir_fallback tasks/task-viewer_*.md`, each carry the gate exemption this task retires. Today the selector matches [task-viewer_chart-a11y-and-cost.md](../task-viewer_chart-a11y-and-cost.md) and [task-viewer_chart-geometry-and-labels.md](task-viewer_chart-geometry-and-labels.md), which link here as the flake's owner, and `tasks/task-viewer_ui-labels-and-contrast.md`, which names the test without linking here, so this task ships before each of them is implemented.
 - Prior art: [task-viewer_git-command-timeout.md](task-viewer_git-command-timeout.md) shipped the bounded-command helper this test measures.
 
 ## Approach

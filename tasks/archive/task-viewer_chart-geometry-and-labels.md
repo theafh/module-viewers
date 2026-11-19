@@ -2,11 +2,11 @@
 description: "Fix hover hit-rects, repeated y labels, multi-year month labels, radar draw order and collisions, surrogate-pair truncation, and impossible-date fallback."
 scope: task-viewer
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-19T15:50:46Z
-status: implemented
+updated: 2026-11-19T15:56:02Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: "Andreas Hoffmann"
-design-extended: true
+design-extended: false
 ---
 
 # Correct chart geometry, labels, and date parsing
@@ -20,7 +20,7 @@ Hover reports the bar under the cursor instead of its neighbour, every y axis sh
 - Build order: after `task-viewer_harvest-timeout-flake.md`. No required order against `task-viewer_chart-a11y-and-cost.md`; both edit `dashboard.js`, so land them one at a time. Other live tasks that also edit `dashboard.js` are `task-viewer_chart-empty-backlog-mean-age.md` and `task-viewer_chart-future-dates.md`.
 - `task-viewer/static/js/dashboard.js` owns the drawing. The relevant anchors are `Math.max(band, 18)` in the weekly hit rect, the weekly `yTicks` and the line charts' inline tick loop in `drawLine`, the month-label loop, the radar draw order, the radar ring bounds `ringWidth` and `ringHeight`, the radar label truncation, `fn parseDay`, and `Math.max(maxAbs, row.shipped, row.created)`.
 - `task-viewer/templates/dashboard.html` carries the chart frame.
-- Prior art: [task-viewer_narrow-chart-layout.md](archive/task-viewer_narrow-chart-layout.md) and [task-viewer_dashboard-draw-cost.md](archive/task-viewer_dashboard-draw-cost.md) covered layout and cost, not these correctness cases.
+- Prior art: [task-viewer_narrow-chart-layout.md](task-viewer_narrow-chart-layout.md) and [task-viewer_dashboard-draw-cost.md](task-viewer_dashboard-draw-cost.md) covered layout and cost, not these correctness cases.
 
 ## Approach
 
