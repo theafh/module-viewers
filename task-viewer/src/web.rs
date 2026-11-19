@@ -345,9 +345,10 @@ pub fn remaining(deadline: Instant) -> Duration {
 /// against, so the caller can bound its own teardown with `remaining`.
 ///
 /// The deadline is taken when the shutdown future resolves. `axum`'s graceful
-/// shutdown stops accepting and drains the open connections; a running Update
-/// holds `state.scan` from listing through the last store, so the drain waits
-/// for that lock under the same deadline. The database close then runs under
+/// shutdown stops accepting and drains the open connections; a store that holds
+/// `state.scan` from listing through the last store — an Update scan or Add's
+/// detached store — is waited for under the same deadline. The database close
+/// then runs under
 /// the time the deadline has left and is dropped once it is spent, leaving an
 /// unfinished store to the WAL rollback on the next open. A listener that ends
 /// before any signal arrives skips the drain and still closes the pool within
@@ -1638,18 +1639,29 @@ fn osascript_outcome(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> Pi
     match exit_code {
         Some(0) if !stdout.is_empty() => PickerResult::Picked(stdout.to_vec()),
         Some(0) => PickerResult::Failed(Vec::new()),
-        Some(1) if carries(stderr, b"-128") => PickerResult::Cancelled,
+        Some(1) if carries_cancel_number(stderr, b"-128") => PickerResult::Cancelled,
         _ => PickerResult::Failed(stderr.to_vec()),
     }
 }
 
-/// Whether `haystack` holds `needle` as a byte sequence, so a match stays exact
-/// whatever the surrounding bytes are.
-fn carries(haystack: &[u8], needle: &[u8]) -> bool {
+/// Whether `haystack` holds `needle` as a whole token: an occurrence that is
+/// neither preceded nor followed by another ASCII letter or digit. AppleScript's
+/// cancel message carries the number as `(-128)`, so the token matches there,
+/// while `-1280` and a name such as `proj-128-backup` do not.
+fn carries_cancel_number(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
             .windows(needle.len())
-            .any(|window| window == needle)
+            .enumerate()
+            .any(|(start, window)| {
+                window == needle
+                    && start
+                        .checked_sub(1)
+                        .is_none_or(|before| !haystack[before].is_ascii_alphanumeric())
+                    && haystack
+                        .get(start + needle.len())
+                        .is_none_or(|after| !after.is_ascii_alphanumeric())
+            })
 }
 
 fn safe_project(project: &str) -> String {
@@ -5343,6 +5355,23 @@ mod tests {
         cleanup(&path);
     }
 
+    /// A picker that cannot start at all reports the session code, so the
+    /// picker's `Err` arm keeps its own failure-path test beside the
+    /// `PickerResult::Failed` one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_reports_a_picker_session_error() {
+        let (mut state, path) = app_state("add_picker_no_session").await;
+        state.picker = Arc::new(|| Err(Banner::PickerNoSession));
+
+        let response = add_repository(State(state.clone())).await;
+        let location = redirect_location(&response);
+        assert_eq!(location, "/repositories?error=picker-no-session");
+
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert!(repositories.is_empty());
+        cleanup(&path);
+    }
+
     /// A picker failure logs the picker's stderr once, in the async handler,
     /// before the redirect is built.
     #[tokio::test(flavor = "current_thread")]
@@ -5403,6 +5432,22 @@ mod tests {
         assert_eq!(
             osascript_outcome(Some(1), b"", b"execution error: something else (-1)"),
             PickerResult::Failed(b"execution error: something else (-1)".to_vec())
+        );
+        assert_eq!(
+            osascript_outcome(Some(1), b"", b"execution error: something failed (-1280)"),
+            PickerResult::Failed(b"execution error: something failed (-1280)".to_vec()),
+            "-1280 carries -128 without a boundary, so it is not the cancel number"
+        );
+        assert_eq!(
+            osascript_outcome(
+                Some(1),
+                b"",
+                b"execution error: Can't get folder \"proj-128-backup\". (-1728)"
+            ),
+            PickerResult::Failed(
+                b"execution error: Can't get folder \"proj-128-backup\". (-1728)".to_vec()
+            ),
+            "a folder name holding -128 does not mark a cancel"
         );
     }
 
