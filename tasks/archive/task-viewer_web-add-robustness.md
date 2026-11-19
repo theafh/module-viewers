@@ -2,8 +2,8 @@
 description: "Detach Add's first harvest, distinguish picker cancel from failure, keep picker paths byte-exact, and separate missing folders from other errors."
 scope: task-viewer/src
 created: 2026-11-13T13:25:45Z
-updated: 2026-11-19T19:00:03Z
-status: implemented
+updated: 2026-11-19T19:08:35Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: true
@@ -19,8 +19,8 @@ Add's first store completes after a client disconnect: the insert and the first 
 
 - Build order: second on the banner channel. Ships after `task-viewer_web-outcome-plumbing.md`, after `task-viewer_harvest-git-failure-cases.md`, which widens the same `add_repository` gate this task classifies, and after `task-viewer_web-pool-close-and-comments.md`, whose Acceptance pins the `fn run_scan` comment this task must refresh.
 - `task-viewer/src/web.rs` runs Add's first harvest inside the request future, maps every non-zero zenity exit to `Ok(None)`, matches the macOS cancel on the English word "cancel" and drops stderr, decodes the picker output lossily and trims it, and maps every `canonicalize` failure and every `tasks` `is_dir` probe that returns false to "That folder has no tasks directory."
-- The finished task [task-viewer_web-outcome-plumbing.md](archive/task-viewer_web-outcome-plumbing.md) landed first and closed every `/repositories` banner to a fixed code; this task then adds three codes to that set, `picker-failed`, `folder-unreadable`, and `path-not-utf8`, so one canonical banner rule holds.
-- The finished task [task-viewer_folder-picker-lock.md](archive/task-viewer_folder-picker-lock.md) moved the picker off the scan lock; these are the remaining failure and disconnect paths.
+- The finished task [task-viewer_web-outcome-plumbing.md](task-viewer_web-outcome-plumbing.md) landed first and closed every `/repositories` banner to a fixed code; this task then adds three codes to that set, `picker-failed`, `folder-unreadable`, and `path-not-utf8`, so one canonical banner rule holds.
+- The finished task [task-viewer_folder-picker-lock.md](task-viewer_folder-picker-lock.md) moved the picker off the scan lock; these are the remaining failure and disconnect paths.
 
 ## Approach
 
@@ -44,4 +44,4 @@ Add's first store completes after a client disconnect: the insert and the first 
 - A successful pick whose stdout carries a trailing newline and a non-ASCII UTF-8 path stores the repository at exactly that path.
 - A picker returning a non-UTF-8 path is refused with the `path-not-utf8` code, no repository row exists for that path, and a later Update does not fail on it.
 - A folder that exists but cannot be read reports the `folder-unreadable` code and logs the real error, proved with a `chmod 000` on the picked repository folder whose mode is restored before cleanup, so `metadata` of `<picked>/tasks` returns `EACCES` while `canonicalize` of the picked path still succeeds, and a missing folder reports "no tasks directory".
-- The async handler performs no blocking filesystem call, proved by a counter held on `AppState` (not a module static, so the test stays parallel-safe) that increments once per offloaded call and reads two after the redirect, so the item fails if either `canonicalize` or the `tasks` probe returns to the handler.
+- The async handler performs no blocking filesystem call, proved by a counter held on `AppState` (not a module static, so the test stays parallel-safe) that increments once per offloaded call and reads two after the redirect for a folder whose working tree holds `tasks/`, and three for a folder whose `tasks/` lives only in a ref, so the item fails if `canonicalize`, the `tasks` probe, or the ref-union check returns to the handler.

@@ -97,8 +97,8 @@ pub struct AppState {
     store_hook: Arc<StoreHookFn>,
     prior_read_hook: Arc<PriorReadHookFn>,
     /// Counts the filesystem calls Add hands to `spawn_blocking`, so a test can
-    /// prove that neither `canonicalize` nor the `tasks` probe runs on the
-    /// async worker. Production never reads it.
+    /// prove that none of `canonicalize`, the `tasks` probe, or the ref-union
+    /// check runs on the async worker. Production never reads it.
     offloaded_fs_calls: Arc<AtomicUsize>,
     harvest: Arc<HarvestFn>,
     flash: Arc<Mutex<FlashStore>>,
@@ -1156,9 +1156,23 @@ async fn add_repository(State(state): State<AppState>) -> Response {
     };
     // A folder whose working tree lacks `tasks/` is still accepted when a ref of
     // the repository that holds it carries `tasks/`, matching what a scan
-    // charts. A folder with no tasks anywhere stays rejected.
-    if !worktree_tasks && !harvest::holds_tasks(&canonical) {
-        return redirect_repositories(Banner::NoTasksDirectory);
+    // charts. A folder with no tasks anywhere stays rejected. The ref union
+    // canonicalizes and runs git, so it also runs on a blocking worker.
+    if !worktree_tasks {
+        state.offloaded_fs_calls.fetch_add(1, Ordering::SeqCst);
+        let probe = canonical.clone();
+        match tokio::task::spawn_blocking(move || harvest::holds_tasks(&probe)).await {
+            Ok(true) => {}
+            Ok(false) => return redirect_repositories(Banner::NoTasksDirectory),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    path = %canonical.display(),
+                    "the ref union probe stopped"
+                );
+                return redirect_repositories(Banner::FolderUnreadable);
+            }
+        }
     }
 
     // The insert and the first harvest run in their own task that takes the scan
@@ -1749,6 +1763,44 @@ mod tests {
             "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Live\n",
         )
         .expect("task");
+        repo
+    }
+
+    /// A git repository whose working tree has no `tasks/`, but whose `feature`
+    /// branch commits one, so only the ref union finds a tasks tree.
+    fn ref_only_repository(name: &str) -> PathBuf {
+        let repo = unique_temp_dir(name);
+        std::fs::create_dir_all(&repo).expect("repo scratch");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::write(repo.join("README.md"), "# repo\n").expect("readme");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "no tasks on main"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "feature"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        std::fs::write(
+            repo.join("tasks/scope_feature.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Feature\n",
+        )
+        .expect("task");
+        git(&repo, &["add", "-A"], "2026-05-02T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "feature task"],
+            "2026-05-02T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-05-02T12:00:00+00:00");
         repo
     }
 
@@ -5480,9 +5532,10 @@ mod tests {
         cleanup(&path);
     }
 
-    /// The async handler hands `canonicalize` and the `tasks` probe to blocking
-    /// workers: the counter on `AppState` reads two after the redirect, so
-    /// either call returning to the handler fails this test.
+    /// The async handler hands `canonicalize`, the `tasks` probe, and the ref
+    /// union check to blocking workers: a working-tree folder reads two after
+    /// the redirect, and a folder whose `tasks/` lives only in a ref reads
+    /// three, so any of those calls returning to the handler fails this test.
     #[tokio::test(flavor = "current_thread")]
     async fn web_add_offloads_the_folder_probe() {
         let (mut state, path) = app_state("add_offload").await;
@@ -5500,6 +5553,26 @@ mod tests {
             state.offloaded_fs_calls.load(Ordering::SeqCst),
             2,
             "canonicalize and the tasks probe each run off the async worker"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+
+        // A working tree without `tasks/` reaches the ref union, so the third
+        // blocking call runs as well.
+        let (mut state, path) = app_state("add_offload_refs").await;
+        let folder = ref_only_repository("add_offload_refs_repo");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+
+        let response = add_repository(State(state.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=repository-added"
+        );
+        assert_eq!(
+            state.offloaded_fs_calls.load(Ordering::SeqCst),
+            3,
+            "the ref union check also runs off the async worker"
         );
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);

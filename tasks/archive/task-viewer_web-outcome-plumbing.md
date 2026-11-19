@@ -21,7 +21,7 @@ A failed `set_scan_error` write logs instead of vanishing. Update over zero repo
 - `task-viewer/src/web.rs` discards the result of every `let _ = db::set_scan_error(...)` call, keys the Update outcome off an empty failure list, puts `STOPPED_ERROR` and the list failure in the redirect query, renders banner text straight from the query, and has a `FlashStore` whose `restore` skips the eviction loop.
 - `FEATURES.md` promises a banner is "shown once… a reload shows nothing".
 - Prior art: [task-viewer_update-response-transport.md](task-viewer_update-response-transport.md) moved the failure list out of the URL; [task-viewer_scan-failure-reporting.md](task-viewer_scan-failure-reporting.md) made Update report real failures.
-- This task lands first on the shared `/repositories` banner channel that `fn add_repository` and `fn redirect_repositories` carry: every message becomes a closed code here, and [task-viewer_web-add-robustness.md](../task-viewer_web-add-robustness.md) then adds three codes, `picker-failed`, `folder-unreadable`, and `path-not-utf8`, and logs the picker's stderr text, so both changes hold one canonical banner rule.
+- This task lands first on the shared `/repositories` banner channel that `fn add_repository` and `fn redirect_repositories` carry: every message becomes a closed code here, and [task-viewer_web-add-robustness.md](task-viewer_web-add-robustness.md) then adds three codes, `picker-failed`, `folder-unreadable`, and `path-not-utf8`, and logs the picker's stderr text, so both changes hold one canonical banner rule.
 
 ## Approach
 
