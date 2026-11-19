@@ -18,6 +18,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -63,6 +64,7 @@ fn repo_launcher() -> PathBuf {
     repo.join("scripts/task-viewer.sh")
 }
 
+#[cfg(unix)]
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).expect("write script");
     let mut permissions = fs::metadata(path).expect("script metadata").permissions();
@@ -97,6 +99,7 @@ impl Root {
         let launcher = dir.join("scripts/task-viewer.sh");
         fs::write(&launcher, staged).expect("write the launcher copy");
 
+        #[cfg(unix)]
         symlink(
             env!("CARGO_BIN_EXE_task-viewer"),
             dir.join("target/release/task-viewer"),

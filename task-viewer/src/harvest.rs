@@ -7968,6 +7968,7 @@ mod tests {
     }
 
     /// The pid a stand-in recorded, when its write completed.
+    #[cfg(unix)]
     fn recorded_pid(pid_file: &Path) -> Option<String> {
         fs::read_to_string(pid_file)
             .ok()
@@ -8205,6 +8206,7 @@ mod tests {
 
     /// A folder outside git with one chartable task, for the enclosing-probe
     /// tests.
+    #[cfg(unix)]
     fn outside_git_folder(name: &str) -> PathBuf {
         let repo = scratch(name);
         write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
@@ -8325,6 +8327,7 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
     }
 
+    #[cfg(unix)]
     fn nested_enclosing_fixture(name: &str) -> PathBuf {
         let parent = scratch(name);
         git(
@@ -9443,12 +9446,16 @@ mod tests {
 
     /// The source files whose unix-only test sites must stay gated, read at
     /// compile time so the scan sees exactly the text that is built.
-    const UNIX_GATE_SOURCES: [(&str, &str); 5] = [
+    const UNIX_GATE_SOURCES: [(&str, &str); 6] = [
         ("main.rs", include_str!("main.rs")),
         ("harvest.rs", include_str!("harvest.rs")),
         ("web.rs", include_str!("web.rs")),
         ("db.rs", include_str!("db.rs")),
         ("launcher_tests.rs", include_str!("launcher_tests.rs")),
+        (
+            "tests/launcher_process_safety.rs",
+            include_str!("../tests/launcher_process_safety.rs"),
+        ),
     ];
 
     /// One function definition's name and the lines it spans.
@@ -9632,7 +9639,11 @@ mod tests {
             .max_by_key(|span| span.first)
     }
 
-    /// Whether the attributes directly above `line` carry a `unix` cfg gate.
+    /// Whether the attributes directly above `line` carry a positive `unix`
+    /// cfg gate.
+    ///
+    /// A negated gate such as `#[cfg(not(unix))]` marks the non-unix build, so
+    /// it never counts as gating a site on unix.
     fn has_unix_gate(lines: &[&str], line: usize) -> bool {
         let mut cursor = line;
         while cursor > 0 {
@@ -9640,12 +9651,41 @@ mod tests {
             if !previous.starts_with("#[") {
                 break;
             }
-            if previous.contains("unix") {
+            if positive_unix_gate(previous) {
                 return true;
             }
             cursor -= 1;
         }
         false
+    }
+
+    /// Whether `attribute` gates on unix instead of negating it.
+    fn positive_unix_gate(attribute: &str) -> bool {
+        let compact: String = attribute.chars().filter(|ch| !ch.is_whitespace()).collect();
+        if !compact.contains("unix") {
+            return false;
+        }
+        let Some(start) = compact.find("not(") else {
+            return true;
+        };
+        // Only a `not(...)` group that names unix negates the gate; a
+        // `not(windows)` beside a plain `unix` leaves it positive.
+        let mut depth = 0usize;
+        let mut end = compact.len();
+        for (offset, ch) in compact[start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        !compact[start..end].contains("unix")
     }
 
     /// True when the enclosing block that holds `line` is gated on `unix`.
@@ -9654,27 +9694,57 @@ mod tests {
     /// sitting above the line or above the enclosing `fn`, which is how
     /// `main.rs` guards its signal handler. Walking out to the block opener
     /// catches that shape, so the scan sees it instead of reporting nothing.
-    fn block_unix_gate(lines: &[&str], line: usize) -> bool {
+    ///
+    /// The walk stops at the enclosing `fn`'s own signature, because the scan
+    /// already asks `has_unix_gate` about that line: without the boundary the
+    /// walk would climb past the function and answer from the gate on a
+    /// preceding item.
+    fn block_unix_gate(lines: &[&str], line: usize, span: Option<&FnSpan>) -> bool {
+        let boundary = span.map(|span| span.first);
         let indent = lines[line].len() - lines[line].trim_start().len();
+        // The shallowest close passed on the way out. An opener at or above it
+        // belongs to a block that ended before the site, so its gate cannot
+        // answer for the site; only an opener below it encloses the line.
+        let mut closed_at: Option<usize> = None;
         let mut cursor = line;
         while cursor > 0 {
             cursor -= 1;
+            if Some(cursor) == boundary {
+                return false;
+            }
             let candidate = lines[cursor];
             let candidate_indent = candidate.len() - candidate.trim_start().len();
-            if candidate.trim().is_empty() {
+            let trimmed = candidate.trim();
+            if trimmed.is_empty() {
                 continue;
             }
             if candidate_indent >= indent {
                 continue;
             }
-            let opens_block = candidate.trim_end().ends_with('{');
-            return opens_block && has_unix_gate(lines, cursor);
+            if trimmed.starts_with('}') {
+                closed_at =
+                    Some(closed_at.map_or(candidate_indent, |seen| seen.min(candidate_indent)));
+                continue;
+            }
+            // A less-indented line that opens no block is a statement in an
+            // outer scope, so keep walking outward instead of answering from
+            // it.
+            if !candidate.trim_end().ends_with('{') {
+                continue;
+            }
+            if closed_at.is_some_and(|shallowest| candidate_indent >= shallowest) {
+                continue;
+            }
+            if has_unix_gate(lines, cursor) {
+                return true;
+            }
         }
         false
     }
 
     /// Covers: every unix-only test site across `main.rs`, `harvest.rs`,
-    /// `web.rs`, `db.rs`, and `launcher_tests.rs` sits under a `unix` cfg gate,
+    /// `web.rs`, `db.rs`, `launcher_tests.rs`, and
+    /// `tests/launcher_process_safety.rs` sits under a `unix` cfg gate,
     /// whether that gate is on the line, on the enclosing `fn`, or on an
     /// enclosing block, so a non-unix `cargo test` build excludes it instead of
     /// failing to compile.
@@ -9715,6 +9785,9 @@ mod tests {
             "register_fake_git",
             "register_fake_git_with_deadline",
             "clear_fake_git",
+            "recorded_pid",
+            "outside_git_folder",
+            "nested_enclosing_fixture",
         ];
         let mut failures = Vec::new();
         for (file, source) in UNIX_GATE_SOURCES {
@@ -9752,7 +9825,7 @@ mod tests {
                     continue;
                 }
                 let gated = has_unix_gate(&lines, index)
-                    || block_unix_gate(&lines, index)
+                    || block_unix_gate(&lines, index, enclosing)
                     || enclosing.is_some_and(|span| has_unix_gate(&lines, span.first));
                 if !gated {
                     failures.push(format!(

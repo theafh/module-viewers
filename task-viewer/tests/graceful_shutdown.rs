@@ -388,7 +388,7 @@ fn task_viewer_finishes_an_in_flight_store_and_rolls_back_one_held_past_the_grac
 
     // Run one: the store pause sits inside the grace, so the drain waits for
     // the store and its rows commit before the server exits.
-    let mut inside = Server::start(&scratch, "inside", &db, Some(1_200));
+    let mut inside = Server::start(&scratch, "inside", &db, Some(2_500));
     seed_repository(&db, "repo", &folder);
     trigger_update(inside.port);
     let marker = inside.marker().expect("the in-flight run pauses its store");
