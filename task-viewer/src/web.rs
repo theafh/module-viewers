@@ -375,8 +375,8 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// The grace period a stopped server drains within: one second inside the
-/// launcher's five-second stop window.
+/// The grace period a stopped server drains within, leaving a one-second
+/// margin inside the launcher's five-second stop window before it force-kills.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
 
 /// The time left to `deadline`, and zero once it has passed.

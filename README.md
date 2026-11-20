@@ -6,7 +6,7 @@ This repository holds the programs, their guardrails, and the build tooling. It 
 
 ## task-viewer
 
-`task-viewer` is one Rust binary. It serves a browser dashboard on `127.0.0.1:7880`. The person running it adds repository folders with a folder picker, then reads eight charts of how tasks are created and shipped.
+`task-viewer` is one Rust binary. It serves a browser dashboard on `127.0.0.1:7880`. The person running it adds repository folders with a folder picker, then reads a dashboard of charts showing how tasks are created and shipped.
 
 The configuration and the parsed chart rows live in a SQLite database at `~/.task-viewer`. Update re-reads every configured repository and replaces that repository's rows. Removing a repository from the dashboard deletes only its rows in that database. The source repository is left unchanged.
 
@@ -46,7 +46,7 @@ make stop
 make status
 ```
 
-The launcher writes four files to `~/Library/Logs/task-viewer/` on macOS and to `${XDG_STATE_HOME:-~/.local/state}/task-viewer/` on Linux: the PID file, the server log, the build log, and the binary stamp. The directory is mode `700` and every one of those files is mode `600`. `make start` and a click on the icon rebuild the release binary first, so after a source change they restart the server on the new code; a failed build is reported and nothing stale is started, and a missing `cargo` fails the start with a message naming `make build`. The launcher stops only the release binary from this checkout; when another program holds port 7880, start reports that and leaves it running.
+The launcher keeps its state in `~/Library/Logs/task-viewer/` on macOS and in `${XDG_STATE_HOME:-~/.local/state}/task-viewer/` on Linux: the PID file, the server log, the build log, the binary stamp, and a lock directory it removes when the command finishes. The directory is mode `700` and every file the launcher creates there is mode `600`. `make start` and a click on the icon rebuild the release binary first, so after a source change they restart the server on the new code; a failed build is reported and nothing stale is started, and a missing `cargo` fails the start with a message naming `make build`. The launcher stops only the release binary from this checkout; when another program holds port 7880, start reports that and leaves it running.
 
 ## Build
 

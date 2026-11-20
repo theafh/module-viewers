@@ -24,7 +24,7 @@ Durable state is the SQLite file `~/.task-viewer`, or the file named by `TASK_VI
 
 Parsed rows stay in `~/.task-viewer`. The binary makes no outbound request. Chart code and styles are files in this repository, served by the same process.
 
-The desktop launcher keeps four files in a per-user directory outside the checkout: `~/Library/Logs/task-viewer/` on macOS and `${XDG_STATE_HOME:-~/.local/state}/task-viewer/` on Linux. They are the PID file, the server log, which records repository paths, the build log, and the binary stamp. The directory is mode `700` and every one of the four files is mode `600`. The launcher signals only a PID whose command line is this checkout's release binary.
+The desktop launcher keeps its state in a per-user directory outside the checkout: `~/Library/Logs/task-viewer/` on macOS and `${XDG_STATE_HOME:-~/.local/state}/task-viewer/` on Linux. It holds the PID file, the server log, which records repository paths, the build log, the binary stamp, and a lock directory that lives only while a launcher command runs. The directory is mode `700` and every file the launcher creates there is mode `600`; `ls -l` on it shows `drwx------` for the directory and `-rw-------` for each file. The launcher signals only a PID whose command line is this checkout's release binary.
 
 `make install` writes the desktop launcher into the person's own desktop configuration. On macOS that is `~/Applications/Task Viewer.app` and a Task Viewer tile in the Dock's `persistent-apps` list (`com.apple.dock`), after which the Dock restarts. On Linux it is `~/.local/share/applications/task-viewer.desktop` and `~/.local/share/icons/hicolor/256x256/apps/task-viewer.png`. These files carry the path to this checkout and nothing from the viewed repositories.
 
