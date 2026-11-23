@@ -15,13 +15,13 @@
         <div class="nav-start">
             <a href="/" class="brand">TASK VIEWER</a>
             <div class="nav-tabs">
-                <a href="/" class="nav-tab{% if page == "dashboard" %} active{% endif %}">Dashboard</a>
-                <a href="/repositories" class="nav-tab{% if page == "repositories" %} active{% endif %}">Repositories</a>
+                <a href="/" class="nav-tab{% if page == "dashboard" %} active{% endif %}"{% if page == "dashboard" %} aria-current="page"{% endif %}>Dashboard</a>
+                <a href="/repositories" class="nav-tab{% if page == "repositories" %} active{% endif %}"{% if page == "repositories" %} aria-current="page"{% endif %}>Repositories</a>
             </div>
         </div>
         <div class="nav-actions">
             {% block nav %}{% endblock %}
-            <button class="btn btn-secondary" id="theme-toggle" type="button">Light</button>
+            <button class="btn btn-secondary" id="theme-toggle" type="button" aria-pressed="true">Dark theme</button>
         </div>
     </nav>
     <div class="container">

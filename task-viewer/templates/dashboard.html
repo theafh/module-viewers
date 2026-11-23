@@ -3,12 +3,13 @@
 {% block nav %}
 <form class="nav-form" method="get" action="/">
     <label for="project">Project</label>
-    <select id="project" name="project" onchange="this.form.submit()">
+    <select id="project" name="project">
         <option value="all" {% if selected == "all" %}selected{% endif %}>All projects</option>
         {% for project in projects %}
         <option value="{{ project.id_str }}" {% if selected == project.id_str %}selected{% endif %}>{{ project.name }}</option>
         {% endfor %}
     </select>
+    <button class="btn btn-secondary" type="submit">Show</button>
 </form>
 <form method="post" action="/scan">
     <input type="hidden" name="project" value="{{ selected }}">
@@ -31,63 +32,67 @@
 {% if not has_projects %}
 <p class="banner">No repositories yet. Open <a href="/repositories">Repositories</a> to add a project folder with a <code>tasks/</code> tree.</p>
 {% endif %}
-{# Each SVG names itself from its card heading and describes itself from the summary line, which the draw fills with the series it plots. #}
+{# Without scripting the charts stay empty, so name the way back to the repository list and say why the charts are missing. #}
+<noscript>
+    <p class="banner">The charts need scripting. Open <a href="/repositories">Repositories</a> to manage the folders the dashboard reads.</p>
+</noscript>
+{# Each SVG names itself from its card heading and describes itself from the summary line, which the draw fills with the series it plots. The loading text stays until the draw clears the chart. #}
 <section class="charts">
     <article class="chart-card" data-chart="weekly">
         <header>
             <h2 id="weekly-title">Tasks shipped vs created by week</h2>
             <p class="muted summary" id="weekly-summary"></p>
         </header>
-        <div class="chart-frame"><svg role="img" aria-labelledby="weekly-title" aria-describedby="weekly-summary"></svg><div class="tooltip" hidden></div></div>
+        <div class="chart-frame"><svg role="group" aria-labelledby="weekly-title" aria-describedby="weekly-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
     </article>
     <article class="chart-card" data-chart="cumulative">
         <header>
             <h2 id="cumulative-title">Cumulative tasks shipped</h2>
             <p class="muted summary" id="cumulative-summary"></p>
         </header>
-        <div class="chart-frame"><svg role="img" aria-labelledby="cumulative-title" aria-describedby="cumulative-summary"></svg><div class="tooltip" hidden></div></div>
+        <div class="chart-frame"><svg role="group" aria-labelledby="cumulative-title" aria-describedby="cumulative-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
     </article>
     <article class="chart-card wide" data-chart="shipped-calendar">
         <header>
             <h2 id="shipped-calendar-title">Tasks shipped, last 365 days</h2>
             <p class="muted summary" id="shipped-calendar-summary"></p>
         </header>
-        <div class="chart-frame calendar"><svg role="img" aria-labelledby="shipped-calendar-title" aria-describedby="shipped-calendar-summary"></svg><div class="tooltip" hidden></div></div>
+        <div class="chart-frame calendar"><svg role="group" aria-labelledby="shipped-calendar-title" aria-describedby="shipped-calendar-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
     </article>
     <article class="chart-card wide" data-chart="created-calendar">
         <header>
             <h2 id="created-calendar-title">Tasks created, last 365 days</h2>
             <p class="muted summary" id="created-calendar-summary"></p>
         </header>
-        <div class="chart-frame calendar"><svg role="img" aria-labelledby="created-calendar-title" aria-describedby="created-calendar-summary"></svg><div class="tooltip" hidden></div></div>
+        <div class="chart-frame calendar"><svg role="group" aria-labelledby="created-calendar-title" aria-describedby="created-calendar-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
     </article>
     <article class="chart-card" data-chart="backlog">
         <header>
             <h2 id="backlog-title">Live backlog</h2>
             <p class="muted summary" id="backlog-summary"></p>
         </header>
-        <div class="chart-frame"><svg role="img" aria-labelledby="backlog-title" aria-describedby="backlog-summary"></svg><div class="tooltip" hidden></div></div>
+        <div class="chart-frame"><svg role="group" aria-labelledby="backlog-title" aria-describedby="backlog-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
     </article>
     <article class="chart-card" data-chart="age">
         <header>
             <h2 id="age-title">Mean backlog age</h2>
             <p class="muted summary" id="age-summary"></p>
         </header>
-        <div class="chart-frame"><svg role="img" aria-labelledby="age-title" aria-describedby="age-summary"></svg><div class="tooltip" hidden></div></div>
+        <div class="chart-frame"><svg role="group" aria-labelledby="age-title" aria-describedby="age-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
     </article>
     <article class="chart-card" data-chart="radar-shipped">
         <header>
             <h2 id="radar-shipped-title">Shipped</h2>
             <p class="muted summary" id="radar-shipped-summary"></p>
         </header>
-        <div class="chart-frame radar"><svg role="img" aria-labelledby="radar-shipped-title" aria-describedby="radar-shipped-summary"></svg><div class="tooltip" hidden></div></div>
+        <div class="chart-frame radar"><svg role="group" aria-labelledby="radar-shipped-title" aria-describedby="radar-shipped-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
     </article>
     <article class="chart-card" data-chart="radar-live">
         <header>
             <h2 id="radar-live-title">Live backlog by slice</h2>
             <p class="muted summary" id="radar-live-summary"></p>
         </header>
-        <div class="chart-frame radar"><svg role="img" aria-labelledby="radar-live-title" aria-describedby="radar-live-summary"></svg><div class="tooltip" hidden></div></div>
+        <div class="chart-frame radar"><svg role="group" aria-labelledby="radar-live-title" aria-describedby="radar-live-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
     </article>
 </section>
 {% endblock %}

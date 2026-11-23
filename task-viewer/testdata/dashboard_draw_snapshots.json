@@ -1,901 +1,932 @@
 {
-  "note": "SVG markup captured from static/js/dashboard.js before the draw-cost change; the browser_chart_markup test compares against these.",
-  "config": {
-    "narrow": false,
-    "storageThrows": false,
-    "cssValue": "#123456"
-  },
   "cards": {
-    "weekly": {
-      "name": "svg",
+    "age": {
       "attrs": {
         "viewBox": "0 0 1000 280"
       },
-      "style": {},
-      "text": "",
       "children": [
         {
-          "name": "line",
           "attrs": {
-            "x1": "40",
-            "x2": "984",
-            "y1": "132",
-            "y2": "132",
             "stroke": "#123456",
-            "stroke-width": "1.5"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "32",
-            "y": "93.33333333333334",
-            "width": "16",
-            "height": "38.66666666666666",
-            "fill": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "32",
-            "y": "132",
-            "width": "16",
-            "height": "77.33333333333334",
-            "fill": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "31",
-            "y": "16",
-            "width": "18",
-            "height": "232",
-            "fill": "transparent"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "504",
-            "y": "54.66666666666666",
-            "width": "16",
-            "height": "77.33333333333334",
-            "fill": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "504",
-            "y": "132",
-            "width": "16",
-            "height": "116",
-            "fill": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "503",
-            "y": "16",
-            "width": "18",
-            "height": "232",
-            "fill": "transparent"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "40",
-            "y": "264",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "Jan 2026",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "34",
-            "y": "252",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "-3",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "34",
-            "y": "213.33333333333334",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "-2",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "34",
-            "y": "174.66666666666669",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "-1",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "34",
-            "y": "136",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "0",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "34",
-            "y": "97.33333333333334",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "1",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "34",
-            "y": "58.66666666666666",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "2",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "34",
-            "y": "20",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "3",
-          "children": []
-        }
-      ]
-    },
-    "cumulative": {
-      "name": "svg",
-      "attrs": {
-        "viewBox": "0 0 1000 280"
-      },
-      "style": {},
-      "text": "",
-      "children": [
-        {
-          "name": "line",
-          "attrs": {
             "x1": "44",
             "x2": "984",
             "y1": "248",
-            "y2": "248",
-            "stroke": "#123456"
+            "y2": "248"
           },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "38",
-            "y": "252",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "0",
-          "children": []
-        },
-        {
+          "children": [],
           "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
           "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "252"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "0"
+        },
+        {
+          "attrs": {
+            "stroke": "#123456",
             "x1": "44",
             "x2": "984",
             "y1": "132",
-            "y2": "132",
-            "stroke": "#123456"
+            "y2": "132"
           },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "38",
-            "y": "136",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "1",
-          "children": []
-        },
-        {
+          "children": [],
           "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
           "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "136"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "1"
+        },
+        {
+          "attrs": {
+            "stroke": "#123456",
             "x1": "44",
             "x2": "984",
             "y1": "16",
-            "y2": "16",
-            "stroke": "#123456"
+            "y2": "16"
           },
+          "children": [],
+          "name": "line",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         },
         {
-          "name": "text",
           "attrs": {
-            "x": "38",
-            "y": "20",
-            "text-anchor": "end",
             "fill": "#123456",
-            "font-size": "11"
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "20"
           },
+          "children": [],
+          "name": "text",
           "style": {},
-          "text": "2",
-          "children": []
+          "text": "2"
         },
         {
+          "attrs": {
+            "d": "M44 16 L44 248 L44 248 Z",
+            "fill": "#123456",
+            "opacity": "0.16"
+          },
+          "children": [],
           "name": "path",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "d": "M44 16",
+            "fill": "none",
+            "stroke": "#123456",
+            "stroke-width": "2"
+          },
+          "children": [],
+          "name": "path",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "x": "44",
+            "y": "264"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "Jan 2026"
+        },
+        {
+          "attrs": {
+            "aria-label": "Jan 5, 2026 · mean age 2 days · 1 tasks",
+            "fill": "transparent",
+            "height": "232",
+            "role": "img",
+            "tabindex": "0",
+            "width": "940",
+            "x": "44",
+            "y": "16"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        }
+      ],
+      "name": "svg",
+      "style": {},
+      "text": ""
+    },
+    "backlog": {
+      "attrs": {
+        "viewBox": "0 0 1000 280"
+      },
+      "children": [
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "x1": "44",
+            "x2": "984",
+            "y1": "248",
+            "y2": "248"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "252"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "0"
+        },
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "x1": "44",
+            "x2": "984",
+            "y1": "16",
+            "y2": "16"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "20"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "1"
+        },
+        {
+          "attrs": {
+            "d": "M44 16 L44 248 L44 248 Z",
+            "fill": "#123456",
+            "opacity": "0.16"
+          },
+          "children": [],
+          "name": "path",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "d": "M44 16",
+            "fill": "none",
+            "stroke": "#123456",
+            "stroke-width": "2"
+          },
+          "children": [],
+          "name": "path",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "x": "44",
+            "y": "264"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "Jan 2026"
+        },
+        {
+          "attrs": {
+            "aria-label": "Jan 5, 2026 · live 1",
+            "fill": "transparent",
+            "height": "232",
+            "role": "img",
+            "tabindex": "0",
+            "width": "940",
+            "x": "44",
+            "y": "16"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        }
+      ],
+      "name": "svg",
+      "style": {},
+      "text": ""
+    },
+    "created-calendar": {
+      "attrs": {
+        "viewBox": "0 0 52 190",
+        "width": "52"
+      },
+      "children": [
+        {
+          "attrs": {
+            "aria-label": "Jan 5, 2026 · 2 tasks created",
+            "data-tip": "Jan 5, 2026 · 2 tasks created",
+            "fill": "#123456",
+            "height": "14",
+            "opacity": "1",
+            "role": "img",
+            "rx": "2",
+            "tabindex": "0",
+            "width": "14",
+            "x": "28",
+            "y": "34"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        }
+      ],
+      "name": "svg",
+      "style": {
+        "width": ""
+      },
+      "text": ""
+    },
+    "cumulative": {
+      "attrs": {
+        "viewBox": "0 0 1000 280"
+      },
+      "children": [
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "x1": "44",
+            "x2": "984",
+            "y1": "248",
+            "y2": "248"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "252"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "0"
+        },
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "x1": "44",
+            "x2": "984",
+            "y1": "132",
+            "y2": "132"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "136"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "1"
+        },
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "x1": "44",
+            "x2": "984",
+            "y1": "16",
+            "y2": "16"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "20"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "2"
+        },
+        {
           "attrs": {
             "d": "M44 132 L984 16 L984 248 L44 248 Z",
             "fill": "#123456",
             "opacity": "0.16"
           },
+          "children": [],
+          "name": "path",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         },
         {
-          "name": "path",
           "attrs": {
             "d": "M44 132 L984 16",
             "fill": "none",
             "stroke": "#123456",
             "stroke-width": "2"
           },
+          "children": [],
+          "name": "path",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         },
         {
-          "name": "path",
           "attrs": {
             "d": "M44 132 L984 74",
             "fill": "none",
+            "opacity": "0.55",
             "stroke": "#123456",
-            "stroke-width": "1.5",
             "stroke-dasharray": "6 5",
-            "opacity": "0.55"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "44",
-            "y": "264",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "Jan 2026",
-          "children": []
-        },
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "44",
-            "y": "16",
-            "width": "940",
-            "height": "232",
-            "fill": "transparent"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        }
-      ]
-    },
-    "shipped-calendar": {
-      "name": "svg",
-      "attrs": {
-        "viewBox": "0 0 52 190",
-        "width": "52"
-      },
-      "style": {
-        "width": ""
-      },
-      "text": "",
-      "children": [
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "28",
-            "y": "34",
-            "width": "14",
-            "height": "14",
-            "rx": "2",
-            "fill": "#123456",
-            "opacity": "1",
-            "data-tip": "Jan 5, 2026 · 1 task shipped"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        }
-      ]
-    },
-    "created-calendar": {
-      "name": "svg",
-      "attrs": {
-        "viewBox": "0 0 52 190",
-        "width": "52"
-      },
-      "style": {
-        "width": ""
-      },
-      "text": "",
-      "children": [
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "28",
-            "y": "34",
-            "width": "14",
-            "height": "14",
-            "rx": "2",
-            "fill": "#123456",
-            "opacity": "1",
-            "data-tip": "Jan 5, 2026 · 2 tasks created"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        }
-      ]
-    },
-    "backlog": {
-      "name": "svg",
-      "attrs": {
-        "viewBox": "0 0 1000 280"
-      },
-      "style": {},
-      "text": "",
-      "children": [
-        {
-          "name": "line",
-          "attrs": {
-            "x1": "44",
-            "x2": "984",
-            "y1": "248",
-            "y2": "248",
-            "stroke": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "38",
-            "y": "252",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "0",
-          "children": []
-        },
-        {
-          "name": "line",
-          "attrs": {
-            "x1": "44",
-            "x2": "984",
-            "y1": "16",
-            "y2": "16",
-            "stroke": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "38",
-            "y": "20",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "1",
-          "children": []
-        },
-        {
-          "name": "path",
-          "attrs": {
-            "d": "M44 16 L44 248 L44 248 Z",
-            "fill": "#123456",
-            "opacity": "0.16"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "path",
-          "attrs": {
-            "d": "M44 16",
-            "fill": "none",
-            "stroke": "#123456",
-            "stroke-width": "2"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "44",
-            "y": "264",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "Jan 2026",
-          "children": []
-        },
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "44",
-            "y": "16",
-            "width": "940",
-            "height": "232",
-            "fill": "transparent"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        }
-      ]
-    },
-    "age": {
-      "name": "svg",
-      "attrs": {
-        "viewBox": "0 0 1000 280"
-      },
-      "style": {},
-      "text": "",
-      "children": [
-        {
-          "name": "line",
-          "attrs": {
-            "x1": "44",
-            "x2": "984",
-            "y1": "248",
-            "y2": "248",
-            "stroke": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "38",
-            "y": "252",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "0",
-          "children": []
-        },
-        {
-          "name": "line",
-          "attrs": {
-            "x1": "44",
-            "x2": "984",
-            "y1": "132",
-            "y2": "132",
-            "stroke": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "38",
-            "y": "136",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "1",
-          "children": []
-        },
-        {
-          "name": "line",
-          "attrs": {
-            "x1": "44",
-            "x2": "984",
-            "y1": "16",
-            "y2": "16",
-            "stroke": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "38",
-            "y": "20",
-            "text-anchor": "end",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "2",
-          "children": []
-        },
-        {
-          "name": "path",
-          "attrs": {
-            "d": "M44 16 L44 248 L44 248 Z",
-            "fill": "#123456",
-            "opacity": "0.16"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "path",
-          "attrs": {
-            "d": "M44 16",
-            "fill": "none",
-            "stroke": "#123456",
-            "stroke-width": "2"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "44",
-            "y": "264",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "Jan 2026",
-          "children": []
-        },
-        {
-          "name": "rect",
-          "attrs": {
-            "x": "44",
-            "y": "16",
-            "width": "940",
-            "height": "232",
-            "fill": "transparent"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        }
-      ]
-    },
-    "radar-shipped": {
-      "name": "svg",
-      "attrs": {
-        "viewBox": "0 0 1000 360"
-      },
-      "style": {
-        "width": "",
-        "height": ""
-      },
-      "text": "",
-      "children": [
-        {
-          "name": "circle",
-          "attrs": {
-            "cx": "500",
-            "cy": "184",
-            "r": "29",
-            "fill": "none",
-            "stroke": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "circle",
-          "attrs": {
-            "cx": "500",
-            "cy": "184",
-            "r": "58",
-            "fill": "none",
-            "stroke": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "circle",
-          "attrs": {
-            "cx": "500",
-            "cy": "184",
-            "r": "87",
-            "fill": "none",
-            "stroke": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "circle",
-          "attrs": {
-            "cx": "500",
-            "cy": "184",
-            "r": "116",
-            "fill": "none",
-            "stroke": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "line",
-          "attrs": {
-            "x1": "500",
-            "y1": "184",
-            "x2": "500",
-            "y2": "68",
-            "stroke": "#123456"
-          },
-          "style": {},
-          "text": "",
-          "children": []
-        },
-        {
-          "name": "text",
-          "attrs": {
-            "x": "500",
-            "y": "52",
-            "text-anchor": "middle",
-            "fill": "#123456",
-            "font-size": "11"
-          },
-          "style": {},
-          "text": "alpha",
-          "children": []
-        },
-        {
-          "name": "polygon",
-          "attrs": {
-            "points": "500,68",
-            "fill": "#123456",
-            "opacity": "0.22",
-            "stroke": "#123456",
             "stroke-width": "1.5"
           },
+          "children": [],
+          "name": "path",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         },
         {
-          "name": "circle",
           "attrs": {
-            "cx": "500",
-            "cy": "68",
-            "r": "4",
-            "fill": "#123456"
+            "fill": "#123456",
+            "font-size": "11",
+            "x": "44",
+            "y": "264"
           },
+          "children": [],
+          "name": "text",
           "style": {},
-          "text": "",
-          "children": []
+          "text": "Jan 2026"
+        },
+        {
+          "attrs": {
+            "aria-label": "Jan 5, 2026 · cumulative 1 · shipped 1",
+            "fill": "transparent",
+            "height": "232",
+            "role": "img",
+            "tabindex": "0",
+            "width": "940",
+            "x": "44",
+            "y": "16"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
         }
-      ]
+      ],
+      "name": "svg",
+      "style": {},
+      "text": ""
     },
     "radar-live": {
-      "name": "svg",
       "attrs": {
         "viewBox": "0 0 1000 360"
       },
-      "style": {
-        "width": "",
-        "height": ""
-      },
-      "text": "",
       "children": [
         {
-          "name": "circle",
           "attrs": {
             "cx": "500",
             "cy": "184",
+            "fill": "none",
             "r": "29",
-            "fill": "none",
             "stroke": "#123456"
           },
+          "children": [],
+          "name": "circle",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         },
         {
-          "name": "circle",
           "attrs": {
             "cx": "500",
             "cy": "184",
+            "fill": "none",
             "r": "58",
-            "fill": "none",
             "stroke": "#123456"
           },
+          "children": [],
+          "name": "circle",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         },
         {
-          "name": "circle",
           "attrs": {
             "cx": "500",
             "cy": "184",
+            "fill": "none",
             "r": "87",
-            "fill": "none",
             "stroke": "#123456"
           },
+          "children": [],
+          "name": "circle",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         },
         {
-          "name": "circle",
           "attrs": {
             "cx": "500",
             "cy": "184",
-            "r": "116",
             "fill": "none",
+            "r": "116",
             "stroke": "#123456"
           },
+          "children": [],
+          "name": "circle",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         },
         {
-          "name": "line",
           "attrs": {
+            "stroke": "#123456",
             "x1": "500",
-            "y1": "184",
             "x2": "500",
-            "y2": "68",
-            "stroke": "#123456"
+            "y1": "184",
+            "y2": "68"
           },
+          "children": [],
+          "name": "line",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         },
         {
-          "name": "text",
           "attrs": {
-            "x": "500",
-            "y": "52",
-            "text-anchor": "middle",
             "fill": "#123456",
-            "font-size": "11"
+            "font-size": "11",
+            "text-anchor": "middle",
+            "x": "500",
+            "y": "52"
           },
+          "children": [],
+          "name": "text",
           "style": {},
-          "text": "alpha",
-          "children": []
+          "text": "alpha"
         },
         {
-          "name": "polygon",
           "attrs": {
-            "points": "500,68",
             "fill": "#123456",
             "opacity": "0.22",
+            "points": "500,68",
             "stroke": "#123456",
             "stroke-width": "1.5"
           },
+          "children": [],
+          "name": "polygon",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         },
         {
-          "name": "circle",
           "attrs": {
+            "aria-label": "alpha · 1 live",
             "cx": "500",
             "cy": "68",
+            "data-tip": "alpha · 1 live",
+            "fill": "#123456",
             "r": "4",
-            "fill": "#123456"
+            "role": "img",
+            "tabindex": "0"
           },
+          "children": [],
+          "name": "circle",
           "style": {},
-          "text": "",
-          "children": []
+          "text": ""
         }
-      ]
+      ],
+      "name": "svg",
+      "style": {
+        "height": "",
+        "width": ""
+      },
+      "text": ""
+    },
+    "radar-shipped": {
+      "attrs": {
+        "viewBox": "0 0 1000 360"
+      },
+      "children": [
+        {
+          "attrs": {
+            "cx": "500",
+            "cy": "184",
+            "fill": "none",
+            "r": "29",
+            "stroke": "#123456"
+          },
+          "children": [],
+          "name": "circle",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "cx": "500",
+            "cy": "184",
+            "fill": "none",
+            "r": "58",
+            "stroke": "#123456"
+          },
+          "children": [],
+          "name": "circle",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "cx": "500",
+            "cy": "184",
+            "fill": "none",
+            "r": "87",
+            "stroke": "#123456"
+          },
+          "children": [],
+          "name": "circle",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "cx": "500",
+            "cy": "184",
+            "fill": "none",
+            "r": "116",
+            "stroke": "#123456"
+          },
+          "children": [],
+          "name": "circle",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "x1": "500",
+            "x2": "500",
+            "y1": "184",
+            "y2": "68"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "middle",
+            "x": "500",
+            "y": "52"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "alpha"
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "opacity": "0.22",
+            "points": "500,68",
+            "stroke": "#123456",
+            "stroke-width": "1.5"
+          },
+          "children": [],
+          "name": "polygon",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "aria-label": "alpha · 1 shipped",
+            "cx": "500",
+            "cy": "68",
+            "data-tip": "alpha · 1 shipped",
+            "fill": "#123456",
+            "r": "4",
+            "role": "img",
+            "tabindex": "0"
+          },
+          "children": [],
+          "name": "circle",
+          "style": {},
+          "text": ""
+        }
+      ],
+      "name": "svg",
+      "style": {
+        "height": "",
+        "width": ""
+      },
+      "text": ""
+    },
+    "shipped-calendar": {
+      "attrs": {
+        "viewBox": "0 0 52 190",
+        "width": "52"
+      },
+      "children": [
+        {
+          "attrs": {
+            "aria-label": "Jan 5, 2026 · 1 task shipped",
+            "data-tip": "Jan 5, 2026 · 1 task shipped",
+            "fill": "#123456",
+            "height": "14",
+            "opacity": "1",
+            "role": "img",
+            "rx": "2",
+            "tabindex": "0",
+            "width": "14",
+            "x": "28",
+            "y": "34"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        }
+      ],
+      "name": "svg",
+      "style": {
+        "width": ""
+      },
+      "text": ""
+    },
+    "weekly": {
+      "attrs": {
+        "viewBox": "0 0 1000 280"
+      },
+      "children": [
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "stroke-width": "1.5",
+            "x1": "40",
+            "x2": "984",
+            "y1": "132",
+            "y2": "132"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "height": "38.66666666666666",
+            "width": "16",
+            "x": "32",
+            "y": "93.33333333333334"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "height": "77.33333333333334",
+            "width": "16",
+            "x": "32",
+            "y": "132"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "aria-label": "Week of Jan 5, 2026 · shipped 1 · created 2",
+            "data-tip": "Week of Jan 5, 2026 · shipped 1 · created 2",
+            "fill": "transparent",
+            "height": "232",
+            "role": "img",
+            "tabindex": "0",
+            "width": "18",
+            "x": "31",
+            "y": "16"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "height": "77.33333333333334",
+            "width": "16",
+            "x": "504",
+            "y": "54.66666666666666"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "height": "116",
+            "width": "16",
+            "x": "504",
+            "y": "132"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "aria-label": "Week of Jan 12, 2026 · shipped 2 · created 3",
+            "data-tip": "Week of Jan 12, 2026 · shipped 2 · created 3",
+            "fill": "transparent",
+            "height": "232",
+            "role": "img",
+            "tabindex": "-1",
+            "width": "18",
+            "x": "503",
+            "y": "16"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "x": "40",
+            "y": "264"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "Jan 2026"
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "34",
+            "y": "252"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "-3"
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "34",
+            "y": "213.33333333333334"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "-2"
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "34",
+            "y": "174.66666666666669"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "-1"
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "34",
+            "y": "136"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "0"
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "34",
+            "y": "97.33333333333334"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "1"
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "34",
+            "y": "58.66666666666666"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "2"
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "34",
+            "y": "20"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "3"
+        }
+      ],
+      "name": "svg",
+      "style": {},
+      "text": ""
     }
-  }
+  },
+  "config": {
+    "cssValue": "#123456",
+    "narrow": false,
+    "storageThrows": false
+  },
+  "note": "SVG markup captured from static/js/dashboard.js with the keyboard, tooltip, and accessible-name attributes; the browser_chart_markup test compares against these."
 }

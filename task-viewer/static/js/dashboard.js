@@ -112,19 +112,83 @@
     node.textContent = text;
   }
 
+  // Every open tooltip hides from one document-level pointerdown listener, so a
+  // tap elsewhere on the page clears a tooltip a focused mark revealed.
+  var tips = [];
+
+  function hideAllTips() {
+    tips.forEach(function (tip) { tip.hidden = true; });
+  }
+
   function tipFor(frame) {
     var tip = frame.querySelector(".tooltip");
+    tips.push(tip);
+    function place(x, y) {
+      tip.style.left = x + 12 + "px";
+      tip.style.top = y + 12 + "px";
+    }
     return {
       show: function (event, text) {
         tip.hidden = false;
         tip.textContent = text;
-        tip.style.left = event.clientX + 12 + "px";
-        tip.style.top = event.clientY + 12 + "px";
+        place(event.clientX, event.clientY);
+      },
+      // A focus event carries no pointer coordinates, so a mark revealed by the
+      // keyboard anchors its tooltip to its own box.
+      showAt: function (node, text) {
+        tip.hidden = false;
+        tip.textContent = text;
+        var box = node.getBoundingClientRect();
+        place(box.left + box.width / 2, box.top);
       },
       hide: function () {
         tip.hidden = true;
       }
     };
+  }
+
+  // Roving tabindex: one mark per chart is the frame's single tab stop and the
+  // arrow keys move the focus through the chart's marks, so a 365-day calendar
+  // adds one stop instead of 365. Each mark names its value for a screen reader
+  // and reveals the same text as a tooltip when focused.
+  function roving(nodes, tip) {
+    if (!nodes.length) {
+      return;
+    }
+    function select(index, moveFocus) {
+      nodes.forEach(function (node, position) {
+        node.setAttribute("tabindex", position === index ? "0" : "-1");
+      });
+      if (moveFocus) {
+        nodes[index].focus();
+      }
+    }
+    nodes.forEach(function (node, index) {
+      var text = node.getAttribute("data-tip") || "";
+      node.setAttribute("role", "img");
+      node.setAttribute("aria-label", text);
+      node.addEventListener("focus", function () {
+        select(index, false);
+        tip.showAt(node, text);
+      });
+      node.addEventListener("blur", tip.hide);
+      node.addEventListener("keydown", function (event) {
+        var next = null;
+        if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+          next = Math.min(index + 1, nodes.length - 1);
+        } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+          next = Math.max(index - 1, 0);
+        }
+        if (next === null) {
+          return;
+        }
+        if (typeof event.preventDefault === "function") {
+          event.preventDefault();
+        }
+        select(next, true);
+      });
+    });
+    select(0, false);
   }
 
   function message(name, svg, text) {
@@ -227,6 +291,7 @@
     // later rect would report the neighbour's bar.
     var hitWidth = Math.min(Math.max(band, 18), slot);
     var tip = tipFor(root.querySelector(".chart-frame"));
+    var hits = [];
     rows.forEach(function (row, index) {
       var dx = x(dates[index].getTime());
       var shipY = y(row.shipped);
@@ -243,9 +308,12 @@
         fill: "transparent"
       });
       var text = "Week of " + dateLabel(dates[index]) + " · shipped " + fmt(row.shipped) + " · created " + fmt(row.created);
+      hit.setAttribute("data-tip", text);
       hit.addEventListener("mousemove", function (event) { tip.show(event, text); });
       hit.addEventListener("mouseleave", tip.hide);
+      hits.push(hit);
     });
+    roving(hits, tip);
     monthTicks("weekly", svg, dates[0], dates[dates.length - 1], x, frame.bottom + 16, muted);
     yTicks("weekly", svg, -maxAbs, maxAbs, y, frame.left, muted);
   }
@@ -317,6 +385,36 @@
       tip.show(event, tipText(rows[bestIndex], dates[bestIndex]));
     });
     overlay.addEventListener("mouseleave", tip.hide);
+    // The overlay is the line chart's one tab stop: focus reveals the first
+    // day and the arrow keys walk the drawn rows, so every point stays
+    // reachable without a pointer.
+    var active = 0;
+    function showRow(index) {
+      active = index;
+      var text = tipText(rows[index], dates[index]);
+      overlay.setAttribute("aria-label", text);
+      tip.showAt(overlay, text);
+    }
+    overlay.setAttribute("tabindex", "0");
+    overlay.setAttribute("role", "img");
+    overlay.setAttribute("aria-label", tipText(rows[0], dates[0]));
+    overlay.addEventListener("focus", function () { showRow(0); });
+    overlay.addEventListener("blur", tip.hide);
+    overlay.addEventListener("keydown", function (event) {
+      var next = null;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        next = Math.min(active + 1, rows.length - 1);
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        next = Math.max(active - 1, 0);
+      }
+      if (next === null) {
+        return;
+      }
+      if (typeof event.preventDefault === "function") {
+        event.preventDefault();
+      }
+      showRow(next);
+    });
   }
 
   function drawCalendar(name, rows, colorName, noun, peak) {
@@ -355,6 +453,7 @@
     svg.setAttribute("viewBox", "0 0 " + naturalWidth + " " + height);
     var maxLog = Math.log1p(peak);
     var tip = tipFor(root.querySelector(".chart-frame"));
+    var marks = [];
     var lastLabelX = null;
     for (var col = 0; col < columns; col += 1) {
       var first = cells[col * 7];
@@ -394,8 +493,10 @@
         });
         rect.setAttribute("data-tip", text);
         rect.addEventListener("mouseleave", tip.hide);
+        marks.push(rect);
       }
     }
+    roving(marks, tip);
     // Record the natural width as the chart's intrinsic size once every cell is
     // drawn. The stylesheet's `width: auto` lets the viewBox ratio size the
     // element, so this attribute does not lay the fallback out; `message()`
@@ -515,12 +616,16 @@
     mark(name, el(svg, "polygon", {
       points: points.join(" "), fill: color, opacity: "0.22", stroke: color, "stroke-width": "1.5"
     }), { fill: colorName, stroke: colorName });
+    var marks = [];
     dots.forEach(function (dot) {
       var node = el(svg, "circle", { cx: dot.vx, cy: dot.vy, r: "4", fill: color });
       mark(name, node, { fill: colorName });
+      node.setAttribute("data-tip", dot.text);
       node.addEventListener("mousemove", function (event) { tip.show(event, dot.text); });
       node.addEventListener("mouseleave", tip.hide);
+      marks.push(node);
     });
+    roving(marks, tip);
     // Adopt the grown box whenever the frame does not contain the measured
     // extents, so the labels and the ring all stay inside the viewBox.
     if (minX >= 0 && maxX <= width && minY >= 0 && maxY <= height) {
@@ -682,6 +787,9 @@
   }
 
   function renderAll() {
+    // A redraw replaces every tooltip node, so the pointerdown registry starts
+    // empty for the draw that follows.
+    tips = [];
     if (!payload) {
       CARD_NAMES.forEach(renderUnavailable);
       return;
@@ -732,6 +840,7 @@
   }
 
   window.addEventListener("task-viewer-theme", recolor);
+  document.addEventListener("pointerdown", hideAllTips);
   renderAll();
   var resizeTimer = 0;
   window.addEventListener("resize", function () {

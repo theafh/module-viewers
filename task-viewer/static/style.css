@@ -291,6 +291,11 @@ select {
     height: 360px;
 }
 
+.chart-loading {
+    fill: var(--chart-muted);
+    font-size: 14px;
+}
+
 .tooltip {
     position: fixed;
     z-index: 5;

@@ -32,8 +32,8 @@
                 <span class="error-text">{{ project.last_error }}</span>
                 {% endif %}
             </div>
-            <form method="post" action="/repositories/{{ project.id }}/delete" onsubmit="return confirm('Remove this repository from the dashboard?');">
-                <button class="btn btn-secondary btn-small" type="submit">Remove</button>
+            <form method="post" action="/repositories/{{ project.id }}/delete" data-repository="{{ project.name }}">
+                <button class="btn btn-secondary btn-small" type="submit">Remove {{ project.name }}</button>
             </form>
         </li>
         {% endfor %}
@@ -45,4 +45,7 @@
     <p>Choose a project folder that keeps its task files in <code>tasks/</code>. The dashboard reads those files on this machine and stores the parsed rows in your home directory.</p>
 </section>
 {% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/repositories.js?v={{ version }}"></script>
 {% endblock %}

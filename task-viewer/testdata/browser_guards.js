@@ -110,6 +110,35 @@
   Node.prototype.addEventListener = function (type, handler) {
     (this.listeners[type] = this.listeners[type] || []).push(handler);
   };
+  // Run the listeners a dispatch names, then bubble the event through the
+  // parents and on to the document, so a delegated page-level listener sees an
+  // event a test dispatches on a mark.
+  Node.prototype.dispatchEvent = function (event) {
+    event = event || {};
+    if (!event.type) return true;
+    if (event.target === undefined) event.target = this;
+    if (typeof event.preventDefault !== "function") {
+      event.defaultPrevented = false;
+      event.preventDefault = function () { this.defaultPrevented = true; };
+    }
+    var node = this;
+    while (node) {
+      event.currentTarget = node;
+      var handlers = (node.listeners && node.listeners[event.type]) || [];
+      handlers.slice().forEach(function (handler) { handler(event); });
+      node = node.parent;
+    }
+    if (globalThis.document && globalThis.document.dispatchEvent) {
+      globalThis.document.dispatchEvent(event);
+    }
+    return !event.defaultPrevented;
+  };
+  Node.prototype.focus = function () {
+    this.dispatchEvent({ type: "focus" });
+  };
+  Node.prototype.blur = function () {
+    this.dispatchEvent({ type: "blur" });
+  };
   Node.prototype.getBoundingClientRect = function () {
     return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight };
   };
@@ -223,7 +252,11 @@
     ? JSON.stringify(defaultPayload)
     : String(config.payloadText);
 
+  // The template's own theme button: a constant "Dark theme" name whose
+  // pressed state carries the applied theme.
   var themeButton = new Node("button");
+  themeButton.textContent = "Dark theme";
+  themeButton.attrs["aria-pressed"] = "true";
   var store = {};
   if (config.storedTheme !== undefined && config.storedTheme !== null) {
     store["task-viewer-theme"] = String(config.storedTheme);
@@ -239,6 +272,7 @@
     }
   };
 
+  var documentListeners = {};
   var document = {
     documentElement: html,
     getElementById: function (id) {
@@ -251,10 +285,32 @@
     },
     querySelector: function (selector) {
       return Object.prototype.hasOwnProperty.call(registry, selector) ? registry[selector] : null;
+    },
+    // A page-level listener such as the dashboard's pointerdown hide and the
+    // repositories page's delegated submit.
+    addEventListener: function (type, handler) {
+      (documentListeners[type] = documentListeners[type] || []).push(handler);
+    },
+    dispatchEvent: function (event) {
+      event = event || {};
+      if (!event.type) return true;
+      if (event.target === undefined) event.target = document;
+      if (typeof event.preventDefault !== "function") {
+        event.defaultPrevented = false;
+        event.preventDefault = function () { this.defaultPrevented = true; };
+      }
+      event.currentTarget = document;
+      (documentListeners[event.type] || []).slice().forEach(function (handler) {
+        handler(event);
+      });
+      return !event.defaultPrevented;
     }
   };
 
   var events = [];
+  // Every confirm message the shipped scripts build, in order, so a test can
+  // assert the text a Remove submit produced.
+  var confirms = [];
   var window = {
     addEventListener: function (type, handler) {
       events.push([type, handler]);
@@ -263,6 +319,19 @@
       events.slice().forEach(function (pair) {
         if (pair[0] === event.type) pair[1](event);
       });
+    },
+    // A browser without `matchMedia` is one the guard skips; when it exists it
+    // reports no preference unless the test asks for light.
+    matchMedia: function (query) {
+      var text = String(query);
+      return {
+        media: text,
+        matches: /prefers-color-scheme:\s*light/.test(text) && !!config.prefersLight
+      };
+    },
+    confirm: function (message) {
+      confirms.push(String(message));
+      return config.confirmResult !== false;
     },
     setTimeout: function () {
       return 1;
@@ -304,6 +373,7 @@
     cardNames: CARD_NAMES,
     chartHeights: CHART_HEIGHT,
     html: html,
-    themeButton: themeButton
+    themeButton: themeButton,
+    confirms: confirms
   };
 })();

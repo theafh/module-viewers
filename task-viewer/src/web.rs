@@ -2905,8 +2905,9 @@ mod tests {
     }
 
     /// The CSP carries `frame-ancestors` alone, so it restricts no script
-    /// source: the theme bootstrap, the Project selector's `onchange`, the
-    /// Remove form's `onsubmit`, and the static scripts all stay in the pages.
+    /// source: the theme bootstrap, the project filter's Show button, the
+    /// Remove form's delegated confirm, and the static scripts all stay in the
+    /// pages, with no inline handler left to block.
     #[tokio::test(flavor = "current_thread")]
     async fn web_csp_restricts_only_framing_and_pages_keep_their_scripts() {
         let (state, path, folder, _id) = state_with_repository("security_csp_pages").await;
@@ -2932,8 +2933,13 @@ mod tests {
             "the theme bootstrap script still renders"
         );
         assert!(
-            dashboard_body.contains("onchange=\"this.form.submit()\""),
-            "the Project selector's onchange still renders"
+            dashboard_body
+                .contains("<button class=\"btn btn-secondary\" type=\"submit\">Show</button>"),
+            "the project filter's Show submit button still renders"
+        );
+        assert!(
+            !dashboard_body.contains("onchange="),
+            "the project filter no longer carries an inline onchange"
         );
         assert!(
             dashboard_body.contains("/static/js/dashboard.js"),
@@ -2948,10 +2954,16 @@ mod tests {
             "the theme bootstrap script still renders"
         );
         assert!(
-            repositories_body.contains(
-                "onsubmit=\"return confirm('Remove this repository from the dashboard?');\""
-            ),
-            "the Remove form's onsubmit still renders"
+            repositories_body.contains("data-repository=\"repo\""),
+            "the Remove form carries its repository name"
+        );
+        assert!(
+            !repositories_body.contains("onsubmit="),
+            "the Remove form no longer carries an inline onsubmit"
+        );
+        assert!(
+            repositories_body.contains("/static/js/repositories.js"),
+            "the repositories script still loads"
         );
         assert!(
             repositories_body.contains("/static/js/theme.js"),
@@ -5971,6 +5983,7 @@ mod tests {
     const THEME_BOOT_SCRIPT: &str = include_str!("../static/js/theme-boot.js");
     const THEME_SCRIPT: &str = include_str!("../static/js/theme.js");
     const DASHBOARD_SCRIPT: &str = include_str!("../static/js/dashboard.js");
+    const REPOSITORIES_SCRIPT: &str = include_str!("../static/js/repositories.js");
     const STYLE_SHEET: &str = include_str!("../static/style.css");
 
     /// Run the real shipped scripts against the stub DOM, then evaluate
@@ -6001,6 +6014,8 @@ mod tests {
             ctx.eval::<(), _>(THEME_SCRIPT).expect("theme.js loads");
             ctx.eval::<(), _>(DASHBOARD_SCRIPT)
                 .expect("dashboard.js loads");
+            ctx.eval::<(), _>(REPOSITORIES_SCRIPT)
+                .expect("repositories.js loads");
             let json: String = ctx.eval(assertion).expect("assertion script");
             serde_json::from_str(&json).expect("assertion json")
         })
@@ -6093,7 +6108,10 @@ mod tests {
         );
         assert_eq!(result["error"], serde_json::Value::Null);
         assert_eq!(result["theme"], "light");
-        assert_eq!(result["button"], "Dark");
+        assert_eq!(
+            result["button"], "Dark theme",
+            "the theme button keeps its constant name"
+        );
         let before = result["before"].as_array().expect("before fills");
         assert!(
             before.iter().any(|fill| fill.as_str() == Some("#111111")),
@@ -6135,6 +6153,295 @@ mod tests {
         assert_eq!(
             kept["theme"], "dark",
             "a storage that throws keeps the default theme"
+        );
+    }
+
+    /// Covers: each chart's discrete marks are one roving tab stop, and each
+    /// mark names its value and reveals it as a tooltip on focus, hides on
+    /// blur, and hides from the document's pointerdown listener.
+    #[test]
+    fn browser_marks_reveal_their_value_on_focus() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function marks(name) {
+    return env.cards[name].querySelector("svg").children.filter(function (node) {
+      return node.attrs.tabindex !== undefined;
+    });
+  }
+  var tabStops = {};
+  var labelled = true;
+  env.cardNames.forEach(function (name) {
+    var group = marks(name);
+    tabStops[name] = group.filter(function (node) { return node.attrs.tabindex === "0"; }).length;
+    group.forEach(function (node) {
+      if (node.attrs.role !== "img" || !node.attrs["aria-label"]) labelled = false;
+    });
+  });
+  var cells = marks("shipped-calendar");
+  var tip = env.cards["shipped-calendar"].querySelector(".tooltip");
+  cells[0].focus();
+  var shown = { hidden: tip.hidden, text: tip.textContent, label: cells[0].attrs["aria-label"] };
+  cells[0].blur();
+  var blurred = tip.hidden;
+  cells[0].focus();
+  env.document.dispatchEvent({ type: "pointerdown" });
+  var tapped = tip.hidden;
+  return JSON.stringify({
+    tabStops: tabStops,
+    labelled: labelled,
+    shown: shown,
+    blurred: blurred,
+    tapped: tapped
+  });
+})()"#,
+        );
+        let tab_stops = result["tabStops"].as_object().expect("tab stops per card");
+        assert_eq!(
+            tab_stops.len(),
+            template_card_names().len(),
+            "every chart card reports its tab stops"
+        );
+        for (name, count) in tab_stops {
+            assert_eq!(
+                count.as_u64(),
+                Some(1),
+                "the {name} chart is one roving tab stop"
+            );
+        }
+        assert_eq!(result["labelled"], serde_json::json!(true));
+        assert_eq!(
+            result["shown"]["hidden"],
+            serde_json::json!(false),
+            "focus reveals the tooltip"
+        );
+        assert_eq!(
+            result["shown"]["text"], result["shown"]["label"],
+            "the tooltip text is the mark's own accessible name"
+        );
+        assert!(
+            result["shown"]["text"]
+                .as_str()
+                .expect("tooltip text")
+                .contains("shipped"),
+            "the calendar mark names its day's count"
+        );
+        assert_eq!(
+            result["blurred"],
+            serde_json::json!(true),
+            "blur hides the tooltip again"
+        );
+        assert_eq!(
+            result["tapped"],
+            serde_json::json!(true),
+            "a pointerdown on the document hides an open tooltip"
+        );
+    }
+
+    /// Covers: a line chart's overlay is one tab stop, and the arrow keys step
+    /// the highlighted row so every drawn day is reachable.
+    #[test]
+    fn browser_line_overlay_steps_through_rows_with_arrow_keys() {
+        let payload = serde_json::json!({
+            "counts": {"shipped_events": 3, "created_events": 5},
+            "weekly": [{"week": "2026-01-05", "shipped": 1, "created": 2}],
+            "cumulative": [
+                {"date": "2026-01-05", "cumulative": 1, "shipped": 1, "trend": 1},
+                {"date": "2026-01-06", "cumulative": 2, "shipped": 1, "trend": 1.5},
+                {"date": "2026-01-07", "cumulative": 3, "shipped": 1, "trend": 2}
+            ],
+            "shipped_calendar": [{"date": "2026-01-05", "count": 1}],
+            "created_calendar": [{"date": "2026-01-05", "count": 2}],
+            "calendar_peak_shipped": 1,
+            "calendar_peak_created": 2,
+            "live_backlog": [{"date": "2026-01-05", "live": 1}],
+            "mean_age": [{"date": "2026-01-05", "avg_age": 2, "n": 1}],
+            "radar_shipped": [{"label": "alpha", "count": 1}],
+            "radar_live": [{"label": "alpha", "count": 1}],
+            "radar_mode": "scope"
+        });
+        let text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(text.as_str()),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["cumulative"].querySelector("svg");
+  var overlay = svg.children.filter(function (node) {
+    return node.name === "rect" && node.attrs.tabindex === "0";
+  })[0];
+  var tip = env.cards["cumulative"].querySelector(".tooltip");
+  function press(key) {
+    overlay.dispatchEvent({ type: "keydown", key: key });
+  }
+  overlay.focus();
+  var first = tip.textContent;
+  press("ArrowRight");
+  var second = tip.textContent;
+  press("ArrowRight");
+  var third = tip.textContent;
+  return JSON.stringify({
+    overlays: svg.children.filter(function (node) {
+      return node.name === "rect" && node.attrs.tabindex !== undefined;
+    }).length,
+    first: first,
+    second: second,
+    third: third,
+    hidden: tip.hidden
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["overlays"],
+            serde_json::json!(1),
+            "the overlay is the line chart's only tab stop"
+        );
+        let first = result["first"].as_str().expect("first tooltip");
+        let second = result["second"].as_str().expect("second tooltip");
+        let third = result["third"].as_str().expect("third tooltip");
+        assert!(
+            first.contains("Jan 5"),
+            "focus starts on the first day: {first}"
+        );
+        assert!(
+            second.contains("Jan 6"),
+            "ArrowRight steps to the next day: {second}"
+        );
+        assert!(
+            third.contains("Jan 7"),
+            "a second ArrowRight steps again: {third}"
+        );
+        assert_ne!(first, second, "each arrow press rewrites the tooltip");
+        assert_ne!(second, third, "each arrow press rewrites the tooltip");
+        assert_eq!(result["hidden"], serde_json::json!(false));
+    }
+
+    /// Covers: the theme toggle's pressed state carries the applied theme while
+    /// its name stays constant.
+    #[test]
+    fn browser_theme_toggle_reports_its_pressed_state() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var states = [env.themeButton.getAttribute("aria-pressed")];
+  var names = [env.themeButton.textContent];
+  env.themeButton.click();
+  states.push(env.themeButton.getAttribute("aria-pressed"));
+  names.push(env.themeButton.textContent);
+  env.themeButton.click();
+  states.push(env.themeButton.getAttribute("aria-pressed"));
+  names.push(env.themeButton.textContent);
+  return JSON.stringify({ states: states, names: names, theme: env.html.getAttribute("data-theme") });
+})()"#,
+        );
+        assert_eq!(
+            result["states"],
+            serde_json::json!(["true", "false", "true"]),
+            "the pressed state follows the applied theme"
+        );
+        assert_eq!(
+            result["names"],
+            serde_json::json!(["Dark theme", "Dark theme", "Dark theme"]),
+            "the button's name stays constant"
+        );
+        assert_eq!(result["theme"], "dark");
+    }
+
+    /// Covers: with no stored theme a first visit follows the operating
+    /// system's colour scheme, and a stored choice stays sticky.
+    #[test]
+    fn browser_first_visit_follows_the_operating_system_theme() {
+        let mut light = browser_config(false, false, None, serde_json::json!("#123456"));
+        light["prefersLight"] = serde_json::json!(true);
+        let applied = run_browser(
+            &light,
+            r#"JSON.stringify({
+  theme: globalThis.__env.html.getAttribute("data-theme"),
+  pressed: globalThis.__env.themeButton.getAttribute("aria-pressed")
+})"#,
+        );
+        assert_eq!(
+            applied["theme"], "light",
+            "a light OS preference opens the light theme"
+        );
+        assert_eq!(applied["pressed"], "false");
+
+        let dark = browser_config(false, false, None, serde_json::json!("#123456"));
+        let kept = run_browser(
+            &dark,
+            r#"JSON.stringify({ theme: globalThis.__env.html.getAttribute("data-theme") })"#,
+        );
+        assert_eq!(kept["theme"], "dark", "no preference keeps the dark theme");
+
+        let mut sticky = browser_config(false, false, None, serde_json::json!("#123456"));
+        sticky["prefersLight"] = serde_json::json!(true);
+        sticky["storedTheme"] = serde_json::Value::String("dark".to_string());
+        let stored = run_browser(
+            &sticky,
+            r#"JSON.stringify({ theme: globalThis.__env.html.getAttribute("data-theme") })"#,
+        );
+        assert_eq!(
+            stored["theme"], "dark",
+            "an explicit choice outranks the OS preference"
+        );
+    }
+
+    /// Covers: the delegated Remove confirmation names the repository, even one
+    /// whose name holds an apostrophe, and a declined confirm cancels the
+    /// submit.
+    #[test]
+    fn browser_remove_confirmation_names_the_repository() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var form = {
+    getAttribute: function (name) {
+      return name === "data-repository" ? "bob's repo" : null;
+    }
+  };
+  var event = { type: "submit", target: form };
+  env.document.dispatchEvent(event);
+  return JSON.stringify({ confirms: env.confirms.slice(), prevented: !!event.defaultPrevented });
+})()"#,
+        );
+        assert_eq!(
+            result["confirms"],
+            serde_json::json!(["Remove bob's repo from the dashboard?"]),
+            "the confirmation names the repository"
+        );
+        assert_eq!(result["prevented"], serde_json::json!(false));
+
+        let mut declined = browser_config(false, false, None, serde_json::json!("#123456"));
+        declined["confirmResult"] = serde_json::json!(false);
+        let cancelled = run_browser(
+            &declined,
+            r#"(function () {
+  var env = globalThis.__env;
+  var form = {
+    getAttribute: function (name) {
+      return name === "data-repository" ? "bob's repo" : null;
+    }
+  };
+  var event = { type: "submit", target: form };
+  env.document.dispatchEvent(event);
+  return JSON.stringify({ prevented: !!event.defaultPrevented });
+})()"#,
+        );
+        assert_eq!(
+            cancelled["prevented"],
+            serde_json::json!(true),
+            "a declined confirmation cancels the submit"
         );
     }
 
@@ -6682,9 +6989,11 @@ mod tests {
         }
     }
 
-    /// Covers: `.tooltip` is fixed to the viewport and `tipFor` places
-    /// it from the pointer's client coordinates with no frame offset, so the
-    /// scrolling calendar frame neither clips nor shifts it.
+    /// Covers: `.tooltip` is fixed to the viewport; `tipFor` places it from the
+    /// pointer's client coordinates with no frame offset, so the scrolling
+    /// calendar frame neither clips nor shifts it; and a focused mark anchors
+    /// it to the mark's own box, because a focus event carries no pointer
+    /// coordinates.
     #[test]
     fn tooltip_is_fixed_and_follows_the_pointer() {
         let tooltip = css_rule(".tooltip");
@@ -6694,15 +7003,19 @@ mod tests {
         );
         let tip_for = function_source("function tipFor(frame)");
         assert!(
-            tip_for.contains("event.clientX + 12"),
-            "the tooltip follows the pointer's viewport x: {tip_for}"
+            tip_for.contains("place(event.clientX, event.clientY)"),
+            "the tooltip follows the pointer's viewport coordinates: {tip_for}"
         );
         assert!(
-            tip_for.contains("event.clientY + 12"),
-            "the tooltip follows the pointer's viewport y: {tip_for}"
+            tip_for.contains("tip.style.left = x + 12 + \"px\""),
+            "the tooltip sits 12px right of its anchor: {tip_for}"
         );
         assert!(
-            !tip_for.contains("getBoundingClientRect"),
+            tip_for.contains("place(box.left + box.width / 2, box.top)"),
+            "a focused mark anchors the tooltip to its own box: {tip_for}"
+        );
+        assert!(
+            !tip_for.contains("svg.getBoundingClientRect"),
             "the tooltip takes no frame offset lookup: {tip_for}"
         );
     }
@@ -8491,7 +8804,7 @@ mod tests {
             let summary_id = attribute(summary, "id").expect("the summary carries an id");
 
             let svg = tag_of(block, "<svg");
-            assert_eq!(attribute(svg, "role").as_deref(), Some("img"));
+            assert_eq!(attribute(svg, "role").as_deref(), Some("group"));
             assert_eq!(
                 attribute(svg, "aria-labelledby").as_deref(),
                 Some(name_id.as_str()),
@@ -8517,6 +8830,120 @@ mod tests {
             template_card_names().len(),
             "every chart card was checked"
         );
+        cleanup(&path);
+    }
+
+    /// Covers: each chart SVG carries its "Loading chart…" text node and the
+    /// dashboard carries a `<noscript>` block naming the Repositories link.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_dashboard_explains_the_charts_need_scripting() {
+        let (state, path) = app_state("a11y_noscript").await;
+        let html = render_home(&state, &HomeQuery::default())
+            .await
+            .expect("render");
+        let noscript = html
+            .split("<noscript>")
+            .nth(1)
+            .expect("the dashboard carries a noscript block")
+            .split("</noscript>")
+            .next()
+            .expect("the noscript block closes");
+        assert!(
+            noscript.contains("href=\"/repositories\""),
+            "the no-script block names the Repositories link: {noscript}"
+        );
+        let mut charts = 0;
+        for block in html.split("<svg ").skip(1) {
+            let svg = block.split("</svg>").next().expect("the svg closes");
+            assert!(
+                svg.contains("Loading chart…"),
+                "each chart SVG carries its loading text"
+            );
+            charts += 1;
+        }
+        assert_eq!(
+            charts,
+            template_card_names().len(),
+            "every chart SVG was checked"
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: the project filter submits through a Show button and carries no
+    /// inline onchange.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_project_filter_offers_a_submit_button() {
+        let (state, path) = app_state("a11y_filter_submit").await;
+        let html = render_home(&state, &HomeQuery::default())
+            .await
+            .expect("render");
+        assert!(
+            html.contains("<button class=\"btn btn-secondary\" type=\"submit\">Show</button>"),
+            "the filter carries a Show submit button"
+        );
+        assert!(
+            !html.contains("onchange="),
+            "the filter carries no inline onchange"
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: the active nav tab carries `aria-current="page"` and the theme
+    /// toggle names itself "Dark theme" with its pressed state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_nav_marks_the_active_tab_and_theme_state() {
+        let (state, path, folder, _id) = state_with_repository("a11y_nav_state").await;
+        let dashboard = body_text(send(state.clone(), get_page("/", "127.0.0.1:7880")).await).await;
+        assert!(
+            dashboard.contains("aria-current=\"page\">Dashboard</a>"),
+            "the dashboard tab marks the current page"
+        );
+        assert_eq!(
+            dashboard.matches("aria-current=\"page\"").count(),
+            1,
+            "only the active tab is current"
+        );
+        assert!(
+            dashboard.contains(
+                "id=\"theme-toggle\" type=\"button\" aria-pressed=\"true\">Dark theme</button>"
+            ),
+            "the theme toggle carries its constant name and pressed state"
+        );
+        let repositories =
+            body_text(send(state.clone(), get_page("/repositories", "127.0.0.1:7880")).await).await;
+        assert!(
+            repositories.contains("aria-current=\"page\">Repositories</a>"),
+            "the repositories tab marks the current page"
+        );
+        assert_eq!(
+            repositories.matches("aria-current=\"page\"").count(),
+            1,
+            "only the active tab is current"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Covers: each Remove button names its repository and the form carries the
+    /// name for the delegated confirmation.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_remove_button_names_its_repository() {
+        let (state, path, folder, _id) = state_with_repository("a11y_remove_name").await;
+        let body =
+            body_text(send(state.clone(), get_page("/repositories", "127.0.0.1:7880")).await).await;
+        assert!(
+            body.contains(">Remove repo</button>"),
+            "the Remove button names its repository"
+        );
+        assert!(
+            body.contains("data-repository=\"repo\""),
+            "the form carries the repository name for the confirm text"
+        );
+        assert!(
+            !body.contains("onsubmit="),
+            "the Remove form carries no inline onsubmit"
+        );
+        let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 

@@ -14,10 +14,10 @@ What `task-viewer` does, from the person's side. Structure is `ARCHITECTURE.md`,
 ## 2. Navigation
 
 - The sticky bar carries Dashboard and Repositories tabs, plus the theme control. The app opens on Dashboard.
-- On Dashboard, the bar also carries the project filter and Update.
+- On Dashboard, the bar also carries the project filter with its Show button, and Update. Show submits the filter, so the page changes only when the person asks.
 - On Repositories, the bar carries Add repository.
 - All projects is the default filter.
-- Light and Dark switch the page. The browser remembers the choice, except where a restricted browser blocks storage: the switch still applies for the session and recolors the charts, it just is not remembered for the next visit.
+- Light and Dark switch the page. The theme control keeps the constant name Dark theme and its pressed state reports whether the dark theme is applied. The browser remembers an explicit choice, except where a restricted browser blocks storage: the switch still applies for the session and recolors the charts, it just is not remembered for the next visit. A first visit with no remembered choice follows the operating system's colour scheme, so a light OS preference opens the light theme.
 
 ## 3. Repositories
 
@@ -39,6 +39,6 @@ The dashboard shows eight charts from the stored rows, for all configured reposi
 - Shipped radar.
 - Live radar.
 
-Hovering a mark shows the count for that week, day, or spoke. With all projects selected, each radar spoke is one repository. With one project selected, each spoke is one task scope, the filename prefix before the first underscore. Each chart is named by its card heading and described by its summary line. A theme switch recolours the drawn charts in place.
+Hovering or focusing a mark shows the count for that week, day, or spoke. A chart's marks form one tab stop, and the arrow keys step the focus through them; a line chart's overlay takes the one tab stop and its arrow keys step through the drawn days. A page without scripting keeps a Loading chart text in each frame and says the charts need scripting, naming the Repositories link. With all projects selected, each radar spoke is one repository. With one project selected, each spoke is one task scope, the filename prefix before the first underscore. Each chart is named by its card heading and described by its summary line. A theme switch recolours the drawn charts in place.
 
 A card whose chart cannot be drawn shows Charts unavailable in place of the chart and in its summary line, and the other cards still render.
