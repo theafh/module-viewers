@@ -6,7 +6,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -28,7 +28,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use walkdir::WalkDir;
 
 use crate::db::{self, Repository, StoreHookFn};
-use crate::harvest::{self, HarvestError, ParsedTask, PriorTask};
+use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
 use crate::series::{self, RadarMode};
 
 pub const PORT: u16 = 7880;
@@ -332,6 +332,7 @@ pub fn router(state: AppState) -> Router {
     // alone, so it never wraps the static service below.
     let pages: Router<AppState> = Router::new()
         .route("/", get(home))
+        .route("/tasks", get(tasks_page))
         .route("/repositories", get(repositories_page).post(add_repository))
         .route("/repositories/{id}/delete", post(remove_repository))
         .route("/scan", post(scan_all))
@@ -775,6 +776,24 @@ struct FlashQuery {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct TasksQuery {
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    to: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct ProjectForm {
     #[serde(default)]
     project: String,
@@ -805,6 +824,20 @@ async fn repositories_page(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "The repositories page could not be rendered.",
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn tasks_page(State(state): State<AppState>, Query(query): Query<TasksQuery>) -> Response {
+    match render_tasks(&state, &query).await {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "task list render failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The task list could not be rendered.",
             )
                 .into_response()
         }
@@ -961,7 +994,8 @@ async fn render_dashboard(
     let html = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         #[cfg(test)]
         record_render_blocking_thread();
-        let board = series::dashboard(&tasks, crate::dates::today(), mode, &label);
+        let mut board = series::dashboard(&tasks, crate::dates::today(), mode, &label);
+        board.project = selected.clone();
         let data_json = chart_payload(&board)?;
         let page = DashboardPage {
             version,
@@ -1000,6 +1034,127 @@ async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Re
     };
     let context = Context::from_serialize(page)?;
     Ok(state.templates.render("repositories.html", &context)?)
+}
+
+/// The day axis a `from`/`to` window bounds on the task list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateAxis {
+    Created,
+    Shipped,
+}
+
+/// The filters a `/tasks` request carries. Each one narrows the stored rows the
+/// way the dashboard's chart marks ask for, so a count opens the rows behind it.
+#[derive(Debug)]
+struct TaskFilter {
+    kind: Option<TaskKind>,
+    scope: Option<String>,
+    q: Option<String>,
+    date: DateAxis,
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+}
+
+impl TaskFilter {
+    fn from_query(query: &TasksQuery) -> Self {
+        let kind = TaskKind::parse(query.kind.trim());
+        let scope = query.scope.trim();
+        let q = query.q.trim().to_lowercase();
+        let date = match query.date.trim() {
+            "shipped" => DateAxis::Shipped,
+            _ => DateAxis::Created,
+        };
+        Self {
+            kind,
+            scope: (!scope.is_empty()).then(|| scope.to_string()),
+            q: (!q.is_empty()).then_some(q),
+            date,
+            from: crate::dates::parse_iso_date(query.from.trim()),
+            to: crate::dates::parse_iso_date(query.to.trim()),
+        }
+    }
+
+    fn matches(&self, task: &series::TaskRecord) -> bool {
+        if self.kind.is_some_and(|kind| kind != task.kind) {
+            return false;
+        }
+        if self
+            .scope
+            .as_deref()
+            .is_some_and(|scope| scope != task.scope)
+        {
+            return false;
+        }
+        if self
+            .q
+            .as_deref()
+            .is_some_and(|q| !task.path.to_lowercase().contains(q))
+        {
+            return false;
+        }
+        if self.from.is_none() && self.to.is_none() {
+            return true;
+        }
+        let day = match self.date {
+            DateAxis::Created => Some(task.created),
+            DateAxis::Shipped => task.ship_date,
+        };
+        let Some(day) = day else {
+            return false;
+        };
+        self.from.is_none_or(|from| day >= from) && self.to.is_none_or(|to| day <= to)
+    }
+}
+
+async fn render_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<String> {
+    let repositories = db::list_repositories(&state.pool).await?;
+    let selected = selected_id(&repositories, &query.project);
+    let tasks = db::load_tasks(&state.pool, selected).await?;
+    let filter = TaskFilter::from_query(query);
+    let mut matched = tasks
+        .iter()
+        .filter(|task| filter.matches(task))
+        .collect::<Vec<_>>();
+    matched.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let rows = matched.into_iter().map(task_row_view).collect::<Vec<_>>();
+    let project = match selected {
+        Some(id) => id.to_string(),
+        None => "all".to_string(),
+    };
+    let page = TasksPage {
+        version: state.static_version.clone(),
+        page: "tasks",
+        count: rows.len(),
+        back_href: format!("/?project={project}"),
+        rows,
+    };
+    let context = Context::from_serialize(page)?;
+    Ok(state.templates.render("tasks.html", &context)?)
+}
+
+/// One stored row as the list renders it. A finished row names its ship day, a
+/// deferred row its leave day, and a live row carries an em dash.
+fn task_row_view(task: &series::TaskRecord) -> TaskRowView {
+    let (day_kind, day) = match task.kind {
+        TaskKind::Finished => ("Shipped", task.ship_date.or(task.leave_date)),
+        TaskKind::Deferred => ("Left", task.leave_date),
+        TaskKind::Live => ("", None),
+    };
+    TaskRowView {
+        repository: task.project.to_string(),
+        scope: task.scope.clone(),
+        path: task.path.clone(),
+        kind: task.kind.as_str().to_string(),
+        created: crate::dates::format_date(task.created),
+        day_kind,
+        day: day
+            .map(crate::dates::format_date)
+            .unwrap_or_else(|| "—".to_string()),
+    }
 }
 
 fn selected_id(repositories: &[Repository], project: &str) -> Option<i64> {
@@ -1092,6 +1247,28 @@ struct RepositoriesPage {
     notice: String,
     error: String,
     has_projects: bool,
+}
+
+#[derive(Serialize)]
+struct TasksPage {
+    version: String,
+    page: &'static str,
+    count: usize,
+    back_href: String,
+    rows: Vec<TaskRowView>,
+}
+
+#[derive(Serialize)]
+struct TaskRowView {
+    repository: String,
+    scope: String,
+    path: String,
+    kind: String,
+    created: String,
+    /// `Shipped` or `Left` for an archived row, empty for a live one.
+    day_kind: &'static str,
+    /// The ship or leave day, or an em dash when the row has none.
+    day: String,
 }
 
 #[derive(Serialize)]
@@ -5977,6 +6154,195 @@ mod tests {
         cleanup(&path);
     }
 
+    /// One stored row with explicit dates, so a task-list test can seed the
+    /// filters it drives.
+    fn stored_row(
+        path: &str,
+        scope: &str,
+        kind: TaskKind,
+        created: (i32, u32, u32),
+        ship: Option<(i32, u32, u32)>,
+        leave: Option<(i32, u32, u32)>,
+    ) -> ParsedTask {
+        let date = |(year, month, day): (i32, u32, u32)| {
+            chrono::NaiveDate::from_ymd_opt(year, month, day).expect("date")
+        };
+        ParsedTask {
+            path: path.to_string(),
+            scope: scope.to_string(),
+            kind,
+            created: date(created),
+            updated: date(created),
+            ship_date: ship.map(date),
+            leave_date: leave.map(date),
+            content_hash: Some("0123456789abcdef".to_string()),
+            path_is_lossy: false,
+        }
+    }
+
+    /// Seed two repositories with four rows: two live, one finished, and one
+    /// deferred, spread across scopes, repositories, and days.
+    async fn seeded_task_list(name: &str) -> (AppState, PathBuf, i64, i64) {
+        let (state, path) = app_state(name).await;
+        let folder_a = unique_temp_dir(&format!("{name}_a"));
+        let folder_b = unique_temp_dir(&format!("{name}_b"));
+        std::fs::create_dir_all(&folder_a).expect("folder a");
+        std::fs::create_dir_all(&folder_b).expect("folder b");
+        let alpha = db::insert_repository(&state.pool, "Alpha", &folder_a.to_string_lossy())
+            .await
+            .expect("alpha");
+        let beta = db::insert_repository(&state.pool, "Beta", &folder_b.to_string_lossy())
+            .await
+            .expect("beta");
+        db::replace_tasks(
+            &state.pool,
+            alpha,
+            &[
+                stored_row(
+                    "alpha_live.md",
+                    "alpha",
+                    TaskKind::Live,
+                    (2026, 5, 1),
+                    None,
+                    None,
+                ),
+                stored_row(
+                    "alpha_done.md",
+                    "alpha",
+                    TaskKind::Finished,
+                    (2026, 5, 2),
+                    Some((2026, 5, 10)),
+                    Some((2026, 5, 10)),
+                ),
+            ],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("alpha rows");
+        db::replace_tasks(
+            &state.pool,
+            beta,
+            &[
+                stored_row(
+                    "beta_defer.md",
+                    "beta",
+                    TaskKind::Deferred,
+                    (2026, 3, 1),
+                    None,
+                    Some((2026, 4, 1)),
+                ),
+                stored_row(
+                    "gamma_live.md",
+                    "gamma",
+                    TaskKind::Live,
+                    (2026, 6, 1),
+                    None,
+                    None,
+                ),
+            ],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("beta rows");
+        (state, path, alpha, beta)
+    }
+
+    async fn task_list_body(state: &AppState, query: &str) -> String {
+        let uri = if query.is_empty() {
+            "/tasks".to_string()
+        } else {
+            format!("/tasks?{query}")
+        };
+        let response = send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri} renders");
+        body_text(response).await
+    }
+
+    /// Covers: `GET /tasks` lists every stored row for the default
+    /// All-projects view, with the repository, scope, path, kind, and dates.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_lists_every_row_for_all_projects() {
+        let (state, path, _alpha, _beta) = seeded_task_list("tasks_default").await;
+        let body = task_list_body(&state, "").await;
+        for expected in [
+            "Alpha",
+            "Beta",
+            "alpha",
+            "beta",
+            "gamma",
+            "alpha_live.md",
+            "alpha_done.md",
+            "beta_defer.md",
+            "gamma_live.md",
+            "live",
+            "finished",
+            "deferred",
+            "2026-05-01",
+            "2026-05-10",
+            "2026-04-01",
+            "4 tasks",
+            "Back to dashboard",
+            "project=all",
+        ] {
+            assert!(body.contains(expected), "the list shows {expected}: {body}");
+        }
+        cleanup(&path);
+    }
+
+    /// Covers: each filter parameter narrows the list, driven against a seeded
+    /// database.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_filters_narrow_the_list() {
+        let (state, path, alpha, _beta) = seeded_task_list("tasks_filters").await;
+
+        let body = task_list_body(&state, &format!("project={alpha}")).await;
+        assert!(body.contains("alpha_live.md"));
+        assert!(body.contains("alpha_done.md"));
+        assert!(!body.contains("beta_defer.md"));
+        assert!(!body.contains("gamma_live.md"));
+
+        let body = task_list_body(&state, "kind=finished").await;
+        assert!(body.contains("alpha_done.md"));
+        assert!(!body.contains("alpha_live.md"));
+        assert!(!body.contains("beta_defer.md"));
+
+        let body = task_list_body(&state, "kind=live").await;
+        assert!(body.contains("alpha_live.md"));
+        assert!(body.contains("gamma_live.md"));
+        assert!(!body.contains("alpha_done.md"));
+
+        let body = task_list_body(&state, "kind=deferred").await;
+        assert!(body.contains("beta_defer.md"));
+        assert!(!body.contains("alpha_done.md"));
+
+        let body = task_list_body(&state, "scope=beta").await;
+        assert!(body.contains("beta_defer.md"));
+        assert!(!body.contains("gamma_live.md"));
+
+        let body = task_list_body(&state, "q=GAMMA").await;
+        assert!(body.contains("gamma_live.md"));
+        assert!(!body.contains("alpha_live.md"));
+
+        let body = task_list_body(&state, "date=shipped&from=2026-05-10&to=2026-05-10").await;
+        assert!(body.contains("alpha_done.md"));
+        assert!(!body.contains("alpha_live.md"));
+
+        let body = task_list_body(&state, "date=created&from=2026-05-02&to=2026-05-02").await;
+        assert!(body.contains("alpha_done.md"));
+        assert!(!body.contains("alpha_live.md"));
+
+        let body = task_list_body(&state, "from=2026-06-01").await;
+        assert!(body.contains("gamma_live.md"));
+        assert!(!body.contains("alpha_live.md"));
+        assert!(body.contains("1 task"));
+
+        let body = task_list_body(&state, "to=2026-03-01").await;
+        assert!(body.contains("beta_defer.md"));
+        assert!(!body.contains("alpha_live.md"));
+
+        cleanup(&path);
+    }
+
     const BROWSER_GUARDS: &str = include_str!("../testdata/browser_guards.js");
     const DASHBOARD_DRAW_SNAPSHOTS: &str =
         include_str!("../testdata/dashboard_draw_snapshots.json");
@@ -6086,9 +6452,14 @@ mod tests {
   var env = globalThis.__env;
   function fills() {
     var svg = env.cards["created-calendar"].querySelector("svg");
-    return svg.children
-      .filter(function (node) { return node.name === "rect"; })
-      .map(function (node) { return node.attrs.fill; });
+    var rects = [];
+    svg.children.forEach(function (node) {
+      if (node.name === "rect") rects.push(node);
+      node.children.forEach(function (child) {
+        if (child.name === "rect") rects.push(child);
+      });
+    });
+    return rects.map(function (node) { return node.attrs.fill; });
   }
   var before = fills();
   var error = null;
@@ -6177,7 +6548,10 @@ mod tests {
     var group = marks(name);
     tabStops[name] = group.filter(function (node) { return node.attrs.tabindex === "0"; }).length;
     group.forEach(function (node) {
-      if (node.attrs.role !== "img" || !node.attrs["aria-label"]) labelled = false;
+      // A drill-down mark is a link; every other mark is an image. Both are
+      // focusable and carry the tooltip text as their accessible name.
+      if (node.attrs.role !== "img" && node.attrs.role !== "link") labelled = false;
+      if (!node.attrs["aria-label"]) labelled = false;
     });
   });
   var cells = marks("shipped-calendar");
@@ -6237,6 +6611,258 @@ mod tests {
             result["tapped"],
             serde_json::json!(true),
             "a pointerdown on the document hides an open tooltip"
+        );
+    }
+
+    /// Covers: a weekly bar, a calendar day, and a radar spoke each link to
+    /// `/tasks` with the project, kind, date axis, and window that reproduce
+    /// the count, and the spoke carries no window.
+    #[test]
+    fn browser_marks_link_to_the_filtered_task_list() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function anchors(name) {
+    return env.cards[name].querySelector("svg").children.filter(function (node) {
+      return node.name === "a";
+    });
+  }
+  var weekly = anchors("weekly");
+  var shipped = anchors("shipped-calendar")[0];
+  var radar = anchors("radar-shipped")[0];
+  var linked = weekly.concat([shipped, radar]);
+  return JSON.stringify({
+    weekly: weekly.map(function (node) { return node.attrs.href; }),
+    shipped: shipped.attrs.href,
+    radar: radar.attrs.href,
+    roles: linked.every(function (node) {
+      return node.attrs.role === "link" && node.attrs.tabindex !== undefined;
+    })
+  });
+})()"#,
+        );
+        let weekly = result["weekly"].as_array().expect("weekly links");
+        assert_eq!(weekly.len(), 4, "each week carries one link per bar");
+        assert_eq!(
+            weekly[0].as_str(),
+            Some("/tasks?project=3&kind=finished&date=shipped&to=2026-01-11"),
+            "the first week omits its lower bound so pre-floor ships still list"
+        );
+        assert_eq!(
+            weekly[1].as_str(),
+            Some("/tasks?project=3&kind=all&date=created&to=2026-01-11"),
+            "the first week's created bar omits its lower bound"
+        );
+        assert_eq!(
+            weekly[2].as_str(),
+            Some("/tasks?project=3&kind=finished&date=shipped&from=2026-01-12"),
+            "the last week omits its upper bound so after-today ships still list"
+        );
+        assert_eq!(
+            result["shipped"],
+            "/tasks?project=3&kind=finished&date=shipped&from=2026-01-05&to=2026-01-05",
+            "a calendar day opens the shipped tasks of that day"
+        );
+        let radar = result["radar"].as_str().expect("radar link");
+        assert_eq!(
+            radar, "/tasks?project=3&kind=finished&scope=alpha",
+            "a scope spoke opens its slice under the page's project"
+        );
+        assert!(!radar.contains("from="), "the spoke carries no window");
+        assert_eq!(result["roles"], serde_json::json!(true));
+    }
+
+    /// Covers: a project-mode radar spoke links to its own repository, not to
+    /// the page's all-projects filter, and carries no scope.
+    #[test]
+    fn browser_project_radar_spoke_links_to_its_repository() {
+        let payload = serde_json::json!({
+            "project": "all",
+            "radar_mode": "project",
+            "counts": {"shipped_events": 1, "created_events": 1},
+            "weekly": [],
+            "cumulative": [],
+            "shipped_calendar": [],
+            "created_calendar": [],
+            "calendar_peak_shipped": 0,
+            "calendar_peak_created": 0,
+            "live_backlog": [],
+            "mean_age": [],
+            "radar_shipped": [{"label": "Alpha", "count": 1, "repository_id": 7}],
+            "radar_live": [{"label": "Alpha", "count": 0, "repository_id": 7}]
+        });
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var anchors = env.cards["radar-shipped"].querySelector("svg").children.filter(function (node) {
+    return node.name === "a";
+  });
+  return JSON.stringify({ href: anchors[0].attrs.href, anchors: anchors.length });
+})()"#,
+        );
+        assert_eq!(result["anchors"].as_u64(), Some(1));
+        let href = result["href"].as_str().expect("project spoke link");
+        assert_eq!(href, "/tasks?project=7&kind=finished");
+        assert!(!href.contains("scope="), "a project spoke carries no scope");
+        assert!(!href.contains("from="), "the spoke carries no window");
+    }
+
+    /// Covers: the weekly link's omitted bound reaches the rows `series.rs`
+    /// folds into the last charted week, so the list holds the bar's count even
+    /// when a task is dated after today.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_weekly_link_lists_the_folded_last_week() {
+        let (state, path) = app_state("weekly_folded").await;
+        let folder = unique_temp_dir("weekly_folded_repo");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let repository = db::insert_repository(&state.pool, "Alpha", &folder.to_string_lossy())
+            .await
+            .expect("repository");
+        db::replace_tasks(
+            &state.pool,
+            repository,
+            &[
+                stored_row(
+                    "tasks/alpha_first.md",
+                    "alpha",
+                    TaskKind::Live,
+                    (2026, 1, 5),
+                    None,
+                    None,
+                ),
+                stored_row(
+                    "tasks/alpha_last.md",
+                    "alpha",
+                    TaskKind::Live,
+                    (2026, 1, 20),
+                    None,
+                    None,
+                ),
+                stored_row(
+                    "tasks/alpha_future.md",
+                    "alpha",
+                    TaskKind::Live,
+                    (2026, 3, 1),
+                    None,
+                    None,
+                ),
+            ],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("rows");
+        let tasks = db::load_tasks(&state.pool, None).await.expect("tasks");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 22).expect("today");
+        let mut board = series::dashboard(&tasks, today, RadarMode::Project, "All projects");
+        board.project = "all".to_string();
+        let payload_text = serde_json::to_string(&board).expect("payload");
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var payload = JSON.parse(globalThis.__config.payloadText);
+  var anchors = globalThis.__env.cards["weekly"].querySelector("svg").children.filter(function (node) {
+    return node.name === "a" && node.attrs.href.indexOf("kind=all") !== -1;
+  });
+  return JSON.stringify({
+    first: anchors[0].attrs.href,
+    last: anchors[anchors.length - 1].attrs.href,
+    firstCount: payload.weekly[0].created,
+    lastCount: payload.weekly[payload.weekly.length - 1].created
+  });
+})()"#,
+        );
+        let last = result["last"].as_str().expect("last week link");
+        assert!(
+            !last.contains("to="),
+            "the last week omits its upper bound: {last}"
+        );
+        let last_count = result["lastCount"].as_u64().expect("last bar count");
+        assert_eq!(last_count, 2, "the future task folds into the last week");
+        let response = send(state.clone(), get_page(last, "127.0.0.1:7880")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        assert_eq!(
+            body.matches("<code>").count() as u64,
+            last_count,
+            "the linked list holds every row the last bar counts"
+        );
+        assert!(body.contains("alpha_future.md"));
+
+        let first = result["first"].as_str().expect("first week link");
+        assert!(
+            !first.contains("from="),
+            "the first week omits its lower bound: {first}"
+        );
+        let first_count = result["firstCount"].as_u64().expect("first bar count");
+        assert_eq!(first_count, 1);
+        let response = send(state.clone(), get_page(first, "127.0.0.1:7880")).await;
+        let body = body_text(response).await;
+        assert_eq!(
+            body.matches("<code>").count() as u64,
+            first_count,
+            "the first bar's link holds its own count"
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: every chart card's "Show data" table holds one row per payload
+    /// series row for that card.
+    #[test]
+    fn browser_show_data_tables_match_the_series_length() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var counts = {};
+  var firstWeek = null;
+  env.cardNames.forEach(function (name) {
+    var body = env.cards[name].querySelector(".data-table tbody");
+    counts[name] = body.children.length;
+  });
+  var weekly = env.cards["weekly"].querySelector(".data-table tbody").children[0];
+  firstWeek = weekly.children.map(function (cell) { return cell.textContent; });
+  return JSON.stringify({ counts: counts, firstWeek: firstWeek });
+})()"#,
+        );
+        let counts = result["counts"].as_object().expect("table row counts");
+        let expected = [
+            ("weekly", 2),
+            ("cumulative", 2),
+            ("shipped-calendar", 1),
+            ("created-calendar", 1),
+            ("backlog", 1),
+            ("age", 1),
+            ("radar-shipped", 1),
+            ("radar-live", 1),
+        ];
+        for (name, rows) in expected {
+            assert_eq!(
+                counts.get(name).and_then(serde_json::Value::as_u64),
+                Some(rows),
+                "the {name} table has one row per series row"
+            );
+        }
+        assert_eq!(
+            result["firstWeek"],
+            serde_json::json!(["2026-01-05", "1", "2"]),
+            "the weekly table prints the exact series numbers"
         );
     }
 
@@ -6465,18 +7091,19 @@ mod tests {
   var badWidths = 0;
   var circles = 0;
   var badRadii = 0;
+  function visit(node) {
+    if (node.name === "rect") {
+      rects += 1;
+      if (Number(node.attrs.width) < 0) badWidths += 1;
+    }
+    if (node.name === "circle") {
+      circles += 1;
+      if (Number(node.attrs.r) < 0) badRadii += 1;
+    }
+    node.children.forEach(visit);
+  }
   env.cardNames.forEach(function (name) {
-    var svg = env.cards[name].querySelector("svg");
-    svg.children.forEach(function (node) {
-      if (node.name === "rect") {
-        rects += 1;
-        if (Number(node.attrs.width) < 0) badWidths += 1;
-      }
-      if (node.name === "circle") {
-        circles += 1;
-        if (Number(node.attrs.r) < 0) badRadii += 1;
-      }
-    });
+    env.cards[name].querySelector("svg").children.forEach(visit);
   });
   return JSON.stringify({ rects: rects, badWidths: badWidths, circles: circles, badRadii: badRadii });
 })()"#,
@@ -6881,7 +7508,13 @@ mod tests {
   var parts = String(svg.getAttribute("viewBox")).trim().split(/\s+/).map(Number);
   var box = { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
   var eps = 1e-6;
-  var rects = svg.children.filter(function (node) { return node.name === "rect"; });
+  var rects = [];
+  svg.children.forEach(function (node) {
+    if (node.name === "rect") rects.push(node);
+    node.children.forEach(function (child) {
+      if (child.name === "rect") rects.push(child);
+    });
+  });
   var badSize = rects.filter(function (node) {
     return Number(node.attrs.width) !== 14 || Number(node.attrs.height) !== 14;
   }).length;
@@ -7200,9 +7833,17 @@ mod tests {
   var centreDots = 0;
   svg.children.forEach(function (node, index) {
     if (node.name === "polygon") polygon = index;
-    if (node.name === "circle" && node.attrs.fill !== "none") {
-      dots.push({ index: index, cx: Number(node.attrs.cx), cy: Number(node.attrs.cy) });
-      if (Number(node.attrs.cx) === 500 && Number(node.attrs.cy) === 184) centreDots += 1;
+    // A drill-down dot is a circle inside its link anchor; the anchor paints
+    // after the polygon, so its index is the paint position that matters.
+    var circle = node.name === "circle" ? node : null;
+    if (node.name === "a") {
+      node.children.forEach(function (child) {
+        if (child.name === "circle") circle = child;
+      });
+    }
+    if (circle && circle.attrs.fill !== "none") {
+      dots.push({ index: index, cx: Number(circle.attrs.cx), cy: Number(circle.attrs.cy) });
+      if (Number(circle.attrs.cx) === 500 && Number(circle.attrs.cy) === 184) centreDots += 1;
     }
   });
   return JSON.stringify({ polygon: polygon, dots: dots, centreDots: centreDots });
@@ -7507,7 +8148,13 @@ mod tests {
             r#"(function () {
   var env = globalThis.__env;
   var calendar = env.cards["shipped-calendar"].querySelector("svg");
-  var cells = calendar.children.filter(function (node) { return node.name === "rect"; });
+  var cells = [];
+  calendar.children.forEach(function (node) {
+    if (node.name === "rect") cells.push(node);
+    node.children.forEach(function (child) {
+      if (child.name === "rect") cells.push(child);
+    });
+  });
   var radar = env.cards["radar-shipped"].querySelector("svg");
   var radius = 0;
   radar.children.forEach(function (node) {
@@ -7733,6 +8380,7 @@ mod tests {
     /// same rows to two runs that differ by one week.
     fn fixture_payload() -> serde_json::Value {
         serde_json::json!({
+            "project": "3",
             "counts": {"shipped_events": 3, "created_events": 5},
             "weekly": [
                 {"week": "2026-01-05", "shipped": 1, "created": 2},
@@ -8134,8 +8782,15 @@ mod tests {
             r#"(function () {
   var env = globalThis.__env;
   function fills(name) {
-    return env.cards[name].querySelector("svg").children
-      .filter(function (node) { return node.name === "rect"; })
+    var svg = env.cards[name].querySelector("svg");
+    var rects = [];
+    svg.children.forEach(function (node) {
+      if (node.name === "rect") rects.push(node);
+      node.children.forEach(function (child) {
+        if (child.name === "rect") rects.push(child);
+      });
+    });
+    return rects
       .map(function (node) { return node.attrs.fill; })
       .filter(function (fill) { return fill !== "transparent"; });
   }
@@ -8418,75 +9073,55 @@ mod tests {
     return months[parts[1] - 1] + " " + parts[2] + ", " + parts[0];
   }
   var svg = env.cards["weekly"].querySelector("svg");
-  var hits = svg.children.filter(function (node) {
-    return node.name === "rect" && node.attrs.fill === "transparent";
-  });
+  var anchors = svg.children.filter(function (node) { return node.name === "a"; });
   var tip = env.cards["weekly"].querySelector(".chart-frame").querySelector(".tooltip");
   var slot = (984 - 40) / rows.length;
-  var widths = hits.map(function (node) { return Number(node.attrs.width); });
+  var widths = anchors.map(function (anchor) {
+    return Number(anchor.children[0].attrs.width);
+  });
   var mismatches = [];
-  var probes = 0;
-  var skipped = 0;
-  hits.forEach(function (node, index) {
-    // The right edge of this bar's own column, just inside the rect.
-    var centre = Number(node.attrs.x) + Number(node.attrs.width) / 2;
-    var px = centre + slot / 2 - 0.01;
-    var next = hits[index + 1];
-    // A daylight-saving week is an hour shorter than the slot pitch, so its
-    // column ends before the probe; that one column has no right edge to test.
-    if (next && px >= Number(next.attrs.x)) {
-      skipped += 1;
-      return;
-    }
-    // The topmost rect at the probe wins, as the browser's hit test does.
-    var target = null;
-    hits.forEach(function (candidate) {
-      var left = Number(candidate.attrs.x);
-      if (px >= left && px <= left + Number(candidate.attrs.width)) target = candidate;
+  anchors.forEach(function (anchor, index) {
+    var rect = anchor.children[0];
+    anchor.listeners.mousemove[0]({
+      type: "mousemove",
+      clientX: Number(rect.attrs.x) + Number(rect.attrs.width) / 2,
+      clientY: 100
     });
-    target.listeners.mousemove[0]({ type: "mousemove", clientX: px, clientY: 100 });
-    probes += 1;
-    var row = rows[index];
-    var expected = "Week of " + label(row.week) + " · shipped " + row.shipped +
-      " · created " + row.created;
+    var row = rows[Math.floor(index / 2)];
+    var expected = "Week of " + label(row.week) +
+      (index % 2 === 0 ? " · shipped " + row.shipped : " · created " + row.created);
     if (tip.textContent !== expected) {
       mismatches.push({ index: index, expected: expected, actual: tip.textContent });
     }
   });
   return JSON.stringify({
-    hits: hits.length,
+    anchors: anchors.length,
     slot: slot,
     widths: widths,
-    probes: probes,
-    skipped: skipped,
     mismatches: mismatches
   });
 })()"#,
         );
-        assert_eq!(result["hits"].as_u64(), Some(54));
-        assert!(
-            result["probes"].as_u64().expect("probes") >= 50,
-            "nearly every column's right edge is probed"
-        );
-        assert!(
-            result["skipped"].as_u64().expect("skipped columns") <= 2,
-            "only a daylight-saving column has no right edge to probe"
+        assert_eq!(
+            result["anchors"].as_u64(),
+            Some(108),
+            "each of the 54 weeks carries one shipped and one created link region"
         );
         let slot = result["slot"].as_f64().expect("slot pitch");
         assert!(
             slot < 18.0,
             "the fixture's pitch is below the minimum width"
         );
-        for width in result["widths"].as_array().expect("hit widths") {
+        for width in result["widths"].as_array().expect("region widths") {
             assert!(
-                (width.as_f64().expect("hit width") - slot).abs() < 1e-6,
-                "every hit rect's width is the slot pitch"
+                (width.as_f64().expect("region width") - slot).abs() < 1e-6,
+                "every link region's width is the slot pitch"
             );
         }
         assert_eq!(
             result["mismatches"],
             serde_json::json!([]),
-            "the right edge of a column reports that column's bar"
+            "each bar's own link region reports that bar"
         );
     }
 
@@ -8582,8 +9217,14 @@ mod tests {
   var env = globalThis.__env;
   var svg = env.cards["weekly"].querySelector("svg");
   function fills(node) {
-    return node.children
-      .filter(function (child) { return child.name === "rect"; })
+    var rects = [];
+    node.children.forEach(function (child) {
+      if (child.name === "rect") rects.push(child);
+      child.children.forEach(function (grandchild) {
+        if (grandchild.name === "rect") rects.push(grandchild);
+      });
+    });
+    return rects
       .map(function (child) { return child.attrs.fill; })
       .filter(function (fill) { return fill !== "transparent"; });
   }
@@ -8989,24 +9630,26 @@ mod tests {
             r#"(function () {
   var env = globalThis.__env;
   var svg = env.cards["weekly"].querySelector("svg");
-  var hits = svg.children.filter(function (node) {
-    return node.name === "rect" && node.attrs.fill === "transparent";
-  });
-  var second = hits.filter(function (node) { return Number(node.attrs.x) > 500; })[0];
+  var anchors = svg.children.filter(function (node) { return node.name === "a"; });
+  var second = anchors.filter(function (node) {
+    return Number(node.children[0].attrs.x) > 500;
+  })[0];
+  var rect = second.children[0];
   second.listeners.mousemove[0]({
     type: "mousemove",
-    clientX: Number(second.attrs.x) + Number(second.attrs.width) / 2,
+    clientX: Number(rect.attrs.x) + Number(rect.attrs.width) / 2,
     clientY: 100
   });
   var tip = env.cards["weekly"].querySelector(".chart-frame").querySelector(".tooltip");
-  return JSON.stringify({ hits: hits.length, text: tip.textContent });
+  return JSON.stringify({ anchors: anchors.length, text: tip.textContent });
 })()"#,
         );
-        assert_eq!(result["hits"].as_u64(), Some(2));
         assert_eq!(
-            result["text"],
-            "Week of Jan 12, 2026 · shipped 2 · created 3"
+            result["anchors"].as_u64(),
+            Some(4),
+            "two weeks carry four link regions"
         );
+        assert_eq!(result["text"], "Week of Jan 12, 2026 · shipped 2");
     }
 
     /// A loopback listener on a free port, so a serve test never competes for

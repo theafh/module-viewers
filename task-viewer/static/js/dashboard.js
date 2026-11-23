@@ -103,6 +103,48 @@
     return monthName(date) + " " + date.getDate() + ", " + date.getFullYear();
   }
 
+  // A UTC calendar day as the `from`/`to` query spells it, built from the
+  // local-noon `Date` the chart already parses so no timezone shifts the day.
+  function isoDay(date) {
+    var month = date.getMonth() + 1;
+    var day = date.getDate();
+    return date.getFullYear() + "-" + (month < 10 ? "0" : "") + month +
+      "-" + (day < 10 ? "0" : "") + day;
+  }
+
+  // The page's own project filter, which every drill-down link carries.
+  function pageProject() {
+    return payload && payload.project ? payload.project : "all";
+  }
+
+  // One `/tasks` link. The filter it carries reproduces the count the mark
+  // shows: the project, the task kind, the day axis, and the window.
+  function taskLink(filters) {
+    var parts = ["project=" + encodeURIComponent(filters.project || pageProject())];
+    if (filters.kind) {
+      parts.push("kind=" + encodeURIComponent(filters.kind));
+    }
+    if (filters.scope) {
+      parts.push("scope=" + encodeURIComponent(filters.scope));
+    }
+    if (filters.date) {
+      parts.push("date=" + encodeURIComponent(filters.date));
+    }
+    if (filters.from) {
+      parts.push("from=" + encodeURIComponent(filters.from));
+    }
+    if (filters.to) {
+      parts.push("to=" + encodeURIComponent(filters.to));
+    }
+    return "/tasks?" + parts.join("&");
+  }
+
+  // A drill-down mark: an SVG anchor that is both the focusable mark and the
+  // link, so focus shows the tooltip and activation opens the list.
+  function linkMark(parent, href, text) {
+    return el(parent, "a", { href: href, "data-tip": text, role: "link" });
+  }
+
   function card(name) {
     return document.querySelector('[data-chart="' + name + '"]');
   }
@@ -165,7 +207,11 @@
     }
     nodes.forEach(function (node, index) {
       var text = node.getAttribute("data-tip") || "";
-      node.setAttribute("role", "img");
+      // A drill-down mark is already an `<a>` with `role="link"`; only a mark
+      // that is not a link takes the image role.
+      if (!node.getAttribute("role")) {
+        node.setAttribute("role", "img");
+      }
       node.setAttribute("aria-label", text);
       node.addEventListener("focus", function () {
         select(index, false);
@@ -286,9 +332,9 @@
     }), { stroke: "--chart-zero" });
     var slot = (frame.right - frame.left) / rows.length;
     var band = Math.max(3, Math.min(16, slot - 4));
-    // The hit rect never reaches past its own column: a fixed 18px minimum
+    // The link region never reaches past its own column: a fixed 18px minimum
     // would overlap the next column once the pitch drops below it, and the
-    // later rect would report the neighbour's bar.
+    // later anchor would report the neighbour's bar.
     var hitWidth = Math.min(Math.max(band, 18), slot);
     var tip = tipFor(root.querySelector(".chart-frame"));
     var hits = [];
@@ -303,15 +349,41 @@
         x: dx - band / 2, y: zero, width: band, height: Math.max(0, y(-row.created) - zero),
         fill: createColor
       }), { fill: "--chart-create" });
-      var hit = el(svg, "rect", {
-        x: dx - hitWidth / 2, y: frame.top, width: hitWidth, height: frame.bottom - frame.top,
-        fill: "transparent"
+      // One link region per bar, so the shipped bar and the created bar each
+      // carry their own tooltip and their own drill-down target.
+      var weekEnd = isoDay(new Date(dates[index].getTime() + 6 * 86400000));
+      // `weekly_points` folds every event before the first charted week into
+      // that row and every after-today event into the last row, so those two
+      // rows hold no lower or upper bound of their own. Leaving the bound out
+      // lets the list reach the folded events instead of clipping them.
+      var from = index === 0 ? null : row.week;
+      var to = index === rows.length - 1 ? null : weekEnd;
+      var shipText = "Week of " + dateLabel(dates[index]) + " · shipped " + fmt(row.shipped);
+      var ship = linkMark(
+        svg,
+        taskLink({ kind: "finished", date: "shipped", from: from, to: to }),
+        shipText
+      );
+      el(ship, "rect", {
+        x: dx - hitWidth / 2, y: Math.min(shipY, zero), width: hitWidth,
+        height: Math.max(1, Math.abs(zero - shipY)), fill: "transparent"
       });
-      var text = "Week of " + dateLabel(dates[index]) + " · shipped " + fmt(row.shipped) + " · created " + fmt(row.created);
-      hit.setAttribute("data-tip", text);
-      hit.addEventListener("mousemove", function (event) { tip.show(event, text); });
-      hit.addEventListener("mouseleave", tip.hide);
-      hits.push(hit);
+      ship.addEventListener("mousemove", function (event) { tip.show(event, shipText); });
+      ship.addEventListener("mouseleave", tip.hide);
+      hits.push(ship);
+      var createText = "Week of " + dateLabel(dates[index]) + " · created " + fmt(row.created);
+      var create = linkMark(
+        svg,
+        taskLink({ kind: "all", date: "created", from: from, to: to }),
+        createText
+      );
+      el(create, "rect", {
+        x: dx - hitWidth / 2, y: Math.min(zero, y(-row.created)), width: hitWidth,
+        height: Math.max(1, Math.abs(y(-row.created) - zero)), fill: "transparent"
+      });
+      create.addEventListener("mousemove", function (event) { tip.show(event, createText); });
+      create.addEventListener("mouseleave", tip.hide);
+      hits.push(create);
     });
     roving(hits, tip);
     monthTicks("weekly", svg, dates[0], dates[dates.length - 1], x, frame.bottom + 16, muted);
@@ -417,7 +489,7 @@
     });
   }
 
-  function drawCalendar(name, rows, colorName, noun, peak) {
+  function drawCalendar(name, rows, colorName, noun, peak, kind, axis) {
     var root = card(name);
     var svg = root.querySelector("svg");
     // A fallback draw forces the width to the frame; clear it so a later
@@ -477,7 +549,14 @@
         if (item.count > 0 && maxLog > 0) {
           opacity = 0.22 + 0.78 * (Math.log1p(item.count) / maxLog);
         }
-        var rect = el(svg, "rect", {
+        var text = dateLabel(item.date) + " · " + fmt(item.count) + (item.count === 1 ? " task " : " tasks ") + noun;
+        var day = isoDay(item.date);
+        var anchor = linkMark(
+          svg,
+          taskLink({ kind: kind, date: axis, from: day, to: day }),
+          text
+        );
+        var rect = el(anchor, "rect", {
           x: labelW + col * (cell + gap),
           y: 18 + row * (cell + gap),
           width: cell,
@@ -487,13 +566,11 @@
           opacity: item.count > 0 ? String(opacity) : "1"
         });
         mark(name, rect, { fill: item.count > 0 ? colorName : "--chart-track" });
-        var text = dateLabel(item.date) + " · " + fmt(item.count) + (item.count === 1 ? " task " : " tasks ") + noun;
-        rect.addEventListener("mousemove", function (event) {
+        anchor.addEventListener("mousemove", function (event) {
           tip.show(event, event.currentTarget.getAttribute("data-tip"));
         });
-        rect.setAttribute("data-tip", text);
-        rect.addEventListener("mouseleave", tip.hide);
-        marks.push(rect);
+        anchor.addEventListener("mouseleave", tip.hide);
+        marks.push(anchor);
       }
     }
     roving(marks, tip);
@@ -513,7 +590,7 @@
     }
   }
 
-  function drawRadar(name, rows, colorName, noun, mode) {
+  function drawRadar(name, rows, colorName, noun, mode, kind) {
     var root = card(name);
     var svg = root.querySelector("svg");
     // Radar: fit the frame by expanding the viewBox rather than shrinking the
@@ -609,7 +686,7 @@
       // guard, so a count that is not a number still throws into the fallback.
       var text = row.label + " · " + fmt(row.count) + " " + noun;
       if (row.count !== 0) {
-        dots.push({ vx: vx, vy: vy, text: text });
+        dots.push({ vx: vx, vy: vy, text: text, repository_id: row.repository_id, label: row.label });
       }
     });
     // The polygon paints before its dots, so each dot sits above the shape.
@@ -618,12 +695,18 @@
     }), { fill: colorName, stroke: colorName });
     var marks = [];
     dots.forEach(function (dot) {
-      var node = el(svg, "circle", { cx: dot.vx, cy: dot.vy, r: "4", fill: color });
+      // A project-mode spoke names its repository, so the link opens that
+      // repository; a scope-mode spoke relies on the page's project filter and
+      // carries the slice as its scope. Neither carries a day window.
+      var filters = dot.repository_id === undefined || dot.repository_id === null
+        ? { kind: kind, scope: dot.label }
+        : { project: String(dot.repository_id), kind: kind };
+      var anchor = linkMark(svg, taskLink(filters), dot.text);
+      var node = el(anchor, "circle", { cx: dot.vx, cy: dot.vy, r: "4", fill: color });
       mark(name, node, { fill: colorName });
-      node.setAttribute("data-tip", dot.text);
-      node.addEventListener("mousemove", function (event) { tip.show(event, dot.text); });
-      node.addEventListener("mouseleave", tip.hide);
-      marks.push(node);
+      anchor.addEventListener("mousemove", function (event) { tip.show(event, dot.text); });
+      anchor.addEventListener("mouseleave", tip.hide);
+      marks.push(anchor);
     });
     roving(marks, tip);
     // Adopt the grown box whenever the frame does not contain the measured
@@ -751,6 +834,61 @@
     console.error(error);
   }
 
+  // The per-card "Show data" table: one row per drawn series row, filled from
+  // the same payload the chart draws, so the exact numbers are readable without
+  // hover and without a server read.
+  function clearNode(node) {
+    while (node.firstChild) {
+      node.removeChild(node.firstChild);
+    }
+  }
+
+  // A table cell's text. A count formats like every other number; a missing
+  // field stays empty instead of throwing the whole table away.
+  function cellText(value) {
+    if (typeof value === "number") {
+      return fmt(value);
+    }
+    return value === undefined || value === null ? "" : String(value);
+  }
+
+  function showData(name, rows, cells) {
+    var root = card(name);
+    if (!root) return;
+    var body = root.querySelector(".data-table tbody");
+    if (!body) return;
+    clearNode(body);
+    rows.forEach(function (row) {
+      var tr = document.createElement("tr");
+      cells(row).forEach(function (value) {
+        var td = document.createElement("td");
+        td.textContent = cellText(value);
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+  }
+
+  function renderData() {
+    if (!payload) return;
+    [
+      ["weekly", payload.weekly, function (row) { return [row.week, row.shipped, row.created]; }],
+      ["cumulative", payload.cumulative, function (row) { return [row.date, row.shipped, row.cumulative]; }],
+      ["shipped-calendar", payload.shipped_calendar, function (row) { return [row.date, row.count]; }],
+      ["created-calendar", payload.created_calendar, function (row) { return [row.date, row.count]; }],
+      ["backlog", payload.live_backlog, function (row) { return [row.date, row.live]; }],
+      ["age", payload.mean_age, function (row) { return [row.date, row.avg_age, row.n]; }],
+      ["radar-shipped", payload.radar_shipped, function (row) { return [row.label, row.count]; }],
+      ["radar-live", payload.radar_live, function (row) { return [row.label, row.count]; }]
+    ].forEach(function (entry) {
+      try {
+        showData(entry[0], entry[1] || [], entry[2]);
+      } catch (error) {
+        logError(error);
+      }
+    });
+  }
+
   function renderUnavailable(name) {
     var root = card(name);
     if (!root) return;
@@ -806,10 +944,10 @@
       );
     });
     renderCard("shipped-calendar", function () {
-      drawCalendar("shipped-calendar", payload.shipped_calendar, "--chart-ship", "shipped", payload.calendar_peak_shipped);
+      drawCalendar("shipped-calendar", payload.shipped_calendar, "--chart-ship", "shipped", payload.calendar_peak_shipped, "finished", "shipped");
     });
     renderCard("created-calendar", function () {
-      drawCalendar("created-calendar", payload.created_calendar, "--chart-create", "created", payload.calendar_peak_created);
+      drawCalendar("created-calendar", payload.created_calendar, "--chart-create", "created", payload.calendar_peak_created, "all", "created");
     });
     renderCard("backlog", function () {
       drawLine(
@@ -832,11 +970,12 @@
       );
     });
     renderCard("radar-shipped", function () {
-      drawRadar("radar-shipped", payload.radar_shipped, "--chart-ship", "shipped", payload.radar_mode);
+      drawRadar("radar-shipped", payload.radar_shipped, "--chart-ship", "shipped", payload.radar_mode, "finished");
     });
     renderCard("radar-live", function () {
-      drawRadar("radar-live", payload.radar_live, "--chart-create", "live", payload.radar_mode);
+      drawRadar("radar-live", payload.radar_live, "--chart-create", "live", payload.radar_mode, "live");
     });
+    renderData();
   }
 
   window.addEventListener("task-viewer-theme", recolor);

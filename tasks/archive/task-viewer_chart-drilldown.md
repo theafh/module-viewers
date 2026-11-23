@@ -2,9 +2,11 @@
 description: "Give every chart a read-only drill-down: a task list route behind marks and a per-card data table, so a count can be traced to the tasks that make it."
 scope: task-viewer
 created: 2026-11-23T17:31:20Z
-updated: 2026-11-23T17:37:27Z
-status: ready
+updated: 2026-11-23T18:49:30Z
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Chart drill-down and per-card data table
@@ -19,7 +21,7 @@ Let a person trace a chart count back to the tasks behind it and read every card
 - `task-viewer/src/db.rs` exposes `load_tasks(pool, Option<i64>)`, which already returns the stored rows for one repository or all of them. Each stored row still carries its `repository_id` before `row_to_record` turns it into a `TaskRecord`.
 - `task-viewer/src/web.rs` declares the page routes in `router`; `home` renders the dashboard from `series::dashboard`, and the templates live under `task-viewer/templates/`. `ARCHITECTURE.md` records each route and states that a route names a repository by its integer id.
 - `task-viewer/static/js/dashboard.js` builds each series SVG and attaches the tooltip text to marks. The weekly card draws one transparent hit region per column across the full plot, and that single tooltip names both the shipped and the created count for the week. The payload is embedded in the page as the `#payload` JSON script tag.
-- [task-viewer_a11y-and-noscript.md](archive/task-viewer_a11y-and-noscript.md) makes each mark focusable and shows its tooltip on focus. This task builds on that, because the mark's link target and its focus behaviour sit on one element, so this task lands after it.
+- [task-viewer_a11y-and-noscript.md](task-viewer_a11y-and-noscript.md) makes each mark focusable and shows its tooltip on focus. This task builds on that, because the mark's link target and its focus behaviour sit on one element, so this task lands after it.
 - `CHARTER.md` forbids treating a chart as a place to edit, finish, or delete a task file, so the list stays read-only.
 
 ## Approach
@@ -27,7 +29,7 @@ Let a person trace a chart count back to the tasks behind it and read every card
 1. Add a `GET /tasks` route and a `tasks.html` template that renders the stored rows as a table: repository, scope, path, kind, created, and leave or ship day. Sort by scope then path.
 2. Accept filter query parameters on `/tasks`: `project` (repository id, default all), `kind` (`live`, `finished`, `deferred`, or all), `scope`, `q` (a case-insensitive substring over `path`), `date` (`created` or `shipped`, default `created`, naming the day `from` and `to` bound), and the `from` and `to` day bounds themselves. Reuse `db::load_tasks` and filter in Rust; no schema change.
 3. Carry the repository id into the project-mode radar rows, so a spoke names its repository the way `ARCHITECTURE.md` requires; `series.rs` and `db.rs` pass it through from the stored row.
-4. Link each count mark to `/tasks` with the filter that reproduces its count: the page's current `project`, plus the `kind`, `date` axis, and `from`/`to` window that produced the value, where a radar spoke carries its kind and slice and no window. Split the weekly card's one per-column hit region into one link region per bar, so each bar carries its own tooltip and target. The mark's link is the element `task-viewer_a11y-and-noscript.md` (archived) makes focusable, so focus shows the tooltip and activation opens the list.
+4. Link each count mark to `/tasks` with the filter that reproduces its count: the page's current `project`, plus the `kind`, `date` axis, and `from`/`to` window that produced the value, where a radar spoke carries its kind and slice and no window. Split the weekly card's one per-column hit region into one link region per bar, so each bar carries its own tooltip and target. The first charted week folds every earlier event into its row and the last folds every after-today event, so their links omit `from` and `to` respectively; the list then reaches the folded rows instead of clipping them. The mark's link is the element `task-viewer_a11y-and-noscript.md` (archived) makes focusable, so focus shows the tooltip and activation opens the list.
 5. Add a per-card `<details><summary>Show data</summary>` table built client-side from the payload series that card draws, so the exact numbers are readable without hover and without new server work.
 6. Render the filtered task count in the list header and a link back to the dashboard carrying the same project filter.
 

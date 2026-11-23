@@ -543,7 +543,8 @@ pub async fn load_tasks(
         let Some(project) = projects.get(&row.repository_id).map(Arc::clone) else {
             continue;
         };
-        match row_to_record(row, Arc::clone(&project)) {
+        let repository_id = row.repository_id;
+        match row_to_record(row, repository_id, Arc::clone(&project)) {
             Ok(task) => tasks.push(task),
             Err(unparsed) => {
                 tracing::warn!(
@@ -612,6 +613,7 @@ impl UnparsedRow {
 /// The success path moves the row's strings instead of copying them.
 fn row_to_record(
     row: TaskRow,
+    repository_id: i64,
     project: Arc<str>,
 ) -> std::result::Result<crate::series::TaskRecord, UnparsedRow> {
     let Some(kind) = crate::harvest::TaskKind::parse(&row.kind) else {
@@ -629,6 +631,7 @@ fn row_to_record(
         .as_deref()
         .and_then(crate::dates::parse_iso_date);
     Ok(crate::series::TaskRecord {
+        repository_id,
         project,
         path: row.path,
         scope: row.scope,

@@ -8,6 +8,9 @@ use crate::harvest::TaskKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
+    /// The integer id of the repository the row belongs to, so a drill-down
+    /// link can name it the way every other route does.
+    pub repository_id: i64,
     pub project: Arc<str>,
     /// The stored path of the task file, relative to its repository. It names
     /// the row in a warning and is otherwise not charted.
@@ -30,6 +33,9 @@ pub struct Dashboard {
     pub as_of: String,
     pub radar_mode: String,
     pub project_label: String,
+    /// The page's project filter, as the query spells it: `all` or a repository
+    /// id. A drill-down link carries it so the list opens on the same project.
+    pub project: String,
     pub counts: Counts,
     pub weekly: Vec<WeekPoint>,
     pub cumulative: Vec<CumPoint>,
@@ -93,6 +99,10 @@ pub struct AgePoint {
 pub struct LabeledCount {
     pub label: String,
     pub count: i64,
+    /// The repository a project-mode spoke names, so its drill-down link can
+    /// open that repository's tasks. A scope-mode spoke carries `None` and
+    /// relies on the page's project filter instead.
+    pub repository_id: Option<i64>,
 }
 
 pub fn dashboard(
@@ -163,6 +173,7 @@ pub fn dashboard(
         }
         .to_string(),
         project_label: project_label.to_string(),
+        project: "all".to_string(),
         counts: Counts {
             tasks: tasks.len(),
             finished,
@@ -486,20 +497,28 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
 
 fn radar(tasks: &[TaskRecord], mode: RadarMode) -> (Vec<LabeledCount>, Vec<LabeledCount>) {
     match mode {
-        // The project radar keys on the shared handle, so counting a task costs a
-        // refcount bump instead of a `String` allocation per task.
+        // The project radar keys on the shared handle and the repository id, so
+        // counting a task costs a refcount bump instead of a `String`
+        // allocation per task while a spoke still names its repository.
         RadarMode::Project => {
-            let mut shipped: BTreeMap<Arc<str>, i64> = BTreeMap::new();
-            let mut live: BTreeMap<Arc<str>, i64> = BTreeMap::new();
+            let mut shipped: BTreeMap<(Arc<str>, i64), i64> = BTreeMap::new();
+            let mut live: BTreeMap<(Arc<str>, i64), i64> = BTreeMap::new();
             for task in tasks {
                 let counts = match task.kind {
                     TaskKind::Finished => &mut shipped,
                     TaskKind::Live => &mut live,
                     TaskKind::Deferred => continue,
                 };
-                *counts.entry(Arc::clone(&task.project)).or_insert(0) += 1;
+                *counts
+                    .entry((Arc::clone(&task.project), task.repository_id))
+                    .or_insert(0) += 1;
             }
-            radar_rows(&shipped, &live, |project| project.to_string())
+            radar_rows(
+                &shipped,
+                &live,
+                |project| project.0.to_string(),
+                |project| Some(project.1),
+            )
         }
         RadarMode::Scope => {
             let mut shipped: BTreeMap<&str, i64> = BTreeMap::new();
@@ -512,18 +531,20 @@ fn radar(tasks: &[TaskRecord], mode: RadarMode) -> (Vec<LabeledCount>, Vec<Label
                 };
                 *counts.entry(task.scope.as_str()).or_insert(0) += 1;
             }
-            radar_rows(&shipped, &live, |scope| (*scope).to_string())
+            radar_rows(&shipped, &live, |scope| (*scope).to_string(), |_| None)
         }
     }
 }
 
 /// Materialize the shared label set once per distinct key, sorted by shipped
 /// plus live and then by label, and turn each distinct key into a label string
-/// once per chart rather than once per task.
+/// once per chart rather than once per task. `repository` names the repository
+/// a project-mode key stands for; a scope-mode key names none.
 fn radar_rows<K: Ord>(
     shipped: &BTreeMap<K, i64>,
     live: &BTreeMap<K, i64>,
     label: impl Fn(&K) -> String,
+    repository: impl Fn(&K) -> Option<i64>,
 ) -> (Vec<LabeledCount>, Vec<LabeledCount>) {
     let mut labels: Vec<&K> = shipped
         .keys()
@@ -539,11 +560,13 @@ fn radar_rows<K: Ord>(
         right_total.cmp(&left_total).then_with(|| left.cmp(right))
     });
     let label = &label;
+    let repository = &repository;
     let shipped_rows = labels
         .iter()
         .map(|key| LabeledCount {
             label: label(key),
             count: shipped.get(*key).copied().unwrap_or(0),
+            repository_id: repository(key),
         })
         .collect();
     let live_rows = labels
@@ -551,6 +574,7 @@ fn radar_rows<K: Ord>(
         .map(|key| LabeledCount {
             label: label(key),
             count: live.get(*key).copied().unwrap_or(0),
+            repository_id: repository(key),
         })
         .collect();
     (shipped_rows, live_rows)
@@ -630,6 +654,7 @@ mod tests {
         leave: Option<NaiveDate>,
     ) -> TaskRecord {
         TaskRecord {
+            repository_id: 0,
             project: Arc::from(project),
             path: format!("tasks/{project}_{scope}.md"),
             scope: scope.to_string(),
@@ -1618,5 +1643,40 @@ mod tests {
                 .any(|row| row.label == "two" && row.count == 1)
         );
         assert!(one.radar_shipped.iter().all(|row| row.label != "alpha"));
+    }
+
+    #[test]
+    fn series_project_radar_spokes_name_their_repository() {
+        let today = day(2026, 6, 2);
+        let mut alpha = task("alpha", "one", TaskKind::Live, day(2026, 6, 1), None, None);
+        alpha.repository_id = 7;
+        let mut beta = task("beta", "one", TaskKind::Live, day(2026, 6, 1), None, None);
+        beta.repository_id = 9;
+        let board = dashboard(&[alpha, beta], today, RadarMode::Project, "All projects");
+        let ids: BTreeMap<&str, Option<i64>> = board
+            .radar_live
+            .iter()
+            .map(|row| (row.label.as_str(), row.repository_id))
+            .collect();
+        assert_eq!(ids.get("alpha").copied().flatten(), Some(7));
+        assert_eq!(ids.get("beta").copied().flatten(), Some(9));
+
+        let one = dashboard(
+            &[task(
+                "alpha",
+                "one",
+                TaskKind::Live,
+                day(2026, 6, 1),
+                None,
+                None,
+            )],
+            today,
+            RadarMode::Scope,
+            "alpha",
+        );
+        assert!(
+            one.radar_live.iter().all(|row| row.repository_id.is_none()),
+            "a scope-mode spoke names no repository"
+        );
     }
 }

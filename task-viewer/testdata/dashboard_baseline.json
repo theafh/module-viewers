@@ -1788,26 +1788,31 @@
       "trend": 14.7
     }
   ],
+  "project": "all",
   "project_label": "All projects",
   "radar_live": [
     {
       "count": 1,
-      "label": "Alpha"
+      "label": "Alpha",
+      "repository_id": 2
     },
     {
       "count": 1,
-      "label": "zeta"
+      "label": "zeta",
+      "repository_id": 1
     }
   ],
   "radar_mode": "project",
   "radar_shipped": [
     {
       "count": 1,
-      "label": "Alpha"
+      "label": "Alpha",
+      "repository_id": 2
     },
     {
       "count": 1,
-      "label": "zeta"
+      "label": "zeta",
+      "repository_id": 1
     }
   ],
   "shipped_calendar": [

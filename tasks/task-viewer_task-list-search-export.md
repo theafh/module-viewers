@@ -15,7 +15,7 @@ Let a person find a task by a filename fragment, narrow the list by scope, and d
 
 ## Context
 
-- This task builds on [task-viewer_chart-drilldown.md](task-viewer_chart-drilldown.md), which adds `GET /tasks`, its filters, and the task table; that task states and proves what `q` and `scope` mean, so this task adds only the controls that carry those two values, while the search box, scope select, and export link live on its page.
+- This task builds on [archive/task-viewer_chart-drilldown.md](archive/task-viewer_chart-drilldown.md), which adds `GET /tasks`, its filters, and the task table; that task states and proves what `q` and `scope` mean, so this task adds only the controls that carry those two values, while the search box, scope select, and export link live on its page.
 - `task-viewer/src/db.rs` `load_tasks` returns rows carrying `path` and `scope`, so both search and scope filtering run over stored rows with no schema change.
 - `task-viewer/src/web.rs` owns the routes; the other pages render through Tera templates.
 - `task-viewer/src/harvest.rs` derives a task's scope as the filename prefix before the first underscore, which is the same value stored in `tasks.scope`.

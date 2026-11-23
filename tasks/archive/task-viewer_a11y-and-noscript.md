@@ -25,7 +25,7 @@ Make every value on the dashboard reachable without a mouse and legible when the
 - `task-viewer/static/js/theme-boot.js` reads only `localStorage`; no `prefers-color-scheme` query exists in the styles or scripts.
 - `task-viewer/testdata/browser_guards.js` is the stub DOM behind every browser-guard test documented in `TESTING.md`. Its `document` has no `addEventListener`, its `window` has no `matchMedia`, and its nodes expose no `dispatchEvent` or `focus`, so a page-level listener or a bare `matchMedia` call throws at load until the stub grows.
 - Shipped tests pin the markup and handlers this task changes: `browser_chart_markup_matches_the_pre_change_snapshots` compares every card's serialized SVG against `task-viewer/testdata/dashboard_draw_snapshots.json`, `web_csp_restricts_only_framing_and_pages_keep_their_scripts` asserts the filter's `onchange` and the Remove form's fixed `onsubmit`, and `browser_theme_toggle_survives_throwing_storage` asserts the button text `Dark`.
-- `tasks/task-viewer_chart-drilldown.md` adds a `/tasks` target to the keyboard focus handler this task introduces, so this task ships first and leaves that handler able to carry a target.
+- `tasks/archive/task-viewer_chart-drilldown.md` adds a `/tasks` target to the keyboard focus handler this task introduces, so this task ships first and leaves that handler able to carry a target.
 
 ## Approach
 
@@ -41,7 +41,7 @@ Make every value on the dashboard reachable without a mouse and legible when the
 
 **Out of scope:**
 
-- A per-point data table; [task-viewer_chart-drilldown.md](../task-viewer_chart-drilldown.md) owns the per-card table and the drill-down list.
+- A per-point data table; [task-viewer_chart-drilldown.md](task-viewer_chart-drilldown.md) owns the per-card table and the drill-down list.
 - Reworking the theme control into a three-state control.
 
 ## Acceptance

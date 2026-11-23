@@ -120,7 +120,7 @@
         },
         {
           "attrs": {
-            "aria-label": "Jan 5, 2026 · mean age 2 days · 1 tasks",
+            "aria-label": "Jan 5, 2026 \u00b7 mean age 2 days \u00b7 1 tasks",
             "fill": "transparent",
             "height": "232",
             "role": "img",
@@ -233,7 +233,7 @@
         },
         {
           "attrs": {
-            "aria-label": "Jan 5, 2026 · live 1",
+            "aria-label": "Jan 5, 2026 \u00b7 live 1",
             "fill": "transparent",
             "height": "232",
             "role": "img",
@@ -260,20 +260,30 @@
       "children": [
         {
           "attrs": {
-            "aria-label": "Jan 5, 2026 · 2 tasks created",
-            "data-tip": "Jan 5, 2026 · 2 tasks created",
-            "fill": "#123456",
-            "height": "14",
-            "opacity": "1",
-            "role": "img",
-            "rx": "2",
-            "tabindex": "0",
-            "width": "14",
-            "x": "28",
-            "y": "34"
+            "aria-label": "Jan 5, 2026 \u00b7 2 tasks created",
+            "data-tip": "Jan 5, 2026 \u00b7 2 tasks created",
+            "href": "/tasks?project=3&kind=all&date=created&from=2026-01-05&to=2026-01-05",
+            "role": "link",
+            "tabindex": "0"
           },
-          "children": [],
-          "name": "rect",
+          "children": [
+            {
+              "attrs": {
+                "fill": "#123456",
+                "height": "14",
+                "opacity": "1",
+                "rx": "2",
+                "width": "14",
+                "x": "28",
+                "y": "34"
+              },
+              "children": [],
+              "name": "rect",
+              "style": {},
+              "text": ""
+            }
+          ],
+          "name": "a",
           "style": {},
           "text": ""
         }
@@ -418,7 +428,7 @@
         },
         {
           "attrs": {
-            "aria-label": "Jan 5, 2026 · cumulative 1 · shipped 1",
+            "aria-label": "Jan 5, 2026 \u00b7 cumulative 1 \u00b7 shipped 1",
             "fill": "transparent",
             "height": "232",
             "role": "img",
@@ -535,17 +545,27 @@
         },
         {
           "attrs": {
-            "aria-label": "alpha · 1 live",
-            "cx": "500",
-            "cy": "68",
-            "data-tip": "alpha · 1 live",
-            "fill": "#123456",
-            "r": "4",
-            "role": "img",
+            "aria-label": "alpha \u00b7 1 live",
+            "data-tip": "alpha \u00b7 1 live",
+            "href": "/tasks?project=3&kind=live&scope=alpha",
+            "role": "link",
             "tabindex": "0"
           },
-          "children": [],
-          "name": "circle",
+          "children": [
+            {
+              "attrs": {
+                "cx": "500",
+                "cy": "68",
+                "fill": "#123456",
+                "r": "4"
+              },
+              "children": [],
+              "name": "circle",
+              "style": {},
+              "text": ""
+            }
+          ],
+          "name": "a",
           "style": {},
           "text": ""
         }
@@ -655,17 +675,27 @@
         },
         {
           "attrs": {
-            "aria-label": "alpha · 1 shipped",
-            "cx": "500",
-            "cy": "68",
-            "data-tip": "alpha · 1 shipped",
-            "fill": "#123456",
-            "r": "4",
-            "role": "img",
+            "aria-label": "alpha \u00b7 1 shipped",
+            "data-tip": "alpha \u00b7 1 shipped",
+            "href": "/tasks?project=3&kind=finished&scope=alpha",
+            "role": "link",
             "tabindex": "0"
           },
-          "children": [],
-          "name": "circle",
+          "children": [
+            {
+              "attrs": {
+                "cx": "500",
+                "cy": "68",
+                "fill": "#123456",
+                "r": "4"
+              },
+              "children": [],
+              "name": "circle",
+              "style": {},
+              "text": ""
+            }
+          ],
+          "name": "a",
           "style": {},
           "text": ""
         }
@@ -685,20 +715,30 @@
       "children": [
         {
           "attrs": {
-            "aria-label": "Jan 5, 2026 · 1 task shipped",
-            "data-tip": "Jan 5, 2026 · 1 task shipped",
-            "fill": "#123456",
-            "height": "14",
-            "opacity": "1",
-            "role": "img",
-            "rx": "2",
-            "tabindex": "0",
-            "width": "14",
-            "x": "28",
-            "y": "34"
+            "aria-label": "Jan 5, 2026 \u00b7 1 task shipped",
+            "data-tip": "Jan 5, 2026 \u00b7 1 task shipped",
+            "href": "/tasks?project=3&kind=finished&date=shipped&from=2026-01-05&to=2026-01-05",
+            "role": "link",
+            "tabindex": "0"
           },
-          "children": [],
-          "name": "rect",
+          "children": [
+            {
+              "attrs": {
+                "fill": "#123456",
+                "height": "14",
+                "opacity": "1",
+                "rx": "2",
+                "width": "14",
+                "x": "28",
+                "y": "34"
+              },
+              "children": [],
+              "name": "rect",
+              "style": {},
+              "text": ""
+            }
+          ],
+          "name": "a",
           "style": {},
           "text": ""
         }
@@ -756,18 +796,55 @@
         },
         {
           "attrs": {
-            "aria-label": "Week of Jan 5, 2026 · shipped 1 · created 2",
-            "data-tip": "Week of Jan 5, 2026 · shipped 1 · created 2",
-            "fill": "transparent",
-            "height": "232",
-            "role": "img",
-            "tabindex": "0",
-            "width": "18",
-            "x": "31",
-            "y": "16"
+            "aria-label": "Week of Jan 5, 2026 \u00b7 shipped 1",
+            "data-tip": "Week of Jan 5, 2026 \u00b7 shipped 1",
+            "href": "/tasks?project=3&kind=finished&date=shipped&to=2026-01-11",
+            "role": "link",
+            "tabindex": "0"
           },
-          "children": [],
-          "name": "rect",
+          "children": [
+            {
+              "attrs": {
+                "fill": "transparent",
+                "height": "38.66666666666666",
+                "width": "18",
+                "x": "31",
+                "y": "93.33333333333334"
+              },
+              "children": [],
+              "name": "rect",
+              "style": {},
+              "text": ""
+            }
+          ],
+          "name": "a",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "aria-label": "Week of Jan 5, 2026 \u00b7 created 2",
+            "data-tip": "Week of Jan 5, 2026 \u00b7 created 2",
+            "href": "/tasks?project=3&kind=all&date=created&to=2026-01-11",
+            "role": "link",
+            "tabindex": "-1"
+          },
+          "children": [
+            {
+              "attrs": {
+                "fill": "transparent",
+                "height": "77.33333333333334",
+                "width": "18",
+                "x": "31",
+                "y": "132"
+              },
+              "children": [],
+              "name": "rect",
+              "style": {},
+              "text": ""
+            }
+          ],
+          "name": "a",
           "style": {},
           "text": ""
         },
@@ -799,18 +876,55 @@
         },
         {
           "attrs": {
-            "aria-label": "Week of Jan 12, 2026 · shipped 2 · created 3",
-            "data-tip": "Week of Jan 12, 2026 · shipped 2 · created 3",
-            "fill": "transparent",
-            "height": "232",
-            "role": "img",
-            "tabindex": "-1",
-            "width": "18",
-            "x": "503",
-            "y": "16"
+            "aria-label": "Week of Jan 12, 2026 \u00b7 shipped 2",
+            "data-tip": "Week of Jan 12, 2026 \u00b7 shipped 2",
+            "href": "/tasks?project=3&kind=finished&date=shipped&from=2026-01-12",
+            "role": "link",
+            "tabindex": "-1"
           },
-          "children": [],
-          "name": "rect",
+          "children": [
+            {
+              "attrs": {
+                "fill": "transparent",
+                "height": "77.33333333333334",
+                "width": "18",
+                "x": "503",
+                "y": "54.66666666666666"
+              },
+              "children": [],
+              "name": "rect",
+              "style": {},
+              "text": ""
+            }
+          ],
+          "name": "a",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "aria-label": "Week of Jan 12, 2026 \u00b7 created 3",
+            "data-tip": "Week of Jan 12, 2026 \u00b7 created 3",
+            "href": "/tasks?project=3&kind=all&date=created&from=2026-01-12",
+            "role": "link",
+            "tabindex": "-1"
+          },
+          "children": [
+            {
+              "attrs": {
+                "fill": "transparent",
+                "height": "116",
+                "width": "18",
+                "x": "503",
+                "y": "132"
+              },
+              "children": [],
+              "name": "rect",
+              "style": {},
+              "text": ""
+            }
+          ],
+          "name": "a",
           "style": {},
           "text": ""
         },

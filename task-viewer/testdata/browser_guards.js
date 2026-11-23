@@ -186,6 +186,9 @@
     var frame = new Node("frame");
     var tip = new Node("tip");
     var summary = new Node("summary");
+    // The card's "Show data" table body, so the shipped script fills a node a
+    // test can count the rows of.
+    var tableBody = new Node("tbody");
     // A scrolling frame reports its chart's laid-out width as its content
     // width, so a chart wider than the frame scrolls, and `scrollLeft` clamps
     // to the range a browser allows.
@@ -211,6 +214,7 @@
       if (selector === ".summary") return summary;
       if (selector === ".chart-frame") return frame;
       if (selector === ".tooltip") return tip;
+      if (selector === ".data-table tbody") return tableBody;
       return null;
     };
     // The page puts `.tooltip` inside `.chart-frame`, so a draw that reaches
@@ -227,6 +231,7 @@
   });
 
   var defaultPayload = {
+    project: "3",
     counts: { shipped_events: 3, created_events: 5 },
     weekly: [
       { week: "2026-01-05", shipped: 1, created: 2 },
@@ -281,6 +286,10 @@
       return null;
     },
     createElementNS: function (namespace, name) {
+      return new Node(name);
+    },
+    // The data tables build plain HTML rows and cells.
+    createElement: function (name) {
       return new Node(name);
     },
     querySelector: function (selector) {

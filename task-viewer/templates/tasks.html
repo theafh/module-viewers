@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Tasks{% endblock %}
+{% block content %}
+<header class="page-header">
+    <div class="page-header-row">
+        <h1 class="page-title">{{ count }} task{% if count != 1 %}s{% endif %}</h1>
+        <p class="muted"><a href="{{ back_href }}">Back to dashboard</a></p>
+    </div>
+</header>
+<table class="task-list">
+    <thead>
+        <tr>
+            <th scope="col">Repository</th>
+            <th scope="col">Scope</th>
+            <th scope="col">Path</th>
+            <th scope="col">Kind</th>
+            <th scope="col">Created</th>
+            <th scope="col">Ship or leave day</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in rows %}
+        <tr>
+            <td>{{ row.repository }}</td>
+            <td>{{ row.scope }}</td>
+            <td><code>{{ row.path }}</code></td>
+            <td>{{ row.kind }}</td>
+            <td>{{ row.created }}</td>
+            <td>{% if row.day_kind %}<span class="muted">{{ row.day_kind }}</span> {% endif %}{{ row.day }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

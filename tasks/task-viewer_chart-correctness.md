@@ -22,7 +22,7 @@ Make the drawn charts correct and readable at their edges: a one-day series show
 - `task-viewer/src/dates.rs` defines `SERIES_FLOOR` as 1970-01-01, and `series.rs` clamps each series start to it, so `created: 1926-03-01` yields 20,781 points and draws the axis across five decades.
 - `task-viewer/src/series.rs` `radar_rows` sorts both radars by shipped-plus-live and then label, and `drawRadar` walks the payload in that order, so the two charts share one spoke order.
 - The 1970 start is stated in `ARCHITECTURE.md` under **Extraction Rules** ("The cumulative and backlog charts include every calendar day from the later of their first day and 1970-01-01 through today…") and in the **Series** bullet of `TESTING.md` ("a date before 1970-01-01 folds into the first charted day").
-- The weekly draw and `FEATURES.md` section 4 are also edited by [task-viewer_deferred-and-staleness.md](task-viewer_deferred-and-staleness.md), and the radar marks by [task-viewer_chart-drilldown.md](task-viewer_chart-drilldown.md); this task keeps to geometry and scale so those edits compose.
+- The weekly draw and `FEATURES.md` section 4 are also edited by [task-viewer_deferred-and-staleness.md](task-viewer_deferred-and-staleness.md), and the radar marks by [archive/task-viewer_chart-drilldown.md](archive/task-viewer_chart-drilldown.md); this task keeps to geometry and scale so those edits compose.
 
 ## Approach
 
