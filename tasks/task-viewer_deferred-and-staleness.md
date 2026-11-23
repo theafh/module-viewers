@@ -33,7 +33,7 @@ Give deferred tasks and untouched live tasks a view. A person can see how much a
 
 **Out of scope:**
 
-- The deferred total in the dashboard header line, which `tasks/task-viewer_data-truth.md` owns together with the other totals it shows.
+- The deferred total in the dashboard header line, which `tasks/archive/task-viewer_data-truth.md` owns together with the other totals it shows.
 - Changing what counts as deferred or when a deferred task leaves the backlog.
 - Editing a task file from the card.
 

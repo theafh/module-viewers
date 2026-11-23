@@ -28,7 +28,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use walkdir::WalkDir;
 
 use crate::db::{self, Repository, StoreHookFn};
-use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
+use crate::harvest::{self, HarvestError, PriorTask, TaskKind};
 use crate::series::{self, RadarMode};
 
 pub const PORT: u16 = 7880;
@@ -980,6 +980,18 @@ async fn render_dashboard(
     };
     let projects = repositories.iter().map(project_view).collect::<Vec<_>>();
     let scan_label = scan_label(&repositories, selected);
+    let in_scope = repositories
+        .iter()
+        .filter(|repo| selected.is_none_or(|id| repo.repository_id == id))
+        .count();
+    // A failing repository's stored cause reaches the dashboard the way it
+    // reaches Repositories, so the page never hides which folder is failing.
+    let failures = repositories
+        .iter()
+        .filter(|repo| selected.is_none_or(|id| repo.repository_id == id))
+        .filter(|repo| repo.last_error.is_some())
+        .map(project_view)
+        .collect::<Vec<_>>();
     let selected = match selected {
         Some(id) => id.to_string(),
         None => "all".to_string(),
@@ -996,6 +1008,7 @@ async fn render_dashboard(
         record_render_blocking_thread();
         let mut board = series::dashboard(&tasks, crate::dates::today(), mode, &label);
         board.project = selected.clone();
+        let summary = dashboard_summary(&board.counts, in_scope, &board.as_of);
         let data_json = chart_payload(&board)?;
         let page = DashboardPage {
             version,
@@ -1005,6 +1018,8 @@ async fn render_dashboard(
             notice,
             error,
             scan_label,
+            summary,
+            failures,
             data_json,
             has_projects,
         };
@@ -1181,20 +1196,62 @@ fn project_view(repo: &Repository) -> ProjectView {
 }
 
 fn scan_label(repositories: &[Repository], selected: Option<i64>) -> String {
-    let stamps: Vec<&str> = repositories
+    let in_scope = repositories
         .iter()
-        .filter(|repo| selected.is_none_or(|id| repo.repository_id == id))
+        .filter(|repo| selected.is_none_or(|id| repo.repository_id == id));
+    let in_scope = in_scope.collect::<Vec<_>>();
+    // The oldest parseable stamp is the day the numbers are current to: a
+    // repository that failed keeps the stamp of its last successful scan, so the
+    // header never claims the freshest repository instead.
+    let oldest = in_scope
+        .iter()
         .filter_map(|repo| repo.scanned_at.as_deref())
-        .collect();
-    let latest = stamps
-        .iter()
-        .filter_map(|stamp| scan_instant(stamp).map(|instant| (instant, *stamp)))
-        .max_by_key(|(instant, _)| *instant)
+        .filter_map(|stamp| scan_instant(stamp).map(|instant| (instant, stamp)))
+        .min_by_key(|(instant, _)| *instant)
         .map(|(_, stamp)| stamp);
-    match latest.or_else(|| stamps.iter().max().copied()) {
-        Some(stamp) => format!("Last scan {stamp}"),
+    // A stamp that does not parse proves no freshness, so its repository counts
+    // as stale beside one that carries a stored scan error.
+    let stale = in_scope
+        .iter()
+        .filter(|repo| {
+            repo.last_error.is_some()
+                || repo
+                    .scanned_at
+                    .as_deref()
+                    .is_none_or(|stamp| scan_instant(stamp).is_none())
+        })
+        .count();
+    // A stored stamp that does not parse is a folder that was scanned, so it
+    // reads as an unknown time rather than as a folder that was never scanned.
+    let any_stamp = in_scope.iter().any(|repo| repo.scanned_at.is_some());
+    let mut label = match oldest {
+        Some(stamp) => format!("Oldest scan {stamp}"),
+        None if any_stamp => "Last scan unknown".to_string(),
         None => "Not scanned yet".to_string(),
+    };
+    if stale > 0 {
+        let noun = if stale == 1 {
+            "repository"
+        } else {
+            "repositories"
+        };
+        let _ = write!(label, " · {stale} {noun} stale");
     }
+    label
+}
+
+/// The dashboard header line: how many repositories the page reads, the task
+/// totals the charts are built from, and the day those numbers are current to.
+fn dashboard_summary(counts: &series::Counts, repositories: usize, as_of: &str) -> String {
+    let noun = if repositories == 1 {
+        "repository"
+    } else {
+        "repositories"
+    };
+    format!(
+        "{repositories} {noun} in scope · {} tasks · {} live · {} deferred · {} finished · as of {as_of}",
+        counts.tasks, counts.live, counts.deferred, counts.finished
+    )
 }
 
 /// Read a stored scan stamp as an instant. A stamp written before the UTC clock
@@ -1235,6 +1292,8 @@ struct DashboardPage {
     notice: String,
     error: String,
     scan_label: String,
+    summary: String,
+    failures: Vec<ProjectView>,
     data_json: String,
     has_projects: bool,
 }
@@ -1555,8 +1614,9 @@ async fn run_scan(state: AppState) -> Result<ScanReport, Banner> {
     .await)
 }
 
-type HarvestFn =
-    dyn Fn(&std::path::Path, &[PriorTask]) -> Result<Vec<ParsedTask>, HarvestError> + Send + Sync;
+type HarvestFn = dyn Fn(&std::path::Path, &[PriorTask]) -> Result<harvest::Harvested, HarvestError>
+    + Send
+    + Sync;
 
 /// One repository whose scan left a scan error behind.
 struct ScanFailure {
@@ -1564,16 +1624,25 @@ struct ScanFailure {
     banner: Banner,
 }
 
-/// What one Update run did: how many repositories it attempted and which ones
-/// failed, so the dashboard can report the run truthfully.
+/// What one Update run did: how many repositories it attempted, which ones
+/// failed, and how many task files the run skipped, so the dashboard can report
+/// the run truthfully.
 struct ScanReport {
     attempted: usize,
     failures: Vec<ScanFailure>,
+    skipped: usize,
 }
 
 /// One harvest result as it leaves its join, before the store turns it into a
 /// scan error or a set of stored rows.
-type HarvestOutcome = Result<Result<Vec<ParsedTask>, HarvestError>, tokio::task::JoinError>;
+type HarvestOutcome = Result<Result<harvest::Harvested, HarvestError>, tokio::task::JoinError>;
+
+/// What storing one harvest outcome produced: the banner a failure earns and
+/// how many task files the harvest skipped.
+struct StoredOutcome {
+    banner: Option<Banner>,
+    skipped: usize,
+}
 
 /// Harvest the repositories up to `cap` at once, draining each result as soon
 /// as it finishes so a completed harvest never holds its parsed rows in the set
@@ -1596,11 +1665,13 @@ async fn scan_core(
         spawn_harvest(&mut harvests, pool, repository, &harvest, prior_read_hook).await;
     }
     let mut failures = Vec::new();
+    let mut skipped = 0_usize;
     while let Some(finished) = harvests.join_next().await {
         match finished {
             Ok((repository_id, outcome)) => {
-                if let Some(banner) = store_outcome(pool, repository_id, outcome, store_hook).await
-                {
+                let stored = store_outcome(pool, repository_id, outcome, store_hook).await;
+                skipped += stored.skipped;
+                if let Some(banner) = stored.banner {
                     failures.push(ScanFailure {
                         repository: repository_name(repositories, repository_id),
                         banner,
@@ -1618,6 +1689,7 @@ async fn scan_core(
     ScanReport {
         attempted: repositories.len(),
         failures,
+        skipped,
     }
 }
 
@@ -1667,7 +1739,7 @@ const STOPPED_ERROR: &str = "The scan stopped before it finished.";
 /// Record one repository's scan error. A write that fails is logged with the
 /// repository and the error, because the stored message is the only place the
 /// person sees the failure and a silent write would lose it.
-async fn record_scan_error(pool: &sqlx::SqlitePool, repository_id: i64, message: &'static str) {
+async fn record_scan_error(pool: &sqlx::SqlitePool, repository_id: i64, message: &str) {
     if let Err(error) = db::set_scan_error(pool, repository_id, message).await {
         tracing::error!(
             %error,
@@ -1678,45 +1750,78 @@ async fn record_scan_error(pool: &sqlx::SqlitePool, repository_id: i64, message:
     }
 }
 
+/// The message stored for a git history read that failed: the fixed sentence
+/// followed by the failure's first line, trimmed and cut at 200 characters, so
+/// the repository names a cause instead of one fixed sentence.
+fn git_scan_message(reason: &str) -> String {
+    let first = reason.lines().next().unwrap_or_default().trim();
+    if first.is_empty() {
+        return GIT_ERROR.to_string();
+    }
+    let reason = first.chars().take(200).collect::<String>();
+    format!("{GIT_ERROR} {reason}")
+}
+
 /// Record one harvest outcome, whether it arrived through the parallel join loop
 /// or a single repository refresh, so both paths report the same banners. The
-/// banner a failed outcome stored is returned for the run report.
+/// banner a failed outcome stored and the skipped-file count are returned for
+/// the run report.
 async fn store_outcome(
     pool: &sqlx::SqlitePool,
     repository_id: i64,
     outcome: HarvestOutcome,
     store_hook: &Arc<StoreHookFn>,
-) -> Option<Banner> {
+) -> StoredOutcome {
     match outcome {
-        Ok(Ok(tasks)) => {
+        Ok(Ok(harvested)) => {
+            let skipped = harvested.skipped_count();
             if let Err(error) =
-                db::replace_tasks(pool, repository_id, &tasks, store_hook.as_ref()).await
+                db::replace_tasks(pool, repository_id, &harvested.tasks, store_hook.as_ref()).await
             {
                 tracing::error!(%error, repository_id, "replace failed");
                 record_scan_error(pool, repository_id, SAVE_ERROR).await;
-                Some(Banner::SaveFailed)
+                StoredOutcome {
+                    banner: Some(Banner::SaveFailed),
+                    skipped,
+                }
             } else {
-                None
+                StoredOutcome {
+                    banner: None,
+                    skipped,
+                }
             }
         }
         Ok(Err(HarvestError::MissingTasks)) => {
             record_scan_error(pool, repository_id, MISSING_TASKS_ERROR).await;
-            Some(Banner::NoTasksDirectory)
+            StoredOutcome {
+                banner: Some(Banner::NoTasksDirectory),
+                skipped: 0,
+            }
         }
         Ok(Err(HarvestError::Git(reason))) => {
             tracing::error!(%reason, repository_id, "git could not read the history");
-            record_scan_error(pool, repository_id, GIT_ERROR).await;
-            Some(Banner::GitUnreadable)
+            let message = git_scan_message(&reason);
+            record_scan_error(pool, repository_id, &message).await;
+            StoredOutcome {
+                banner: Some(Banner::GitUnreadable),
+                skipped: 0,
+            }
         }
         Ok(Err(HarvestError::Io(error))) => {
             tracing::error!(%error, repository_id, "scan failed");
             record_scan_error(pool, repository_id, IO_ERROR).await;
-            Some(Banner::ScanUnreadable)
+            StoredOutcome {
+                banner: Some(Banner::ScanUnreadable),
+                skipped: 0,
+            }
         }
         Err(error) => {
             tracing::error!(%error, repository_id, "scan task stopped");
             record_scan_error(pool, repository_id, STOPPED_ERROR).await;
-            Some(Banner::ScanStopped)
+            StoredOutcome {
+                banner: Some(Banner::ScanStopped),
+                skipped: 0,
+            }
         }
     }
 }
@@ -1738,12 +1843,15 @@ async fn refresh_one(
     let outcome =
         tokio::task::spawn_blocking(move || harvest::harvest_repository_with_prior(&owned, &prior))
             .await;
-    store_outcome(pool, repository_id, outcome, store_hook).await
+    store_outcome(pool, repository_id, outcome, store_hook)
+        .await
+        .banner
 }
 
 /// The dashboard banner a scan run deserves: a distinct "nothing to update"
 /// notice when no repository exists, the success notice only when every
 /// repository harvested, and an error naming each failed repository otherwise.
+/// A run that skipped task files appends how many, on either message.
 fn scan_flash(report: &ScanReport) -> (&'static str, String) {
     if report.attempted == 0 {
         return (
@@ -1751,10 +1859,11 @@ fn scan_flash(report: &ScanReport) -> (&'static str, String) {
             Banner::NothingToUpdate.message().to_string(),
         );
     }
+    let skipped = skipped_note(report.skipped);
     if report.failures.is_empty() {
         return (
             Banner::ChartsUpdated.key(),
-            Banner::ChartsUpdated.message().to_string(),
+            format!("{}{skipped}", Banner::ChartsUpdated.message()),
         );
     }
     let clean = report.attempted.saturating_sub(report.failures.len());
@@ -1767,10 +1876,20 @@ fn scan_flash(report: &ScanReport) -> (&'static str, String) {
     (
         "error",
         format!(
-            "Charts updated for {clean} of {} repositories. Failed: {failed}.",
+            "Charts updated for {clean} of {} repositories. Failed: {failed}.{skipped}",
             report.attempted
         ),
     )
+}
+
+/// The skipped-file sentence a scan banner appends, or nothing when the run
+/// skipped no task file.
+fn skipped_note(skipped: usize) -> String {
+    match skipped {
+        0 => String::new(),
+        1 => " 1 task file skipped.".to_string(),
+        count => format!(" {count} task files skipped."),
+    }
 }
 
 async fn scan_response(state: &AppState, project: &str, report: &ScanReport) -> Response {
@@ -2658,6 +2777,102 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Covers: the dashboard header line names the repository count in scope,
+    /// the task totals, and the as-of day, and a failing repository's stored
+    /// message renders on the dashboard as it does on Repositories.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_dashboard_header_names_the_totals_and_the_failing_repository() {
+        let (state, path) = app_state("dashboard_header").await;
+        let fresh = unique_temp_dir("dashboard_header_fresh");
+        std::fs::create_dir_all(&fresh).expect("fresh folder");
+        let failed_folder = unique_temp_dir("dashboard_header_failed");
+        std::fs::create_dir_all(&failed_folder).expect("failed folder");
+        let fresh_id = db::insert_repository(&state.pool, "fresh", &fresh.to_string_lossy())
+            .await
+            .expect("insert fresh");
+        let failed_id =
+            db::insert_repository(&state.pool, "broken", &failed_folder.to_string_lossy())
+                .await
+                .expect("insert failed");
+        db::set_scan_error(
+            &state.pool,
+            failed_id,
+            "Git could not read the history: fatal: boom",
+        )
+        .await
+        .expect("scan error");
+
+        let created = chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("date");
+        let shipped = chrono::NaiveDate::from_ymd_opt(2026, 5, 20).expect("date");
+        let rows = vec![
+            ParsedTask {
+                path: "tasks/one_live.md".to_string(),
+                scope: "one".to_string(),
+                kind: TaskKind::Live,
+                created,
+                updated: created,
+                ship_date: None,
+                leave_date: None,
+                content_hash: None,
+                path_is_lossy: false,
+            },
+            ParsedTask {
+                path: "tasks/archive/two_finished.md".to_string(),
+                scope: "two".to_string(),
+                kind: TaskKind::Finished,
+                created,
+                updated: shipped,
+                ship_date: Some(shipped),
+                leave_date: Some(shipped),
+                content_hash: None,
+                path_is_lossy: false,
+            },
+            ParsedTask {
+                path: "tasks/archive/three_deferred.md".to_string(),
+                scope: "three".to_string(),
+                kind: TaskKind::Deferred,
+                created,
+                updated: shipped,
+                ship_date: None,
+                leave_date: Some(shipped),
+                content_hash: None,
+                path_is_lossy: false,
+            },
+        ];
+        db::replace_tasks(
+            &state.pool,
+            fresh_id,
+            &rows,
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("store rows");
+
+        let html = render_home(&state, &HomeQuery::default())
+            .await
+            .expect("render");
+        let as_of = crate::dates::format_date(crate::dates::today());
+        let expected = format!(
+            "2 repositories in scope · 3 tasks · 1 live · 1 deferred · 1 finished · as of {as_of}"
+        );
+        assert!(
+            html.contains(&expected),
+            "the header line names every total: {expected}"
+        );
+        assert!(
+            html.contains("Git could not read the history: fatal: boom"),
+            "the failing repository's cause renders on the dashboard"
+        );
+        assert!(
+            html.contains("class=\"error-text\""),
+            "the cause renders with the error-text class"
+        );
+
+        let _ = std::fs::remove_dir_all(fresh);
+        let _ = std::fs::remove_dir_all(failed_folder);
+        cleanup(&path);
+    }
+
     /// Covers: the embedded chart payload is the JSON serialized with every
     /// `<` written as `\u003c` while the bytes pass, so a repository name that
     /// holds `</script><b>` cannot close the payload script element and the
@@ -2720,6 +2935,7 @@ mod tests {
         let report = ScanReport {
             attempted: 1,
             failures: Vec::new(),
+            skipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
         let request = Request::builder()
@@ -2750,6 +2966,7 @@ mod tests {
         let report = ScanReport {
             attempted: 1,
             failures: Vec::new(),
+            skipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
         let token = flash_token(&location, "all");
@@ -2819,6 +3036,7 @@ mod tests {
         let report = ScanReport {
             attempted: 1,
             failures: Vec::new(),
+            skipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
 
@@ -3169,32 +3387,75 @@ mod tests {
 
     #[test]
     fn web_scan_label_compares_stamps_as_instants() {
-        let repository = |id: i64, scanned_at: Option<&str>| db::Repository {
-            repository_id: id,
-            name: format!("repo {id}"),
-            path: format!("/tmp/repo-{id}"),
-            created_at: "2026-11-01T00:00:00Z".to_string(),
-            scanned_at: scanned_at.map(str::to_string),
-            last_error: None,
-        };
+        let repository =
+            |id: i64, scanned_at: Option<&str>, last_error: Option<&str>| db::Repository {
+                repository_id: id,
+                name: format!("repo {id}"),
+                path: format!("/tmp/repo-{id}"),
+                created_at: "2026-11-01T00:00:00Z".to_string(),
+                scanned_at: scanned_at.map(str::to_string),
+                last_error: last_error.map(str::to_string),
+            };
 
         // 2026-11-09 00:30 Berlin is 2026-11-08 23:30 UTC, earlier than the
-        // 23:45 UTC scan, even though its text sorts later.
+        // 23:45 UTC scan, even though its text sorts later. The oldest stamp is
+        // the day the numbers are current to.
         let repositories = vec![
-            repository(1, Some("2026-11-09 00:30")),
-            repository(2, Some("2026-11-08T23:45Z")),
+            repository(1, Some("2026-11-09 00:30"), None),
+            repository(2, Some("2026-11-08T23:45Z"), None),
         ];
         assert_eq!(
             scan_label(&repositories, None),
-            "Last scan 2026-11-08T23:45Z"
+            "Oldest scan 2026-11-09 00:30"
         );
 
-        // No stamp parses, so the string maximum still names a latest scan.
+        // One fresh and one failed repository: the failed repository's last
+        // successful stamp is the oldest, and it counts as stale.
         let repositories = vec![
-            repository(1, Some("pending")),
-            repository(2, Some("unknown")),
+            repository(1, Some("2026-11-10T08:00Z"), None),
+            repository(
+                2,
+                Some("2026-11-09T08:00Z"),
+                Some("Git could not read the history."),
+            ),
         ];
-        assert_eq!(scan_label(&repositories, None), "Last scan unknown");
+        assert_eq!(
+            scan_label(&repositories, None),
+            "Oldest scan 2026-11-09T08:00Z · 1 repository stale"
+        );
+
+        // A stored stamp that does not parse reads as an unknown time, not as
+        // a folder that was never scanned, and still counts as stale.
+        let repositories = vec![
+            repository(1, Some("pending"), None),
+            repository(2, Some("unknown"), None),
+        ];
+        assert_eq!(
+            scan_label(&repositories, None),
+            "Last scan unknown · 2 repositories stale"
+        );
+
+        // A repository with no stamp at all is the only "not scanned yet".
+        let repositories = vec![repository(1, None, None)];
+        assert_eq!(
+            scan_label(&repositories, None),
+            "Not scanned yet · 1 repository stale"
+        );
+
+        // A selected repository scopes both the oldest stamp and the stale
+        // count.
+        let repositories = vec![
+            repository(1, Some("2026-11-10T08:00Z"), None),
+            repository(
+                2,
+                Some("2026-11-09T08:00Z"),
+                Some("Git could not read the history."),
+            ),
+        ];
+        assert_eq!(
+            scan_label(&repositories, Some(1)),
+            "Oldest scan 2026-11-10T08:00Z"
+        );
     }
 
     #[test]
@@ -3229,7 +3490,7 @@ mod tests {
                 peak.fetch_max(running, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(50));
                 active.fetch_sub(1, Ordering::SeqCst);
-                Ok(Vec::new())
+                Ok(harvest::Harvested::from(Vec::new()))
             })
         };
         scan_core(
@@ -3309,7 +3570,7 @@ mod tests {
             Arc::new(move |_: &Path, _: &[PriorTask]| {
                 std::thread::sleep(Duration::from_millis(10));
                 completed.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![parsed_task()])
+                Ok(harvest::Harvested::from(vec![parsed_task()]))
             })
         };
         // The store hook runs inside each write, so it sees how many harvests
@@ -3439,7 +3700,7 @@ mod tests {
                 if prior_reads.load(Ordering::SeqCst) > started + 1 {
                     over_read.fetch_add(1, Ordering::SeqCst);
                 }
-                Ok(vec![parsed_task()])
+                Ok(harvest::Harvested::from(vec![parsed_task()]))
             })
         };
 
@@ -3499,7 +3760,7 @@ mod tests {
                     let _ = release.recv();
                 }
                 active.fetch_sub(1, Ordering::SeqCst);
-                Ok(vec![parsed_task()])
+                Ok(harvest::Harvested::from(vec![parsed_task()]))
             })
         };
         state.harvest = harvest;
@@ -3560,7 +3821,7 @@ mod tests {
                 {
                     let _ = release.recv();
                 }
-                Ok(vec![parsed_task()])
+                Ok(harvest::Harvested::from(vec![parsed_task()]))
             })
         };
         state.harvest = harvest;
@@ -3588,7 +3849,8 @@ mod tests {
         let repository_id = db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
             .await
             .expect("insert");
-        state.harvest = Arc::new(|_: &Path, _: &[PriorTask]| Ok(vec![parsed_task()]));
+        state.harvest =
+            Arc::new(|_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(vec![parsed_task()])));
 
         let response = send(state.clone(), form_post("/scan", None, None)).await;
         let location = redirect_location(&response);
@@ -3636,7 +3898,7 @@ mod tests {
                 {
                     let _ = release.recv();
                 }
-                Ok(vec![parsed_task()])
+                Ok(harvest::Harvested::from(vec![parsed_task()]))
             })
         };
         state.harvest = harvest;
@@ -3694,7 +3956,8 @@ mod tests {
         db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
             .await
             .expect("insert");
-        state.harvest = Arc::new(|_: &Path, _: &[PriorTask]| Ok(vec![parsed_task()]));
+        state.harvest =
+            Arc::new(|_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(vec![parsed_task()])));
 
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
@@ -3825,7 +4088,8 @@ mod tests {
         db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
             .await
             .expect("insert");
-        state.harvest = Arc::new(|_: &Path, _: &[PriorTask]| Ok(vec![parsed_task()]));
+        state.harvest =
+            Arc::new(|_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(vec![parsed_task()])));
         let mut store = counting_store(None);
         state.store_hook = Arc::clone(&store.hook);
 
@@ -3957,7 +4221,7 @@ mod tests {
                     }
                     return Err(HarvestError::MissingTasks);
                 }
-                Ok(vec![parsed_task()])
+                Ok(harvest::Harvested::from(vec![parsed_task()]))
             })
         };
         state.harvest = harvest;
@@ -4036,7 +4300,7 @@ mod tests {
         let (harvest_tx, mut harvest_rx) = tokio::sync::mpsc::channel::<()>(8);
         state.harvest = Arc::new(move |_: &Path, _: &[PriorTask]| {
             let _ = harvest_tx.blocking_send(());
-            Ok(vec![parsed_task()])
+            Ok(harvest::Harvested::from(vec![parsed_task()]))
         });
         let mut store = counting_store(None);
         state.store_hook = Arc::clone(&store.hook);
@@ -4084,7 +4348,8 @@ mod tests {
         db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
             .await
             .expect("insert");
-        state.harvest = Arc::new(|_: &Path, _: &[PriorTask]| Ok(vec![parsed_task()]));
+        state.harvest =
+            Arc::new(|_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(vec![parsed_task()])));
         let mut store = counting_store(None);
         state.store_hook = Arc::clone(&store.hook);
 
@@ -4121,7 +4386,8 @@ mod tests {
         db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
             .await
             .expect("insert");
-        state.harvest = Arc::new(|_: &Path, _: &[PriorTask]| Ok(vec![parsed_task()]));
+        state.harvest =
+            Arc::new(|_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(vec![parsed_task()])));
         // The follow-up's store is entry one and panics, so that run ends
         // without publishing a result.
         let mut store = counting_store(Some(1));
@@ -4536,10 +4802,17 @@ mod tests {
             .iter()
             .find(|repository| repository.repository_id == id)
             .expect("repository");
-        assert_eq!(
-            failed.last_error.as_deref(),
-            Some("Git could not read the history, so the rows were left as they were."),
-            "the vanished object records a scan error"
+        let stored = failed
+            .last_error
+            .as_deref()
+            .expect("the vanished object records a scan error");
+        assert!(
+            stored.starts_with(GIT_ERROR),
+            "the stored message opens with the fixed git sentence: {stored}"
+        );
+        assert!(
+            stored.contains("vanished during the scan"),
+            "the stored message carries the failure reason: {stored}"
         );
         let rows = db::load_tasks(&pool, Some(id)).await.expect("earlier rows");
         assert_eq!(rows.len(), 1, "the earlier rows stay intact");
@@ -4639,10 +4912,17 @@ mod tests {
             .iter()
             .find(|repository| repository.repository_id == id)
             .expect("repository");
-        assert_eq!(
-            failed.last_error.as_deref(),
-            Some(GIT_ERROR),
-            "the failed probe stores the fixed git message"
+        let stored = failed
+            .last_error
+            .as_deref()
+            .expect("the failed probe records a scan error");
+        assert!(
+            stored.starts_with(GIT_ERROR),
+            "the stored message opens with the fixed git sentence: {stored}"
+        );
+        assert!(
+            stored.contains("simulated probe failure"),
+            "the stored message carries the failure reason: {stored}"
         );
         let rows = db::load_tasks(&pool, Some(id)).await.expect("earlier rows");
         assert_eq!(rows.len(), 1, "the earlier rows stay intact");
@@ -4673,7 +4953,7 @@ mod tests {
             if path == broken_path {
                 Err(HarvestError::Git("no history".to_string()))
             } else {
-                Ok(Vec::new())
+                Ok(harvest::Harvested::from(Vec::new()))
             }
         });
         let report = scan_core(
@@ -4750,6 +5030,7 @@ mod tests {
                     banner: Banner::NoTasksDirectory,
                 },
             ],
+            skipped: 0,
         };
         let (key, message) = scan_flash(&report);
         assert_eq!(key, "error");
@@ -4767,6 +5048,7 @@ mod tests {
         let report = ScanReport {
             attempted: 0,
             failures: Vec::new(),
+            skipped: 0,
         };
         let (key, message) = scan_flash(&report);
         assert_eq!(key, "notice");
@@ -4782,10 +5064,40 @@ mod tests {
         let report = ScanReport {
             attempted: 2,
             failures: Vec::new(),
+            skipped: 0,
         };
         let (key, message) = scan_flash(&report);
         assert_eq!(key, "notice");
         assert_eq!(message, "Charts updated.");
+    }
+
+    /// Covers: the Update banner appends the skipped-file count when the run
+    /// skipped a task file, on the clean and the failed message alike.
+    #[test]
+    fn web_scan_banner_reports_the_skipped_file_count() {
+        let clean = ScanReport {
+            attempted: 1,
+            failures: Vec::new(),
+            skipped: 2,
+        };
+        let (key, message) = scan_flash(&clean);
+        assert_eq!(key, "notice");
+        assert_eq!(message, "Charts updated. 2 task files skipped.");
+
+        let failed = ScanReport {
+            attempted: 1,
+            failures: vec![ScanFailure {
+                repository: "repo".to_string(),
+                banner: Banner::GitUnreadable,
+            }],
+            skipped: 1,
+        };
+        let (key, message) = scan_flash(&failed);
+        assert_eq!(key, "error");
+        assert!(
+            message.ends_with(" 1 task file skipped."),
+            "the failure message names the skipped file: {message}"
+        );
     }
 
     /// Covers: Update over zero repositories shows a distinct "nothing to
@@ -5071,6 +5383,7 @@ mod tests {
                 repository: "sysadmin".to_string(),
                 banner: Banner::GitUnreadable,
             }],
+            skipped: 0,
         };
         let failure_location = redirect_location(&scan_response(&state, "all", &failed).await);
         let failure_token = flash_token(&failure_location, "all");
@@ -5085,6 +5398,7 @@ mod tests {
         let clean = ScanReport {
             attempted: 2,
             failures: Vec::new(),
+            skipped: 0,
         };
         let clean_location = redirect_location(&scan_response(&state, "all", &clean).await);
         let clean_token = flash_token(&clean_location, "all");
@@ -5207,6 +5521,7 @@ mod tests {
         let report = ScanReport {
             attempted: 1,
             failures: Vec::new(),
+            skipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
         let token = flash_token(&location, "all");
@@ -5250,6 +5565,7 @@ mod tests {
         let report = ScanReport {
             attempted: 1,
             failures: Vec::new(),
+            skipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
 
@@ -5306,6 +5622,7 @@ mod tests {
         let report = ScanReport {
             attempted: 1,
             failures: Vec::new(),
+            skipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
         let token = flash_token(&location, "all");
@@ -5350,6 +5667,7 @@ mod tests {
         let report = ScanReport {
             attempted: 1,
             failures: Vec::new(),
+            skipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
         let token = flash_token(&location, "all");
@@ -5512,9 +5830,17 @@ mod tests {
         );
         let repositories = db::list_repositories(&state.pool).await.expect("list");
         assert_eq!(repositories.len(), 1);
-        assert_eq!(
-            repositories[0].last_error.as_deref(),
-            Some("Git could not read the history, so the rows were left as they were.")
+        let stored = repositories[0]
+            .last_error
+            .as_deref()
+            .expect("the failed first harvest stores a scan error");
+        assert!(
+            stored.starts_with(GIT_ERROR),
+            "the stored message opens with the fixed git sentence: {stored}"
+        );
+        assert!(
+            stored.len() > GIT_ERROR.len(),
+            "the stored message carries the failure reason: {stored}"
         );
         let rows = db::load_tasks(&state.pool, Some(repositories[0].repository_id))
             .await
@@ -5968,7 +6294,7 @@ mod tests {
             if let Ok(release) = release_rx.lock() {
                 let _ = release.recv();
             }
-            Ok(vec![parsed_task()])
+            Ok(harvest::Harvested::from(vec![parsed_task()]))
         });
         let scan_state = state.clone();
         let scan = tokio::spawn(async move {

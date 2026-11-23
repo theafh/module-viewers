@@ -28,7 +28,15 @@
         <h1 class="page-title">Task dashboard</h1>
         <p class="muted">{{ scan_label }}</p>
     </div>
+    <p class="muted">{{ summary }}</p>
 </header>
+{% if failures %}
+<ul class="repo-list">
+    {% for project in failures %}
+    <li><span class="error-text">{{ project.name }}: {{ project.last_error }}</span></li>
+    {% endfor %}
+</ul>
+{% endif %}
 {% if not has_projects %}
 <p class="banner">No repositories yet. Open <a href="/repositories">Repositories</a> to add a project folder with a <code>tasks/</code> tree.</p>
 {% endif %}

@@ -120,17 +120,20 @@ impl std::fmt::Display for GitFailure {
 
 #[cfg(test)]
 pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> {
-    harvest_repository_with_prior(repo, &[])
+    harvest_repository_with_prior(repo, &[]).map(|harvested| harvested.tasks)
 }
 
 /// Harvest `repo`, reusing the stored leave day of every archived path whose
 /// content hash still matches the row the database holds. Prior rows arrive as
-/// an argument, so harvest stays read-only of the database.
+/// an argument, so harvest stays read-only of the database. The returned rows
+/// carry the task files the harvest charted, and the tally says how many task
+/// files it skipped and why.
 pub fn harvest_repository_with_prior(
     repo: &Path,
     prior: &[PriorTask],
-) -> Result<Vec<ParsedTask>, HarvestError> {
+) -> Result<Harvested, HarvestError> {
     let repo = fs::canonicalize(repo)?;
+    let mut skipped = SkipTally::default();
     // The working-tree half of the `tasks/` disjunction. The ref half arrives
     // with the union listing below, so a folder whose checked-out branch has no
     // `tasks/` still charts a branch that holds it.
@@ -152,14 +155,15 @@ pub fn harvest_repository_with_prior(
             if git.dir.is_some() {
                 git_read(&repo, dir, &["rev-parse", "--git-dir"]).map_err(HarvestError::Git)?;
             }
-            let (chosen, worktree, ref_holds_tasks) = union_files(&repo, root, dir, &git.prefix)?;
+            let (chosen, worktree, ref_holds_tasks) =
+                union_files(&repo, root, dir, &git.prefix, &mut skipped)?;
             // Neither the working tree nor any ref holds `tasks/`, so the folder
             // has no tasks directory. The error keeps the repository's stored
             // rows instead of replacing them with an empty set.
             if !tasks_present(worktree_tasks, ref_holds_tasks) {
                 return Err(HarvestError::MissingTasks);
             }
-            harvest_chosen(&repo, &git, root, dir, chosen, worktree, prior)
+            harvest_chosen(&repo, &git, root, dir, chosen, worktree, prior, skipped)
         }
         None => {
             // A folder outside git holds `tasks/` only when its working tree
@@ -167,7 +171,8 @@ pub fn harvest_repository_with_prior(
             if !tasks_present(worktree_tasks, false) {
                 return Err(HarvestError::MissingTasks);
             }
-            harvest_files(&repo, &git, files_on_disk(&repo)?, prior)
+            let files = files_on_disk(&repo, &mut skipped)?;
+            harvest_files(&repo, &git, files, prior, skipped)
         }
     }
 }
@@ -277,9 +282,9 @@ type Candidate = ((u8, u8, i64), Option<String>, String, bool);
 /// a commit, and whether that path decoded lossily.
 type ChosenFile = (String, Option<String>, bool);
 
-/// Why a working-tree task file contributed no row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkipReason {
+/// Why a task file contributed no row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SkipReason {
     /// The file could not be opened or read.
     Unreadable,
     /// Its bytes are not valid UTF-8.
@@ -297,6 +302,38 @@ impl SkipReason {
             Self::Oversized => "is larger than the 4 MiB cap",
         }
     }
+}
+
+/// How many task files one harvest skipped, keyed by why.
+pub type SkipTally = std::collections::BTreeMap<SkipReason, usize>;
+
+/// What one repository harvest produced: the rows it charted and the task files
+/// it skipped, keyed by why.
+#[derive(Debug, Default)]
+pub struct Harvested {
+    pub tasks: Vec<ParsedTask>,
+    pub skipped: SkipTally,
+}
+
+impl Harvested {
+    /// The number of task files the harvest skipped, whatever the reason.
+    pub fn skipped_count(&self) -> usize {
+        self.skipped.values().sum()
+    }
+}
+
+impl From<Vec<ParsedTask>> for Harvested {
+    fn from(tasks: Vec<ParsedTask>) -> Self {
+        Self {
+            tasks,
+            skipped: SkipTally::default(),
+        }
+    }
+}
+
+/// Count one skipped task file under its reason.
+fn record_skip(tally: &mut SkipTally, reason: SkipReason) {
+    *tally.entry(reason).or_insert(0) += 1;
 }
 
 /// One `.md` file under `tasks/`, in one of three states: charted (`text` is
@@ -336,6 +373,7 @@ fn union_files(
     root: &Path,
     dir: &Path,
     prefix: &str,
+    tally: &mut SkipTally,
 ) -> Result<(Vec<ChosenFile>, WorktreeFiles, bool), HarvestError> {
     // Every (path, blob, lossy) triple, then the newest touch of each blob once.
     // Two refs at one commit list identical triples, so the second is skipped.
@@ -368,7 +406,7 @@ fn union_files(
     // retains the text of the rows that fit the cache budget. A skipped row
     // still enters the ranking, so it claims its task name and blocks an older
     // committed copy without charting anything.
-    let worktree = files_on_disk(folder)?;
+    let worktree = files_on_disk(folder, tally)?;
     let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
     for row in &worktree {
         if row.skip.is_some() {
@@ -494,6 +532,7 @@ fn tasks_subtree(entry: &[u8]) -> Option<String> {
 /// contents are therefore never all resident: committed contents stream one at
 /// a time, and the retained working-tree cache stays within
 /// `MAX_WORKTREE_CACHE_BYTES`.
+#[allow(clippy::too_many_arguments)]
 fn harvest_chosen(
     repo: &Path,
     git: &GitContext,
@@ -502,7 +541,8 @@ fn harvest_chosen(
     chosen: Vec<ChosenFile>,
     mut worktree: WorktreeFiles,
     prior: &[PriorTask],
-) -> Result<Vec<ParsedTask>, HarvestError> {
+    mut skipped: SkipTally,
+) -> Result<Harvested, HarvestError> {
     let blobs: Vec<String> = chosen
         .iter()
         .filter_map(|(_, blob, _)| blob.clone())
@@ -525,15 +565,17 @@ fn harvest_chosen(
                     }
                     BlobContent::Missing => vanished = Some(path.clone()),
                     BlobContent::Oversized => {
-                        warn_skipped_task(&path, "the committed blob is larger than the 4 MiB cap")
+                        record_skip(&mut skipped, SkipReason::Oversized);
+                        warn_skipped_task(&path, SkipReason::Oversized);
                     }
                     BlobContent::NotUtf8 => {
-                        warn_skipped_task(&path, "the committed blob is not valid UTF-8");
+                        record_skip(&mut skipped, SkipReason::NotUtf8);
+                        warn_skipped_task(&path, SkipReason::NotUtf8);
                     }
                 }
                 break;
             }
-            if let Some(text) = worktree_content(repo, &mut worktree, &path) {
+            if let Some(text) = worktree_content(repo, &mut worktree, &path, &mut skipped) {
                 state.harvest_file(&path, &text, path_is_lossy);
             }
         }
@@ -546,11 +588,14 @@ fn harvest_chosen(
     // Every committed row has taken its content, so the rows left are
     // working-tree ones.
     for (path, _, path_is_lossy) in rows {
-        if let Some(text) = worktree_content(repo, &mut worktree, &path) {
+        if let Some(text) = worktree_content(repo, &mut worktree, &path, &mut skipped) {
             state.harvest_file(&path, &text, path_is_lossy);
         }
     }
-    state.finish(repo, git, prior)
+    Ok(Harvested {
+        tasks: state.finish(repo, git, prior)?,
+        skipped,
+    })
 }
 
 /// One chosen working-tree row's content: the text the cache retained, or a
@@ -558,7 +603,12 @@ fn harvest_chosen(
 /// row or the file changed since the walk. A file that can no longer be read,
 /// is not UTF-8, or is over the cap contributes no row and warns once with its
 /// path, byte count, and reason, as the walk does.
-fn worktree_content(repo: &Path, worktree: &mut WorktreeFiles, path: &str) -> Option<String> {
+fn worktree_content(
+    repo: &Path,
+    worktree: &mut WorktreeFiles,
+    path: &str,
+    skipped: &mut SkipTally,
+) -> Option<String> {
     if let Some((text, _)) = worktree.remove(path) {
         return Some(text);
     }
@@ -573,6 +623,7 @@ fn worktree_content(repo: &Path, worktree: &mut WorktreeFiles, path: &str) -> Op
             let bytes = fs::metadata(repo.join(path))
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
+            record_skip(skipped, reason);
             warn_skipped_worktree_task(path, bytes, reason);
             None
         }
@@ -928,7 +979,8 @@ fn harvest_files(
     git: &GitContext,
     files: Vec<WorktreeRow>,
     prior: &[PriorTask],
-) -> Result<Vec<ParsedTask>, HarvestError> {
+    mut skipped: SkipTally,
+) -> Result<Harvested, HarvestError> {
     let mut state = HarvestState::default();
     for row in files {
         // A skipped row warned once during the walk and contributes no row.
@@ -954,6 +1006,7 @@ fn harvest_files(
                         let bytes = fs::metadata(repo.join(&row.path))
                             .map(|metadata| metadata.len())
                             .unwrap_or(0);
+                        record_skip(&mut skipped, reason);
                         warn_skipped_worktree_task(&row.path, bytes, reason);
                         None
                     }
@@ -964,7 +1017,10 @@ fn harvest_files(
             state.harvest_file(&row.path, &text, row.lossy);
         }
     }
-    state.finish(repo, git, prior)
+    Ok(Harvested {
+        tasks: state.finish(repo, git, prior)?,
+        skipped,
+    })
 }
 
 /// Split an `ls-tree -r -z` listing into task paths, their blob ids, and
@@ -1181,7 +1237,7 @@ fn parse_batch<R: BufRead>(
 /// file is retained only while the running total stays within
 /// `MAX_WORKTREE_CACHE_BYTES`; a row past that budget keeps its path and is
 /// re-read one file at a time when it is charted.
-fn files_on_disk(repo: &Path) -> Result<Vec<WorktreeRow>, HarvestError> {
+fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow>, HarvestError> {
     // A folder whose working tree has no `tasks/` holds no working-tree row.
     // The ref union still supplies the rows, and the caller's `tasks/` gate
     // decides whether the folder has any tasks at all.
@@ -1231,6 +1287,7 @@ fn files_on_disk(repo: &Path) -> Result<Vec<WorktreeRow>, HarvestError> {
                 let bytes = fs::metadata(path)
                     .map(|metadata| metadata.len())
                     .unwrap_or(0);
+                record_skip(skipped, reason);
                 warn_skipped_worktree_task(&rel, bytes, reason);
                 WorktreeRow {
                     path: rel,
@@ -1335,17 +1392,17 @@ fn has_task_name_shape(rel: &str) -> bool {
 /// Report one task file that contributes no row: a warning when its name has
 /// the task shape, a debug line otherwise, so a stray `README.md` under
 /// `tasks/` stays out of the warning stream.
-fn warn_skipped_task(path: &str, reason: &str) {
+fn warn_skipped_task(path: &str, reason: SkipReason) {
     if has_task_name_shape(path) {
         tracing::warn!(
             path = %path,
-            reason = %reason,
+            reason = reason.describe(),
             "task file was skipped; no row charted"
         );
     } else {
         tracing::debug!(
             path = %path,
-            reason = %reason,
+            reason = reason.describe(),
             "file under tasks/ was skipped; no row charted"
         );
     }
@@ -2821,10 +2878,10 @@ mod tests {
     use super::{
         BlobContent, CONTENT_HASH_REVISION, GIT_COMMAND_TIMEOUT, GitContext, GitFailure,
         HarvestError, HarvestState, LogLookup, MAX_TASK_FILE_BYTES, MAX_WORKTREE_CACHE_BYTES,
-        ParsedTask, PriorTask, TaskKind, archive_log_args, archived_leave_lookup, blob_days,
-        blob_days_log_args, content_hash, drain_reader, enclosing_prefix, escape_posix_ere,
-        first_status_commit_date, fnv1a_digest, frontmatter, git_bin, git_deadline,
-        git_dir_command, git_log_args, git_path, git_program, git_read, git_timeout,
+        ParsedTask, PriorTask, SkipReason, TaskKind, archive_log_args, archived_leave_lookup,
+        blob_days, blob_days_log_args, content_hash, drain_reader, enclosing_prefix,
+        escape_posix_ere, first_status_commit_date, fnv1a_digest, frontmatter, git_bin,
+        git_deadline, git_dir_command, git_log_args, git_path, git_program, git_read, git_timeout,
         harvest_repository, harvest_repository_with_prior, parse_archive_log, parse_batch,
         pickaxe_log_args, read_blobs, run_git_command, run_git_log, run_git_streaming,
         scan_log_dates, scrub_git_env, stream_blob_days, take_leave_walk_count,
@@ -3664,7 +3721,9 @@ mod tests {
                 content_hash: task.content_hash.clone(),
             })
             .collect();
-        let second = harvest_repository_with_prior(&repo, &prior).expect("second harvest");
+        let second = harvest_repository_with_prior(&repo, &prior)
+            .expect("second harvest")
+            .tasks;
         assert_eq!(
             take_leave_walk_count(&repo),
             0,
@@ -3795,7 +3854,9 @@ mod tests {
             content_hash: Some(fnv1a_digest(&text)),
         }];
 
-        let tasks = harvest_repository_with_prior(&repo, &prior).expect("harvest");
+        let tasks = harvest_repository_with_prior(&repo, &prior)
+            .expect("harvest")
+            .tasks;
         assert_eq!(
             take_leave_walk_count(&repo),
             1,
@@ -4001,7 +4062,9 @@ mod tests {
             content_hash: Some(format!("r2:{}", fnv1a_digest(&text))),
         }];
 
-        let tasks = harvest_repository_with_prior(&repo, &prior).expect("harvest");
+        let tasks = harvest_repository_with_prior(&repo, &prior)
+            .expect("harvest")
+            .tasks;
         assert_eq!(
             take_leave_walk_count(&repo),
             1,
@@ -5402,7 +5465,9 @@ mod tests {
             "2026-07-01T12:00:00+00:00",
         );
 
-        let second = harvest_repository_with_prior(&repo, &prior).expect("second harvest");
+        let second = harvest_repository_with_prior(&repo, &prior)
+            .expect("second harvest")
+            .tasks;
         assert_eq!(
             take_leave_walk_count(&repo),
             1,
@@ -5479,7 +5544,9 @@ mod tests {
             })
             .collect();
 
-        let second = harvest_repository_with_prior(&repo, &prior).expect("second harvest");
+        let second = harvest_repository_with_prior(&repo, &prior)
+            .expect("second harvest")
+            .tasks;
         assert_eq!(
             take_leave_walk_count(&repo),
             0,
@@ -6845,6 +6912,42 @@ mod tests {
         bytes.push(0xff);
         bytes.extend_from_slice(b"\n");
         fs::write(path, bytes).expect("write non-UTF-8 task");
+    }
+
+    /// Covers: the harvest entry point returns the skipped-file tally, with an
+    /// oversized and a non-UTF-8 task file each reported under its own reason
+    /// while a valid task still charts.
+    #[test]
+    fn harvest_reports_the_skipped_file_tally_by_reason() {
+        let repo = scratch("harvest_skip_tally");
+        write_task(&repo, "tasks/scope_valid.md", "2026-05-01", "open");
+        let oversized = repo.join("tasks/scope_big.md");
+        fs::write(&oversized, vec![b'a'; MAX_TASK_FILE_BYTES + 1]).expect("oversized task");
+        write_non_utf8_task(
+            &repo,
+            "tasks/scope_bad.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+
+        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        assert_eq!(
+            harvested.skipped.get(&SkipReason::Oversized).copied(),
+            Some(1),
+            "the oversized task file is tallied: {:?}",
+            harvested.skipped
+        );
+        assert_eq!(
+            harvested.skipped.get(&SkipReason::NotUtf8).copied(),
+            Some(1),
+            "the non-UTF-8 task file is tallied: {:?}",
+            harvested.skipped
+        );
+        assert_eq!(harvested.skipped_count(), 2);
+        assert_eq!(harvested.tasks.len(), 1, "the valid task still charts");
+        assert_eq!(harvested.tasks[0].path, "tasks/scope_valid.md");
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
