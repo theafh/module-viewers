@@ -7693,7 +7693,11 @@ mod tests {
             result["radius"].as_f64().expect("radar radius") >= 31.0,
             "the radius keeps the 31px floor"
         );
-        assert_eq!(result["labels"].as_u64(), Some(4));
+        assert_eq!(
+            result["labels"].as_u64(),
+            Some(8),
+            "four spoke labels and four ring-value labels"
+        );
         assert_eq!(
             result["outside"].as_u64(),
             Some(0),
@@ -8353,6 +8357,374 @@ mod tests {
         assert!(
             result["minGap"].as_f64().expect("minimum label gap") >= 24.0,
             "consecutive month labels sit at least 24px apart"
+        );
+    }
+
+    /// Covers: a calendar whose window starts mid-week labels its first month
+    /// with a month name and year even though that column's first cell is
+    /// padding.
+    #[test]
+    fn browser_calendar_first_month_label_carries_the_year() {
+        let payload = year_of_calendar_rows();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var svg = globalThis.__env.cards["shipped-calendar"].querySelector("svg");
+  var labels = svg.children
+    .filter(function (node) { return node.name === "text"; })
+    .map(function (node) { return node.textContent; });
+  return JSON.stringify({ labels: labels });
+})()"#,
+        );
+        let labels = result["labels"].as_array().expect("calendar labels");
+        assert_eq!(
+            labels.first().and_then(|label| label.as_str()),
+            Some("Nov 2025"),
+            "the window's first month carries its year: {labels:?}"
+        );
+        assert!(
+            labels.len() > 1,
+            "the later months keep their labels: {labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .skip(1)
+                .all(|label| !label.as_str().unwrap_or_default().contains("20")),
+            "only the first label carries a year: {labels:?}"
+        );
+    }
+
+    /// Covers: a calendar whose window opens in a month's last days keeps the
+    /// following month's label instead of dropping it to the 24px guard.
+    #[test]
+    fn browser_calendar_keeps_the_month_after_a_late_window_start() {
+        let mut payload = year_of_calendar_rows();
+        let start = chrono::NaiveDate::from_ymd_opt(2025, 11, 28).expect("start date");
+        let rows: Vec<serde_json::Value> = (0..365)
+            .map(|offset| {
+                let date = start + chrono::Duration::days(offset);
+                serde_json::json!({
+                    "date": date.format("%Y-%m-%d").to_string(),
+                    "count": offset % 3,
+                })
+            })
+            .collect();
+        payload["shipped_calendar"] = serde_json::Value::Array(rows);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var svg = globalThis.__env.cards["shipped-calendar"].querySelector("svg");
+  var labels = svg.children
+    .filter(function (node) { return node.name === "text"; })
+    .map(function (node) { return node.textContent; });
+  return JSON.stringify({ labels: labels });
+})()"#,
+        );
+        let labels = result["labels"].as_array().expect("calendar labels");
+        assert_eq!(
+            labels.first().and_then(|label| label.as_str()),
+            Some("Dec 2025"),
+            "the month after a late window start keeps its label: {labels:?}"
+        );
+        assert!(
+            labels.len() > 1 && labels[1].as_str() == Some("Jan"),
+            "the months after December keep their labels: {labels:?}"
+        );
+    }
+
+    /// Covers: a one-row cumulative, backlog, and age series each draw a
+    /// filled dot at their value and say "Not enough days yet".
+    #[test]
+    fn browser_one_day_series_draws_a_dot_and_says_not_enough_days() {
+        let mut payload = fixture_payload();
+        payload["cumulative"] =
+            serde_json::json!([{"date": "2026-01-05", "cumulative": 4, "shipped": 4, "trend": 8}]);
+        payload["live_backlog"] = serde_json::json!([{"date": "2026-01-05", "live": 3}]);
+        payload["mean_age"] =
+            serde_json::json!([{"date": "2026-01-05", "avg_age": 2, "trend": 6, "n": 2}]);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function card(name) {
+    var svg = env.cards[name].querySelector("svg");
+    var circles = svg.children
+      .filter(function (node) { return node.name === "circle"; })
+      .map(function (node) {
+        return {
+          cx: Number(node.attrs.cx),
+          cy: Number(node.attrs.cy),
+          r: Number(node.attrs.r),
+          fill: node.attrs.fill
+        };
+      });
+    return {
+      circles: circles,
+      summary: env.cards[name].querySelector(".summary").textContent
+    };
+  }
+  return JSON.stringify({
+    cumulative: card("cumulative"),
+    backlog: card("backlog"),
+    age: card("age")
+  });
+})()"#,
+        );
+        // frame.left is 44, frame.top 16, frame.bottom 248, so a value on a
+        // maxY of 8 sits at 132, on 3 at 16, and on 6 at 170.67.
+        for (name, expected_cy) in [
+            ("cumulative", 132.0_f64),
+            ("backlog", 16.0_f64),
+            ("age", 248.0 - 2.0 / 6.0 * 232.0),
+        ] {
+            let card = &result[name];
+            assert_eq!(
+                card["summary"], "Not enough days yet",
+                "{name} says why its line is empty"
+            );
+            let circles = card["circles"].as_array().expect("dots");
+            assert_eq!(circles.len(), 1, "{name} draws one dot");
+            assert_eq!(circles[0]["cx"].as_f64(), Some(44.0), "{name} dot x");
+            assert!(
+                (circles[0]["cy"].as_f64().expect("dot y") - expected_cy).abs() < 1e-6,
+                "{name} dot sits at its series value"
+            );
+            assert_eq!(circles[0]["r"].as_f64(), Some(4.0), "{name} dot radius");
+            assert_eq!(circles[0]["fill"], "#123456", "{name} dot fill");
+        }
+    }
+
+    /// Covers: a one-spoke radar labels each of its four rings with a value and
+    /// keeps the filled dot at its spoke.
+    #[test]
+    fn browser_one_spoke_radar_labels_four_rings_and_keeps_the_dot() {
+        let mut payload = fixture_payload();
+        payload["radar_shipped"] = serde_json::json!([{"label": "alpha", "count": 4}]);
+        payload["radar_live"] = serde_json::json!([{"label": "beta", "count": 4}]);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["radar-shipped"].querySelector("svg");
+  var rings = svg.children
+    .filter(function (node) {
+      return node.name === "text" && node.attrs["font-size"] === "10";
+    })
+    .map(function (node) { return node.textContent; });
+  var dot = null;
+  svg.children.forEach(function (node) {
+    if (node.name !== "a") return;
+    node.children.forEach(function (child) {
+      if (child.name === "circle") {
+        dot = {
+          cx: Number(child.attrs.cx),
+          cy: Number(child.attrs.cy),
+          r: Number(child.attrs.r),
+          fill: child.attrs.fill
+        };
+      }
+    });
+  });
+  return JSON.stringify({ rings: rings, dot: dot });
+})()"#,
+        );
+        assert_eq!(
+            result["rings"],
+            serde_json::json!(["1", "2", "3", "4"]),
+            "each of the four rings carries its value"
+        );
+        let dot = &result["dot"];
+        assert_eq!(dot["cx"].as_f64(), Some(500.0), "the dot sits on its spoke");
+        assert_eq!(
+            dot["cy"].as_f64(),
+            Some(68.0),
+            "the one spoke runs straight up to the outer ring"
+        );
+        assert_eq!(
+            dot["r"].as_f64(),
+            Some(4.0),
+            "the spoke keeps its filled dot"
+        );
+        assert_eq!(dot["fill"], "#123456", "the dot carries the series colour");
+    }
+
+    /// Covers: two radars whose maxima differ share one ring scale, so both
+    /// cards carry the same four ring labels and the outermost reads the
+    /// larger maximum.
+    #[test]
+    fn browser_two_radars_share_one_ring_scale() {
+        let mut payload = fixture_payload();
+        payload["radar_shipped"] = serde_json::json!([{"label": "alpha", "count": 2}]);
+        payload["radar_live"] = serde_json::json!([{"label": "alpha", "count": 8}]);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function rings(name) {
+    return env.cards[name].querySelector("svg").children
+      .filter(function (node) {
+        return node.name === "text" && node.attrs["font-size"] === "10";
+      })
+      .map(function (node) { return node.textContent; });
+  }
+  return JSON.stringify({
+    shipped: rings("radar-shipped"),
+    live: rings("radar-live")
+  });
+})()"#,
+        );
+        let shipped = result["shipped"].as_array().expect("shipped rings");
+        assert_eq!(
+            shipped,
+            &vec![
+                serde_json::json!("2"),
+                serde_json::json!("4"),
+                serde_json::json!("6"),
+                serde_json::json!("8"),
+            ],
+            "the shipped radar draws the shared scale"
+        );
+        assert_eq!(
+            result["live"], result["shipped"],
+            "both radars draw the same four ring labels"
+        );
+        assert_eq!(
+            shipped.last().and_then(|label| label.as_str()),
+            Some("8"),
+            "the outermost ring reads the larger maximum"
+        );
+    }
+
+    /// A payload whose weekly series carries `count` Monday weeks from
+    /// 2003-01-06, so a wide plot's slots fall below the bar's minimum width.
+    fn weeks_payload(count: i64) -> serde_json::Value {
+        let mut payload = fixture_payload();
+        let start = chrono::NaiveDate::from_ymd_opt(2003, 1, 6).expect("a Monday");
+        let rows: Vec<serde_json::Value> = (0..count)
+            .map(|index| {
+                let week = start + chrono::Duration::days(index * 7);
+                serde_json::json!({
+                    "week": week.format("%Y-%m-%d").to_string(),
+                    "shipped": 1,
+                    "created": 1
+                })
+            })
+            .collect();
+        payload["weekly"] = serde_json::Value::Array(rows);
+        payload
+    }
+
+    /// Covers: a three-week plot keeps each bar inside the frame and centred on
+    /// its slot, and a 1,200-week plot keeps every bar inside the frame even
+    /// though each slot is narrower than the bar.
+    #[test]
+    fn browser_weekly_bars_sit_inside_the_plot() {
+        let assertion = r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["weekly"].querySelector("svg");
+  var frame = { left: 40, right: 984 };
+  var bars = svg.children
+    .filter(function (node) {
+      return node.name === "rect" && node.attrs.fill !== "transparent";
+    })
+    .map(function (node) {
+      return { x: Number(node.attrs.x), width: Number(node.attrs.width) };
+    });
+  var weeks = WEEKS;
+  var slot = (frame.right - frame.left) / weeks;
+  var outside = 0;
+  var offCentre = 0;
+  bars.forEach(function (bar, index) {
+    var week = Math.floor(index / 2);
+    var centre = bar.x + bar.width / 2;
+    var expected = frame.left + slot * (week + 0.5);
+    if (bar.x < frame.left - 1e-6 || bar.x + bar.width > frame.right + 1e-6) {
+      outside += 1;
+    }
+    if (Math.abs(centre - expected) > 0.5) {
+      offCentre += 1;
+    }
+  });
+  return JSON.stringify({
+    bars: bars.length,
+    outside: outside,
+    offCentre: offCentre,
+    firstLeft: bars.length ? bars[0].x : null,
+    lastRight: bars.length ? bars[bars.length - 1].x + bars[bars.length - 1].width : null
+  });
+})()"#;
+
+        let three = weeks_payload(3).to_string();
+        let three_config = browser_config(false, false, Some(&three), serde_json::json!("#123456"));
+        let three_result = run_browser(&three_config, &assertion.replace("WEEKS", "3"));
+        assert_eq!(three_result["bars"].as_u64(), Some(6), "two bars per week");
+        assert_eq!(
+            three_result["outside"].as_u64(),
+            Some(0),
+            "every three-week bar stays inside the plot"
+        );
+        assert_eq!(
+            three_result["offCentre"].as_u64(),
+            Some(0),
+            "every three-week bar is centred on its slot"
+        );
+        assert!(
+            three_result["firstLeft"].as_f64().expect("first bar") >= 40.0,
+            "the first bar starts at or right of the frame's left edge"
+        );
+        assert!(
+            three_result["lastRight"].as_f64().expect("last bar") <= 984.0,
+            "the last bar ends at or left of the frame's right edge"
+        );
+
+        let wide = weeks_payload(1200).to_string();
+        let wide_config = browser_config(false, false, Some(&wide), serde_json::json!("#123456"));
+        let wide_result = run_browser(&wide_config, &assertion.replace("WEEKS", "1200"));
+        assert_eq!(
+            wide_result["bars"].as_u64(),
+            Some(2400),
+            "two bars per week"
+        );
+        assert_eq!(
+            wide_result["outside"].as_u64(),
+            Some(0),
+            "a slot narrower than the bar still keeps every bar inside the plot"
         );
     }
 
@@ -9390,7 +9762,20 @@ mod tests {
     /// their leave day instead of claiming they are excluded.
     #[test]
     fn browser_age_subtitle_states_deferred_aging() {
-        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        // Two rows, so the card draws a line and prints its subtitle rather
+        // than the one-day "Not enough days yet" message.
+        let mut payload = fixture_payload();
+        payload["mean_age"] = serde_json::json!([
+            {"date": "2026-01-05", "avg_age": 2, "n": 1},
+            {"date": "2026-01-06", "avg_age": 3, "n": 1}
+        ]);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
         let result = run_browser(
             &config,
             r#"JSON.stringify({ text: globalThis.__env.cards["age"].querySelector(".summary").textContent })"#,

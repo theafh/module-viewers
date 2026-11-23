@@ -133,6 +133,13 @@ fn strip_one_quote_pair(value: &str) -> &str {
 pub(crate) const SERIES_FLOOR: NaiveDate =
     NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid date");
 
+/// The earliest day a task file can plausibly have been created: the day git
+/// records its first commit. A git-backed task row dated before this is a
+/// mistyped year, so every series starts no earlier than here. `SERIES_FLOOR`
+/// stays the absolute lower bound.
+pub(crate) const PLAUSIBLE_FLOOR: NaiveDate =
+    NaiveDate::from_ymd_opt(2005, 4, 7).expect("2005-04-07 is a valid date");
+
 pub(crate) fn format_date(date: NaiveDate) -> String {
     date.format("%Y-%m-%d").to_string()
 }

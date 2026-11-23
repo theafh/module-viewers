@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::dates::SERIES_FLOOR;
+use crate::dates::{PLAUSIBLE_FLOOR, SERIES_FLOOR};
 use crate::harvest::TaskKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +157,27 @@ pub fn dashboard(
         }
     }
 
+    // One warning per row dated before the plausible floor, emitted from the
+    // same single site as the after-today warnings. The row keeps its real
+    // values and folds into the first charted point, so a mistyped year stays
+    // visible while the series stay bounded.
+    for task in tasks {
+        let ship = task.ship_date.filter(|_| task.kind == TaskKind::Finished);
+        let earliest = [Some(task.created), ship]
+            .into_iter()
+            .flatten()
+            .filter(|day| *day < PLAUSIBLE_FLOOR)
+            .min();
+        if let Some(day) = earliest {
+            tracing::warn!(
+                repository = %task.project,
+                path = %task.path,
+                date = %crate::dates::format_date(day),
+                "task dated before the plausible floor; counted in the first charted point"
+            );
+        }
+    }
+
     let weekly = weekly_points(&created_c, &shipped_c, today);
     let cumulative = cumulative_points(&shipped_c, today);
     let (shipped_calendar, calendar_peak_shipped) = calendar(&shipped_c, today);
@@ -231,7 +252,7 @@ fn weekly_points(
     };
     // The start caps at today's Monday too, so a series whose only event lies
     // after today still yields one row.
-    let start = first.max(monday(SERIES_FLOOR)).min(end);
+    let start = first.max(monday(series_floor())).min(end);
     let mut points = Vec::new();
     // Weeks before the first charted week fold into that week's row, the way
     // `cumulative_points` seeds its running total, so the weekly sums still
@@ -277,7 +298,7 @@ fn cumulative_points(shipped: &BTreeMap<NaiveDate, i64>, today: NaiveDate) -> Ve
     };
     // The start caps at today, so a series whose only ship lies after today
     // still yields one row dated today.
-    let start = first.max(SERIES_FLOOR).min(today);
+    let start = first.max(series_floor()).min(today);
     let mut rows = Vec::new();
     // Ships before the first charted day fold into that day's level, so the
     // line still ends at `counts.shipped_events`.
@@ -344,7 +365,7 @@ fn live_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<LivePoint> {
     // rows through today while a series whose every task lies after today
     // still yields today's row. Its created day is never reached, so the walk
     // never adds it.
-    let start = start.max(SERIES_FLOOR).min(today);
+    let start = start.max(series_floor()).min(today);
     let mut rows = Vec::new();
     // Tasks created before the first charted day and still open on it are
     // already in the backlog, so they seed the first row instead of a walk
@@ -424,7 +445,7 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
     // and the running total never subtracts a future day. A series whose every
     // task lies after today walks only today, where the zero-count rule below
     // emits no point.
-    let start = start.max(SERIES_FLOOR).min(today);
+    let start = start.max(series_floor()).min(today);
     let mut rows = Vec::new();
     let mut steps = 0_usize;
     // Tasks created before the first charted day and still open on it seed the
@@ -585,6 +606,13 @@ fn monday(date: NaiveDate) -> NaiveDate {
     date.checked_sub_days(Days::new(offset)).unwrap_or(date)
 }
 
+/// The day every series starts no earlier than. A git-backed task file cannot
+/// predate git's first commit, so `PLAUSIBLE_FLOOR` bounds the walk while
+/// `SERIES_FLOOR` stays the absolute lower bound it never falls below.
+fn series_floor() -> NaiveDate {
+    PLAUSIBLE_FLOOR.max(SERIES_FLOOR)
+}
+
 /// The least-squares fit against the array index, returned at each index. The
 /// cumulative and backlog charts use it because their rows are one per calendar
 /// day, so one index step is one day.
@@ -634,7 +662,7 @@ mod tests {
         AgePoint, RadarMode, TaskRecord, age_points, age_points_counted, cumulative_points,
         dashboard, monday, weekly_points,
     };
-    use crate::dates::SERIES_FLOOR;
+    use crate::dates::{PLAUSIBLE_FLOOR, SERIES_FLOOR};
     use crate::harvest::TaskKind;
     use chrono::{Datelike, Days, NaiveDate};
     use std::collections::BTreeMap;
@@ -831,17 +859,16 @@ mod tests {
 
     /// Covers: the fixed 500-task set starting at the chart floor stays
     /// within the linear work-step bound for `today` 2026-11-06. The pre-change
-    /// day-times-task loop would report about 10,000,000 steps here.
+    /// day-times-task loop would report millions of steps here.
     #[test]
     fn series_age_sweep_stays_linear_for_an_old_task_set() {
         let today = day(2026, 11, 6);
-        let start = SERIES_FLOOR;
+        let start = PLAUSIBLE_FLOOR;
         let span = (today - start).num_days();
-        let step = (span / 500).max(1) as u64;
         let tasks = (0..500_u64)
             .map(|index| {
-                let created = start + Days::new(index * step);
-                let leave = created + Days::new(30);
+                let created = start + Days::new(index * 15);
+                let leave = created + Days::new(15);
                 task(
                     "alpha",
                     "scope",
@@ -854,20 +881,20 @@ mod tests {
             .collect::<Vec<_>>();
         let (points, steps) = age_points_counted(&tasks, today);
         let days = span + 1;
-        assert_eq!(days, 20_764, "the fixture spans the declared day count");
+        assert_eq!(days, 7_884, "the fixture spans the declared day count");
         let bound = days as usize + 2 * tasks.len();
-        assert_eq!(bound, 21_764, "the bound is days + 2 * tasks");
+        assert_eq!(bound, 8_884, "the bound is days + 2 * tasks");
         assert!(
             steps <= bound,
             "the sweep reported {steps} work steps for {days} days and {} tasks, above the linear bound of {bound}",
             tasks.len()
         );
-        // Every window holds 30 unfinished days and the windows start 41 days
-        // apart, so each task contributes its own 30 points and no day is
+        // Every window holds 15 unfinished days and the windows start 15 days
+        // apart, so each task contributes its own 15 points and no day is
         // shared.
         assert_eq!(
             points.len(),
-            tasks.len() * 30,
+            tasks.len() * 15,
             "the sweep emits one point per unfinished day"
         );
         assert!(
@@ -893,7 +920,7 @@ mod tests {
             ),
         ];
         let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
-        let span = (today - SERIES_FLOOR).num_days();
+        let span = (today - PLAUSIBLE_FLOOR).num_days();
         for (name, len) in [
             ("cumulative", board.cumulative.len()),
             ("live_backlog", board.live_backlog.len()),
@@ -930,14 +957,14 @@ mod tests {
                 "alpha",
                 "modern",
                 TaskKind::Live,
-                day(1970, 1, 1),
+                PLAUSIBLE_FLOOR,
                 None,
                 None,
             ),
         ];
         let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
         let first = board.live_backlog.first().expect("first point");
-        assert_eq!(first.date, "1970-01-01");
+        assert_eq!(first.date, "2005-04-07");
         assert_eq!(first.live, 2, "one fold, not a double count");
         let ancient = board
             .radar_live
@@ -966,17 +993,17 @@ mod tests {
                 "alpha",
                 "scope",
                 TaskKind::Finished,
-                day(1970, 1, 1),
-                Some(day(1970, 1, 1)),
-                Some(day(1970, 1, 1)),
+                PLAUSIBLE_FLOOR,
+                Some(PLAUSIBLE_FLOOR),
+                Some(PLAUSIBLE_FLOOR),
             ),
         ];
         let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
         let first = board.cumulative.first().expect("first point");
-        assert_eq!(first.date, "1970-01-01");
+        assert_eq!(first.date, "2005-04-07");
         assert_eq!(first.shipped, 1);
         assert_eq!(first.cumulative, 2, "one fold, not a double count");
-        let span = (today - SERIES_FLOOR).num_days();
+        let span = (today - PLAUSIBLE_FLOOR).num_days();
         assert!(board.cumulative.len() as i64 <= span + 1);
         assert_eq!(
             board.cumulative.last().expect("last point").cumulative,
@@ -1001,9 +1028,9 @@ mod tests {
         )];
         let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
         let first = board.mean_age.first().expect("first point");
-        assert_eq!(first.date, "1970-01-01");
+        assert_eq!(first.date, "2005-04-07");
         assert_eq!(first.n, 1);
-        let expected = (SERIES_FLOOR - created).num_days() as f64;
+        let expected = (PLAUSIBLE_FLOOR - created).num_days() as f64;
         assert_eq!(
             first.avg_age.to_bits(),
             expected.to_bits(),
@@ -1273,7 +1300,10 @@ mod tests {
         ];
         let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
         let first = board.weekly.first().expect("first week");
-        assert_eq!(first.week, crate::dates::format_date(monday(SERIES_FLOOR)));
+        assert_eq!(
+            first.week,
+            crate::dates::format_date(monday(PLAUSIBLE_FLOOR))
+        );
         assert_eq!(
             first.created, 1,
             "the pre-floor created week folds into the first row"
@@ -1481,6 +1511,93 @@ mod tests {
                     && warning.contains("path=tasks/alpha_late.md")
                     && warning.contains("date=2027-01-06")),
             "the ship event names its repository, path, and date: {warnings:?}"
+        );
+    }
+
+    /// Covers: a row dated before `PLAUSIBLE_FLOOR` folds into the first
+    /// charted point, keeps every series inside the plausible span, still
+    /// reaches the summary counts, and logs one warning naming its path and
+    /// date. `SERIES_FLOOR` stays the absolute bound at or below the plausible
+    /// one.
+    #[test]
+    fn series_warns_and_bounds_a_row_before_the_plausible_floor() {
+        assert!(
+            SERIES_FLOOR <= PLAUSIBLE_FLOOR,
+            "the absolute floor stays at or below the plausible floor"
+        );
+        let today = day(2026, 11, 6);
+        let tasks = vec![
+            task(
+                "alpha",
+                "ancient",
+                TaskKind::Finished,
+                day(26, 3, 1),
+                Some(day(26, 3, 2)),
+                Some(day(26, 3, 2)),
+            ),
+            task(
+                "alpha",
+                "modern",
+                TaskKind::Live,
+                day(2026, 6, 1),
+                None,
+                None,
+            ),
+        ];
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        drop(guard);
+        let warnings = captured.take();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one warning for the one pre-floor row: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("repository=alpha")
+                && warnings[0].contains("path=tasks/alpha_ancient.md")
+                && warnings[0].contains("date=0026-03-01"),
+            "the warning names the row's repository, path, and date: {warnings:?}"
+        );
+
+        let span = (today - PLAUSIBLE_FLOOR).num_days();
+        for (name, len) in [
+            ("cumulative", board.cumulative.len()),
+            ("live_backlog", board.live_backlog.len()),
+            ("mean_age", board.mean_age.len()),
+        ] {
+            assert!(
+                len as i64 <= span + 1,
+                "{name} has {len} points, above the bounded {span} days plus one"
+            );
+        }
+        assert!(
+            board.weekly.len() as i64 <= span / 7 + 2,
+            "the weekly series has {} points, above the bounded {} weeks plus two",
+            board.weekly.len(),
+            span / 7
+        );
+        assert_eq!(
+            board.cumulative.first().expect("first point").date,
+            "2005-04-07",
+            "the pre-floor ship folds into the plausible floor"
+        );
+        assert_eq!(
+            board.cumulative.last().expect("last point").cumulative,
+            board.counts.shipped_events as i64,
+            "the folded ship still reaches the line's end"
+        );
+        assert_eq!(
+            board.weekly.iter().map(|point| point.created).sum::<i64>(),
+            board.counts.created_events as i64,
+            "the weekly created bars reach the created count"
+        );
+        assert_eq!(
+            board.weekly.iter().map(|point| point.shipped).sum::<i64>(),
+            board.counts.shipped_events as i64,
+            "the weekly shipped bars reach the shipped count"
         );
     }
 

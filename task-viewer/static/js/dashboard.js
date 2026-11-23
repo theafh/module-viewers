@@ -323,7 +323,16 @@
     rows.forEach(function (row) {
       maxAbs = Math.max(maxAbs, row.shipped, row.created);
     });
-    var x = scale(dates[0].getTime(), dates[dates.length - 1].getTime() + 7 * 86400000, frame.left, frame.right);
+    // Each week owns a slot centred on its Monday, so the domain reaches half a
+    // slot past the first and last week. Without that, the first bar starts
+    // left of the plot and every bar sits half a slot left of its centre.
+    var halfSlot = 3.5 * 86400000;
+    var x = scale(
+      dates[0].getTime() - halfSlot,
+      dates[dates.length - 1].getTime() + halfSlot,
+      frame.left,
+      frame.right
+    );
     var y = scale(-maxAbs, maxAbs, frame.bottom, frame.top);
     var zero = y(0);
     mark("weekly", el(svg, "line", {
@@ -340,13 +349,16 @@
     var hits = [];
     rows.forEach(function (row, index) {
       var dx = x(dates[index].getTime());
+      // A slot narrower than the band would push the outermost bars past the
+      // plot, so each bar's left edge clamps inside the frame instead.
+      var barLeft = Math.min(Math.max(dx - band / 2, frame.left), frame.right - band);
       var shipY = y(row.shipped);
       mark("weekly", el(svg, "rect", {
-        x: dx - band / 2, y: shipY, width: band, height: Math.max(0, zero - shipY),
+        x: barLeft, y: shipY, width: band, height: Math.max(0, zero - shipY),
         fill: shipColor
       }), { fill: "--chart-ship" });
       mark("weekly", el(svg, "rect", {
-        x: dx - band / 2, y: zero, width: band, height: Math.max(0, y(-row.created) - zero),
+        x: barLeft, y: zero, width: band, height: Math.max(0, y(-row.created) - zero),
         fill: createColor
       }), { fill: "--chart-create" });
       // One link region per bar, so the shipped bar and the created bar each
@@ -393,7 +405,9 @@
   function drawLine(name, rows, colorName, yOf, tipText, subtitle) {
     var root = card(name);
     var svg = root.querySelector("svg");
-    summary(name, subtitle);
+    // A lone row has no line to draw, so the card says why instead of leaving
+    // an empty plot under the generic subtitle.
+    summary(name, rows.length === 1 ? "Not enough days yet" : subtitle);
     if (!rows.length) {
       message(name, svg, "No series yet");
       return;
@@ -435,6 +449,13 @@
     var area = line + " L" + xs[xs.length - 1] + " " + frame.bottom + " L" + xs[0] + " " + frame.bottom + " Z";
     mark(name, el(svg, "path", { d: area, fill: color, opacity: "0.16" }), { fill: colorName });
     mark(name, el(svg, "path", { d: line, fill: "none", stroke: color, "stroke-width": "2" }), { stroke: colorName });
+    // A one-row path is a lone moveto that paints nothing, so the row's value
+    // is drawn as a dot instead.
+    if (rows.length === 1) {
+      mark(name, el(svg, "circle", {
+        cx: xs[0], cy: y(yOf(rows[0])), r: "4", fill: color
+      }), { fill: colorName });
+    }
     if (rows[0].trend !== undefined) {
       // The y scale puts zero on `frame.bottom`, so a negative least-squares
       // value would draw below the zero axis. Clamp each trend point at zero
@@ -527,19 +548,61 @@
     var tip = tipFor(root.querySelector(".chart-frame"));
     var marks = [];
     var lastLabelX = null;
+    var labelledOnce = false;
     for (var col = 0; col < columns; col += 1) {
-      var first = cells[col * 7];
-      if (first && first.date.getDate() <= 7) {
+      // The column that holds the window's first day carries that month, and so
+      // does the column that holds the first day of each later month. Scanning
+      // every cell rather than only the column's first keeps a padded opening
+      // column, whose first cell is empty, from losing its month label.
+      var firstDay = null;
+      var monthStart = null;
+      for (var scan = 0; scan < 7; scan += 1) {
+        var scanned = cells[col * 7 + scan];
+        if (!scanned) continue;
+        if (!firstDay) firstDay = scanned;
+        if (scanned.date.getDate() === 1) {
+          monthStart = scanned;
+          break;
+        }
+      }
+      // A month start wins wherever it appears, so the column that holds the
+      // 1st is labelled even when an earlier column already held the window's
+      // first day. Before the first label is drawn, a column with no month
+      // start falls back to its first day so a padded opening column still
+      // names its month.
+      var labelDate = monthStart
+        ? monthStart.date
+        : (labelledOnce ? null : (firstDay ? firstDay.date : null));
+      if (labelDate) {
         var labelX = labelW + col * (cell + gap);
+        // A window that opens in a month's last days would put the opening
+        // month label one 16px column before the next month's day-1 label,
+        // which the 24px guard then drops. Prefer the real month start in that
+        // case, so the following month keeps its name and the first label
+        // drawn still carries the year.
+        var skipOpening = false;
+        if (!labelledOnce && col + 1 < columns) {
+          for (var next = 0; next < 7; next += 1) {
+            var nextCell = cells[(col + 1) * 7 + next];
+            if (nextCell && nextCell.date.getDate() === 1) {
+              skipOpening = true;
+              break;
+            }
+          }
+        }
         // Keep consecutive month labels at least 24px apart so an 11px month
         // name keeps a visible gap at every width. The shipped 53-column
         // layout already spaces month starts 64px or more apart, so this guard
         // is defensive and only binds if a payload packs month starts closer.
-        if (lastLabelX === null || labelX - lastLabelX >= 24) {
+        if (!skipOpening && (lastLabelX === null || labelX - lastLabelX >= 24)) {
+          // The first label drawn in a calendar carries its year, so the
+          // window's own month reads unambiguously.
+          var labelText = monthName(labelDate) + (labelledOnce ? "" : " " + labelDate.getFullYear());
           mark(name, el(svg, "text", {
             x: labelX, y: 12, fill: muted, "font-size": "11"
-          }), { fill: "--chart-muted" }).textContent = monthName(first.date);
+          }), { fill: "--chart-muted" }).textContent = labelText;
           lastLabelX = labelX;
+          labelledOnce = true;
         }
       }
       for (var row = 0; row < 7; row += 1) {
@@ -590,7 +653,7 @@
     }
   }
 
-  function drawRadar(name, rows, colorName, noun, mode, kind) {
+  function drawRadar(name, rows, colorName, noun, mode, kind, max) {
     var root = card(name);
     var svg = root.querySelector("svg");
     // Radar: fit the frame by expanding the viewBox rather than shrinking the
@@ -621,8 +684,6 @@
     // the shipped formula reaches in a 190px-tall frame, so it binds only below
     // that width and never raises the normal-width radius.
     var radius = Math.max(31, Math.min(width, height) / 2 - 64);
-    var max = 1;
-    rows.forEach(function (row) { max = Math.max(max, row.count); });
     for (var ring = 1; ring <= 4; ring += 1) {
       mark(name, el(svg, "circle", {
         cx: cx, cy: cy, r: (radius * ring) / 4, fill: "none", stroke: grid
@@ -693,6 +754,17 @@
     mark(name, el(svg, "polygon", {
       points: points.join(" "), fill: color, opacity: "0.22", stroke: color, "stroke-width": "1.5"
     }), { fill: colorName, stroke: colorName });
+    // Each ring carries its value on the vertical below the centre. The labels
+    // paint after the polygon so the shape never dims the scale it annotates.
+    // The 9px inset keeps every value's text box inside the ring the spoke
+    // labels start from, so a scale label never collides with a spoke label.
+    // Both radars are handed one maximum, so their rings read on one scale.
+    for (var scaleRing = 1; scaleRing <= 4; scaleRing += 1) {
+      mark(name, el(svg, "text", {
+        x: cx, y: cy + (radius * scaleRing) / 4 - 9, "text-anchor": "middle",
+        fill: labelColor, "font-size": "10"
+      }), { fill: "--chart-label" }).textContent = fmt((max * scaleRing) / 4);
+    }
     var marks = [];
     dots.forEach(function (dot) {
       // A project-mode spoke names its repository, so the link opens that
@@ -969,11 +1041,19 @@
         "Mean age in days of the unfinished backlog · deferred tasks age until their leave day"
       );
     });
+    // One maximum across both radars, so the shipped and live charts read on
+    // the same ring scale instead of each card rescaling to its own peak.
+    var radarMax = 1;
+    [payload.radar_shipped, payload.radar_live].forEach(function (rows) {
+      (rows || []).forEach(function (row) {
+        radarMax = Math.max(radarMax, row.count);
+      });
+    });
     renderCard("radar-shipped", function () {
-      drawRadar("radar-shipped", payload.radar_shipped, "--chart-ship", "shipped", payload.radar_mode, "finished");
+      drawRadar("radar-shipped", payload.radar_shipped, "--chart-ship", "shipped", payload.radar_mode, "finished", radarMax);
     });
     renderCard("radar-live", function () {
-      drawRadar("radar-live", payload.radar_live, "--chart-create", "live", payload.radar_mode, "live");
+      drawRadar("radar-live", payload.radar_live, "--chart-create", "live", payload.radar_mode, "live", radarMax);
     });
     renderData();
   }

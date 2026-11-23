@@ -30,14 +30,14 @@ What `task-viewer` does, from the person's side. Structure is `ARCHITECTURE.md`,
 
 The dashboard shows eight charts from the stored rows, for all configured repositories or for the one selected. Every chart day is a UTC calendar day, and a timestamp with no zone is read as `Europe/Berlin`:
 
-- Weekly shipped versus created, Monday weeks, shipped above the axis and created below.
-- Cumulative tasks shipped, with a dashed trend.
-- Tasks shipped over the last 365 days, colour `log1p(count)`.
-- Tasks created over the last 365 days, colour `log1p(count)`.
-- Live backlog size by day, with a dashed trend.
-- Mean age in days of the unfinished backlog, with a dashed trend. Finished and deferred tasks leave that average on their archive leave day; they never count as shipped when deferred.
-- Shipped radar.
-- Live radar.
+- Weekly shipped versus created, Monday weeks, shipped above the axis and created below, each bar centred in its own week's slot and kept inside the plot.
+- Cumulative tasks shipped, with a dashed trend; a one-day series draws a filled dot at its value and says `Not enough days yet` instead of an empty line.
+- Tasks shipped over the last 365 days, colour `log1p(count)`; the first month label carries its year.
+- Tasks created over the last 365 days, colour `log1p(count)`; the first month label carries its year.
+- Live backlog size by day, with a dashed trend; a one-day series draws a filled dot at its value and says `Not enough days yet`.
+- Mean age in days of the unfinished backlog, with a dashed trend; a one-day series draws a filled dot at its value and says `Not enough days yet`. Finished and deferred tasks leave that average on their archive leave day; they never count as shipped when deferred.
+- Shipped radar, four rings labelled with their values on a scale shared with the live radar.
+- Live radar, four rings labelled with their values on the scale the shipped radar uses.
 
 Hovering or focusing a mark shows that mark's count — a week's shipped bar or created bar, a day, or a spoke — and activating it opens the task list filtered to the rows behind that count: the page's project, the task kind, the day axis, and the window, while a radar spoke carries its kind and slice and no window. Each chart card also offers a Show data table of the exact series numbers its chart draws, readable without hover. A chart's marks form one tab stop, and the arrow keys step the focus through them; a line chart's overlay takes the one tab stop and its arrow keys step through the drawn days. A page without scripting keeps a Loading chart text in each frame and says the charts need scripting, naming the Repositories link. With all projects selected, each radar spoke is one repository. With one project selected, each spoke is one task scope, the filename prefix before the first underscore. Each chart is named by its card heading and described by its summary line. A theme switch recolours the drawn charts in place.
 
