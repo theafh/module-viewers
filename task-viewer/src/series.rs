@@ -18,6 +18,10 @@ pub struct TaskRecord {
     pub scope: String,
     pub kind: TaskKind,
     pub created: NaiveDate,
+    /// The stored frontmatter `updated` day, which the staleness card reads.
+    /// `None` when the stored value did not parse: the row still charts in every
+    /// series that does not read this day instead of dropping out of them.
+    pub updated: Option<NaiveDate>,
     pub ship_date: Option<NaiveDate>,
     pub leave_date: Option<NaiveDate>,
 }
@@ -43,6 +47,9 @@ pub struct Dashboard {
     pub created_calendar: Vec<DayCount>,
     pub live_backlog: Vec<LivePoint>,
     pub mean_age: Vec<AgePoint>,
+    /// Live tasks by how long they have gone without an edit, one row per
+    /// charted day and one line per threshold.
+    pub staleness: Vec<StalenessPoint>,
     pub radar_shipped: Vec<LabeledCount>,
     pub radar_live: Vec<LabeledCount>,
     pub calendar_peak_shipped: i64,
@@ -64,6 +71,8 @@ pub struct WeekPoint {
     pub week: String,
     pub created: i64,
     pub shipped: i64,
+    /// Deferred tasks that left the backlog in this week, counted by leave day.
+    pub deferred: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +105,14 @@ pub struct AgePoint {
 }
 
 #[derive(Debug, Serialize)]
+pub struct StalenessPoint {
+    pub date: String,
+    pub over_30: i64,
+    pub over_90: i64,
+    pub over_180: i64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct LabeledCount {
     pub label: String,
     pub count: i64,
@@ -113,6 +130,7 @@ pub fn dashboard(
 ) -> Dashboard {
     let mut created_c: BTreeMap<NaiveDate, i64> = BTreeMap::new();
     let mut shipped_c: BTreeMap<NaiveDate, i64> = BTreeMap::new();
+    let mut deferred_c: BTreeMap<NaiveDate, i64> = BTreeMap::new();
     let mut finished = 0_usize;
     let mut deferred = 0_usize;
     let mut live = 0_usize;
@@ -125,7 +143,15 @@ pub fn dashboard(
                     *shipped_c.entry(day).or_insert(0) += 1;
                 }
             }
-            TaskKind::Deferred => deferred += 1,
+            TaskKind::Deferred => {
+                deferred += 1;
+                // A deferred task leaves the backlog on its leave day, so the
+                // weekly deferred bar sits on that day's Monday, the same day
+                // the live backlog loses it.
+                if let Some(day) = task.leave_date {
+                    *deferred_c.entry(day).or_insert(0) += 1;
+                }
+            }
             TaskKind::Live => live += 1,
         }
     }
@@ -178,12 +204,13 @@ pub fn dashboard(
         }
     }
 
-    let weekly = weekly_points(&created_c, &shipped_c, today);
+    let weekly = weekly_points(&created_c, &shipped_c, &deferred_c, today);
     let cumulative = cumulative_points(&shipped_c, today);
     let (shipped_calendar, calendar_peak_shipped) = calendar(&shipped_c, today);
     let (created_calendar, calendar_peak_created) = calendar(&created_c, today);
     let live_backlog = live_points(tasks, today);
     let mean_age = age_points(tasks, today);
+    let staleness = staleness_points(tasks, today);
     let (radar_shipped, radar_live) = radar(tasks, mode);
 
     Dashboard {
@@ -217,6 +244,7 @@ pub fn dashboard(
         created_calendar,
         live_backlog,
         mean_age,
+        staleness,
         radar_shipped,
         radar_live,
         calendar_peak_shipped,
@@ -227,6 +255,7 @@ pub fn dashboard(
 fn weekly_points(
     created: &BTreeMap<NaiveDate, i64>,
     shipped: &BTreeMap<NaiveDate, i64>,
+    deferred: &BTreeMap<NaiveDate, i64>,
     today: NaiveDate,
 ) -> Vec<WeekPoint> {
     let end = monday(today);
@@ -242,9 +271,14 @@ fn weekly_points(
     for (&day, &count) in shipped {
         *shipped_weeks.entry(monday(day).min(end)).or_insert(0) += count;
     }
+    let mut deferred_weeks: BTreeMap<NaiveDate, i64> = BTreeMap::new();
+    for (&day, &count) in deferred {
+        *deferred_weeks.entry(monday(day).min(end)).or_insert(0) += count;
+    }
     let Some(first) = created_weeks
         .keys()
         .chain(shipped_weeks.keys())
+        .chain(deferred_weeks.keys())
         .min()
         .copied()
     else {
@@ -265,6 +299,10 @@ fn weekly_points(
         .range(..start)
         .map(|(_, count)| *count)
         .sum::<i64>();
+    let mut carry_deferred = deferred_weeks
+        .range(..start)
+        .map(|(_, count)| *count)
+        .sum::<i64>();
     let mut cur = start;
     while cur <= end {
         points.push(WeekPoint {
@@ -273,6 +311,8 @@ fn weekly_points(
                 + created_weeks.get(&cur).copied().unwrap_or(0),
             shipped: std::mem::take(&mut carry_shipped)
                 + shipped_weeks.get(&cur).copied().unwrap_or(0),
+            deferred: std::mem::take(&mut carry_deferred)
+                + deferred_weeks.get(&cur).copied().unwrap_or(0),
         });
         match cur.checked_add_days(Days::new(7)) {
             Some(next) => cur = next,
@@ -399,6 +439,78 @@ fn live_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<LivePoint> {
             trend: round_to(trend, 2),
         })
         .collect()
+}
+
+/// Live tasks by how long they have gone without an edit, one row per charted
+/// day and one line per threshold. A live task counts on a day at or after its
+/// `created` day once its stored `updated` day lies at least 30, 90, or 180
+/// days behind that day, so a task edited long ago appears on all three lines
+/// while a recently edited one appears on none. A task with no updated day
+/// counts on no day.
+///
+/// The walk is linear in days plus tasks: each threshold sorts its activation
+/// days once, then a cursor advances as the days move, so no day revisits every
+/// task.
+fn staleness_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<StalenessPoint> {
+    let Some(first) = tasks
+        .iter()
+        .filter(|task| task.kind == TaskKind::Live)
+        .map(|task| task.created)
+        .min()
+    else {
+        return Vec::new();
+    };
+    let start = first.max(series_floor()).min(today);
+    let thresholds = [30_i64, 90, 180];
+    let mut activations: Vec<Vec<NaiveDate>> = thresholds
+        .iter()
+        .map(|days| activation_days(tasks, *days))
+        .collect();
+    let mut cursors = [0_usize; 3];
+    let mut rows = Vec::new();
+    let mut cur = start;
+    while cur <= today {
+        let mut counts = [0_i64; 3];
+        for (index, days) in activations.iter_mut().enumerate() {
+            while cursors[index] < days.len() && days[cursors[index]] <= cur {
+                cursors[index] += 1;
+            }
+            counts[index] = cursors[index] as i64;
+        }
+        rows.push(StalenessPoint {
+            date: crate::dates::format_date(cur),
+            over_30: counts[0],
+            over_90: counts[1],
+            over_180: counts[2],
+        });
+        match cur.checked_add_days(Days::new(1)) {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
+    rows
+}
+
+/// The days a live task first counts on the line `days` behind, sorted so
+/// `staleness_points` can advance one cursor per threshold. A task counts no
+/// earlier than its own `created` day, so an `updated` day before `created`
+/// still starts the count on the day the task exists.
+fn activation_days(tasks: &[TaskRecord], days: i64) -> Vec<NaiveDate> {
+    let mut activation = Vec::new();
+    for task in tasks {
+        if task.kind != TaskKind::Live {
+            continue;
+        }
+        let Some(updated) = task.updated else {
+            continue;
+        };
+        let stale = updated
+            .checked_add_days(Days::new(days as u64))
+            .unwrap_or(NaiveDate::MAX);
+        activation.push(stale.max(task.created));
+    }
+    activation.sort_unstable();
+    activation
 }
 
 fn age_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<AgePoint> {
@@ -688,6 +800,7 @@ mod tests {
             scope: scope.to_string(),
             kind,
             created,
+            updated: None,
             ship_date: ship,
             leave_date: leave,
         }
@@ -1275,6 +1388,141 @@ mod tests {
         );
     }
 
+    /// Covers: the weekly chart plots deferred tasks by leave week, folding a
+    /// pre-floor leave week into the first charted row, so the deferred bars sum
+    /// to the deferred count.
+    #[test]
+    fn series_weekly_plots_deferred_by_leave_week_including_a_pre_floor_one() {
+        let today = day(2026, 6, 15);
+        let tasks = vec![
+            task(
+                "alpha",
+                "scope",
+                TaskKind::Deferred,
+                day(2026, 5, 25),
+                None,
+                Some(day(2026, 6, 1)),
+            ),
+            task(
+                "alpha",
+                "other",
+                TaskKind::Deferred,
+                day(2026, 5, 25),
+                None,
+                Some(day(2026, 6, 10)),
+            ),
+            task(
+                "alpha",
+                "ancient",
+                TaskKind::Deferred,
+                day(26, 3, 1),
+                None,
+                Some(day(26, 3, 5)),
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let first = board.weekly.first().expect("first week");
+        assert_eq!(
+            first.week,
+            crate::dates::format_date(monday(PLAUSIBLE_FLOOR)),
+            "the pre-floor leave week folds into the first charted week"
+        );
+        assert_eq!(first.deferred, 1, "the pre-floor deferred task folds once");
+        let june_first = board
+            .weekly
+            .iter()
+            .find(|point| point.week == "2026-06-01")
+            .expect("the first leave week");
+        assert_eq!(june_first.deferred, 1);
+        let june_eighth = board
+            .weekly
+            .iter()
+            .find(|point| point.week == "2026-06-08")
+            .expect("the second leave week");
+        assert_eq!(june_eighth.deferred, 1);
+        assert_eq!(
+            board.weekly.iter().map(|point| point.deferred).sum::<i64>(),
+            board.counts.deferred as i64,
+            "the deferred bars reach the deferred count"
+        );
+    }
+
+    /// Covers: the staleness card counts a live task on a day once its stored
+    /// updated day lies at least 30, 90, or 180 days behind that day, never
+    /// before its own created day, and never when it carries no updated day.
+    #[test]
+    fn series_staleness_counts_live_tasks_by_updated_threshold() {
+        let today = day(2026, 11, 7);
+        let mut tasks = vec![
+            // Exactly 30 days behind today.
+            task("alpha", "a", TaskKind::Live, day(2026, 1, 1), None, None),
+            // Exactly 90 days behind today.
+            task("alpha", "b", TaskKind::Live, day(2026, 1, 1), None, None),
+            // Exactly 180 days behind today.
+            task("alpha", "c", TaskKind::Live, day(2026, 1, 1), None, None),
+            // No updated day counts on no day.
+            task("alpha", "d", TaskKind::Live, day(2026, 1, 1), None, None),
+            // Updated before created: the count starts on the created day.
+            task("alpha", "e", TaskKind::Live, day(2026, 10, 1), None, None),
+            // A finished task never counts.
+            task(
+                "alpha",
+                "f",
+                TaskKind::Finished,
+                day(2026, 1, 1),
+                Some(day(2026, 2, 1)),
+                Some(day(2026, 2, 1)),
+            ),
+        ];
+        tasks[0].updated = Some(day(2026, 10, 8));
+        tasks[1].updated = Some(day(2026, 8, 9));
+        tasks[2].updated = Some(day(2026, 5, 11));
+        tasks[4].updated = Some(day(2026, 9, 1));
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+
+        let first = board.staleness.first().expect("first day");
+        assert_eq!(
+            first.date, "2026-01-01",
+            "the walk starts on the first live created day"
+        );
+        let last = board.staleness.last().expect("last day");
+        assert_eq!(last.date, "2026-11-07");
+        assert_eq!(last.over_30, 4, "a, b, c, and e are at least 30 days stale");
+        assert_eq!(last.over_90, 2, "b and c are at least 90 days stale");
+        assert_eq!(last.over_180, 1, "only c is at least 180 days stale");
+
+        let october_eighth = board
+            .staleness
+            .iter()
+            .find(|point| point.date == "2026-10-08")
+            .expect("the day the 30-day line reaches a's activation");
+        assert_eq!(
+            october_eighth.over_30, 3,
+            "b, c, and e count while a is not yet 30 days stale"
+        );
+        assert_eq!(october_eighth.over_90, 1, "c is already 90 days stale");
+        assert_eq!(october_eighth.over_180, 0, "c is not yet 180 days stale");
+
+        let before_created = board
+            .staleness
+            .iter()
+            .find(|point| point.date == "2026-09-30")
+            .expect("the day before e exists");
+        assert_eq!(
+            before_created.over_30, 2,
+            "e counts no earlier than its own created day"
+        );
+        let created_day = board
+            .staleness
+            .iter()
+            .find(|point| point.date == "2026-10-01")
+            .expect("e's created day");
+        assert_eq!(
+            created_day.over_30, 3,
+            "e counts from its created day because its updated day is already 30 days behind"
+        );
+    }
+
     /// Covers: a task created and shipped before the chart floor folds into
     /// the first charted week, so the weekly sums still reach `counts`.
     #[test]
@@ -1614,7 +1862,8 @@ mod tests {
         assert_eq!(cumulative[0].date, "2026-06-10");
         assert_eq!(cumulative[0].cumulative, 1);
         let created: BTreeMap<NaiveDate, i64> = BTreeMap::new();
-        let weekly = weekly_points(&created, &shipped, today);
+        let deferred: BTreeMap<NaiveDate, i64> = BTreeMap::new();
+        let weekly = weekly_points(&created, &shipped, &deferred, today);
         assert_eq!(weekly.len(), 1, "the weekly walk yields one row");
         assert_eq!(weekly[0].week, "2026-06-08", "today's Monday");
         assert_eq!(weekly[0].shipped, 1);

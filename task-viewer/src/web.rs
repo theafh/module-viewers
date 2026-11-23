@@ -1218,7 +1218,7 @@ fn scan_label(repositories: &[Repository], selected: Option<i64>) -> String {
                 || repo
                     .scanned_at
                     .as_deref()
-                    .is_none_or(|stamp| scan_instant(stamp).is_none())
+                    .is_some_and(|stamp| scan_instant(stamp).is_none())
         })
         .count();
     // A stored stamp that does not parse is a folder that was scanned, so it
@@ -3435,12 +3435,10 @@ mod tests {
             "Last scan unknown · 2 repositories stale"
         );
 
-        // A repository with no stamp at all is the only "not scanned yet".
+        // A repository with no stamp at all was never scanned, so it is not
+        // stale: nothing has read it yet.
         let repositories = vec![repository(1, None, None)];
-        assert_eq!(
-            scan_label(&repositories, None),
-            "Not scanned yet · 1 repository stale"
-        );
+        assert_eq!(scan_label(&repositories, None), "Not scanned yet");
 
         // A selected repository scopes both the oldest stamp and the stale
         // count.
@@ -6746,8 +6744,8 @@ mod tests {
             })
             .collect();
         serde_json::json!({
-            "counts": {"shipped_events": 10, "created_events": 12},
-            "weekly": [{"week": "2026-01-05", "shipped": 1, "created": 2}],
+            "counts": {"shipped_events": 10, "created_events": 12, "deferred": 0},
+            "weekly": [{"week": "2026-01-05", "shipped": 1, "created": 2, "deferred": 0}],
             "cumulative": [{"date": "2026-01-05", "cumulative": 1, "shipped": 1, "trend": 1}],
             "shipped_calendar": shipped_calendar,
             "created_calendar": [{"date": "2026-01-05", "count": 2}],
@@ -6755,6 +6753,7 @@ mod tests {
             "calendar_peak_created": 2,
             "live_backlog": [{"date": "2026-01-05", "live": 1}],
             "mean_age": [{"date": "2026-01-05", "avg_age": 2, "n": 1}],
+            "staleness": [{"date": "2026-01-05", "over_30": 0, "over_90": 0, "over_180": 0}],
             "radar_shipped": [{"label": "alpha", "count": 1}],
             "radar_live": [{"label": "alpha", "count": 1}],
             "radar_mode": "scope"
@@ -7175,6 +7174,7 @@ mod tests {
             ("created-calendar", 1),
             ("backlog", 1),
             ("age", 1),
+            ("staleness", 1),
             ("radar-shipped", 1),
             ("radar-live", 1),
         ];
@@ -7187,7 +7187,7 @@ mod tests {
         }
         assert_eq!(
             result["firstWeek"],
-            serde_json::json!(["2026-01-05", "1", "2"]),
+            serde_json::json!(["2026-01-05", "1", "2", "1"]),
             "the weekly table prints the exact series numbers"
         );
     }
@@ -8968,7 +8968,8 @@ mod tests {
                 serde_json::json!({
                     "week": week.format("%Y-%m-%d").to_string(),
                     "shipped": 1,
-                    "created": 1
+                    "created": 1,
+                    "deferred": 1
                 })
             })
             .collect();
@@ -8994,19 +8995,28 @@ mod tests {
     });
   var weeks = WEEKS;
   var slot = (frame.right - frame.left) / weeks;
+  var perWeek = 3;
   var outside = 0;
   var offCentre = 0;
-  bars.forEach(function (bar, index) {
-    var week = Math.floor(index / 2);
-    var centre = bar.x + bar.width / 2;
-    var expected = frame.left + slot * (week + 0.5);
-    if (bar.x < frame.left - 1e-6 || bar.x + bar.width > frame.right + 1e-6) {
-      outside += 1;
+  for (var week = 0; week < weeks; week += 1) {
+    var group = bars.slice(week * perWeek, week * perWeek + perWeek);
+    if (group.length !== perWeek) {
+      offCentre += 1;
+      continue;
     }
+    var left = Math.min.apply(null, group.map(function (bar) { return bar.x; }));
+    var right = Math.max.apply(null, group.map(function (bar) { return bar.x + bar.width; }));
+    var centre = (left + right) / 2;
+    var expected = frame.left + slot * (week + 0.5);
+    group.forEach(function (bar) {
+      if (bar.x < frame.left - 1e-6 || bar.x + bar.width > frame.right + 1e-6) {
+        outside += 1;
+      }
+    });
     if (Math.abs(centre - expected) > 0.5) {
       offCentre += 1;
     }
-  });
+  }
   return JSON.stringify({
     bars: bars.length,
     outside: outside,
@@ -9019,7 +9029,11 @@ mod tests {
         let three = weeks_payload(3).to_string();
         let three_config = browser_config(false, false, Some(&three), serde_json::json!("#123456"));
         let three_result = run_browser(&three_config, &assertion.replace("WEEKS", "3"));
-        assert_eq!(three_result["bars"].as_u64(), Some(6), "two bars per week");
+        assert_eq!(
+            three_result["bars"].as_u64(),
+            Some(9),
+            "three bars per week: shipped, created, and deferred"
+        );
         assert_eq!(
             three_result["outside"].as_u64(),
             Some(0),
@@ -9028,7 +9042,7 @@ mod tests {
         assert_eq!(
             three_result["offCentre"].as_u64(),
             Some(0),
-            "every three-week bar is centred on its slot"
+            "every three-week week's bars are centred on its slot"
         );
         assert!(
             three_result["firstLeft"].as_f64().expect("first bar") >= 40.0,
@@ -9044,8 +9058,8 @@ mod tests {
         let wide_result = run_browser(&wide_config, &assertion.replace("WEEKS", "1200"));
         assert_eq!(
             wide_result["bars"].as_u64(),
-            Some(2400),
-            "two bars per week"
+            Some(3600),
+            "three bars per week"
         );
         assert_eq!(
             wide_result["outside"].as_u64(),
@@ -9079,10 +9093,10 @@ mod tests {
     fn fixture_payload() -> serde_json::Value {
         serde_json::json!({
             "project": "3",
-            "counts": {"shipped_events": 3, "created_events": 5},
+            "counts": {"shipped_events": 3, "created_events": 5, "deferred": 1},
             "weekly": [
-                {"week": "2026-01-05", "shipped": 1, "created": 2},
-                {"week": "2026-01-12", "shipped": 2, "created": 3}
+                {"week": "2026-01-05", "shipped": 1, "created": 2, "deferred": 1},
+                {"week": "2026-01-12", "shipped": 2, "created": 3, "deferred": 0}
             ],
             "cumulative": [
                 {"date": "2026-01-05", "cumulative": 1, "shipped": 1, "trend": 1},
@@ -9094,6 +9108,10 @@ mod tests {
             "calendar_peak_created": 2,
             "live_backlog": [{"date": "2026-01-05", "live": 1}],
             "mean_age": [{"date": "2026-01-05", "avg_age": 2, "n": 1}],
+            "staleness": [
+                {"date": "2026-01-05", "over_30": 1, "over_90": 0, "over_180": 0},
+                {"date": "2026-01-12", "over_30": 2, "over_90": 1, "over_180": 0}
+            ],
             "radar_shipped": [{"label": "alpha", "count": 1}],
             "radar_live": [{"label": "alpha", "count": 1}],
             "radar_mode": "scope"
@@ -9165,11 +9183,23 @@ mod tests {
             .step_by(7)
             .enumerate()
             .map(|(index, week)| {
-                serde_json::json!({"week": week, "shipped": index % 4, "created": index % 5})
+                serde_json::json!({"week": week, "shipped": index % 4, "created": index % 5, "deferred": index % 2})
+            })
+            .collect();
+        let staleness: Vec<serde_json::Value> = dates
+            .iter()
+            .enumerate()
+            .map(|(index, date)| {
+                serde_json::json!({
+                    "date": date,
+                    "over_30": index % 3,
+                    "over_90": index % 2,
+                    "over_180": index % 4
+                })
             })
             .collect();
         serde_json::json!({
-            "counts": {"shipped_events": 3000, "created_events": 3000},
+            "counts": {"shipped_events": 3000, "created_events": 3000, "deferred": 1},
             "weekly": weekly,
             "cumulative": cumulative,
             "shipped_calendar": shipped_calendar,
@@ -9178,6 +9208,7 @@ mod tests {
             "calendar_peak_created": 1,
             "live_backlog": live_backlog,
             "mean_age": mean_age,
+            "staleness": staleness,
             "radar_shipped": [
                 {"label": "alpha", "count": 6},
                 {"label": "beta", "count": 5},
@@ -9201,8 +9232,7 @@ mod tests {
     /// The fixture with one week whose busiest bar is `max`.
     fn weekly_payload(max: i64) -> serde_json::Value {
         let mut payload = fixture_payload();
-        payload["weekly"] =
-            serde_json::json!([{"week": "2026-01-05", "shipped": max, "created": 1}]);
+        payload["weekly"] = serde_json::json!([{"week": "2026-01-05", "shipped": max, "created": 1, "deferred": 0}]);
         payload
     }
 
@@ -9246,6 +9276,7 @@ mod tests {
             "created_calendar",
             "live_backlog",
             "mean_age",
+            "staleness",
         ]
         .iter()
         .map(|key| payload[*key].as_array().expect("series array").len() as u64)
@@ -9453,12 +9484,13 @@ mod tests {
             let result = run_browser_with(COUNTING_GET_COMPUTED_STYLE, &config, assertion);
             counts.push(result["calls"].as_u64().expect("computed style calls"));
         }
-        // Weekly reads its zero line, two bar colours, and the muted tick
-        // colour (4); each line chart reads its series colour, the grid, and
+        // Weekly reads its zero line, three bar colours, and the muted tick
+        // colour (5); each line chart reads its series colour, the grid, and
         // the muted ticks (3); each calendar reads its colour, the track, and
         // the muted month labels (3); each radar reads its colour, the grid,
-        // and the label colour (3).
-        assert_eq!(counts[0], 25, "one full render reads 25 theme colours");
+        // and the label colour (3); the staleness card reads three series
+        // colours, the grid, and the muted ticks (5).
+        assert_eq!(counts[0], 31, "one full render reads 31 theme colours");
         assert_eq!(
             counts[1], counts[0],
             "the count does not grow with the rows"
@@ -9739,7 +9771,8 @@ mod tests {
                     serde_json::json!({
                         "week": week.format("%Y-%m-%d").to_string(),
                         "shipped": offset % 3 + 1,
-                        "created": offset % 2 + 1
+                        "created": offset % 2 + 1,
+                        "deferred": offset % 2
                     })
                 })
                 .collect(),
@@ -9747,8 +9780,8 @@ mod tests {
         payload
     }
 
-    /// Covers: at a 54-week payload every hit rect's width is the slot pitch,
-    /// and hovering the right edge of a bar's own column reports that bar
+    /// Covers: at a 54-week payload a shipped hit rect spans the slot and a created
+    /// one takes half, and hovering a bar's own region reports that bar
     /// rather than the neighbour drawn over it.
     #[test]
     fn browser_weekly_hit_rects_stay_within_their_own_column() {
@@ -9810,10 +9843,16 @@ mod tests {
             slot < 18.0,
             "the fixture's pitch is below the minimum width"
         );
-        for width in result["widths"].as_array().expect("region widths") {
+        for (index, width) in result["widths"]
+            .as_array()
+            .expect("region widths")
+            .iter()
+            .enumerate()
+        {
+            let expected = if index % 2 == 0 { slot } else { slot / 2.0 };
             assert!(
-                (width.as_f64().expect("region width") - slot).abs() < 1e-6,
-                "every link region's width is the slot pitch"
+                (width.as_f64().expect("region width") - expected).abs() < 1e-6,
+                "a shipped link region spans the slot and a created one takes its left half"
             );
         }
         assert_eq!(
@@ -9890,7 +9929,7 @@ mod tests {
             "one formatter serves the whole page instead of one per value"
         );
         assert_eq!(
-            result["weekly"], "3 shipped · 5 created · Monday weeks",
+            result["weekly"], "3 shipped · 5 created · 1 deferred · Monday weeks",
             "the hoisted formatter still formats the weekly summary"
         );
         assert_eq!(
@@ -10117,6 +10156,69 @@ mod tests {
         );
     }
 
+    /// Covers: the staleness card draws one line per threshold, summarises the
+    /// last day's counts, and its single overlay names all three thresholds.
+    #[test]
+    fn browser_staleness_card_draws_three_threshold_lines() {
+        let payload = fixture_payload().to_string();
+        let config = browser_config(false, false, Some(&payload), serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["staleness"].querySelector("svg");
+  var paths = svg.children.filter(function (node) { return node.name === "path"; });
+  var overlay = svg.children.filter(function (node) {
+    return node.name === "rect" && node.attrs.fill === "transparent";
+  })[0];
+  return JSON.stringify({
+    summary: env.cards["staleness"].querySelector(".summary").textContent,
+    paths: paths.length,
+    label: overlay.attrs["aria-label"]
+  });
+})()"#,
+        );
+        assert_eq!(result["paths"], 3, "one line per threshold");
+        let summary = result["summary"].as_str().expect("the summary");
+        assert!(
+            summary.contains("2 over 30 days")
+                && summary.contains("1 over 90 days")
+                && summary.contains("0 over 180 days"),
+            "the summary states the last day's counts: {summary}"
+        );
+        let label = result["label"].as_str().expect("the overlay label");
+        assert!(
+            label.contains("over 30") && label.contains("over 90") && label.contains("over 180"),
+            "the tooltip names every threshold: {label}"
+        );
+    }
+
+    /// Covers: the weekly deferred bar draws in its own theme colour and names
+    /// its count on hover, without claiming a drill-down link.
+    #[test]
+    fn browser_weekly_deferred_bar_names_its_count() {
+        let payload = fixture_payload().to_string();
+        let config = browser_config(false, false, Some(&payload), serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["weekly"].querySelector("svg");
+  var deferred = svg.children.filter(function (node) {
+    return node.name === "rect" && String(node.attrs["data-tip"] || "").indexOf("deferred") >= 0;
+  });
+  deferred[0].listeners.mousemove[0]({ type: "mousemove", clientX: 100, clientY: 100 });
+  var tip = env.cards["weekly"].querySelector(".chart-frame").querySelector(".tooltip");
+  return JSON.stringify({ bars: deferred.length, text: tip.textContent });
+})()"#,
+        );
+        assert_eq!(result["bars"], 2, "one deferred hit mark per week");
+        assert_eq!(
+            result["text"], "Week of Jan 5, 2026 · deferred 1",
+            "the deferred bar names its own count"
+        );
+    }
+
     /// Covers: every chart card's SVG names itself from its heading and
     /// describes itself from the summary line the draw fills.
     #[tokio::test(flavor = "current_thread")]
@@ -10314,13 +10416,13 @@ mod tests {
         plus_one["weekly"]
             .as_array_mut()
             .expect("weekly rows")
-            .push(serde_json::json!({"week": "2026-01-19", "shipped": 1, "created": 1}));
+            .push(serde_json::json!({"week": "2026-01-19", "shipped": 1, "created": 1, "deferred": 0}));
         let plus_text = plus_one.to_string();
         let plus_config =
             browser_config(false, false, Some(&plus_text), serde_json::json!("#123456"));
         let added = run_browser_with(COUNTING_DATE, &plus_config, assertion);
         let added = added["parses"].as_u64().expect("added parses");
-        assert_eq!(baseline, 8, "the fixture draws parse eight days");
+        assert_eq!(baseline, 10, "the fixture draws parse ten days");
         assert_eq!(added, baseline + 1, "one extra week costs one more parse");
     }
 

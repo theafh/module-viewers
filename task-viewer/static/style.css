@@ -17,6 +17,7 @@
     --font-body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
     --chart-ship: #3dba6c;
     --chart-create: #4c8fe0;
+    --chart-defer: #e06c5a;
     --chart-age: #c9a227;
     --chart-grid: #5a5a5a;
     --chart-axis: #9a9a9a;
@@ -43,6 +44,7 @@
     --input-bg: #fff;
     --chart-ship: #1f8a4c;
     --chart-create: #1d5fbf;
+    --chart-defer: #b5402c;
     --chart-age: #9a7208;
     --chart-grid: #d5d0c6;
     --chart-axis: #5c584f;

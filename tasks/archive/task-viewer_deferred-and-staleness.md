@@ -2,9 +2,11 @@
 description: "Show deferred work and live-task staleness: chart deferred tasks per week and chart how long live tasks have gone without an edit, from the stored updated day."
 scope: task-viewer
 created: 2026-11-23T17:31:20Z
-updated: 2026-11-23T17:37:19Z
-status: ready
+updated: 2026-11-23T23:08:00Z
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Deferred visibility and live-task staleness

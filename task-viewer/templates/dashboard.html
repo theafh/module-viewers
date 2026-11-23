@@ -55,7 +55,7 @@
         <details class="chart-data">
             <summary>Show data</summary>
             <table class="data-table">
-                <thead><tr><th scope="col">Week</th><th scope="col">Shipped</th><th scope="col">Created</th></tr></thead>
+                <thead><tr><th scope="col">Week</th><th scope="col">Shipped</th><th scope="col">Created</th><th scope="col">Deferred</th></tr></thead>
                 <tbody></tbody>
             </table>
         </details>
@@ -126,6 +126,20 @@
             <summary>Show data</summary>
             <table class="data-table">
                 <thead><tr><th scope="col">Day</th><th scope="col">Mean age</th><th scope="col">Tasks</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </details>
+    </article>
+    <article class="chart-card" data-chart="staleness">
+        <header>
+            <h2 id="staleness-title">Live tasks by days since last edit</h2>
+            <p class="muted summary" id="staleness-summary"></p>
+        </header>
+        <div class="chart-frame"><svg role="group" aria-labelledby="staleness-title" aria-describedby="staleness-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
+        <details class="chart-data">
+            <summary>Show data</summary>
+            <table class="data-table">
+                <thead><tr><th scope="col">Day</th><th scope="col">Over 30</th><th scope="col">Over 90</th><th scope="col">Over 180</th></tr></thead>
                 <tbody></tbody>
             </table>
         </details>

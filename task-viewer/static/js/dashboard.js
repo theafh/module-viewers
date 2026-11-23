@@ -9,7 +9,7 @@
       payload = null;
     }
   }
-  var CARD_NAMES = ["weekly", "cumulative", "shipped-calendar", "created-calendar", "backlog", "age", "radar-shipped", "radar-live"];
+  var CARD_NAMES = ["weekly", "cumulative", "shipped-calendar", "created-calendar", "backlog", "age", "staleness", "radar-shipped", "radar-live"];
   var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   // Calendars whose initial scroll position is already chosen, so a redraw on
   // a resize keeps the reader's scroll position instead of snapping the frame
@@ -18,7 +18,7 @@
 
   // Each draw records the marks it coloured with a theme colour, together with
   // the custom property it read, so a theme switch rewrites those attributes
-  // instead of rebuilding all eight charts.
+  // instead of rebuilding all nine charts.
   var painted = {};
 
   function cssVar(name) {
@@ -305,7 +305,8 @@
     var rows = payload.weekly || [];
     summary(
       "weekly",
-      fmt(payload.counts.shipped_events) + " shipped · " + fmt(payload.counts.created_events) + " created · Monday weeks"
+      fmt(payload.counts.shipped_events) + " shipped · " + fmt(payload.counts.created_events) + " created · " +
+        fmt(payload.counts.deferred) + " deferred · Monday weeks"
     );
     if (!rows.length) {
       message("weekly", svg, "No weeks yet");
@@ -316,12 +317,13 @@
     var zeroColor = cssVar("--chart-zero");
     var shipColor = cssVar("--chart-ship");
     var createColor = cssVar("--chart-create");
+    var deferColor = cssVar("--chart-defer");
     var muted = cssVar("--chart-muted");
     var frame = frameOf(svg, { top: 16, right: 16, bottom: 32, left: 40 });
     var dates = rows.map(function (row) { return parseDay(row.week); });
     var maxAbs = 1;
     rows.forEach(function (row) {
-      maxAbs = Math.max(maxAbs, row.shipped, row.created);
+      maxAbs = Math.max(maxAbs, row.shipped, row.created, row.deferred);
     });
     // Each week owns a slot centred on its Monday, so the domain reaches half a
     // slot past the first and last week. Without that, the first bar starts
@@ -352,15 +354,22 @@
       // A slot narrower than the band would push the outermost bars past the
       // plot, so each bar's left edge clamps inside the frame instead.
       var barLeft = Math.min(Math.max(dx - band / 2, frame.left), frame.right - band);
+      // The two below-axis series share the slot: created takes the left half
+      // and deferred the right, so neither bar hides the other.
+      var halfBand = Math.max(1, Math.floor(band / 2));
       var shipY = y(row.shipped);
       mark("weekly", el(svg, "rect", {
         x: barLeft, y: shipY, width: band, height: Math.max(0, zero - shipY),
         fill: shipColor
       }), { fill: "--chart-ship" });
       mark("weekly", el(svg, "rect", {
-        x: barLeft, y: zero, width: band, height: Math.max(0, y(-row.created) - zero),
+        x: barLeft, y: zero, width: halfBand, height: Math.max(0, y(-row.created) - zero),
         fill: createColor
       }), { fill: "--chart-create" });
+      mark("weekly", el(svg, "rect", {
+        x: barLeft + halfBand, y: zero, width: band - halfBand,
+        height: Math.max(0, y(-row.deferred) - zero), fill: deferColor
+      }), { fill: "--chart-defer" });
       // One link region per bar, so the shipped bar and the created bar each
       // carry their own tooltip and their own drill-down target.
       var weekEnd = isoDay(new Date(dates[index].getTime() + 6 * 86400000));
@@ -390,12 +399,25 @@
         createText
       );
       el(create, "rect", {
-        x: dx - hitWidth / 2, y: Math.min(zero, y(-row.created)), width: hitWidth,
-        height: Math.max(1, Math.abs(y(-row.created) - zero)), fill: "transparent"
+        x: dx - hitWidth / 2, y: Math.min(zero, y(-row.created)),
+        width: hitWidth / 2, height: Math.max(1, Math.abs(y(-row.created) - zero)),
+        fill: "transparent"
       });
       create.addEventListener("mousemove", function (event) { tip.show(event, createText); });
       create.addEventListener("mouseleave", tip.hide);
       hits.push(create);
+      // The deferred bar names its count but carries no drill-down link: the
+      // task list filters on created and ship days, and no filter reproduces a
+      // leave-day count. It stays one focusable mark like the others.
+      var deferText = "Week of " + dateLabel(dates[index]) + " · deferred " + fmt(row.deferred);
+      var defer = el(svg, "rect", {
+        x: dx, y: Math.min(zero, y(-row.deferred)),
+        width: hitWidth / 2, height: Math.max(1, Math.abs(y(-row.deferred) - zero)),
+        fill: "transparent", "data-tip": deferText
+      });
+      defer.addEventListener("mousemove", function (event) { tip.show(event, deferText); });
+      defer.addEventListener("mouseleave", tip.hide);
+      hits.push(defer);
     });
     roving(hits, tip);
     monthTicks("weekly", svg, dates[0], dates[dates.length - 1], x, frame.bottom + 16, muted);
@@ -481,6 +503,112 @@
     // The overlay is the line chart's one tab stop: focus reveals the first
     // day and the arrow keys walk the drawn rows, so every point stays
     // reachable without a pointer.
+    var active = 0;
+    function showRow(index) {
+      active = index;
+      var text = tipText(rows[index], dates[index]);
+      overlay.setAttribute("aria-label", text);
+      tip.showAt(overlay, text);
+    }
+    overlay.setAttribute("tabindex", "0");
+    overlay.setAttribute("role", "img");
+    overlay.setAttribute("aria-label", tipText(rows[0], dates[0]));
+    overlay.addEventListener("focus", function () { showRow(0); });
+    overlay.addEventListener("blur", tip.hide);
+    overlay.addEventListener("keydown", function (event) {
+      var next = null;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        next = Math.min(active + 1, rows.length - 1);
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        next = Math.max(active - 1, 0);
+      }
+      if (next === null) {
+        return;
+      }
+      if (typeof event.preventDefault === "function") {
+        event.preventDefault();
+      }
+      showRow(next);
+    });
+  }
+
+  // The staleness card draws one line per threshold from the payload's
+  // `staleness` rows, reusing the line chart's frame, scales, ticks, theme
+  // marks, and tooltip placement. It has no trend line: the three thresholds
+  // are the comparison, not a fit.
+  function drawStaleness() {
+    var root = card("staleness");
+    var svg = root.querySelector("svg");
+    var rows = payload.staleness || [];
+    var series = [
+      { key: "over_30", color: "--chart-create" },
+      { key: "over_90", color: "--chart-age" },
+      { key: "over_180", color: "--chart-defer" }
+    ];
+    if (!rows.length) {
+      summary("staleness", "No live tasks yet");
+      message("staleness", svg, "No live tasks yet");
+      return;
+    }
+    var last = rows[rows.length - 1];
+    summary(
+      "staleness",
+      fmt(last.over_30) + " over 30 days · " + fmt(last.over_90) + " over 90 days · " +
+        fmt(last.over_180) + " over 180 days · live tasks by days since last edit"
+    );
+    clear(svg);
+    resetMarks("staleness");
+    var grid = cssVar("--chart-grid");
+    var muted = cssVar("--chart-muted");
+    var colors = series.map(function (entry) { return cssVar(entry.color); });
+    var frame = frameOf(svg, { top: 16, right: 16, bottom: 32, left: 44 });
+    var dates = rows.map(function (row) { return parseDay(row.date); });
+    var maxY = 1;
+    rows.forEach(function (row) {
+      series.forEach(function (entry) { maxY = Math.max(maxY, row[entry.key]); });
+    });
+    var x = scale(dates[0].getTime(), dates[dates.length - 1].getTime(), frame.left, frame.right);
+    var y = scale(0, maxY, frame.bottom, frame.top);
+    var xs = dates.map(function (date) { return x(date.getTime()); });
+    var step = yStep(maxY);
+    for (var value = 0; value <= maxY; value += step) {
+      var py = y(value);
+      mark("staleness", el(svg, "line", {
+        x1: frame.left, x2: frame.right, y1: py, y2: py, stroke: grid
+      }), { stroke: "--chart-grid" });
+      mark("staleness", el(svg, "text", {
+        x: frame.left - 6, y: py + 4, "text-anchor": "end", fill: muted, "font-size": "11"
+      }), { fill: "--chart-muted" }).textContent = fmt(value);
+    }
+    series.forEach(function (entry, seriesIndex) {
+      var line = rows.map(function (row, index) {
+        return (index === 0 ? "M" : "L") + xs[index] + " " + y(row[entry.key]);
+      }).join(" ");
+      mark("staleness", el(svg, "path", {
+        d: line, fill: "none", stroke: colors[seriesIndex], "stroke-width": "2"
+      }), { stroke: entry.color });
+      if (rows.length === 1) {
+        mark("staleness", el(svg, "circle", {
+          cx: xs[0], cy: y(rows[0][entry.key]), r: "4", fill: colors[seriesIndex]
+        }), { fill: entry.color });
+      }
+    });
+    monthTicks("staleness", svg, dates[0], dates[dates.length - 1], x, frame.bottom + 16, muted);
+    var tip = tipFor(root.querySelector(".chart-frame"));
+    function tipText(row, date) {
+      return dateLabel(date) + " · over 30 " + fmt(row.over_30) +
+        " · over 90 " + fmt(row.over_90) + " · over 180 " + fmt(row.over_180);
+    }
+    var overlay = el(svg, "rect", {
+      x: frame.left, y: frame.top, width: frame.right - frame.left, height: frame.bottom - frame.top, fill: "transparent"
+    });
+    overlay.addEventListener("mousemove", function (event) {
+      var bounds = svg.getBoundingClientRect();
+      var px = ((event.clientX - bounds.left) / bounds.width) * (svg.viewBox.baseVal.width || bounds.width);
+      var bestIndex = nearestIndex(xs, px);
+      tip.show(event, tipText(rows[bestIndex], dates[bestIndex]));
+    });
+    overlay.addEventListener("mouseleave", tip.hide);
     var active = 0;
     function showRow(index) {
       active = index;
@@ -944,12 +1072,13 @@
   function renderData() {
     if (!payload) return;
     [
-      ["weekly", payload.weekly, function (row) { return [row.week, row.shipped, row.created]; }],
+      ["weekly", payload.weekly, function (row) { return [row.week, row.shipped, row.created, row.deferred]; }],
       ["cumulative", payload.cumulative, function (row) { return [row.date, row.shipped, row.cumulative]; }],
       ["shipped-calendar", payload.shipped_calendar, function (row) { return [row.date, row.count]; }],
       ["created-calendar", payload.created_calendar, function (row) { return [row.date, row.count]; }],
       ["backlog", payload.live_backlog, function (row) { return [row.date, row.live]; }],
       ["age", payload.mean_age, function (row) { return [row.date, row.avg_age, row.n]; }],
+      ["staleness", payload.staleness, function (row) { return [row.date, row.over_30, row.over_90, row.over_180]; }],
       ["radar-shipped", payload.radar_shipped, function (row) { return [row.label, row.count]; }],
       ["radar-live", payload.radar_live, function (row) { return [row.label, row.count]; }]
     ].forEach(function (entry) {
@@ -1041,6 +1170,7 @@
         "Mean age in days of the unfinished backlog · deferred tasks age until their leave day"
       );
     });
+    renderCard("staleness", drawStaleness);
     // One maximum across both radars, so the shipped and live charts read on
     // the same ring scale instead of each card rescaling to its own peak.
     var radarMax = 1;

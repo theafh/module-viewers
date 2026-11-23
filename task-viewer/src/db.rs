@@ -59,6 +59,7 @@ struct TaskRow {
     scope: String,
     kind: String,
     created: String,
+    updated: String,
     ship_date: Option<String>,
     leave_date: Option<String>,
 }
@@ -516,7 +517,7 @@ pub async fn load_tasks(
     let projects = load_project_handles(&mut tx, repository_id).await?;
     let rows = match repository_id {
         Some(id) => sqlx::query_as::<_, TaskRow>(
-            "SELECT t.repository_id, t.path, t.scope, t.kind, t.created, t.ship_date, t.leave_date
+            "SELECT t.repository_id, t.path, t.scope, t.kind, t.created, t.updated, t.ship_date, t.leave_date
                  FROM tasks t
                  INNER JOIN repositories r ON r.repository_id = t.repository_id
                  WHERE r.repository_id = ?
@@ -526,7 +527,7 @@ pub async fn load_tasks(
         .fetch_all(&mut *tx)
         .await?,
         None => sqlx::query_as::<_, TaskRow>(
-            "SELECT t.repository_id, t.path, t.scope, t.kind, t.created, t.ship_date, t.leave_date
+            "SELECT t.repository_id, t.path, t.scope, t.kind, t.created, t.updated, t.ship_date, t.leave_date
                  FROM tasks t
                  INNER JOIN repositories r ON r.repository_id = t.repository_id
                  ORDER BY r.name COLLATE NOCASE, t.path",
@@ -630,6 +631,18 @@ fn row_to_record(
         .leave_date
         .as_deref()
         .and_then(crate::dates::parse_iso_date);
+    // A stored `updated` day another writer left unreadable only costs the
+    // staleness card its point for this row, so it stays a charted row with no
+    // updated day instead of dropping out of every series.
+    let updated = crate::dates::parse_iso_date(&row.updated);
+    if updated.is_none() {
+        tracing::warn!(
+            repository = %project,
+            path = %row.path,
+            updated = %row.updated,
+            "stored task row's updated day did not parse; charted without it"
+        );
+    }
     Ok(crate::series::TaskRecord {
         repository_id,
         project,
@@ -637,6 +650,7 @@ fn row_to_record(
         scope: row.scope,
         kind,
         created,
+        updated,
         ship_date,
         leave_date,
     })
@@ -1020,6 +1034,7 @@ mod tests {
         path: Option<String>,
         kind: Option<String>,
         created: Option<String>,
+        updated: Option<String>,
     }
 
     impl WarningFields {
@@ -1032,6 +1047,7 @@ mod tests {
                 ("path", &self.path),
                 ("kind", &self.kind),
                 ("created", &self.created),
+                ("updated", &self.updated),
             ] {
                 if let Some(value) = value {
                     line.push(' ');
@@ -1050,6 +1066,7 @@ mod tests {
                 "path" => &mut self.path,
                 "kind" => &mut self.kind,
                 "created" => &mut self.created,
+                "updated" => &mut self.updated,
                 _ => return,
             };
             *slot = Some(value.to_string());
@@ -1824,14 +1841,168 @@ mod tests {
         warnings.lock().expect("warning log").clear();
         let loaded = load_tasks(&pool, None).await.expect("load");
         assert!(loaded.is_empty(), "the unparseable row charts nothing");
+        // The capture is process-global, so a test running in parallel can add
+        // its own warnings here; count only this row's.
         let warnings = warnings.lock().expect("warning log").clone();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        let warning = &warnings[0];
+        let mine: Vec<&String> = warnings
+            .iter()
+            .filter(|warning| warning.contains("tasks/scope_broken.md"))
+            .collect();
+        assert_eq!(mine.len(), 1, "{warnings:?}");
+        let warning = mine[0];
         assert!(warning.contains("ai-modules"), "{warning}");
         assert!(warning.contains("tasks/scope_broken.md"), "{warning}");
         assert!(warning.contains("not-a-date"), "{warning}");
         pool.close().await;
         remove_scratch(&path);
+    }
+
+    /// Covers: `load_tasks` returns each row's stored `updated` day, so the
+    /// staleness card can read it from the parsed record.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_loads_each_rows_stored_updated_day() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        let mut row = task();
+        row.updated = date(2026, 6, 15);
+        replace_tasks(&pool, id, &[row], immediate_hook().as_ref())
+            .await
+            .expect("replace");
+        let loaded = load_tasks(&pool, None).await.expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].updated,
+            Some(date(2026, 6, 15)),
+            "the stored updated day round-trips onto the record"
+        );
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a row stored with an unparseable `updated` value still charts,
+    /// carries no updated day, and logs one warning naming its repository, path,
+    /// and value, so one bad day never drops a task from the charts that never
+    /// read it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_warns_once_about_an_unparseable_updated_day_and_still_charts_the_row() {
+        install_capture();
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        sqlx::query(
+            "INSERT INTO tasks (repository_id, path, scope, kind, created, updated)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("tasks/scope_bad_updated.md")
+        .bind("scope")
+        .bind("live")
+        .bind("2026-01-01")
+        .bind("not-a-day")
+        .execute(&pool)
+        .await
+        .expect("unparseable updated row");
+
+        let warnings = captured_warnings();
+        warnings.lock().expect("warning log").clear();
+        let loaded = load_tasks(&pool, None).await.expect("load");
+        assert_eq!(loaded.len(), 1, "the row still charts");
+        assert_eq!(loaded[0].updated, None, "the unreadable day stays unset");
+        let warnings = warnings
+            .lock()
+            .expect("warning log")
+            .iter()
+            .filter(|warning| warning.contains("tasks/scope_bad_updated.md"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = &warnings[0];
+        assert!(warning.contains("repository=ai-modules"), "{warning}");
+        assert!(
+            warning.contains("path=tasks/scope_bad_updated.md"),
+            "{warning}"
+        );
+        assert!(warning.contains("updated=not-a-day"), "{warning}");
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a task file whose frontmatter `updated` value did not parse is
+    /// harvested with `created` as its updated day, and that fallback reaches
+    /// the staleness card through the stored row: the card starts on the
+    /// created day and the task first counts on the 30-day line 30 days later.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_charts_a_harvested_unparseable_updated_day_on_its_created_day() {
+        let dir = unique_temp_dir("db_harvest_updated_fallback");
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        std::fs::write(
+            repo.join("tasks/scope_bad_updated.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: not-a-date\nstatus: open\n---\n\n# Task\n",
+        )
+        .expect("task file");
+        let parsed = crate::harvest::harvest_repository(&repo).expect("harvest");
+        assert_eq!(parsed.len(), 1, "the readable task harvests");
+        let created = date(2026, 5, 1);
+        assert_eq!(
+            parsed[0].updated, created,
+            "an unparseable updated value falls back to created"
+        );
+
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "repo", &repo.display().to_string())
+            .await
+            .expect("insert");
+        replace_tasks(&pool, id, &parsed, immediate_hook().as_ref())
+            .await
+            .expect("store");
+
+        let loaded = load_tasks(&pool, None).await.expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].updated, Some(created));
+        let board = crate::series::dashboard(
+            &loaded,
+            date(2026, 5, 10),
+            crate::series::RadarMode::Scope,
+            "repo",
+        );
+        assert_eq!(
+            board.staleness.first().expect("the first charted day").date,
+            "2026-05-01",
+            "the card starts on the task's created day"
+        );
+        assert!(
+            board.staleness.iter().all(|point| point.over_30 == 0),
+            "the fallback day leaves the task under every threshold on its created day"
+        );
+        let thirty_days_later = crate::series::dashboard(
+            &loaded,
+            date(2026, 5, 31),
+            crate::series::RadarMode::Scope,
+            "repo",
+        );
+        assert_eq!(
+            thirty_days_later
+                .staleness
+                .last()
+                .expect("the last charted day")
+                .over_30,
+            1,
+            "the stored fallback day starts the 30-day line on created + 30"
+        );
+
+        pool.close().await;
+        remove_scratch(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A leave day that only the frontmatter `updated` fallback supplies carries

@@ -25,6 +25,7 @@
     "created-calendar": "calendar",
     backlog: "line",
     age: "line",
+    staleness: "line",
     "radar-shipped": "radar",
     "radar-live": "radar"
   };
@@ -175,6 +176,7 @@
     "created-calendar",
     "backlog",
     "age",
+    "staleness",
     "radar-shipped",
     "radar-live"
   ];
@@ -232,10 +234,10 @@
 
   var defaultPayload = {
     project: "3",
-    counts: { shipped_events: 3, created_events: 5 },
+    counts: { shipped_events: 3, created_events: 5, deferred: 1 },
     weekly: [
-      { week: "2026-01-05", shipped: 1, created: 2 },
-      { week: "2026-01-12", shipped: 2, created: 3 }
+      { week: "2026-01-05", shipped: 1, created: 2, deferred: 1 },
+      { week: "2026-01-12", shipped: 2, created: 3, deferred: 0 }
     ],
     cumulative: [
       { date: "2026-01-05", cumulative: 1, shipped: 1, trend: 1 },
@@ -247,6 +249,7 @@
     calendar_peak_created: 2,
     live_backlog: [{ date: "2026-01-05", live: 1 }],
     mean_age: [{ date: "2026-01-05", avg_age: 2, n: 1 }],
+    staleness: [{ date: "2026-01-05", over_30: 1, over_90: 0, over_180: 0 }],
     radar_shipped: [{ label: "alpha", count: 1 }],
     radar_live: [{ label: "alpha", count: 1 }],
     radar_mode: "scope"
