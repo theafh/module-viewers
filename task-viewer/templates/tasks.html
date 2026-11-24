@@ -7,6 +7,25 @@
         <p class="muted"><a href="{{ back_href }}">Back to dashboard</a></p>
     </div>
 </header>
+{# One server-rendered form carries every filter, so a filtered view is a link and works without scripting. The hidden fields keep the filters a chart drill-down carried onto the page when Show submits the search and scope controls. #}
+<form class="task-filter" method="get" action="/tasks">
+    <input type="hidden" name="project" value="{{ project }}">
+    <input type="hidden" name="kind" value="{{ kind }}">
+    <input type="hidden" name="date" value="{{ date }}">
+    <input type="hidden" name="from" value="{{ from }}">
+    <input type="hidden" name="to" value="{{ to }}">
+    <label for="q">Search</label>
+    <input type="search" id="q" name="q" value="{{ q }}" placeholder="Filename fragment">
+    <label for="scope">Scope</label>
+    <select id="scope" name="scope">
+        <option value=""{% if selected_scope == "" %} selected{% endif %}>All scopes</option>
+        {% for scope in scopes %}
+        <option value="{{ scope }}"{% if scope == selected_scope %} selected{% endif %}>{{ scope }}</option>
+        {% endfor %}
+    </select>
+    <button class="btn btn-secondary" type="submit">Show</button>
+    <a class="btn btn-secondary" href="/tasks.csv?{{ export_query }}">Export CSV</a>
+</form>
 <table class="task-list">
     <thead>
         <tr>

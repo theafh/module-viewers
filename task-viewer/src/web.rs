@@ -386,6 +386,7 @@ pub fn router(state: AppState) -> Router {
     let pages: Router<AppState> = Router::new()
         .route("/", get(home))
         .route("/tasks", get(tasks_page))
+        .route("/tasks.csv", get(tasks_csv))
         .route("/repositories", get(repositories_page).post(add_repository))
         .route("/repositories/{id}/delete", post(remove_repository))
         .route("/repositories/{id}/scan", post(scan_repository))
@@ -919,6 +920,33 @@ async fn tasks_page(State(state): State<AppState>, Query(query): Query<TasksQuer
     }
 }
 
+/// `GET /tasks.csv` builds the CSV body from the same filtered rows the list
+/// renders, so the numbers can leave the page. It is a read of the stored rows
+/// and never writes a task file, the same boundary the list holds.
+async fn tasks_csv(State(state): State<AppState>, Query(query): Query<TasksQuery>) -> Response {
+    match render_tasks_csv(&state, &query).await {
+        Ok(csv) => (
+            [
+                (header::CONTENT_TYPE, "text/csv"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"tasks.csv\"",
+                ),
+            ],
+            csv,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "task CSV render failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The task list could not be exported.",
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn render_home(state: &AppState, query: &HomeQuery) -> anyhow::Result<String> {
     let claimed = claim_banner(state, query).await;
     let (notice, error) = banner_text(claimed.as_ref(), query);
@@ -1236,22 +1264,47 @@ impl TaskFilter {
     }
 }
 
-async fn render_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<String> {
+/// The rows one `/tasks` request selects, shared by the HTML list and the CSV
+/// export so both read one filter.
+struct TaskSelection {
+    rows: Vec<series::TaskRecord>,
+    selected: Option<i64>,
+    /// The distinct scopes the loaded project filter carries, sorted, so the
+    /// scope select offers exactly the scopes a person can reach from here.
+    scopes: Vec<String>,
+}
+
+async fn select_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<TaskSelection> {
     let repositories = db::list_repositories(&state.pool).await?;
     let selected = selected_id(&repositories, &query.project);
     let tasks = db::load_tasks(&state.pool, selected).await?;
-    let filter = TaskFilter::from_query(query);
-    let mut matched = tasks
+    let mut scopes = tasks
         .iter()
+        .map(|task| task.scope.clone())
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+    let filter = TaskFilter::from_query(query);
+    let mut rows = tasks
+        .into_iter()
         .filter(|task| filter.matches(task))
         .collect::<Vec<_>>();
-    matched.sort_by(|left, right| {
+    rows.sort_by(|left, right| {
         left.scope
             .cmp(&right.scope)
             .then_with(|| left.path.cmp(&right.path))
     });
-    let rows = matched.into_iter().map(task_row_view).collect::<Vec<_>>();
-    let project = match selected {
+    Ok(TaskSelection {
+        rows,
+        selected,
+        scopes,
+    })
+}
+
+async fn render_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<String> {
+    let selection = select_tasks(state, query).await?;
+    let rows = selection.rows.iter().map(task_row_view).collect::<Vec<_>>();
+    let project = match selection.selected {
         Some(id) => id.to_string(),
         None => "all".to_string(),
     };
@@ -1260,10 +1313,101 @@ async fn render_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<St
         page: "tasks",
         count: rows.len(),
         back_href: format!("/?project={project}"),
+        project: project.clone(),
+        kind: query.kind.trim().to_string(),
+        q: query.q.trim().to_string(),
+        selected_scope: query.scope.trim().to_string(),
+        date: query.date.trim().to_string(),
+        from: query.from.trim().to_string(),
+        to: query.to.trim().to_string(),
+        scopes: selection.scopes,
+        export_query: export_query(query, &project),
         rows,
     };
     let context = Context::from_serialize(page)?;
     Ok(state.templates.render("tasks.html", &context)?)
+}
+
+/// The query string the Export CSV link carries: the project filter plus every
+/// non-empty filter the request set, each value percent-encoded so it can sit
+/// in an `href`. The template escapes the result for HTML.
+fn export_query(query: &TasksQuery, project: &str) -> String {
+    let mut pairs = vec![format!("project={}", encode_query(project))];
+    for (name, value) in [
+        ("kind", query.kind.trim()),
+        ("scope", query.scope.trim()),
+        ("q", query.q.trim()),
+        ("date", query.date.trim()),
+        ("from", query.from.trim()),
+        ("to", query.to.trim()),
+    ] {
+        if !value.is_empty() {
+            pairs.push(format!("{name}={}", encode_query(value)));
+        }
+    }
+    pairs.join("&")
+}
+
+async fn render_tasks_csv(state: &AppState, query: &TasksQuery) -> anyhow::Result<String> {
+    let selection = select_tasks(state, query).await?;
+    Ok(tasks_csv_text(&selection.rows))
+}
+
+/// The CSV body: a fixed header, then one row per task in the list's own order.
+/// The seven columns name the row's repository, scope, path, kind, created day,
+/// ship day, and leave day, so a finished row's ship day and a deferred row's
+/// leave day are the single day the list shows.
+fn tasks_csv_text(tasks: &[series::TaskRecord]) -> String {
+    let mut out = String::from("repository,scope,path,kind,created,ship day,leave day\n");
+    for task in tasks {
+        let (ship, leave) = match task.kind {
+            TaskKind::Finished => (task.ship_date.or(task.leave_date), task.leave_date),
+            TaskKind::Deferred => (None, task.leave_date),
+            TaskKind::Live => (None, None),
+        };
+        let fields = [
+            task.project.to_string(),
+            task.scope.clone(),
+            task.path.clone(),
+            task.kind.as_str().to_string(),
+            crate::dates::format_date(task.created),
+            ship.map(crate::dates::format_date).unwrap_or_default(),
+            leave.map(crate::dates::format_date).unwrap_or_default(),
+        ];
+        let line = fields
+            .iter()
+            .map(|field| csv_field(field))
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// One CSV field: a value holding a comma, a quote, or a line break is wrapped
+/// in double quotes, and each inner quote is doubled, so a path with any of
+/// them survives the round trip instead of splitting the record.
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod csv_field_tests {
+    use super::csv_field;
+
+    #[test]
+    fn csv_field_quotes_a_line_break_so_a_path_cannot_split_the_record() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_field("a\rb"), "\"a\rb\"");
+    }
 }
 
 /// One stored row as the list renders it. A finished row names its ship day, a
@@ -1524,6 +1668,21 @@ struct TasksPage {
     page: &'static str,
     count: usize,
     back_href: String,
+    /// The active project filter, as `all` or a repository id.
+    project: String,
+    /// The request's `kind`, `q`, `scope`, `date`, `from`, and `to` values, so
+    /// the form carries them back on submit and the search and scope controls
+    /// show what is active.
+    kind: String,
+    q: String,
+    selected_scope: String,
+    date: String,
+    from: String,
+    to: String,
+    /// The distinct scopes of the current project filter, for the scope select.
+    scopes: Vec<String>,
+    /// The percent-encoded query the Export CSV link carries.
+    export_query: String,
     rows: Vec<TaskRowView>,
 }
 
@@ -7802,6 +7961,445 @@ mod tests {
         assert!(body.contains("beta_defer.md"));
         assert!(!body.contains("alpha_live.md"));
 
+        cleanup(&path);
+    }
+
+    /// The value a hidden input carries, HTML-decoded, so a round-trip test
+    /// re-requests with exactly what the form would submit.
+    fn hidden_input_value(body: &str, name: &str) -> String {
+        let needle = format!("name=\"{name}\" value=\"");
+        let start = body
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no hidden input named {name}"))
+            + needle.len();
+        let rest = &body[start..];
+        let end = rest.find('"').expect("hidden value end");
+        html_unescape(&rest[..end])
+    }
+
+    /// The task list's search input value, HTML-decoded.
+    fn search_input_value(body: &str) -> String {
+        let needle = "name=\"q\" value=\"";
+        let start = body.find(needle).expect("search input") + needle.len();
+        let rest = &body[start..];
+        let end = rest.find('"').expect("search value end");
+        html_unescape(&rest[..end])
+    }
+
+    /// Every option value the scope select offers, HTML-decoded, in order.
+    fn scope_options(body: &str) -> Vec<String> {
+        let start = body
+            .find("id=\"scope\" name=\"scope\"")
+            .expect("scope select");
+        let rest = &body[start..];
+        let end = rest.find("</select>").expect("scope select end");
+        rest[..end]
+            .split("<option value=\"")
+            .skip(1)
+            .map(|chunk| {
+                let end = chunk.find('"').expect("option value end");
+                html_unescape(&chunk[..end])
+            })
+            .collect()
+    }
+
+    /// The Export CSV link's target, HTML-decoded.
+    fn export_href(body: &str) -> String {
+        let start = body.find("href=\"/tasks.csv?").expect("export link") + "href=\"".len();
+        let rest = &body[start..];
+        let end = rest.find('"').expect("export href end");
+        html_unescape(&rest[..end])
+    }
+
+    /// Strip every tag, leaving the text a table cell renders.
+    fn strip_tags(text: &str) -> String {
+        let mut out = String::new();
+        let mut inside = false;
+        for ch in text.chars() {
+            match ch {
+                '<' => inside = true,
+                '>' => inside = false,
+                _ if !inside => out.push(ch),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Decode the HTML entities Tera emits, so a rendered cell compares with the
+    /// raw stored value.
+    fn html_unescape(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(index) = rest.find('&') {
+            out.push_str(&rest[..index]);
+            rest = &rest[index..];
+            let Some(semi) = rest.find(';') else {
+                out.push_str(rest);
+                return out;
+            };
+            match &rest[..=semi] {
+                "&amp;" => out.push('&'),
+                "&lt;" => out.push('<'),
+                "&gt;" => out.push('>'),
+                "&quot;" => out.push('"'),
+                "&#x27;" => out.push('\''),
+                "&#x2F;" => out.push('/'),
+                other => out.push_str(other),
+            }
+            rest = &rest[semi + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The task list's `<tbody>` rows as HTML-decoded cell texts.
+    fn task_table_rows(body: &str) -> Vec<Vec<String>> {
+        let start = body.find("<tbody>").expect("tbody start") + "<tbody>".len();
+        let end = start + body[start..].find("</tbody>").expect("tbody end");
+        body[start..end]
+            .split("<tr>")
+            .skip(1)
+            .map(|row| {
+                row.split("</tr>")
+                    .next()
+                    .unwrap_or("")
+                    .split("<td>")
+                    .skip(1)
+                    .map(|cell| {
+                        let text = cell.split("</td>").next().unwrap_or("");
+                        html_unescape(&strip_tags(text)).trim().to_string()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Parse a CSV body with the export's quoting rule: a double quote opens a
+    /// quoted field, a doubled quote inside it is one literal quote, and a comma
+    /// or newline inside it stays in the field.
+    fn csv_rows(text: &str) -> Vec<Vec<String>> {
+        let mut rows = Vec::new();
+        let mut row = Vec::new();
+        let mut field = String::new();
+        let mut quoted = false;
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if quoted {
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        field.push('"');
+                    } else {
+                        quoted = false;
+                    }
+                } else {
+                    field.push(ch);
+                }
+                continue;
+            }
+            match ch {
+                '"' => quoted = true,
+                ',' => row.push(std::mem::take(&mut field)),
+                '\n' => {
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                }
+                '\r' => {}
+                _ => field.push(ch),
+            }
+        }
+        if !field.is_empty() || !row.is_empty() {
+            row.push(field);
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Seed rows whose paths carry a comma and a double quote, beside one
+    /// finished and one deferred task, so the export's quoting and its day
+    /// columns are both exercised.
+    async fn seeded_csv_task_list(name: &str) -> (AppState, PathBuf, i64, i64) {
+        let (state, path) = app_state(name).await;
+        let folder_a = unique_temp_dir(&format!("{name}_a"));
+        let folder_b = unique_temp_dir(&format!("{name}_b"));
+        std::fs::create_dir_all(&folder_a).expect("folder a");
+        std::fs::create_dir_all(&folder_b).expect("folder b");
+        let alpha = db::insert_repository(&state.pool, "Alpha", &folder_a.to_string_lossy())
+            .await
+            .expect("alpha");
+        let beta = db::insert_repository(&state.pool, "Beta", &folder_b.to_string_lossy())
+            .await
+            .expect("beta");
+        db::replace_tasks(
+            &state.pool,
+            alpha,
+            &[
+                stored_row(
+                    "alpha_one,two.md",
+                    "alpha",
+                    TaskKind::Live,
+                    (2026, 5, 1),
+                    None,
+                    None,
+                ),
+                stored_row(
+                    "alpha_quote\"name.md",
+                    "alpha",
+                    TaskKind::Live,
+                    (2026, 5, 3),
+                    None,
+                    None,
+                ),
+                stored_row(
+                    "alpha_done.md",
+                    "alpha",
+                    TaskKind::Finished,
+                    (2026, 5, 2),
+                    Some((2026, 5, 10)),
+                    Some((2026, 5, 10)),
+                ),
+                stored_row(
+                    "alpha_defer.md",
+                    "alpha",
+                    TaskKind::Deferred,
+                    (2026, 3, 1),
+                    None,
+                    Some((2026, 4, 1)),
+                ),
+            ],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("alpha rows");
+        db::replace_tasks(
+            &state.pool,
+            beta,
+            &[stored_row(
+                "beta_live.md",
+                "beta",
+                TaskKind::Live,
+                (2026, 6, 1),
+                None,
+                None,
+            )],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("beta rows");
+        (state, path, alpha, beta)
+    }
+
+    /// Covers: the task list carries one GET form to `/tasks` with a Show button,
+    /// a search input, a scope select, and the project, kind, date, from, and to
+    /// filters as hidden inputs holding the request's own values.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_form_carries_the_filters_as_hidden_inputs() {
+        let (state, path, alpha, _beta) = seeded_task_list("tasks_form").await;
+        let body = task_list_body(
+            &state,
+            &format!("project={alpha}&kind=finished&date=shipped&from=2026-05-01&to=2026-05-31"),
+        )
+        .await;
+        assert!(
+            body.contains("<form class=\"task-filter\" method=\"get\" action=\"/tasks\">"),
+            "{body}"
+        );
+        assert!(
+            body.contains(">Show<"),
+            "the form carries its Show button: {body}"
+        );
+        assert!(
+            body.contains("name=\"q\""),
+            "the form carries a search input: {body}"
+        );
+        assert!(
+            body.contains("name=\"scope\""),
+            "the form carries a scope select: {body}"
+        );
+        assert_eq!(hidden_input_value(&body, "project"), alpha.to_string());
+        assert_eq!(hidden_input_value(&body, "kind"), "finished");
+        assert_eq!(hidden_input_value(&body, "date"), "shipped");
+        assert_eq!(hidden_input_value(&body, "from"), "2026-05-01");
+        assert_eq!(hidden_input_value(&body, "to"), "2026-05-31");
+        cleanup(&path);
+    }
+
+    /// Covers: the hidden filters a chart drill-down carried onto the page keep
+    /// filtering after Show submits the form again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_hidden_filters_round_trip() {
+        let (state, path, alpha, _beta) = seeded_task_list("tasks_round_trip").await;
+        // `q=md` matches a row in each repository and each kind, so `kind=live`
+        // is the only thing excluding `alpha_done.md` and `project=alpha` the
+        // only thing excluding Beta's live row. A dropped hidden filter then
+        // changes the result instead of passing anyway.
+        let body = task_list_body(&state, &format!("project={alpha}&kind=live")).await;
+        let query = format!(
+            "project={}&kind={}&date={}&from={}&to={}&q=md",
+            hidden_input_value(&body, "project"),
+            hidden_input_value(&body, "kind"),
+            hidden_input_value(&body, "date"),
+            hidden_input_value(&body, "from"),
+            hidden_input_value(&body, "to"),
+        );
+        let body = task_list_body(&state, &query).await;
+        assert!(body.contains("alpha_live.md"), "{body}");
+        assert!(!body.contains("alpha_done.md"), "{body}");
+        assert!(!body.contains("beta_defer.md"), "{body}");
+        assert!(!body.contains("gamma_live.md"), "{body}");
+        cleanup(&path);
+    }
+
+    /// Covers: the search input's value reaches `q` and the scope select's value
+    /// reaches `scope`, and each narrows the visible rows. The select offers only
+    /// the current project's distinct scopes plus the All-scopes option.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_search_and_scope_controls_narrow_the_list() {
+        let (state, path, alpha, _beta) = seeded_task_list("tasks_controls").await;
+        let body = task_list_body(&state, &format!("project={alpha}")).await;
+        assert_eq!(search_input_value(&body), "");
+        assert_eq!(scope_options(&body), vec!["", "alpha"]);
+        assert!(
+            body.contains("<option value=\"\" selected>All scopes</option>"),
+            "the select offers an All-scopes option, selected while no scope filters: {body}"
+        );
+
+        let body = task_list_body(&state, &format!("project={alpha}&q=done&scope=alpha")).await;
+        assert_eq!(search_input_value(&body), "done");
+        assert!(
+            body.contains("<option value=\"alpha\" selected>alpha</option>"),
+            "the select marks the active scope: {body}"
+        );
+        assert!(
+            !body.contains("<option value=\"\" selected>"),
+            "All scopes is not marked while a scope filters: {body}"
+        );
+        assert!(body.contains("alpha_done.md"), "{body}");
+        assert!(!body.contains("alpha_live.md"), "{body}");
+
+        let body = task_list_body(&state, &format!("project={alpha}&scope=beta")).await;
+        assert!(!body.contains("alpha_done.md"), "{body}");
+        assert!(!body.contains("alpha_live.md"), "{body}");
+        cleanup(&path);
+    }
+
+    /// Covers: the Export CSV link carries the active filters.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_export_link_carries_the_active_filters() {
+        let (state, path, alpha, _beta) = seeded_task_list("tasks_export_link").await;
+        let body = task_list_body(
+            &state,
+            &format!(
+                "project={alpha}&kind=finished&scope=alpha&q=done&date=created&from=2026-05-01&to=2026-05-31"
+            ),
+        )
+        .await;
+        assert_eq!(
+            export_href(&body),
+            format!(
+                "/tasks.csv?project={alpha}&kind=finished&scope=alpha&q=done&date=created&from=2026-05-01&to=2026-05-31"
+            )
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: `GET /tasks.csv` answers with the CSV headers and one row per
+    /// filtered task, quoting a path that holds a comma or a quote, and every
+    /// row's cells equal the filtered table's row for the same path, with the
+    /// single day cell landing in `ship day` for a finished row and in `leave
+    /// day` for a deferred one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_csv_matches_the_filtered_table() {
+        let (state, path, alpha, beta) = seeded_csv_task_list("tasks_csv").await;
+        let filters = [
+            String::new(),
+            format!("project={alpha}"),
+            format!("project={beta}"),
+            "kind=finished".to_string(),
+            "kind=deferred".to_string(),
+            "kind=live".to_string(),
+            "scope=beta".to_string(),
+            "q=defer".to_string(),
+            "date=shipped&from=2026-05-10&to=2026-05-10".to_string(),
+            "date=created&from=2026-03-01&to=2026-03-01".to_string(),
+            "from=2026-06-01".to_string(),
+            "to=2026-03-02".to_string(),
+        ];
+        for filter in filters {
+            let uri = if filter.is_empty() {
+                "/tasks.csv".to_string()
+            } else {
+                format!("/tasks.csv?{filter}")
+            };
+            let response = send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                header_text(&response, header::CONTENT_TYPE),
+                "text/csv",
+                "{uri}"
+            );
+            assert!(
+                header_text(&response, header::CONTENT_DISPOSITION).starts_with("attachment"),
+                "{uri} is served as an attachment"
+            );
+            let csv = body_text(response).await;
+            let csv_rows = csv_rows(&csv);
+            assert_eq!(
+                csv_rows[0],
+                vec![
+                    "repository",
+                    "scope",
+                    "path",
+                    "kind",
+                    "created",
+                    "ship day",
+                    "leave day"
+                ],
+                "{uri} header"
+            );
+
+            let table = task_list_body(&state, &filter).await;
+            let table_rows = task_table_rows(&table);
+            assert_eq!(
+                csv_rows.len() - 1,
+                table_rows.len(),
+                "{uri} carries one row per filtered task"
+            );
+            for row in &csv_rows[1..] {
+                let row_path = &row[2];
+                let table_row = table_rows
+                    .iter()
+                    .find(|candidate| &candidate[2] == row_path)
+                    .unwrap_or_else(|| panic!("{uri}: no table row for {row_path}"));
+                assert_eq!(row[0], table_row[0], "{uri} repository for {row_path}");
+                assert_eq!(row[1], table_row[1], "{uri} scope for {row_path}");
+                assert_eq!(row[3], table_row[3], "{uri} kind for {row_path}");
+                assert_eq!(row[4], table_row[4], "{uri} created for {row_path}");
+                let day = table_row[5].split_whitespace().last().unwrap_or("");
+                match row[3].as_str() {
+                    "finished" => {
+                        assert_eq!(row[5], day, "{uri} ship day for {row_path}");
+                    }
+                    "deferred" => {
+                        assert_eq!(row[5], "", "{uri} ship day is empty for {row_path}");
+                        assert_eq!(row[6], day, "{uri} leave day for {row_path}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let all =
+            body_text(send(state.clone(), get_page("/tasks.csv", "127.0.0.1:7880")).await).await;
+        assert!(
+            all.contains("\"alpha_one,two.md\""),
+            "a comma path is wrapped in quotes: {all}"
+        );
+        assert!(
+            all.contains("\"alpha_quote\"\"name.md\""),
+            "a quote path is wrapped and its inner quote doubled: {all}"
+        );
         cleanup(&path);
     }
 

@@ -146,6 +146,28 @@ select {
     padding: 0.4rem 0.6rem;
 }
 
+input[type="search"] {
+    background: var(--input-bg);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    font: inherit;
+}
+
+.task-filter {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+}
+
+.task-filter label {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
 .btn {
     display: inline-block;
     background: var(--accent);
