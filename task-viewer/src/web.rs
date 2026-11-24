@@ -10105,6 +10105,23 @@ mod tests {
         );
     }
 
+    /// Covers: every `.task-list` cell and header carries an unbreakable token
+    /// of its own, so each wraps rather than widening the table, and a long
+    /// repository name wraps rather than painting over the action column.
+    #[test]
+    fn stylesheet_task_list_cells_and_repo_name_wrap() {
+        let cell = css_rule(".task-list td,\n.task-list th");
+        assert!(
+            cell.contains("overflow-wrap: anywhere"),
+            "every task cell and header breaks an unbroken token: {cell}"
+        );
+        let name = css_rule(".repo-name");
+        assert!(
+            name.contains("overflow-wrap: anywhere"),
+            "the repository name wraps instead of overlapping the actions: {name}"
+        );
+    }
+
     /// Covers: `.tooltip` is fixed to the viewport; `tipFor` places it from the
     /// pointer's client coordinates with no frame offset, so the scrolling
     /// calendar frame neither clips nor shifts it; and a focused mark anchors

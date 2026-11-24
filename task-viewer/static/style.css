@@ -176,6 +176,13 @@ input[type="search"] {
     overflow-wrap: anywhere;
 }
 
+.task-list td,
+.task-list th {
+    /* The repository name, scope, kind, and two dates are unbreakable tokens
+       of their own, so let every cell wrap rather than widen the table. */
+    overflow-wrap: anywhere;
+}
+
 .btn {
     display: inline-block;
     background: var(--accent);
@@ -329,6 +336,8 @@ input[type="search"] {
 
 .repo-name {
     font-weight: 600;
+    /* A long folder name wraps rather than painting over the action column. */
+    overflow-wrap: anywhere;
 }
 
 .repo-path {
