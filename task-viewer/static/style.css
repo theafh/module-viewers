@@ -244,8 +244,16 @@ select {
 
 .repo-actions {
     display: flex;
-    gap: 0.5rem;
     align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+}
+
+.repo-list .repo-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    align-items: flex-end;
     flex-shrink: 0;
 }
 
@@ -259,6 +267,15 @@ select {
     display: flex;
     flex-direction: column;
     gap: 0.15rem;
+    min-width: 0;
+}
+
+.repo-name {
+    font-weight: 600;
+}
+
+.repo-path {
+    overflow-wrap: anywhere;
 }
 
 .charts {

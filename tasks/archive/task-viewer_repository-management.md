@@ -2,9 +2,11 @@
 description: "Improve repository management: per-repository row counts, a relocate action, duplicate-clone detection, a filtered-dashboard link, human timestamps, and path wrapping."
 scope: task-viewer
 created: 2026-11-23T17:31:20Z
-updated: 2026-11-23T18:08:45Z
-status: ready
+updated: 2026-11-24T00:16:00Z
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Repository management and readability
@@ -34,7 +36,9 @@ Make the Repositories page useful with several repositories and recoverable when
 5. Format the stored stamps in the view model that feeds the templates (`project_view` for the rows, `scan_label` for the header), leaving the stored columns untouched: render the instant in the machine's local zone and append `N days ago` when the UTC day difference is at least one. A helper takes the reference instant and the zone as parameters, so a test fixes both instead of depending on the clock and the machine's zone. Parse with `scan_instant`'s rules so a legacy Berlin wall time and a `Z` stamp without seconds still format, and fall back to the raw text when a stamp does not parse. Replace the raw-stamp assertions in the two tests named in Context.
 6. Give `.repo-list div` `min-width: 0`, give the path span its own `repo-path` class, and set `overflow-wrap: anywhere` on that class; group the row's action forms so Relocate and Remove sit in one action column without stretching the row.
 
-**Settled decision:** relocate keeps its immediate re-harvest, and the guardrail documents are amended to name it. `CHARTER.md`'s invariant and `SECURITY.md`'s data rule are rewritten so one canonical sentence names every refresh path, covering both the relocate refresh and the per-repository rescan that [task-viewer_scan-feedback.md](archive/task-viewer_scan-feedback.md) adds; whichever task lands second leaves that sentence true. The relocated row carries a fresh scan stamp.
+**Settled decision:** relocate keeps its immediate re-harvest, and the guardrail documents are amended to name it. `CHARTER.md`'s invariant and `SECURITY.md`'s data rule are rewritten so one canonical sentence names every refresh path, covering both the relocate refresh and the per-repository rescan that [task-viewer_scan-feedback.md](task-viewer_scan-feedback.md) adds; whichever task lands second leaves that sentence true. The relocated row carries a fresh scan stamp.
+
+**Reconciled against current code:** `scan_label` already reports the oldest parseable in-scope stamp plus a stale count, so the human-time change formats that chosen stamp and leaves the oldest-stamp and stale-count logic intact. The per-row Rescan button and the `.repo-actions` container already exist, so Relocate joins them there and the action rule is raised to `.repo-list .repo-actions` so its column layout outranks `.repo-list div`. The held duplicate-clone path lives in its own `HeldCloneStore` on `AppState`, mirroring `FlashStore`'s capacity, oldest-first eviction, and canonical decimal token, so a token names a slot and no path rides the redirect. Identity reads only a folder that carries its own `.git`, so two configured subfolders of one enclosing repository are not reported as clones of each other, while a linked worktree (which carries a `.git` file) still identifies through its shared common directory. A relocate to the folder the repository already stores re-harvests it instead of reporting a collision with itself.
 
 **Out of scope:**
 

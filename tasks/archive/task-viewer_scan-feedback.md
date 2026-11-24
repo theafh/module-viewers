@@ -27,7 +27,7 @@ Give the person a visible sign that a scan is running, a way to rescan one repos
 - `scan_label` picks the newest stored stamp through `scan_instant`, because a row written by an older build keeps its own spelling.
 - `task-viewer/testdata/browser_guards.js` is the stub DOM the `rquickjs` tests run the shipped scripts against. It has no form node, and `run_browser_with` accepts a `prelude` that a test uses to install a stub such as `fetch`.
 - `FEATURES.md` section 3 documents Update, Add, and Remove and the one-shot outcome banner, `ARCHITECTURE.md` lists the routes, and `CHARTER.md` Key Invariants plus `SECURITY.md` both state that Update and Add are the only refresh paths.
-- The Repositories row is also where [repository management](../task-viewer_repository-management.md) adds a relocate action, so both tasks add a per-row form there.
+- The Repositories row is also where [repository management](task-viewer_repository-management.md) adds a relocate action, so both tasks add a per-row form there.
 
 ## Approach
 

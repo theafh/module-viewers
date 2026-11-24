@@ -25,7 +25,7 @@ Make the dashboard and the Repositories page state what the charts are built fro
 - The `task-viewer/src/web.rs` types that carry a harvest result are `HarvestFn`, `HarvestOutcome`, `store_outcome`, and `refresh_one`. `ScanReport` holds only `attempted` and `failures`, and `scan_flash` builds the Update banner from them.
 - `store_outcome` stores the fixed `GIT_ERROR` string for `HarvestError::Git(reason)` while `reason` — git's first stderr line for a failed command, or the failure's own message when git never ran — reaches only the log. `record_scan_error` takes `message: &'static str`.
 - `FEATURES.md` section 3 documents the scan, the Repositories stamps, and the truthful outcome banner; section 4 documents the dashboard's charts and each card's summary line. `TESTING.md`'s `Scan:` bullet under What Must Be Covered lists the scan checks.
-- [task-viewer_repository-management.md](../task-viewer_repository-management.md) reformats the same `scan_label` stamps as human local times, so this task's oldest-stamp and stale-count logic stays independent of the stamp formatting.
+- [task-viewer_repository-management.md](task-viewer_repository-management.md) reformats the same `scan_label` stamps as human local times, so this task's oldest-stamp and stale-count logic stays independent of the stamp formatting.
 
 ## Approach
 

@@ -19,15 +19,28 @@
     </div>
 </header>
 {% if has_projects %}
+{% if confirm %}
+<p class="banner banner-error">This folder is a second clone of <strong>{{ confirm.existing }}</strong>.</p>
+<section class="card">
+    <h2>Add a second clone</h2>
+    <p>Adding it keeps both repositories on the dashboard, each with its own row counts.</p>
+    <div class="repo-actions">
+        <form method="post" action="/repositories/confirm/{{ confirm.token }}">
+            <button class="btn" type="submit">Add this clone</button>
+        </form>
+        <a class="btn btn-secondary" href="/repositories">Cancel</a>
+    </div>
+</section>
+{% endif %}
 <section class="card">
     <h2>Configured repositories</h2>
     <ul class="repo-list">
         {% for project in projects %}
         <li>
             <div>
-                <strong>{{ project.name }}</strong>
-                <span class="muted">{{ project.path }}</span>
-                <span class="muted">Added {{ project.created_at }} · {% if project.scanned_at %}scanned {{ project.scanned_at }}{% else %}not scanned yet{% endif %}</span>
+                <a class="repo-name" href="/?project={{ project.id_str }}">{{ project.name }}</a>
+                <span class="muted repo-path">{{ project.path }}</span>
+                <span class="muted">Added {{ project.created_at }} · {% if project.scanned_at %}scanned {{ project.scanned_at }}{% if project.counts %} · {{ project.counts }}{% endif %}{% else %}not scanned yet{% endif %}</span>
                 {% if project.last_error %}
                 <span class="error-text">{{ project.last_error }}</span>
                 {% endif %}
@@ -35,6 +48,9 @@
             <div class="repo-actions">
                 <form method="post" action="/repositories/{{ project.id }}/scan">
                     <button class="btn btn-secondary btn-small" type="submit">Rescan {{ project.name }}</button>
+                </form>
+                <form method="post" action="/repositories/{{ project.id }}/path">
+                    <button class="btn btn-secondary btn-small" type="submit">Relocate {{ project.name }}</button>
                 </form>
                 <form method="post" action="/repositories/{{ project.id }}/delete" data-repository="{{ project.name }}">
                     <button class="btn btn-secondary btn-small" type="submit">Remove {{ project.name }}</button>

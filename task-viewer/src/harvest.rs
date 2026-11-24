@@ -2871,6 +2871,84 @@ fn git_read(repo: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&git_read_bytes(repo, dir, args)?).into_owned())
 }
 
+/// How one repository folder identifies itself for duplicate-clone detection.
+///
+/// A clone is recognized by the origin URL it shares with the clone already on
+/// the dashboard, and a folder with no remote by the git common directory it
+/// shares with another worktree of the same repository. A folder outside git,
+/// or one with no readable identity, identifies as nothing, so no configured
+/// repository can be mistaken for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryIdentity {
+    /// The canonical origin URL, trimmed with one trailing `/` and one trailing
+    /// `.git` dropped.
+    Remote(String),
+    /// The canonical git common directory two worktrees of one repository share.
+    CommonDir(PathBuf),
+    /// No identity, because the folder has no own `.git` or git could not read
+    /// it.
+    None,
+}
+
+/// Identify one repository folder the way Add detects a duplicate clone.
+///
+/// Only a folder with its own `.git` identifies as a repository, so two
+/// configured subfolders of one enclosing repository, each charted under its
+/// own folder, are not reported as clones of each other. A linked worktree
+/// carries a `.git` file, so it still identifies through the common directory
+/// it shares with its main worktree.
+pub fn repository_identity(folder: &Path) -> RepositoryIdentity {
+    if git_dir(folder).is_none() {
+        return RepositoryIdentity::None;
+    }
+    if let Some(url) = git_stdout_line(folder, &["config", "--get", "remote.origin.url"]) {
+        return RepositoryIdentity::Remote(normalize_origin_url(&url));
+    }
+    match git_common_dir(folder) {
+        Some(dir) => RepositoryIdentity::CommonDir(dir),
+        None => RepositoryIdentity::None,
+    }
+}
+
+/// The first line one read-only git command writes, trimmed, when it exits
+/// successfully with something to say.
+fn git_stdout_line(folder: &Path, args: &[&str]) -> Option<String> {
+    let mut command = Command::new(git_program(folder));
+    command.arg("-C").arg(folder).args(args);
+    scrub_git_env(&mut command);
+    let output = run_git_command(command, None, git_deadline(folder)).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next().unwrap_or_default().trim();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
+/// The folder's canonical git common directory, resolved from
+/// `git rev-parse --git-common-dir` and canonicalized, so a relative answer is
+/// read against the folder and two spellings of one directory compare equal.
+fn git_common_dir(folder: &Path) -> Option<PathBuf> {
+    let raw = git_stdout_line(folder, &["rev-parse", "--git-common-dir"])?;
+    let path = PathBuf::from(raw);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        folder.join(path)
+    };
+    Some(fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// Normalize an origin URL so two spellings of one remote compare equal: trim
+/// the surrounding whitespace, then drop one trailing `/` and one trailing
+/// `.git`.
+fn normalize_origin_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let trimmed = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    trimmed.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -2878,15 +2956,15 @@ mod tests {
     use super::{
         BlobContent, CONTENT_HASH_REVISION, GIT_COMMAND_TIMEOUT, GitContext, GitFailure,
         HarvestError, HarvestState, LogLookup, MAX_TASK_FILE_BYTES, MAX_WORKTREE_CACHE_BYTES,
-        ParsedTask, PriorTask, SkipReason, TaskKind, archive_log_args, archived_leave_lookup,
-        blob_days, blob_days_log_args, content_hash, drain_reader, enclosing_prefix,
-        escape_posix_ere, first_status_commit_date, fnv1a_digest, frontmatter, git_bin,
-        git_deadline, git_dir_command, git_log_args, git_path, git_program, git_read, git_timeout,
-        harvest_repository, harvest_repository_with_prior, parse_archive_log, parse_batch,
-        pickaxe_log_args, read_blobs, run_git_command, run_git_log, run_git_streaming,
-        scan_log_dates, scrub_git_env, stream_blob_days, take_leave_walk_count,
-        take_recursive_ls_tree_count, take_worktree_cache_peak, take_worktree_read_bytes,
-        take_worktree_read_count,
+        ParsedTask, PriorTask, RepositoryIdentity, SkipReason, TaskKind, archive_log_args,
+        archived_leave_lookup, blob_days, blob_days_log_args, content_hash, drain_reader,
+        enclosing_prefix, escape_posix_ere, first_status_commit_date, fnv1a_digest, frontmatter,
+        git_bin, git_deadline, git_dir_command, git_log_args, git_path, git_program, git_read,
+        git_timeout, harvest_repository, harvest_repository_with_prior, normalize_origin_url,
+        parse_archive_log, parse_batch, pickaxe_log_args, read_blobs, repository_identity,
+        run_git_command, run_git_log, run_git_streaming, scan_log_dates, scrub_git_env,
+        stream_blob_days, take_leave_walk_count, take_recursive_ls_tree_count,
+        take_worktree_cache_peak, take_worktree_read_bytes, take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -3522,6 +3600,102 @@ mod tests {
 
     fn git(dir: &Path, args: &[&str], date: &str) {
         let _ = git_stdout(dir, args, date);
+    }
+
+    /// Covers: two clones identify by their shared origin URL, a worktree of a
+    /// repository with no remote identifies by the common directory it shares
+    /// with its main worktree, and a folder outside git identifies as nothing.
+    #[test]
+    fn harvest_identifies_a_repository_by_origin_or_common_dir() {
+        let root = scratch("harvest_identity");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("tasks")).expect("tasks");
+        git(
+            &source,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::write(
+            source.join("tasks/scope_one.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# One\n",
+        )
+        .expect("task");
+        git(&source, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &source,
+            &["commit", "-m", "tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+
+        // The source has no remote, so it and its linked worktree identify by
+        // the common directory they share.
+        let worktree = root.join("worktree");
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().expect("utf-8 path"),
+                "-b",
+                "wt",
+            ],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let source_identity = repository_identity(&source);
+        assert!(
+            matches!(source_identity, RepositoryIdentity::CommonDir(_)),
+            "a repository with no remote identifies by its common directory: {source_identity:?}"
+        );
+        assert_eq!(
+            repository_identity(&worktree),
+            source_identity,
+            "a linked worktree shares the common directory of its main worktree"
+        );
+
+        // Two clones of the source share the origin URL `git clone` records,
+        // while their common directories differ.
+        let first = root.join("first");
+        let second = root.join("second");
+        for clone in [&first, &second] {
+            git(
+                &root,
+                &[
+                    "clone",
+                    source.to_str().expect("utf-8 path"),
+                    clone.to_str().expect("utf-8 path"),
+                ],
+                "2026-05-01T12:00:00+00:00",
+            );
+        }
+        let first_identity = repository_identity(&first);
+        assert!(
+            matches!(first_identity, RepositoryIdentity::Remote(_)),
+            "a clone identifies by its origin URL: {first_identity:?}"
+        );
+        assert_eq!(
+            repository_identity(&second),
+            first_identity,
+            "two clones of one repository identify alike"
+        );
+
+        // A folder with no `.git` of its own identifies as nothing, so it can
+        // never be mistaken for a configured repository.
+        let plain = root.join("plain");
+        fs::create_dir_all(plain.join("tasks")).expect("plain tasks");
+        assert_eq!(repository_identity(&plain), RepositoryIdentity::None);
+
+        // One trailing slash and one trailing `.git` are dropped, so two
+        // spellings of one remote compare equal.
+        assert_eq!(
+            normalize_origin_url("  https://example.com/team/repo.git/  "),
+            "https://example.com/team/repo"
+        );
+        assert_eq!(
+            normalize_origin_url("https://example.com/team/repo"),
+            "https://example.com/team/repo"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Run git in `dir` at `date` and return its trimmed stdout.

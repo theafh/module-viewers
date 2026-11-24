@@ -6,7 +6,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Offset, Utc};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -102,6 +102,10 @@ pub struct AppState {
     offloaded_fs_calls: Arc<AtomicUsize>,
     harvest: Arc<HarvestFn>,
     flash: Arc<Mutex<FlashStore>>,
+    /// A duplicate-clone Add held for confirmation: the already-validated
+    /// canonical path and the repository it duplicates, named by a one-shot
+    /// token the Repositories redirect carries.
+    held_clone: Arc<Mutex<HeldCloneStore>>,
     static_version: String,
 }
 
@@ -123,6 +127,7 @@ impl AppState {
             offloaded_fs_calls: Arc::new(AtomicUsize::new(0)),
             harvest: Arc::new(harvest::harvest_repository_with_prior),
             flash: Arc::new(Mutex::new(FlashStore::default())),
+            held_clone: Arc::new(Mutex::new(HeldCloneStore::default())),
             static_version,
         })
     }
@@ -270,6 +275,54 @@ impl FlashStore {
     }
 }
 
+/// How many duplicate-clone Adds the held store keeps. The bound and its
+/// oldest-first eviction match the flash store, so a redirect whose page read
+/// never happens cannot grow the store for the life of the process.
+const HELD_CLONE_CAPACITY: usize = 32;
+
+/// One duplicate-clone Add held for confirmation. The canonical path was
+/// already validated exactly as Add validates a pick, so the confirm POST stores
+/// that path without touching the picker or the browser body.
+struct HeldClone {
+    path: PathBuf,
+    existing: String,
+}
+
+/// The duplicate-clone Adds a Repositories redirect can name, each by the same
+/// canonical decimal token the flash store uses. The page peeks its slot so a
+/// reload still shows the warning, and the confirm POST takes it, so one held
+/// path is stored at most once.
+#[derive(Default)]
+struct HeldCloneStore {
+    next_token: u64,
+    slots: BTreeMap<u64, HeldClone>,
+}
+
+impl HeldCloneStore {
+    /// Hold one validated path and return the token that names it. Once the
+    /// store holds more than `HELD_CLONE_CAPACITY` slots, the oldest is dropped.
+    fn insert(&mut self, path: PathBuf, existing: String) -> String {
+        self.next_token = self.next_token.wrapping_add(1);
+        let token = self.next_token;
+        self.slots.insert(token, HeldClone { path, existing });
+        while self.slots.len() > HELD_CLONE_CAPACITY {
+            let _ = self.slots.pop_first();
+        }
+        token.to_string()
+    }
+
+    /// The held Add `token` names, without taking it, so the page renders the
+    /// warning and a reload still shows it.
+    fn peek(&self, token: &str) -> Option<&HeldClone> {
+        self.slots.get(&flash_token_key(token)?)
+    }
+
+    /// Take the held Add `token` names, so the confirm POST stores it once.
+    fn take(&mut self, token: &str) -> Option<HeldClone> {
+        self.slots.remove(&flash_token_key(token)?)
+    }
+}
+
 pub fn init_templates() -> anyhow::Result<Tera> {
     let pattern = format!("{}/templates/**/*", env!("CARGO_MANIFEST_DIR"));
     let mut tera = Tera::new(&pattern)?;
@@ -336,6 +389,8 @@ pub fn router(state: AppState) -> Router {
         .route("/repositories", get(repositories_page).post(add_repository))
         .route("/repositories/{id}/delete", post(remove_repository))
         .route("/repositories/{id}/scan", post(scan_repository))
+        .route("/repositories/{id}/path", post(relocate_repository))
+        .route("/repositories/confirm/{token}", post(confirm_repository))
         .route("/status", get(scan_status))
         .route("/scan", post(scan_all))
         .layer(SetResponseHeaderLayer::overriding(
@@ -627,9 +682,11 @@ enum Banner {
     RepositoryAdded,
     RepositoryRemoved,
     RepositoryScanned,
+    RepositoryRelocated,
     ChartsUpdated,
     NothingToUpdate,
     RepositoryExists,
+    RepositoryPathTaken,
     RepositoryListUnreadable,
     RepositorySaveFailed,
     RepositoryRemoveFailed,
@@ -653,9 +710,11 @@ impl Banner {
             Self::RepositoryAdded => "repository-added",
             Self::RepositoryRemoved => "repository-removed",
             Self::RepositoryScanned => "repository-scanned",
+            Self::RepositoryRelocated => "repository-relocated",
             Self::ChartsUpdated => "charts-updated",
             Self::NothingToUpdate => "nothing-to-update",
             Self::RepositoryExists => "repository-exists",
+            Self::RepositoryPathTaken => "repository-path-taken",
             Self::RepositoryListUnreadable => "repository-list-unreadable",
             Self::RepositorySaveFailed => "repository-save-failed",
             Self::RepositoryRemoveFailed => "repository-remove-failed",
@@ -679,9 +738,11 @@ impl Banner {
             Self::RepositoryAdded => "Repository added.",
             Self::RepositoryRemoved => "Repository removed.",
             Self::RepositoryScanned => "Repository rescanned.",
+            Self::RepositoryRelocated => "Repository relocated.",
             Self::ChartsUpdated => "Charts updated.",
             Self::NothingToUpdate => "Nothing to update.",
             Self::RepositoryExists => "That repository is already on the dashboard.",
+            Self::RepositoryPathTaken => "Another repository already uses that folder.",
             Self::RepositoryListUnreadable => "The repository list could not be read.",
             Self::RepositorySaveFailed => "The repository could not be saved.",
             Self::RepositoryRemoveFailed => "The repository could not be removed.",
@@ -707,6 +768,7 @@ impl Banner {
             Self::RepositoryAdded
                 | Self::RepositoryRemoved
                 | Self::RepositoryScanned
+                | Self::RepositoryRelocated
                 | Self::ChartsUpdated
                 | Self::NothingToUpdate
         )
@@ -723,9 +785,11 @@ impl Banner {
             "repository-added" => Self::RepositoryAdded,
             "repository-removed" => Self::RepositoryRemoved,
             "repository-scanned" => Self::RepositoryScanned,
+            "repository-relocated" => Self::RepositoryRelocated,
             "charts-updated" => Self::ChartsUpdated,
             "nothing-to-update" => Self::NothingToUpdate,
             "repository-exists" => Self::RepositoryExists,
+            "repository-path-taken" => Self::RepositoryPathTaken,
             "repository-list-unreadable" => Self::RepositoryListUnreadable,
             "repository-save-failed" => Self::RepositorySaveFailed,
             "repository-remove-failed" => Self::RepositoryRemoveFailed,
@@ -781,6 +845,9 @@ struct FlashQuery {
     notice: String,
     #[serde(default)]
     error: String,
+    /// The token of a duplicate-clone Add held for confirmation.
+    #[serde(default)]
+    confirm: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1041,8 +1108,47 @@ async fn render_dashboard(
 }
 
 async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Result<String> {
+    render_repositories_at(state, query, Utc::now(), &local_offset()).await
+}
+
+/// Render the Repositories page against a fixed reference instant and zone, so
+/// a test pins both instead of depending on the clock and the machine's zone.
+async fn render_repositories_at(
+    state: &AppState,
+    query: &FlashQuery,
+    now: DateTime<Utc>,
+    zone: &FixedOffset,
+) -> anyhow::Result<String> {
     let repositories = db::list_repositories(&state.pool).await?;
-    let projects = repositories.iter().map(project_view).collect::<Vec<_>>();
+    let counts = db::repository_counts(&state.pool)
+        .await?
+        .into_iter()
+        .map(|counts| (counts.repository_id, counts))
+        .collect::<BTreeMap<_, _>>();
+    let projects = repositories
+        .iter()
+        .map(|repo| {
+            let counts = counts
+                .get(&repo.repository_id)
+                .copied()
+                .unwrap_or(db::RepositoryCounts {
+                    repository_id: repo.repository_id,
+                    total: 0,
+                    live: 0,
+                });
+            RepositoryRowView::new(repo, counts, now, zone)
+        })
+        .collect::<Vec<_>>();
+    // A held duplicate-clone Add renders its warning and Confirm form from the
+    // one-shot slot the redirect named. The page only peeks, so a reload still
+    // shows the warning; the confirm POST takes the slot.
+    let confirm = {
+        let held = state.held_clone.lock().await;
+        held.peek(&query.confirm).map(|held| ConfirmView {
+            token: query.confirm.clone(),
+            existing: held.existing.clone(),
+        })
+    };
     let (notice, error) = match query_banner(&query.notice, &query.error) {
         Some(banner) => split_banner(banner.key(), banner.message().to_string()),
         None => (String::new(), String::new()),
@@ -1053,6 +1159,7 @@ async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Re
         projects,
         notice,
         error,
+        confirm,
         has_projects: !repositories.is_empty(),
     };
     let context = Context::from_serialize(page)?;
@@ -1191,26 +1298,113 @@ fn selected_id(repositories: &[Repository], project: &str) -> Option<i64> {
         .then_some(id)
 }
 
+/// The machine's local zone for this render, taken from the system clock's
+/// current offset.
+fn local_offset() -> FixedOffset {
+    chrono::Local::now().offset().fix()
+}
+
+/// Format one stored stamp as a human local time, appending how old it is once
+/// the UTC day difference reaches one. A stamp that does not parse keeps its raw
+/// text, so a spelling an older build stored still shows. `now` and `zone` are
+/// parameters, so a test fixes both instead of depending on the clock and the
+/// machine's zone.
+fn human_stamp(stamp: &str, now: DateTime<Utc>, zone: &FixedOffset) -> String {
+    let Some(instant) = scan_instant(stamp) else {
+        return stamp.to_string();
+    };
+    let rendered = instant
+        .with_timezone(zone)
+        .format("%Y-%m-%d %H:%M")
+        .to_string();
+    let days = (now.date_naive() - instant.date_naive()).num_days();
+    if days < 1 {
+        return rendered;
+    }
+    let noun = if days == 1 { "day" } else { "days" };
+    format!("{rendered} ({days} {noun} ago)")
+}
+
 fn project_view(repo: &Repository) -> ProjectView {
+    project_view_at(repo, Utc::now(), &local_offset())
+}
+
+/// One repository as the dashboard's rows render it, with both stored stamps
+/// formatted as human local times.
+fn project_view_at(repo: &Repository, now: DateTime<Utc>, zone: &FixedOffset) -> ProjectView {
     ProjectView {
         id: repo.repository_id,
         id_str: repo.repository_id.to_string(),
         name: repo.name.clone(),
         path: repo.path.clone(),
-        created_at: repo.created_at.clone(),
-        scanned_at: repo.scanned_at.clone(),
+        created_at: human_stamp(&repo.created_at, now, zone),
+        scanned_at: repo
+            .scanned_at
+            .as_deref()
+            .map(|stamp| human_stamp(stamp, now, zone)),
         last_error: repo.last_error.clone().unwrap_or_default(),
     }
 }
 
+/// One repository as the Repositories page renders it: the dashboard's fields
+/// plus the row counts that page shows, so `project_view` keeps its shape.
+#[derive(Serialize)]
+struct RepositoryRowView {
+    id: i64,
+    id_str: String,
+    name: String,
+    path: String,
+    created_at: String,
+    scanned_at: Option<String>,
+    last_error: String,
+    /// `N tasks · M live`, or empty for a repository that was never scanned, so
+    /// the row reads `not scanned yet` instead of a pair of zeros.
+    counts: String,
+}
+
+impl RepositoryRowView {
+    fn new(
+        repo: &Repository,
+        counts: db::RepositoryCounts,
+        now: DateTime<Utc>,
+        zone: &FixedOffset,
+    ) -> Self {
+        let project = project_view_at(repo, now, zone);
+        let counts = match project.scanned_at {
+            Some(_) => format!("{} tasks · {} live", counts.total, counts.live),
+            None => String::new(),
+        };
+        Self {
+            id: project.id,
+            id_str: project.id_str,
+            name: project.name,
+            path: project.path,
+            created_at: project.created_at,
+            scanned_at: project.scanned_at,
+            last_error: project.last_error,
+            counts,
+        }
+    }
+}
+
 fn scan_label(repositories: &[Repository], selected: Option<i64>) -> String {
+    scan_label_at(repositories, selected, Utc::now(), &local_offset())
+}
+
+/// The dashboard header's freshness line against a fixed reference instant and
+/// zone. The oldest parseable stamp in scope is the day the numbers are current
+/// to: a repository that failed keeps the stamp of its last successful scan, so
+/// the header never claims the freshest repository instead.
+fn scan_label_at(
+    repositories: &[Repository],
+    selected: Option<i64>,
+    now: DateTime<Utc>,
+    zone: &FixedOffset,
+) -> String {
     let in_scope = repositories
         .iter()
         .filter(|repo| selected.is_none_or(|id| repo.repository_id == id));
     let in_scope = in_scope.collect::<Vec<_>>();
-    // The oldest parseable stamp is the day the numbers are current to: a
-    // repository that failed keeps the stamp of its last successful scan, so the
-    // header never claims the freshest repository instead.
     let oldest = in_scope
         .iter()
         .filter_map(|repo| repo.scanned_at.as_deref())
@@ -1233,7 +1427,7 @@ fn scan_label(repositories: &[Repository], selected: Option<i64>) -> String {
     // reads as an unknown time rather than as a folder that was never scanned.
     let any_stamp = in_scope.iter().any(|repo| repo.scanned_at.is_some());
     let mut label = match oldest {
-        Some(stamp) => format!("Oldest scan {stamp}"),
+        Some(stamp) => format!("Oldest scan {}", human_stamp(stamp, now, zone)),
         None if any_stamp => "Last scan unknown".to_string(),
         None => "Not scanned yet".to_string(),
     };
@@ -1310,10 +1504,18 @@ struct DashboardPage {
 struct RepositoriesPage {
     version: String,
     page: &'static str,
-    projects: Vec<ProjectView>,
+    projects: Vec<RepositoryRowView>,
     notice: String,
     error: String,
+    confirm: Option<ConfirmView>,
     has_projects: bool,
+}
+
+/// The warning and Confirm form a held duplicate-clone Add renders.
+#[derive(Serialize)]
+struct ConfirmView {
+    token: String,
+    existing: String,
 }
 
 #[derive(Serialize)]
@@ -1349,15 +1551,26 @@ struct ProjectView {
     last_error: String,
 }
 
-async fn add_repository(State(state): State<AppState>) -> Response {
+/// What one folder-picking step produced: a canonical folder that passed the
+/// `tasks/` probe, or a dialog the person dismissed.
+enum ChosenFolder {
+    Chosen(PathBuf),
+    Cancelled,
+}
+
+/// Open the folder picker, canonicalize the pick, and probe `tasks/` exactly as
+/// Add always has: the working tree's `tasks/`, or a ref union that carries one.
+/// Add and Relocate both go through this, so a relocate accepts the same folders
+/// an add does.
+async fn choose_folder(state: &AppState) -> Result<ChosenFolder, Banner> {
     let picker = Arc::clone(&state.picker);
     let picked = match tokio::task::spawn_blocking(move || picker()).await {
         Ok(Ok(picked)) => picked,
-        Ok(Err(banner)) => return redirect_repositories(banner),
-        Err(_) => return redirect_repositories(Banner::PickerNoSession),
+        Ok(Err(banner)) => return Err(banner),
+        Err(_) => return Err(Banner::PickerNoSession),
     };
     let picked = match picked {
-        PickerResult::Cancelled => return Redirect::to("/repositories").into_response(),
+        PickerResult::Cancelled => return Ok(ChosenFolder::Cancelled),
         // The picker's stderr belongs in the log, never in the redirect: the
         // banner is one fixed code, so the query carries no free text.
         PickerResult::Failed(stderr) => {
@@ -1365,7 +1578,7 @@ async fn add_repository(State(state): State<AppState>) -> Response {
                 stderr = %String::from_utf8_lossy(&stderr),
                 "the folder picker failed"
             );
-            return redirect_repositories(Banner::PickerFailed);
+            return Err(Banner::PickerFailed);
         }
         PickerResult::Picked(raw) => raw,
     };
@@ -1376,14 +1589,14 @@ async fn add_repository(State(state): State<AppState>) -> Response {
                 path = %String::from_utf8_lossy(&picked),
                 "the picked folder path is not valid UTF-8"
             );
-            return redirect_repositories(banner);
+            return Err(banner);
         }
     };
     // A picker that exits cleanly without naming a path produced no usable
     // selection, which is the same failure as a picker error with no stderr.
     if picked.is_empty() {
         tracing::error!("the folder picker returned no path");
-        return redirect_repositories(Banner::PickerFailed);
+        return Err(Banner::PickerFailed);
     }
     let picked = PathBuf::from(picked);
 
@@ -1396,7 +1609,7 @@ async fn add_repository(State(state): State<AppState>) -> Response {
         // A path that does not exist names no tasks directory; every other
         // resolution failure is a folder this process cannot read.
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return redirect_repositories(Banner::NoTasksDirectory);
+            return Err(Banner::NoTasksDirectory);
         }
         Ok(Err(error)) => {
             tracing::error!(
@@ -1404,7 +1617,7 @@ async fn add_repository(State(state): State<AppState>) -> Response {
                 path = %picked.display(),
                 "the picked folder could not be resolved"
             );
-            return redirect_repositories(Banner::FolderUnreadable);
+            return Err(Banner::FolderUnreadable);
         }
         Err(error) => {
             tracing::error!(
@@ -1412,7 +1625,7 @@ async fn add_repository(State(state): State<AppState>) -> Response {
                 path = %picked.display(),
                 "the picked folder probe stopped"
             );
-            return redirect_repositories(Banner::FolderUnreadable);
+            return Err(Banner::FolderUnreadable);
         }
     };
 
@@ -1432,7 +1645,7 @@ async fn add_repository(State(state): State<AppState>) -> Response {
                 path = %tasks_dir.display(),
                 "the picked folder's tasks directory could not be read"
             );
-            return redirect_repositories(Banner::FolderUnreadable);
+            return Err(Banner::FolderUnreadable);
         }
         Err(error) => {
             tracing::error!(
@@ -1440,7 +1653,7 @@ async fn add_repository(State(state): State<AppState>) -> Response {
                 path = %tasks_dir.display(),
                 "the tasks probe stopped"
             );
-            return redirect_repositories(Banner::FolderUnreadable);
+            return Err(Banner::FolderUnreadable);
         }
     };
     // A folder whose working tree lacks `tasks/` is still accepted when a ref of
@@ -1452,35 +1665,131 @@ async fn add_repository(State(state): State<AppState>) -> Response {
         let probe = canonical.clone();
         match tokio::task::spawn_blocking(move || harvest::holds_tasks(&probe)).await {
             Ok(true) => {}
-            Ok(false) => return redirect_repositories(Banner::NoTasksDirectory),
+            Ok(false) => return Err(Banner::NoTasksDirectory),
             Err(error) => {
                 tracing::error!(
                     %error,
                     path = %canonical.display(),
                     "the ref union probe stopped"
                 );
-                return redirect_repositories(Banner::FolderUnreadable);
+                return Err(Banner::FolderUnreadable);
             }
         }
     }
+    Ok(ChosenFolder::Chosen(canonical))
+}
 
-    // The insert and the first harvest run in their own task that takes the scan
-    // lock itself, so a request that disconnects drops only the handler: the
-    // store keeps the lock and finishes before the next Add, Update, or Remove
-    // can touch the same repository.
+async fn add_repository(State(state): State<AppState>) -> Response {
+    let canonical = match choose_folder(&state).await {
+        Ok(ChosenFolder::Chosen(path)) => path,
+        Ok(ChosenFolder::Cancelled) => return Redirect::to("/repositories").into_response(),
+        Err(banner) => return redirect_repositories(banner),
+    };
+
+    // The identity check, the insert, and the first harvest run in their own task
+    // that takes the scan lock itself, so a request that disconnects drops only
+    // the handler: the store keeps the lock and finishes before the next Add,
+    // Update, or Remove can touch the same repository.
     let store_state = state.clone();
     let store_path = canonical;
     let store = tokio::spawn(async move {
         let _guard = store_state.scan.lock().await;
-        store_repository(&store_state, &store_path).await
+        store_added(&store_state, &store_path).await
     });
     match store.await {
-        Ok(Ok(())) => redirect_repositories(Banner::RepositoryAdded),
+        Ok(Ok(AddOutcome::Stored)) => redirect_repositories(Banner::RepositoryAdded),
+        // A second clone is held under a one-shot token instead of being stored,
+        // so the redirect carries no path and the page names the repository it
+        // duplicates.
+        Ok(Ok(AddOutcome::DuplicateClone { path, existing })) => {
+            let token = state.held_clone.lock().await.insert(path, existing);
+            Redirect::to(&format!("/repositories?confirm={token}")).into_response()
+        }
         Ok(Err(banner)) => redirect_repositories(banner),
         Err(error) => {
             tracing::error!(%error, "the Add store task stopped");
             redirect_repositories(Banner::RepositorySaveFailed)
         }
+    }
+}
+
+/// What one Add attempt's store stage produced.
+enum AddOutcome {
+    Stored,
+    /// The folder duplicates a configured repository, so its validated path is
+    /// held for confirmation instead of being stored.
+    DuplicateClone {
+        path: PathBuf,
+        existing: String,
+    },
+}
+
+/// Store one already-chosen folder, or report the configured repository it
+/// duplicates. The exact stored path is still refused first, so adding the same
+/// folder twice keeps its existing message instead of reading as a clone.
+async fn store_added(state: &AppState, path: &std::path::Path) -> Result<AddOutcome, Banner> {
+    let path_text = path.to_string_lossy();
+    if db::path_exists(&state.pool, &path_text)
+        .await
+        .map_err(|_| Banner::RepositoryListUnreadable)?
+    {
+        return Err(Banner::RepositoryExists);
+    }
+    let existing = db::list_repositories(&state.pool)
+        .await
+        .map_err(|_| Banner::RepositoryListUnreadable)?;
+    if let Some(existing) = duplicate_clone(&existing, path).await {
+        return Ok(AddOutcome::DuplicateClone {
+            path: path.to_path_buf(),
+            existing,
+        });
+    }
+    store_repository(state, path).await?;
+    Ok(AddOutcome::Stored)
+}
+
+/// The name of the configured repository `path` duplicates, or `None`.
+///
+/// Each configured repository is identified by its canonical origin URL or, for
+/// one with no remote, by its canonical git common directory, and the candidate
+/// is compared against them the same way. The reads run git through
+/// `harvest::repository_identity`, so the bounded deadline and the scrubbed
+/// environment apply, and they run on a blocking worker because git is a
+/// subprocess.
+async fn duplicate_clone(existing: &[Repository], path: &std::path::Path) -> Option<String> {
+    if existing.is_empty() {
+        return None;
+    }
+    let candidate = path.to_path_buf();
+    let configured = existing
+        .iter()
+        .map(|repository| (repository.name.clone(), PathBuf::from(&repository.path)))
+        .collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        let identity = harvest::repository_identity(&candidate);
+        if identity == harvest::RepositoryIdentity::None {
+            return None;
+        }
+        configured.into_iter().find_map(|(name, folder)| {
+            (harvest::repository_identity(&folder) == identity).then_some(name)
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Store the held path of a duplicate-clone Add once the person confirmed it.
+/// The slot is taken under the scan lock, so one held path is stored at most
+/// once and a token the store no longer holds reports the not-found code.
+async fn confirm_repository(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+    let _guard = state.scan.lock().await;
+    let Some(held) = state.held_clone.lock().await.take(&token) else {
+        return redirect_repositories(Banner::RepositoryNotFound);
+    };
+    match store_repository(&state, &held.path).await {
+        Ok(()) => redirect_repositories(Banner::RepositoryAdded),
+        Err(banner) => redirect_repositories(banner),
     }
 }
 
@@ -1564,6 +1873,58 @@ async fn scan_repository(State(state): State<AppState>, Path(id): Path<i64>) -> 
     match refresh_one(&state.pool, &state.store_hook, id, &path).await {
         Some(banner) => redirect_repositories(banner),
         None => redirect_repositories(Banner::RepositoryScanned),
+    }
+}
+
+/// Move one repository to a folder the person picks, keeping its id and its
+/// stored rows. The pick passes the same canonicalize-and-probe step Add uses,
+/// a path another repository already stores is refused, and only the relocated
+/// repository is re-harvested, under the scan lock, so its rows read the new
+/// folder and its scan stamp is fresh.
+async fn relocate_repository(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let canonical = match choose_folder(&state).await {
+        Ok(ChosenFolder::Chosen(path)) => path,
+        Ok(ChosenFolder::Cancelled) => return Redirect::to("/repositories").into_response(),
+        Err(banner) => return redirect_repositories(banner),
+    };
+    let _guard = state.scan.lock().await;
+    let repositories = match db::list_repositories(&state.pool).await {
+        Ok(repositories) => repositories,
+        Err(error) => {
+            tracing::error!(%error, "list failed");
+            return redirect_repositories(Banner::RepositoryListUnreadable);
+        }
+    };
+    let Some(repository) = repositories
+        .iter()
+        .find(|repository| repository.repository_id == id)
+    else {
+        return redirect_repositories(Banner::RepositoryNotFound);
+    };
+    let path_text = canonical.to_string_lossy();
+    // Relocating to the folder the repository already stores re-harvests it
+    // rather than reporting a collision with itself.
+    if repository.path.as_str() != path_text.as_ref() {
+        match db::path_exists(&state.pool, &path_text).await {
+            Ok(true) => return redirect_repositories(Banner::RepositoryPathTaken),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(%error, "path lookup failed");
+                return redirect_repositories(Banner::RepositoryListUnreadable);
+            }
+        }
+    }
+    match db::update_repository_path(&state.pool, id, &path_text).await {
+        Ok(0) => return redirect_repositories(Banner::RepositoryNotFound),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, repository_id = id, "the path could not be updated");
+            return redirect_repositories(Banner::RepositorySaveFailed);
+        }
+    }
+    match refresh_one(&state.pool, &state.store_hook, id, &canonical).await {
+        Some(banner) => redirect_repositories(banner),
+        None => redirect_repositories(Banner::RepositoryRelocated),
     }
 }
 
@@ -2128,12 +2489,13 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Banner, FLASH_CAPACITY, FlashStore, GIT_ERROR, HarvestFn, HomeQuery,
+        AppState, Banner, FLASH_CAPACITY, FlashQuery, FlashStore, GIT_ERROR, HarvestFn, HomeQuery,
         MISSING_TASKS_ERROR, PickerFn, PickerResult, PriorReadHookFn, ProjectForm, STOPPED_ERROR,
-        ScanFailure, ScanReport, StoreHookFn, add_repository, claim_banner, encode_query,
-        flash_banner, init_templates, is_local_host, osascript_outcome, query_banner,
-        record_scan_error, remaining, remove_repository, render_blocking_thread, render_home,
-        router, scan_all, scan_core, scan_flash, scan_instant, scan_label, scan_response,
+        ScanFailure, ScanReport, StoreHookFn, add_repository, claim_banner, confirm_repository,
+        encode_query, flash_banner, human_stamp, init_templates, is_local_host, local_offset,
+        osascript_outcome, query_banner, record_scan_error, relocate_repository, remaining,
+        remove_repository, render_blocking_thread, render_home, render_repositories_at, router,
+        scan_all, scan_core, scan_flash, scan_instant, scan_label_at, scan_response,
         scan_worker_cap, serve, serve_until_stopped, static_version, store_hook_from,
         zenity_outcome,
     };
@@ -2146,6 +2508,7 @@ mod tests {
     use axum::extract::Path as UrlPath;
     use axum::extract::State;
     use axum::http::{Method, Request, StatusCode, header};
+    use chrono::{DateTime, FixedOffset, Utc};
     use std::future::ready;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -3330,8 +3693,8 @@ mod tests {
     }
 
     /// Covers: an unscanned repository renders "not scanned yet" once, with no
-    /// doubled "scanned Not scanned yet", while a scanned repository still
-    /// renders its timestamp.
+    /// doubled "scanned Not scanned yet", while a scanned repository renders its
+    /// stamp as a human local time instead of the raw ISO text.
     #[tokio::test(flavor = "current_thread")]
     async fn web_repositories_page_renders_the_scan_label_once() {
         let (state, path) = app_state("repo_scan_label").await;
@@ -3370,14 +3733,433 @@ mod tests {
             !body.contains("scanned not scanned yet") && !body.contains("scanned Not scanned yet"),
             "the unscanned repository never doubles the scanned phrase"
         );
+        let expected = human_stamp(&stamp, Utc::now(), &local_offset());
         assert!(
-            body.contains(&format!("scanned {stamp}")),
-            "the scanned repository still renders its timestamp"
+            body.contains(&format!("scanned {expected}")),
+            "the scanned repository renders its stamp as a human local time"
+        );
+        assert!(
+            !body.contains(&stamp),
+            "the raw ISO stamp no longer reaches the page"
         );
 
         let _ = std::fs::remove_dir_all(unscanned);
         let _ = std::fs::remove_dir_all(scanned);
         cleanup(&path);
+    }
+
+    /// Covers: each row shows its total and live row counts from the grouped
+    /// select, a repository that was never scanned reads `not scanned yet`
+    /// instead of a pair of zeros, and the name links to the filtered dashboard.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_repositories_page_counts_rows_and_links_the_dashboard() {
+        let (state, path) = app_state("repo_counts").await;
+        let counted = live_repository("repo_counts_counted");
+        let id = db::insert_repository(&state.pool, "counted", &counted.to_string_lossy())
+            .await
+            .expect("insert");
+        let rows = vec![
+            parsed_task(),
+            ParsedTask {
+                path: "tasks/archive/scope_done.md".to_string(),
+                kind: TaskKind::Finished,
+                ship_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 6, 1).expect("date")),
+                leave_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 6, 1).expect("date")),
+                ..parsed_task()
+            },
+            ParsedTask {
+                path: "tasks/archive/scope_later.md".to_string(),
+                kind: TaskKind::Deferred,
+                leave_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 6, 2).expect("date")),
+                ..parsed_task()
+            },
+        ];
+        db::replace_tasks(&state.pool, id, &rows, immediate_store_hook().as_ref())
+            .await
+            .expect("store rows");
+        let unscanned = live_repository("repo_counts_unscanned");
+        db::insert_repository(&state.pool, "unscanned", &unscanned.to_string_lossy())
+            .await
+            .expect("insert unscanned");
+
+        let body =
+            body_text(send(state.clone(), get_page("/repositories", "127.0.0.1:7880")).await).await;
+
+        assert!(
+            body.contains("3 tasks · 1 live"),
+            "the row shows its total and live counts"
+        );
+        assert!(
+            !body.contains("0 tasks · 0 live"),
+            "an unscanned repository shows no pair of zeros"
+        );
+        assert!(
+            body.contains(&format!("href=\"/?project={id}\"")),
+            "the repository name links to its filtered dashboard"
+        );
+
+        let _ = std::fs::remove_dir_all(counted);
+        let _ = std::fs::remove_dir_all(unscanned);
+        cleanup(&path);
+    }
+
+    /// Covers: the stored stamps render as human local times with a relative
+    /// `N days ago` past one day, against a fixed reference instant and zone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_repositories_page_renders_human_stamps() {
+        let (state, path) = app_state("repo_human_stamps").await;
+        let folder = live_repository("repo_human_stamps_folder");
+        let id = db::insert_repository(&state.pool, "stamped", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        sqlx::query(
+            "UPDATE repositories SET created_at = ?, scanned_at = ? WHERE repository_id = ?",
+        )
+        .bind("2026-11-01T09:30:00Z")
+        .bind("2026-11-08T23:45:00Z")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .expect("stamp the repository");
+
+        let now = DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
+            .expect("reference instant")
+            .with_timezone(&Utc);
+        let zone = FixedOffset::east_opt(3600).expect("one hour east");
+        let body = render_repositories_at(&state, &FlashQuery::default(), now, &zone)
+            .await
+            .expect("render");
+
+        assert!(
+            body.contains("2026-11-01 10:30 (10 days ago)"),
+            "the Added stamp renders in the fixed zone with its age: {body}"
+        );
+        assert!(
+            body.contains("2026-11-09 00:45 (3 days ago)"),
+            "the scan stamp renders in the fixed zone with its age: {body}"
+        );
+        assert!(
+            !body.contains("2026-11-08T23:45:00Z"),
+            "no raw ISO stamp reaches the page"
+        );
+
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Covers: a relocate writes the picked path, keeps every stored row, and
+    /// leaves a fresh scan stamp after the immediate re-harvest.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_relocate_writes_the_new_path_and_keeps_the_rows() {
+        let (mut state, path) = app_state("relocate_rows").await;
+        let folder = live_repository("relocate_rows_repo");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        add_repository(State(state.clone())).await;
+        let repository = db::list_repositories(&state.pool).await.expect("list")[0].clone();
+        sqlx::query("UPDATE repositories SET scanned_at = ? WHERE repository_id = ?")
+            .bind("2026-01-01T00:00:00Z")
+            .bind(repository.repository_id)
+            .execute(&state.pool)
+            .await
+            .expect("age the stamp");
+
+        let moved = folder.with_file_name("relocate_rows_repo_moved");
+        std::fs::rename(&folder, &moved).expect("move the folder");
+        let expected = std::fs::canonicalize(&moved).expect("canonical moved path");
+        let picked = moved.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+
+        let response =
+            relocate_repository(State(state.clone()), UrlPath(repository.repository_id)).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=repository-relocated"
+        );
+        let relocated = db::list_repositories(&state.pool).await.expect("list")[0].clone();
+        assert_eq!(relocated.path, expected.to_string_lossy());
+        assert_eq!(
+            db::load_tasks(&state.pool, Some(relocated.repository_id))
+                .await
+                .expect("rows")
+                .len(),
+            1,
+            "every stored row survives the move"
+        );
+        assert!(
+            relocated.scanned_at.as_deref().unwrap_or_default() > "2026-01-01T00:00:00Z",
+            "the immediate re-harvest leaves a fresh scan stamp"
+        );
+
+        let _ = std::fs::remove_dir_all(moved);
+        cleanup(&path);
+    }
+
+    /// Covers: a relocate to a path another repository already stores is refused
+    /// and leaves both repositories as they were.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_relocate_refuses_a_path_another_repository_stores() {
+        let (mut state, path) = app_state("relocate_taken").await;
+        let first = live_repository("relocate_taken_first");
+        let second = live_repository("relocate_taken_second");
+        for folder in [&first, &second] {
+            let picked = folder.clone();
+            state.picker = Arc::new(move || Ok(picked_path(&picked)));
+            add_repository(State(state.clone())).await;
+        }
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        let first_repo = repositories
+            .iter()
+            .find(|repository| repository.path.contains("relocate_taken_first"))
+            .expect("first repository")
+            .clone();
+        let second_repo = repositories
+            .iter()
+            .find(|repository| repository.path.contains("relocate_taken_second"))
+            .expect("second repository")
+            .clone();
+
+        let picked = second.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        let response =
+            relocate_repository(State(state.clone()), UrlPath(first_repo.repository_id)).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?error=repository-path-taken"
+        );
+        let after = db::list_repositories(&state.pool).await.expect("list");
+        let first_after = after
+            .iter()
+            .find(|repository| repository.repository_id == first_repo.repository_id)
+            .expect("first repository");
+        let second_after = after
+            .iter()
+            .find(|repository| repository.repository_id == second_repo.repository_id)
+            .expect("second repository");
+        assert_eq!(first_after.path, first_repo.path, "the move is refused");
+        assert_eq!(
+            second_after.path, second_repo.path,
+            "the other row is untouched"
+        );
+        for repository in [first_after, second_after] {
+            assert_eq!(
+                db::load_tasks(&state.pool, Some(repository.repository_id))
+                    .await
+                    .expect("rows")
+                    .len(),
+                1,
+                "both repositories keep their rows"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(first);
+        let _ = std::fs::remove_dir_all(second);
+        cleanup(&path);
+    }
+
+    /// Covers: adding a second clone of a configured repository reports the
+    /// existing repository, stores nothing until the confirm token is posted,
+    /// and stores it once confirmed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_holds_a_second_clone_until_confirmed() {
+        let (mut state, path) = app_state("add_clone").await;
+        let root = unique_temp_dir("add_clone_root");
+        std::fs::create_dir_all(root.join("source/tasks")).expect("tasks");
+        git(
+            &root.join("source"),
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::write(
+            root.join("source/tasks/scope_clone.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Clone\n",
+        )
+        .expect("task");
+        git(
+            &root.join("source"),
+            &["add", "-A"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &root.join("source"),
+            &["commit", "-m", "tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let first = root.join("first");
+        let second = root.join("second");
+        for clone in [&first, &second] {
+            git(
+                &root,
+                &[
+                    "clone",
+                    root.join("source").to_str().expect("utf-8 path"),
+                    clone.to_str().expect("utf-8 path"),
+                ],
+                "2026-05-01T12:00:00+00:00",
+            );
+        }
+
+        let picked = first.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        add_repository(State(state.clone())).await;
+        assert_eq!(
+            db::list_repositories(&state.pool)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "the first clone is stored"
+        );
+
+        let picked = second.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        let response = add_repository(State(state.clone())).await;
+        let location = redirect_location(&response);
+        let token = location
+            .strip_prefix("/repositories?confirm=")
+            .unwrap_or_else(|| panic!("a duplicate clone redirects to its token: {location}"))
+            .to_string();
+        assert_eq!(
+            db::list_repositories(&state.pool)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "the second clone is not stored before the confirm"
+        );
+
+        let page = body_text(
+            send(
+                state.clone(),
+                get_page(&format!("/repositories?confirm={token}"), "127.0.0.1:7880"),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            page.contains("This folder is a second clone of <strong>first</strong>"),
+            "the banner names the existing repository: {page}"
+        );
+        assert!(
+            page.contains(&format!("/repositories/confirm/{token}")),
+            "the page carries the confirm form"
+        );
+
+        let response = confirm_repository(State(state.clone()), UrlPath(token.clone())).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=repository-added"
+        );
+        assert_eq!(
+            db::list_repositories(&state.pool)
+                .await
+                .expect("list")
+                .len(),
+            2,
+            "the confirmed clone is stored"
+        );
+        let response = confirm_repository(State(state.clone()), UrlPath(token)).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?error=repository-not-found",
+            "a held path is stored at most once"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        cleanup(&path);
+    }
+
+    /// Covers: a second worktree of a configured repository shares its git
+    /// common directory, so Add detects it as a duplicate the same way.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_add_detects_a_worktree_by_its_common_directory() {
+        let (mut state, path) = app_state("add_worktree").await;
+        let root = unique_temp_dir("add_worktree_root");
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("tasks")).expect("tasks");
+        git(
+            &source,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::write(
+            source.join("tasks/scope_worktree.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Worktree\n",
+        )
+        .expect("task");
+        git(&source, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &source,
+            &["commit", "-m", "tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let worktree = root.join("worktree");
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().expect("utf-8 path"),
+                "-b",
+                "wt",
+            ],
+            "2026-05-01T12:00:00+00:00",
+        );
+
+        let picked = source.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        add_repository(State(state.clone())).await;
+        let picked = worktree.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        let response = add_repository(State(state.clone())).await;
+        let location = redirect_location(&response);
+        assert!(
+            location.starts_with("/repositories?confirm="),
+            "the worktree is held as a duplicate: {location}"
+        );
+        assert_eq!(
+            db::list_repositories(&state.pool)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "the worktree is not stored before the confirm"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        cleanup(&path);
+    }
+
+    /// Covers: a long repository path wraps at a narrow width, and the action
+    /// column keeps its own column layout at the row end.
+    #[test]
+    fn web_repositories_style_wraps_a_long_path() {
+        let row = css_rule(".repo-list div");
+        assert!(
+            row.split(';')
+                .any(|declaration| declaration.trim() == "min-width: 0"),
+            "the row body may shrink so the path wraps: {row}"
+        );
+        let path_rule = css_rule(".repo-path");
+        assert!(
+            path_rule
+                .split(';')
+                .any(|declaration| declaration.trim() == "overflow-wrap: anywhere"),
+            "the path wraps anywhere: {path_rule}"
+        );
+        let actions = css_rule(".repo-list .repo-actions");
+        assert!(
+            actions
+                .split(';')
+                .any(|declaration| declaration.trim() == "flex-direction: column"),
+            "the action forms sit in one column: {actions}"
+        );
+        assert!(
+            actions
+                .split(';')
+                .any(|declaration| declaration.trim() == "align-items: flex-end"),
+            "the action column sits at the row end: {actions}"
+        );
     }
 
     /// The CSP carries `frame-ancestors` alone, so it restricts no script
@@ -3477,6 +4259,12 @@ mod tests {
                 scanned_at: scanned_at.map(str::to_string),
                 last_error: last_error.map(str::to_string),
             };
+        // A fixed reference instant and zone keep the human rendering independent
+        // of the clock and the machine's own zone.
+        let now = DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
+            .expect("reference instant")
+            .with_timezone(&Utc);
+        let zone = FixedOffset::east_opt(3600).expect("one hour east");
 
         // 2026-11-09 00:30 Berlin is 2026-11-08 23:30 UTC, earlier than the
         // 23:45 UTC scan, even though its text sorts later. The oldest stamp is
@@ -3486,8 +4274,8 @@ mod tests {
             repository(2, Some("2026-11-08T23:45Z"), None),
         ];
         assert_eq!(
-            scan_label(&repositories, None),
-            "Oldest scan 2026-11-09 00:30"
+            scan_label_at(&repositories, None, now, &zone),
+            "Oldest scan 2026-11-09 00:30 (3 days ago)"
         );
 
         // One fresh and one failed repository: the failed repository's last
@@ -3501,8 +4289,8 @@ mod tests {
             ),
         ];
         assert_eq!(
-            scan_label(&repositories, None),
-            "Oldest scan 2026-11-09T08:00Z · 1 repository stale"
+            scan_label_at(&repositories, None, now, &zone),
+            "Oldest scan 2026-11-09 09:00 (2 days ago) · 1 repository stale"
         );
 
         // A stored stamp that does not parse reads as an unknown time, not as
@@ -3512,14 +4300,17 @@ mod tests {
             repository(2, Some("unknown"), None),
         ];
         assert_eq!(
-            scan_label(&repositories, None),
+            scan_label_at(&repositories, None, now, &zone),
             "Last scan unknown · 2 repositories stale"
         );
 
         // A repository with no stamp at all was never scanned, so it is not
         // stale: nothing has read it yet.
         let repositories = vec![repository(1, None, None)];
-        assert_eq!(scan_label(&repositories, None), "Not scanned yet");
+        assert_eq!(
+            scan_label_at(&repositories, None, now, &zone),
+            "Not scanned yet"
+        );
 
         // A selected repository scopes both the oldest stamp and the stale
         // count.
@@ -3532,8 +4323,8 @@ mod tests {
             ),
         ];
         assert_eq!(
-            scan_label(&repositories, Some(1)),
-            "Oldest scan 2026-11-10T08:00Z"
+            scan_label_at(&repositories, Some(1), now, &zone),
+            "Oldest scan 2026-11-10 09:00 (1 day ago)"
         );
     }
 

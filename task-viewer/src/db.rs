@@ -416,6 +416,38 @@ pub async fn path_exists(pool: &Pool<Sqlite>, path: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// One repository's stored row counts: every parsed row it contributes and how
+/// many of those are live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepositoryCounts {
+    pub repository_id: i64,
+    pub total: i64,
+    pub live: i64,
+}
+
+/// The row counts for every configured repository, read with one grouped select
+/// so a repository with no stored rows still appears with two zeros.
+pub async fn repository_counts(pool: &Pool<Sqlite>) -> Result<Vec<RepositoryCounts>> {
+    let rows = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT r.repository_id,
+                COUNT(t.task_id),
+                COALESCE(SUM(CASE WHEN t.kind = 'live' THEN 1 ELSE 0 END), 0)
+         FROM repositories r
+         LEFT JOIN tasks t ON t.repository_id = r.repository_id
+         GROUP BY r.repository_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(repository_id, total, live)| RepositoryCounts {
+            repository_id,
+            total,
+            live,
+        })
+        .collect())
+}
+
 pub async fn insert_repository(pool: &Pool<Sqlite>, name: &str, path: &str) -> Result<i64> {
     let result = sqlx::query("INSERT INTO repositories (name, path, created_at) VALUES (?, ?, ?)")
         .bind(name)
@@ -428,6 +460,23 @@ pub async fn insert_repository(pool: &Pool<Sqlite>, name: &str, path: &str) -> R
 
 pub async fn delete_repository(pool: &Pool<Sqlite>, repository_id: i64) -> Result<u64> {
     let result = sqlx::query("DELETE FROM repositories WHERE repository_id = ?")
+        .bind(repository_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Move one repository to a new folder path, keeping its id and its stored
+/// rows. Returns the number of rows changed, so a caller reports an unknown id
+/// instead of claiming a move. The `path` column's UNIQUE constraint backs a
+/// caller's own refusal of a path another repository already stores.
+pub async fn update_repository_path(
+    pool: &Pool<Sqlite>,
+    repository_id: i64,
+    path: &str,
+) -> Result<u64> {
+    let result = sqlx::query("UPDATE repositories SET path = ? WHERE repository_id = ?")
+        .bind(path)
         .bind(repository_id)
         .execute(pool)
         .await?;
@@ -785,8 +834,9 @@ mod tests {
     use super::{
         PathSource, SCHEMA, SCHEMA_VERSION, StoreHookFn, create_parent_dir, database_path,
         delete_repository, init, init_at, init_with, is_locked, list_repositories,
-        load_prior_tasks, load_tasks, migrate, now_stamp, replace_tasks, set_scan_error, test_db,
-        test_migration, test_version_read, test_worker_name,
+        load_prior_tasks, load_tasks, migrate, now_stamp, replace_tasks, repository_counts,
+        set_scan_error, test_db, test_migration, test_version_read, test_worker_name,
+        update_repository_path,
     };
     use crate::harvest::{ParsedTask, TaskKind};
     use crate::test_support::unique_temp_dir;
@@ -1807,6 +1857,124 @@ mod tests {
         );
         let after = load_tasks(&pool, None).await.expect("after");
         assert!(after.is_empty());
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    /// Covers: one grouped select reports every configured repository's total
+    /// and live row counts, including a repository with no stored rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_counts_each_repositorys_rows_by_kind() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let busy = super::insert_repository(&pool, "busy", "/tmp/busy")
+            .await
+            .expect("insert busy");
+        let quiet = super::insert_repository(&pool, "quiet", "/tmp/quiet")
+            .await
+            .expect("insert quiet");
+        let rows = vec![
+            parsed(
+                "tasks/alpha_live.md",
+                "alpha",
+                TaskKind::Live,
+                date(2026, 5, 1),
+                date(2026, 5, 1),
+                None,
+                None,
+                None,
+            ),
+            parsed(
+                "tasks/beta_live.md",
+                "beta",
+                TaskKind::Live,
+                date(2026, 5, 2),
+                date(2026, 5, 2),
+                None,
+                None,
+                None,
+            ),
+            parsed(
+                "tasks/archive/gamma.md",
+                "gamma",
+                TaskKind::Finished,
+                date(2026, 5, 3),
+                date(2026, 6, 1),
+                Some(date(2026, 6, 1)),
+                Some(date(2026, 6, 1)),
+                None,
+            ),
+            parsed(
+                "tasks/archive/delta.md",
+                "delta",
+                TaskKind::Deferred,
+                date(2026, 5, 4),
+                date(2026, 6, 2),
+                None,
+                Some(date(2026, 6, 2)),
+                None,
+            ),
+        ];
+        replace_tasks(&pool, busy, &rows, immediate_hook().as_ref())
+            .await
+            .expect("replace");
+
+        let counts = repository_counts(&pool).await.expect("counts");
+        let busy_counts = counts
+            .iter()
+            .find(|counts| counts.repository_id == busy)
+            .expect("the busy repository is counted");
+        assert_eq!(busy_counts.total, 4, "every stored row counts");
+        assert_eq!(busy_counts.live, 2, "only live rows count as live");
+        let quiet_counts = counts
+            .iter()
+            .find(|counts| counts.repository_id == quiet)
+            .expect("a repository with no rows still appears");
+        assert_eq!(quiet_counts.total, 0);
+        assert_eq!(quiet_counts.live, 0);
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    /// Covers: a path update moves the repository and leaves its rows in place,
+    /// and an unknown id reports no changed row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_moves_a_repository_path_and_keeps_its_rows() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "moved", "/tmp/old")
+            .await
+            .expect("insert");
+        replace_tasks(&pool, id, &[task()], immediate_hook().as_ref())
+            .await
+            .expect("replace");
+
+        assert_eq!(
+            update_repository_path(&pool, id, "/tmp/new")
+                .await
+                .expect("move"),
+            1
+        );
+        let repositories = list_repositories(&pool).await.expect("list");
+        assert_eq!(repositories[0].path, "/tmp/new");
+        assert_eq!(
+            load_tasks(&pool, Some(id)).await.expect("rows").len(),
+            1,
+            "the move keeps the repository's rows"
+        );
+        assert_eq!(
+            update_repository_path(&pool, id + 1, "/tmp/other")
+                .await
+                .expect("move unknown"),
+            0,
+            "an unknown id reports no changed row"
+        );
+
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
