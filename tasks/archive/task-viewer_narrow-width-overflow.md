@@ -2,8 +2,8 @@
 description: "Let every task-list cell and the repository name wrap, so a narrow window stops scrolling the page sideways and a long folder name stops painting over the row actions."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-24T23:36:40Z
-status: implemented
+updated: 2026-11-24T23:38:29Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: false
