@@ -9,7 +9,7 @@
       payload = null;
     }
   }
-  var CARD_NAMES = ["weekly", "cumulative", "shipped-calendar", "created-calendar", "backlog", "age", "staleness", "radar-shipped", "radar-live"];
+  var CARD_NAMES = ["weekly", "cumulative", "shipped-calendar", "created-calendar", "backlog", "age", "cycle", "staleness", "radar-shipped", "radar-live"];
   var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   // Calendars whose initial scroll position is already chosen, so a redraw on
   // a resize keeps the reader's scroll position instead of snapping the frame
@@ -18,7 +18,7 @@
 
   // Each draw records the marks it coloured with a theme colour, together with
   // the custom property it read, so a theme switch rewrites those attributes
-  // instead of rebuilding all nine charts.
+  // instead of rebuilding all ten charts.
   var painted = {};
 
   function cssVar(name) {
@@ -1078,6 +1078,7 @@
       ["created-calendar", payload.created_calendar, function (row) { return [row.date, row.count]; }],
       ["backlog", payload.live_backlog, function (row) { return [row.date, row.live]; }],
       ["age", payload.mean_age, function (row) { return [row.date, row.avg_age, row.n]; }],
+      ["cycle", payload.cycle, function (row) { return [row.date, row.avg_cycle, row.n]; }],
       ["staleness", payload.staleness, function (row) { return [row.date, row.over_30, row.over_90, row.over_180]; }],
       ["radar-shipped", payload.radar_shipped, function (row) { return [row.label, row.count]; }],
       ["radar-live", payload.radar_live, function (row) { return [row.label, row.count]; }]
@@ -1166,8 +1167,18 @@
         payload.mean_age,
         "--chart-age",
         function (row) { return row.avg_age; },
-        function (row, date) { return dateLabel(date) + " · mean age " + fmt(row.avg_age) + " days · " + fmt(row.n) + " tasks"; },
+        function (row, date) { return dateLabel(date) + " · mean age " + fmt(row.avg_age) + (row.avg_age === 1 ? " day · " : " days · ") + fmt(row.n) + (row.n === 1 ? " task" : " tasks"); },
         "Mean age in days of the unfinished backlog · deferred tasks age until their leave day"
+      );
+    });
+    renderCard("cycle", function () {
+      drawLine(
+        "cycle",
+        payload.cycle,
+        "--chart-cycle",
+        function (row) { return row.avg_cycle; },
+        function (row, date) { return dateLabel(date) + " · mean cycle " + fmt(row.avg_cycle) + (row.avg_cycle === 1 ? " day · " : " days · ") + fmt(row.n) + (row.n === 1 ? " task" : " tasks"); },
+        "Mean days from created to shipped · finished tasks only"
       );
     });
     renderCard("staleness", drawStaleness);

@@ -58,13 +58,20 @@ pub struct ParsedTask {
     pub path_is_lossy: bool,
 }
 
-/// The leave day and content hash the database stored for one task path before
-/// this harvest. A matching hash lets the leave-day walk be skipped.
+/// The leave day, content hash, and stored task identity the database held for
+/// one task path before this harvest. A matching hash lets the leave-day walk be
+/// skipped, and the stored kind, `created` day, and ship day let an Update run
+/// compare the rows it is about to replace with the fresh ones. Each stored
+/// value stays `None` when it did not parse, so an unreadable prior row still
+/// carries its leave day instead of dropping out of the read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriorTask {
     pub path: String,
     pub leave_date: Option<NaiveDate>,
     pub content_hash: Option<String>,
+    pub kind: Option<TaskKind>,
+    pub created: Option<NaiveDate>,
+    pub ship_date: Option<NaiveDate>,
 }
 
 #[derive(Debug)]
@@ -3893,6 +3900,9 @@ mod tests {
                 path: task.path.clone(),
                 leave_date: task.leave_date,
                 content_hash: task.content_hash.clone(),
+                kind: Some(task.kind),
+                created: Some(task.created),
+                ship_date: task.ship_date,
             })
             .collect();
         let second = harvest_repository_with_prior(&repo, &prior)
@@ -4026,6 +4036,9 @@ mod tests {
             path: "tasks/archive/scope_done.md".to_string(),
             leave_date: Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day")),
             content_hash: Some(fnv1a_digest(&text)),
+            kind: Some(TaskKind::Finished),
+            created: Some(NaiveDate::from_ymd_opt(2026, 5, 1).expect("day")),
+            ship_date: Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day")),
         }];
 
         let tasks = harvest_repository_with_prior(&repo, &prior)
@@ -4234,6 +4247,9 @@ mod tests {
             path: "tasks/archive/scope_done.md".to_string(),
             leave_date: Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day")),
             content_hash: Some(format!("r2:{}", fnv1a_digest(&text))),
+            kind: Some(TaskKind::Finished),
+            created: Some(NaiveDate::from_ymd_opt(2026, 5, 1).expect("day")),
+            ship_date: Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day")),
         }];
 
         let tasks = harvest_repository_with_prior(&repo, &prior)
@@ -5629,6 +5645,9 @@ mod tests {
                 path: task.path.clone(),
                 leave_date: task.leave_date,
                 content_hash: task.content_hash.clone(),
+                kind: Some(task.kind),
+                created: Some(task.created),
+                ship_date: task.ship_date,
             })
             .collect();
         let _ = take_leave_walk_count(&repo);
@@ -5715,6 +5734,9 @@ mod tests {
                 path: task.path.clone(),
                 leave_date: task.leave_date,
                 content_hash: task.content_hash.clone(),
+                kind: Some(task.kind),
+                created: Some(task.created),
+                ship_date: task.ship_date,
             })
             .collect();
 

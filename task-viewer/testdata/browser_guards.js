@@ -25,6 +25,7 @@
     "created-calendar": "calendar",
     backlog: "line",
     age: "line",
+    cycle: "line",
     staleness: "line",
     "radar-shipped": "radar",
     "radar-live": "radar"
@@ -179,6 +180,7 @@
     "created-calendar",
     "backlog",
     "age",
+    "cycle",
     "staleness",
     "radar-shipped",
     "radar-live"
@@ -252,6 +254,7 @@
     calendar_peak_created: 2,
     live_backlog: [{ date: "2026-01-05", live: 1 }],
     mean_age: [{ date: "2026-01-05", avg_age: 2, n: 1 }],
+    cycle: [{ date: "2026-01-05", avg_cycle: 3, trend: 3, n: 1 }],
     staleness: [{ date: "2026-01-05", over_30: 1, over_90: 0, over_180: 0 }],
     radar_shipped: [{ label: "alpha", count: 1 }],
     radar_live: [{ label: "alpha", count: 1 }],

@@ -132,7 +132,7 @@
         },
         {
           "attrs": {
-            "aria-label": "Jan 5, 2026 · mean age 2 days · 1 tasks",
+            "aria-label": "Jan 5, 2026 · mean age 2 days · 1 task",
             "fill": "transparent",
             "height": "232",
             "role": "img",
@@ -465,6 +465,197 @@
         {
           "attrs": {
             "aria-label": "Jan 5, 2026 · cumulative 1 · shipped 1",
+            "fill": "transparent",
+            "height": "232",
+            "role": "img",
+            "tabindex": "0",
+            "width": "940",
+            "x": "44",
+            "y": "16"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        }
+      ],
+      "name": "svg",
+      "style": {},
+      "text": ""
+    },
+    "cycle": {
+      "attrs": {
+        "viewBox": "0 0 1000 280"
+      },
+      "children": [
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "x1": "44",
+            "x2": "984",
+            "y1": "248",
+            "y2": "248"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "252"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "0"
+        },
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "x1": "44",
+            "x2": "984",
+            "y1": "170.66666666666669",
+            "y2": "170.66666666666669"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "174.66666666666669"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "1"
+        },
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "x1": "44",
+            "x2": "984",
+            "y1": "93.33333333333334",
+            "y2": "93.33333333333334"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "97.33333333333334"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "2"
+        },
+        {
+          "attrs": {
+            "stroke": "#123456",
+            "x1": "44",
+            "x2": "984",
+            "y1": "16",
+            "y2": "16"
+          },
+          "children": [],
+          "name": "line",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "38",
+            "y": "20"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "3"
+        },
+        {
+          "attrs": {
+            "d": "M44 16 L44 248 L44 248 Z",
+            "fill": "#123456",
+            "opacity": "0.16"
+          },
+          "children": [],
+          "name": "path",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "d": "M44 16",
+            "fill": "none",
+            "stroke": "#123456",
+            "stroke-width": "2"
+          },
+          "children": [],
+          "name": "path",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "cx": "44",
+            "cy": "16",
+            "fill": "#123456",
+            "r": "4"
+          },
+          "children": [],
+          "name": "circle",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "d": "M44 16",
+            "fill": "none",
+            "opacity": "0.55",
+            "stroke": "#123456",
+            "stroke-dasharray": "6 5",
+            "stroke-width": "1.5"
+          },
+          "children": [],
+          "name": "path",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "x": "44",
+            "y": "264"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "Jan 2026"
+        },
+        {
+          "attrs": {
+            "aria-label": "Jan 5, 2026 · mean cycle 3 days · 1 task",
             "fill": "transparent",
             "height": "232",
             "role": "img",

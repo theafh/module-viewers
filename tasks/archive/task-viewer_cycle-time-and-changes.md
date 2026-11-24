@@ -2,9 +2,11 @@
 description: "Add a cycle-time chart and a what-changed-since-last-scan summary, both built from dates and prior rows the app already holds."
 scope: task-viewer
 created: 2026-11-23T17:31:20Z
-updated: 2026-11-23T17:36:41Z
-status: ready
+updated: 2026-11-24T01:05:00Z
+status: finished
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Cycle time and what changed since the last scan
@@ -21,6 +23,7 @@ Show how long tasks take from creation to shipping, and tell the person what cha
 - `task-viewer/templates/dashboard.html` holds the chart cards, and `task-viewer/static/js/dashboard.js` draws them from `CARD_NAMES` and `renderCard`, with `drawLine` behind the cumulative, backlog, and mean-age charts.
 - The browser suite mirrors the card set in four places that must move together: `CARD_NAMES`, `CHART_KIND`, and `defaultPayload` in `task-viewer/testdata/browser_guards.js`, `fixture_payload()` in `web.rs`, and the recorded markup in `task-viewer/testdata/dashboard_draw_snapshots.json`. `browser_malformed_payload_renders_the_fallback_on_every_card` fails when the template renders a card the fixture does not know, and `browser_chart_markup_matches_the_pre_change_snapshots` fails when a registered card has no recorded markup.
 - `FEATURES.md` section 4 lists the charts and section 3 describes the Update outcome; `ARCHITECTURE.md` `## Components` counts the series and `## Extraction Rules` describes each one; `TESTING.md` `## What Must Be Covered` carries the `Series` and `Scan` bullets.
+- Reconciled at implementation: the card set had grown to ten with the staleness card, the harvest now returns `Harvested` with a skip tally, `ScanReport` already carries `skipped`, and the prior read is widened on `PriorTask` itself. Its `kind`, `created`, and `ship_date` stay optional, so a stored value that does not parse never drops that path's leave-day cache.
 
 ## Approach
 

@@ -25,7 +25,7 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 **`task-viewer/src/harvest.rs`** reads `tasks/**/*.md`, reads frontmatter, and asks git for the leave day of each finished or deferred task. It returns the parsed rows together with a reason-keyed tally of the task files it skipped, and does not write them.
 **`task-viewer/src/db.rs`** creates the parent directory of the database file, whether that file is the default `~/.task-viewer` or a path named by `TASK_VIEWER_DB`, opens the database, and brings its schema to the current version one step at a time. The version read, the version-1 baseline, and every later step run inside one `BEGIN IMMEDIATE` transaction on one connection, so two processes starting against one file serialize their migration instead of both stamping it, and a step that fails rolls the whole run back and leaves the version the file already had. That transaction opens before the version read, so every start takes SQLite's write lock even when the schema is already current, and a start that lands while another process holds the lock waits out the five-second busy timeout and fails with `the database at … could not begin its schema migration` instead of opening read-only. The step that adds `content_hash` is guarded on the table's own columns, so a file stamped below that step which already carries the column still migrates. It reads and writes the two tables.
 
-**`task-viewer/src/series.rs`** turns the stored rows into the nine chart series for the current filter, including the weekly deferred bar and the live-task staleness lines.
+**`task-viewer/src/series.rs`** turns the stored rows into the ten chart series for the current filter, including the weekly deferred bar, the live-task staleness lines, and the mean cycle time of the tasks that finished on each day.
 
 ## Data Layout
 
@@ -49,7 +49,8 @@ The git tree holds the program. The SQLite file `~/.task-viewer` holds the repos
 - The two calendars are the last 365 days through today. Colour is `log1p(count)`. Zero stays on the empty track.
 - Live backlog adds one on `created` and subtracts one on the leave day. A leave day before `created` counts from `created`, so a record whose dates are out of order cannot leave the task in the backlog forever.
 - Mean age is the average age, in days, of tasks that exist and are unfinished at the end of that day. A task drops out of that average on its leave day. Calendar days are UTC days: a timestamp that states `Z` or a numeric offset converts to UTC, a timestamp with no zone is read as `Europe/Berlin`, and a date-only value keeps the calendar day it names.
-- The cumulative, backlog, and mean-age line charts carry a least-squares trend; the staleness lines draw their counts without one.
+- The cumulative, backlog, mean-age, and cycle-time line charts carry a least-squares trend; the staleness lines draw their counts without one.
+- Cycle time is the mean of `ship_date - created` in UTC days over the finished tasks that shipped on that day, one point per day that at least one task finished on. A deferred row and a finished row with no ship day contribute nothing. A ship day before `created` counts from `created`, so its point sits on the created day with a zero-day cycle. A day outside the charted range folds into the nearest bound, and the trend is fitted across the days that carry a point.
 - Radar spokes share one axis order, sorted by shipped plus live, then by label. All projects uses the repository name as the label. One project uses the scope.
 
 ## Load-Bearing Decisions

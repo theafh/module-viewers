@@ -47,6 +47,9 @@ pub struct Dashboard {
     pub created_calendar: Vec<DayCount>,
     pub live_backlog: Vec<LivePoint>,
     pub mean_age: Vec<AgePoint>,
+    /// Mean days from `created` to the ship day, one row per day a task
+    /// finished on.
+    pub cycle: Vec<CyclePoint>,
     /// Live tasks by how long they have gone without an edit, one row per
     /// charted day and one line per threshold.
     pub staleness: Vec<StalenessPoint>,
@@ -100,6 +103,14 @@ pub struct LivePoint {
 pub struct AgePoint {
     pub date: String,
     pub avg_age: f64,
+    pub trend: f64,
+    pub n: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CyclePoint {
+    pub date: String,
+    pub avg_cycle: f64,
     pub trend: f64,
     pub n: usize,
 }
@@ -210,6 +221,7 @@ pub fn dashboard(
     let (created_calendar, calendar_peak_created) = calendar(&created_c, today);
     let live_backlog = live_points(tasks, today);
     let mean_age = age_points(tasks, today);
+    let cycle = cycle_points(tasks, today);
     let staleness = staleness_points(tasks, today);
     let (radar_shipped, radar_live) = radar(tasks, mode);
 
@@ -244,6 +256,7 @@ pub fn dashboard(
         created_calendar,
         live_backlog,
         mean_age,
+        cycle,
         staleness,
         radar_shipped,
         radar_live,
@@ -626,6 +639,62 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
         })
         .collect();
     (points, steps)
+}
+
+/// Mean days from `created` to the ship day of the tasks that finished on each
+/// charted day. Only a finished task with a ship day contributes; a deferred row
+/// and a finished row with no ship day contribute nothing, and a day no task
+/// finished on carries no point, so the trend is fitted to exactly the days the
+/// payload carries.
+fn cycle_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<CyclePoint> {
+    let mut sums: BTreeMap<NaiveDate, (i64, usize)> = BTreeMap::new();
+    for task in tasks {
+        if task.kind != TaskKind::Finished {
+            continue;
+        }
+        let Some(ship) = task.ship_date else {
+            continue;
+        };
+        // A task cannot ship before it exists; a ship day before `created`
+        // counts from `created`, the way `live_points` clamps a leave day, so
+        // the point sits on the created day and the cycle reads zero days.
+        let day = ship.max(task.created);
+        // A day outside the charted range folds into the nearest bound, the way
+        // the other series fold theirs.
+        let day = day.max(series_floor()).min(today);
+        let days = (ship - task.created).num_days().max(0);
+        let entry = sums.entry(day).or_insert((0, 0));
+        entry.0 += days;
+        entry.1 += 1;
+    }
+    if sums.is_empty() {
+        return Vec::new();
+    }
+    let rows: Vec<(NaiveDate, f64, usize)> = sums
+        .into_iter()
+        .map(|(date, (total, n))| (date, total as f64 / n as f64, n))
+        .collect();
+    let values: Vec<f64> = rows.iter().map(|(_, avg, _)| *avg).collect();
+    // The rows skip the days no task finished on, so the fit runs against each
+    // point's day offset from the first charted day, the way the mean-age trend
+    // does.
+    let offsets: Vec<f64> = match rows.first() {
+        Some((first, _, _)) => rows
+            .iter()
+            .map(|(date, _, _)| f64::from(date.num_days_from_ce() - first.num_days_from_ce()))
+            .collect(),
+        None => Vec::new(),
+    };
+    let trend = linreg_at(&offsets, &values);
+    rows.into_iter()
+        .zip(trend)
+        .map(|((date, avg, n), trend)| CyclePoint {
+            date: crate::dates::format_date(date),
+            avg_cycle: round_to(avg, 2),
+            trend: round_to(trend, 2),
+            n,
+        })
+        .collect()
 }
 
 fn radar(tasks: &[TaskRecord], mode: RadarMode) -> (Vec<LabeledCount>, Vec<LabeledCount>) {
@@ -2044,5 +2113,157 @@ mod tests {
             one.radar_live.iter().all(|row| row.repository_id.is_none()),
             "a scope-mode spoke names no repository"
         );
+    }
+
+    /// Covers: the cycle-time card averages `ship_date - created` over the tasks
+    /// that finished on each day, counts them, and fits a per-day trend across
+    /// the days that carry a point.
+    #[test]
+    fn series_cycle_time_means_the_days_from_created_to_shipped() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![
+            // Four days.
+            task(
+                "alpha",
+                "a",
+                TaskKind::Finished,
+                day(2026, 6, 1),
+                Some(day(2026, 6, 5)),
+                Some(day(2026, 6, 5)),
+            ),
+            // Two days, on the same ship day as the four-day task.
+            task(
+                "alpha",
+                "b",
+                TaskKind::Finished,
+                day(2026, 6, 3),
+                Some(day(2026, 6, 5)),
+                Some(day(2026, 6, 5)),
+            ),
+            // Three days.
+            task(
+                "alpha",
+                "c",
+                TaskKind::Finished,
+                day(2026, 5, 30),
+                Some(day(2026, 6, 2)),
+                Some(day(2026, 6, 2)),
+            ),
+            // Ten days.
+            task(
+                "alpha",
+                "d",
+                TaskKind::Finished,
+                day(2026, 5, 29),
+                Some(day(2026, 6, 8)),
+                Some(day(2026, 6, 8)),
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        assert_eq!(board.cycle.len(), 3, "one point per day a task finished on");
+
+        let june_second = board
+            .cycle
+            .iter()
+            .find(|point| point.date == "2026-06-02")
+            .expect("the first ship day");
+        assert_eq!(june_second.n, 1);
+        assert_eq!(june_second.avg_cycle.to_bits(), 3.0_f64.to_bits());
+
+        let june_fifth = board
+            .cycle
+            .iter()
+            .find(|point| point.date == "2026-06-05")
+            .expect("the shared ship day");
+        assert_eq!(june_fifth.n, 2, "both tasks count on the shared ship day");
+        assert_eq!(
+            june_fifth.avg_cycle.to_bits(),
+            3.0_f64.to_bits(),
+            "the mean of four and two days"
+        );
+
+        let june_eighth = board
+            .cycle
+            .iter()
+            .find(|point| point.date == "2026-06-08")
+            .expect("the last ship day");
+        assert_eq!(june_eighth.n, 1);
+        assert_eq!(june_eighth.avg_cycle.to_bits(), 10.0_f64.to_bits());
+
+        // Offsets 0, 3, and 6 against the values 3, 3, and 10 fit the line
+        // 1.8333 + 1.1667x, so the rounded trend reads 1.83, 5.33, and 8.83.
+        assert_eq!(june_second.trend.to_bits(), 1.83_f64.to_bits());
+        assert_eq!(june_fifth.trend.to_bits(), 5.33_f64.to_bits());
+        assert_eq!(june_eighth.trend.to_bits(), 8.83_f64.to_bits());
+    }
+
+    /// Covers: a deferred row and a finished row with no ship day contribute no
+    /// cycle-time point.
+    #[test]
+    fn series_cycle_time_skips_a_deferred_row_and_a_finished_row_without_a_ship_day() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![
+            task(
+                "alpha",
+                "deferred",
+                TaskKind::Deferred,
+                day(2026, 6, 1),
+                None,
+                Some(day(2026, 6, 4)),
+            ),
+            task(
+                "alpha",
+                "unshipped",
+                TaskKind::Finished,
+                day(2026, 6, 2),
+                None,
+                Some(day(2026, 6, 5)),
+            ),
+            task(
+                "alpha",
+                "shipped",
+                TaskKind::Finished,
+                day(2026, 6, 1),
+                Some(day(2026, 6, 3)),
+                Some(day(2026, 6, 3)),
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        assert_eq!(board.cycle.len(), 1, "only the shipped task contributes");
+        let only = board.cycle.first().expect("the only point");
+        assert_eq!(only.date, "2026-06-03");
+        assert_eq!(only.n, 1);
+        assert_eq!(only.avg_cycle.to_bits(), 2.0_f64.to_bits());
+        assert!(
+            !board
+                .cycle
+                .iter()
+                .any(|point| point.date == "2026-06-04" || point.date == "2026-06-05"),
+            "the deferred and unshipped rows carry no point"
+        );
+    }
+
+    /// Covers: a task shipped before it was created contributes at its created
+    /// day, with a zero-day cycle.
+    #[test]
+    fn series_cycle_time_counts_a_ship_day_before_created_at_created() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![task(
+            "alpha",
+            "scope",
+            TaskKind::Finished,
+            day(2026, 6, 5),
+            Some(day(2026, 6, 1)),
+            Some(day(2026, 6, 1)),
+        )];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let only = board.cycle.first().expect("the clamped point");
+        assert_eq!(
+            only.date, "2026-06-05",
+            "the point sits on the created day, not the earlier ship day"
+        );
+        assert_eq!(only.n, 1);
+        assert_eq!(only.avg_cycle.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(only.trend.to_bits(), 0.0_f64.to_bits());
     }
 }

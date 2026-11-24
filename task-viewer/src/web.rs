@@ -9,7 +9,7 @@ use axum::{
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Offset, Utc};
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::future::{Future, ready};
 use std::num::IntErrorKind;
@@ -2225,23 +2225,66 @@ struct ScanFailure {
 }
 
 /// What one Update run did: how many repositories it attempted, which ones
-/// failed, and how many task files the run skipped, so the dashboard can report
-/// the run truthfully.
+/// failed, how many task files the run skipped, and how the stored rows changed
+/// against the rows the run replaced, so the dashboard can report the run
+/// truthfully.
 struct ScanReport {
     attempted: usize,
     failures: Vec<ScanFailure>,
     skipped: usize,
+    /// Task rows whose path held no row, or held a different task, before this
+    /// run.
+    new_tasks: usize,
+    /// Task rows that carry a ship day the row they replaced lacked.
+    shipped: usize,
 }
 
 /// One harvest result as it leaves its join, before the store turns it into a
 /// scan error or a set of stored rows.
 type HarvestOutcome = Result<Result<harvest::Harvested, HarvestError>, tokio::task::JoinError>;
 
-/// What storing one harvest outcome produced: the banner a failure earns and
-/// how many task files the harvest skipped.
+/// What storing one harvest outcome produced: the banner a failure earns, how
+/// many task files the harvest skipped, and the change against the rows the
+/// store replaced.
 struct StoredOutcome {
     banner: Option<Banner>,
     skipped: usize,
+    new_tasks: usize,
+    shipped: usize,
+}
+
+/// The Update run's change against one repository's prior rows: a fresh row is
+/// new when its path held no row, or held a row for a different task, and
+/// shipped when the row it replaces carried no ship day and was not already
+/// finished. A repository with no prior rows reports every fresh row as new and
+/// none as shipped.
+fn scan_delta(prior: &[PriorTask], fresh: &[harvest::ParsedTask]) -> (usize, usize) {
+    let mut by_path: HashMap<&str, &PriorTask> = HashMap::with_capacity(prior.len());
+    for row in prior {
+        by_path.insert(row.path.as_str(), row);
+    }
+    let mut new_tasks = 0_usize;
+    let mut shipped = 0_usize;
+    for task in fresh {
+        // A path that now holds a task with a different `created` day holds a
+        // different task, so its fresh row counts as new instead of as an
+        // evolution of the stored one.
+        match by_path
+            .get(task.path.as_str())
+            .filter(|row| row.created == Some(task.created))
+        {
+            Some(row)
+                if row.kind != Some(TaskKind::Finished)
+                    && row.ship_date.is_none()
+                    && task.ship_date.is_some() =>
+            {
+                shipped += 1;
+            }
+            Some(_) => {}
+            None => new_tasks += 1,
+        }
+    }
+    (new_tasks, shipped)
 }
 
 /// Harvest the repositories up to `cap` at once, draining each result as soon
@@ -2266,11 +2309,15 @@ async fn scan_core(
     }
     let mut failures = Vec::new();
     let mut skipped = 0_usize;
+    let mut new_tasks = 0_usize;
+    let mut shipped = 0_usize;
     while let Some(finished) = harvests.join_next().await {
         match finished {
-            Ok((repository_id, outcome)) => {
-                let stored = store_outcome(pool, repository_id, outcome, store_hook).await;
+            Ok((repository_id, prior, outcome)) => {
+                let stored = store_outcome(pool, repository_id, outcome, &prior, store_hook).await;
                 skipped += stored.skipped;
+                new_tasks += stored.new_tasks;
+                shipped += stored.shipped;
                 if let Some(banner) = stored.banner {
                     failures.push(ScanFailure {
                         repository: repository_name(repositories, repository_id),
@@ -2290,6 +2337,8 @@ async fn scan_core(
         attempted: repositories.len(),
         failures,
         skipped,
+        new_tasks,
+        shipped,
     }
 }
 
@@ -2297,7 +2346,7 @@ async fn scan_core(
 /// prior read is its own stage immediately before the spawn, so a run never
 /// holds every repository's prior rows at once.
 async fn spawn_harvest(
-    harvests: &mut JoinSet<(i64, HarvestOutcome)>,
+    harvests: &mut JoinSet<(i64, Vec<PriorTask>, HarvestOutcome)>,
     pool: &sqlx::SqlitePool,
     repository: &Repository,
     harvest: &Arc<HarvestFn>,
@@ -2307,7 +2356,8 @@ async fn spawn_harvest(
     let path = PathBuf::from(&repository.path);
     prior_read_hook(repository_id).await;
     // Load the rows the last Update stored before this harvest runs, so an
-    // unchanged archived file can reuse its leave day.
+    // unchanged archived file can reuse its leave day and the store can compare
+    // the fresh rows against the rows it replaces.
     let prior = match db::load_prior_tasks(pool, repository_id).await {
         Ok(prior) => prior,
         Err(error) => {
@@ -2315,10 +2365,13 @@ async fn spawn_harvest(
             Vec::new()
         }
     };
+    // The harvest borrows the prior rows, and the store compares against the
+    // same snapshot, so the join hands the snapshot back beside its outcome.
+    let harvest_prior = prior.clone();
     let harvest = Arc::clone(harvest);
     harvests.spawn(async move {
-        let outcome = tokio::task::spawn_blocking(move || harvest(&path, &prior)).await;
-        (repository_id, outcome)
+        let outcome = tokio::task::spawn_blocking(move || harvest(&path, &harvest_prior)).await;
+        (repository_id, prior, outcome)
     });
 }
 
@@ -2364,12 +2417,14 @@ fn git_scan_message(reason: &str) -> String {
 
 /// Record one harvest outcome, whether it arrived through the parallel join loop
 /// or a single repository refresh, so both paths report the same banners. The
-/// banner a failed outcome stored and the skipped-file count are returned for
-/// the run report.
+/// banner a failed outcome stored, the skipped-file count, and the change
+/// against `prior` are returned for the run report. A failed store reports no
+/// delta, because the rows it would have replaced stay as they were.
 async fn store_outcome(
     pool: &sqlx::SqlitePool,
     repository_id: i64,
     outcome: HarvestOutcome,
+    prior: &[PriorTask],
     store_hook: &Arc<StoreHookFn>,
 ) -> StoredOutcome {
     match outcome {
@@ -2383,11 +2438,16 @@ async fn store_outcome(
                 StoredOutcome {
                     banner: Some(Banner::SaveFailed),
                     skipped,
+                    new_tasks: 0,
+                    shipped: 0,
                 }
             } else {
+                let (new_tasks, shipped) = scan_delta(prior, &harvested.tasks);
                 StoredOutcome {
                     banner: None,
                     skipped,
+                    new_tasks,
+                    shipped,
                 }
             }
         }
@@ -2396,6 +2456,8 @@ async fn store_outcome(
             StoredOutcome {
                 banner: Some(Banner::NoTasksDirectory),
                 skipped: 0,
+                new_tasks: 0,
+                shipped: 0,
             }
         }
         Ok(Err(HarvestError::Git(reason))) => {
@@ -2405,6 +2467,8 @@ async fn store_outcome(
             StoredOutcome {
                 banner: Some(Banner::GitUnreadable),
                 skipped: 0,
+                new_tasks: 0,
+                shipped: 0,
             }
         }
         Ok(Err(HarvestError::Io(error))) => {
@@ -2413,6 +2477,8 @@ async fn store_outcome(
             StoredOutcome {
                 banner: Some(Banner::ScanUnreadable),
                 skipped: 0,
+                new_tasks: 0,
+                shipped: 0,
             }
         }
         Err(error) => {
@@ -2421,6 +2487,8 @@ async fn store_outcome(
             StoredOutcome {
                 banner: Some(Banner::ScanStopped),
                 skipped: 0,
+                new_tasks: 0,
+                shipped: 0,
             }
         }
     }
@@ -2440,10 +2508,12 @@ async fn refresh_one(
             Vec::new()
         }
     };
-    let outcome =
-        tokio::task::spawn_blocking(move || harvest::harvest_repository_with_prior(&owned, &prior))
-            .await;
-    store_outcome(pool, repository_id, outcome, store_hook)
+    let harvest_prior = prior.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        harvest::harvest_repository_with_prior(&owned, &harvest_prior)
+    })
+    .await;
+    store_outcome(pool, repository_id, outcome, &prior, store_hook)
         .await
         .banner
 }
@@ -2451,7 +2521,8 @@ async fn refresh_one(
 /// The dashboard banner a scan run deserves: a distinct "nothing to update"
 /// notice when no repository exists, the success notice only when every
 /// repository harvested, and an error naming each failed repository otherwise.
-/// A run that skipped task files appends how many, on either message.
+/// A clean run appends what changed since the last scan, and a run that skipped
+/// task files appends how many, on either message.
 fn scan_flash(report: &ScanReport) -> (&'static str, String) {
     if report.attempted == 0 {
         return (
@@ -2463,7 +2534,11 @@ fn scan_flash(report: &ScanReport) -> (&'static str, String) {
     if report.failures.is_empty() {
         return (
             Banner::ChartsUpdated.key(),
-            format!("{}{skipped}", Banner::ChartsUpdated.message()),
+            format!(
+                "{}{}{skipped}",
+                Banner::ChartsUpdated.message(),
+                delta_note(report.new_tasks, report.shipped)
+            ),
         );
     }
     let clean = report.attempted.saturating_sub(report.failures.len());
@@ -2480,6 +2555,16 @@ fn scan_flash(report: &ScanReport) -> (&'static str, String) {
             report.attempted
         ),
     )
+}
+
+/// The change sentence a clean scan banner appends, or nothing when the run
+/// found no new row and no newly shipped one.
+fn delta_note(new_tasks: usize, shipped: usize) -> String {
+    if new_tasks == 0 && shipped == 0 {
+        return String::new();
+    }
+    let task_word = if new_tasks == 1 { "task" } else { "tasks" };
+    format!(" {new_tasks} new {task_word}, {shipped} shipped since the last scan.")
 }
 
 /// The skipped-file sentence a scan banner appends, or nothing when the run
@@ -2748,6 +2833,28 @@ mod tests {
             ship_date: None,
             leave_date: None,
             content_hash: Some("0123456789abcdef".to_string()),
+            path_is_lossy: false,
+        }
+    }
+
+    /// One parsed row with the values a scan-delta test varies, so the prior
+    /// store and the fresh harvest name the same paths.
+    fn scan_row(
+        path: &str,
+        kind: TaskKind,
+        created: chrono::NaiveDate,
+        ship: Option<chrono::NaiveDate>,
+        leave: Option<chrono::NaiveDate>,
+    ) -> ParsedTask {
+        ParsedTask {
+            path: path.to_string(),
+            scope: "delta".to_string(),
+            kind,
+            created,
+            updated: created,
+            ship_date: ship,
+            leave_date: leave,
+            content_hash: None,
             path_is_lossy: false,
         }
     }
@@ -3539,6 +3646,8 @@ mod tests {
             attempted: 1,
             failures: Vec::new(),
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
         let request = Request::builder()
@@ -3570,6 +3679,8 @@ mod tests {
             attempted: 1,
             failures: Vec::new(),
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
         let token = flash_token(&location, "all");
@@ -3640,6 +3751,8 @@ mod tests {
             attempted: 1,
             failures: Vec::new(),
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
 
@@ -4886,7 +4999,10 @@ mod tests {
         let token = flash_token(&location, "all");
         assert_eq!(
             state.flash.lock().await.take(&token),
-            Some(("notice", "Charts updated.".to_string())),
+            Some((
+                "notice",
+                "Charts updated. 1 new task, 0 shipped since the last scan.".to_string()
+            )),
             "the run reports the same clean banner"
         );
         let rows = db::load_tasks(&state.pool, Some(repository_id))
@@ -5308,7 +5424,10 @@ mod tests {
         for token in tokens {
             assert_eq!(
                 state.flash.lock().await.take(&token),
-                Some(("notice", "Charts updated.".to_string())),
+                Some((
+                    "notice",
+                    "Charts updated. 1 new task, 0 shipped since the last scan.".to_string()
+                )),
                 "every joined click reports the follow-up, not the running scan's error"
             );
         }
@@ -5517,6 +5636,137 @@ mod tests {
             assert_eq!(row.ship_date, Some(archived_day));
         }
         let _ = std::fs::remove_dir_all(repo);
+        cleanup(&path);
+    }
+
+    /// Covers: one Update run over prior rows reports one new task and one
+    /// newly shipped task, and the banner names both.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_update_reports_the_new_and_newly_shipped_rows() {
+        let path = temp_database("scan_delta");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let id = db::insert_repository(&pool, "delta", "/tmp/delta")
+            .await
+            .expect("insert");
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        let day = |month, day_of_month| {
+            chrono::NaiveDate::from_ymd_opt(2026, month, day_of_month).expect("day")
+        };
+
+        // The rows the last scan stored: one live task that ships and one that
+        // stays live.
+        let prior = vec![
+            scan_row(
+                "tasks/delta_ships.md",
+                TaskKind::Live,
+                day(5, 1),
+                None,
+                None,
+            ),
+            scan_row(
+                "tasks/delta_stays.md",
+                TaskKind::Live,
+                day(5, 2),
+                None,
+                None,
+            ),
+        ];
+        db::replace_tasks(&pool, id, &prior, immediate_store_hook().as_ref())
+            .await
+            .expect("prior store");
+
+        // The fresh harvest: the first task ships, the second is unchanged, and
+        // a third path appears for the first time.
+        let fresh = vec![
+            scan_row(
+                "tasks/delta_ships.md",
+                TaskKind::Finished,
+                day(5, 1),
+                Some(day(5, 9)),
+                Some(day(5, 9)),
+            ),
+            scan_row(
+                "tasks/delta_stays.md",
+                TaskKind::Live,
+                day(5, 2),
+                None,
+                None,
+            ),
+            scan_row("tasks/delta_new.md", TaskKind::Live, day(5, 3), None, None),
+        ];
+        let harvest: Arc<HarvestFn> =
+            Arc::new(move |_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(fresh.clone())));
+        let report = scan_core(
+            &pool,
+            &repositories,
+            1,
+            harvest,
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+
+        assert!(report.failures.is_empty());
+        assert_eq!(report.new_tasks, 1, "one path appeared since the last scan");
+        assert_eq!(report.shipped, 1, "one row gained a ship day");
+        let (key, message) = scan_flash(&report);
+        assert_eq!(key, "notice");
+        assert_eq!(
+            message, "Charts updated. 1 new task, 1 shipped since the last scan.",
+            "the banner names both counts"
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: a first scan of a repository with no prior rows reports every
+    /// fresh row as new and none as shipped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_first_scan_reports_every_row_as_new_and_none_as_shipped() {
+        let path = temp_database("scan_delta_first");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        db::insert_repository(&pool, "delta", "/tmp/delta")
+            .await
+            .expect("insert");
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        let day = |month, day_of_month| {
+            chrono::NaiveDate::from_ymd_opt(2026, month, day_of_month).expect("day")
+        };
+
+        let fresh = vec![
+            scan_row(
+                "tasks/delta_done.md",
+                TaskKind::Finished,
+                day(5, 1),
+                Some(day(5, 9)),
+                Some(day(5, 9)),
+            ),
+            scan_row("tasks/delta_live.md", TaskKind::Live, day(5, 2), None, None),
+        ];
+        let harvest: Arc<HarvestFn> =
+            Arc::new(move |_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(fresh.clone())));
+        let report = scan_core(
+            &pool,
+            &repositories,
+            1,
+            harvest,
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+
+        assert!(report.failures.is_empty());
+        assert_eq!(report.new_tasks, 2, "both rows are new on a first scan");
+        assert_eq!(
+            report.shipped, 0,
+            "a row with no prior row is new, never newly shipped"
+        );
+        let (_, message) = scan_flash(&report);
+        assert_eq!(
+            message,
+            "Charts updated. 2 new tasks, 0 shipped since the last scan."
+        );
         cleanup(&path);
     }
 
@@ -6060,6 +6310,8 @@ mod tests {
                 },
             ],
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let (key, message) = scan_flash(&report);
         assert_eq!(key, "error");
@@ -6078,6 +6330,8 @@ mod tests {
             attempted: 0,
             failures: Vec::new(),
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let (key, message) = scan_flash(&report);
         assert_eq!(key, "notice");
@@ -6094,6 +6348,8 @@ mod tests {
             attempted: 2,
             failures: Vec::new(),
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let (key, message) = scan_flash(&report);
         assert_eq!(key, "notice");
@@ -6108,6 +6364,8 @@ mod tests {
             attempted: 1,
             failures: Vec::new(),
             skipped: 2,
+            new_tasks: 0,
+            shipped: 0,
         };
         let (key, message) = scan_flash(&clean);
         assert_eq!(key, "notice");
@@ -6120,6 +6378,8 @@ mod tests {
                 banner: Banner::GitUnreadable,
             }],
             skipped: 1,
+            new_tasks: 0,
+            shipped: 0,
         };
         let (key, message) = scan_flash(&failed);
         assert_eq!(key, "error");
@@ -6413,6 +6673,8 @@ mod tests {
                 banner: Banner::GitUnreadable,
             }],
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let failure_location = redirect_location(&scan_response(&state, "all", &failed).await);
         let failure_token = flash_token(&failure_location, "all");
@@ -6428,6 +6690,8 @@ mod tests {
             attempted: 2,
             failures: Vec::new(),
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let clean_location = redirect_location(&scan_response(&state, "all", &clean).await);
         let clean_token = flash_token(&clean_location, "all");
@@ -6551,6 +6815,8 @@ mod tests {
             attempted: 1,
             failures: Vec::new(),
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
         let token = flash_token(&location, "all");
@@ -6595,6 +6861,8 @@ mod tests {
             attempted: 1,
             failures: Vec::new(),
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
 
@@ -6652,6 +6920,8 @@ mod tests {
             attempted: 1,
             failures: Vec::new(),
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
         let token = flash_token(&location, "all");
@@ -6697,6 +6967,8 @@ mod tests {
             attempted: 1,
             failures: Vec::new(),
             skipped: 0,
+            new_tasks: 0,
+            shipped: 0,
         };
         let location = redirect_location(&scan_response(&state, "all", &report).await);
         let token = flash_token(&location, "all");
@@ -10464,6 +10736,58 @@ mod tests {
         );
     }
 
+    /// Covers: a one-day average prints the singular unit in both line-chart
+    /// tooltips, so the `1 day` branch is asserted rather than only written.
+    #[test]
+    fn browser_singular_day_unit_in_the_mean_tooltips() {
+        let mut payload = fixture_payload();
+        payload["mean_age"] = serde_json::json!([
+            {"date": "2026-01-05", "avg_age": 1, "n": 1},
+            {"date": "2026-01-06", "avg_age": 2, "n": 2}
+        ]);
+        payload["cycle"] = serde_json::json!([
+            {"date": "2026-01-05", "avg_cycle": 1, "trend": 1, "n": 1},
+            {"date": "2026-01-06", "avg_cycle": 2, "trend": 1.5, "n": 2}
+        ]);
+        let text = payload.to_string();
+        let config = browser_config(false, false, Some(&text), serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  function overlay(card) {
+    var svg = globalThis.__env.cards[card].querySelector("svg");
+    return svg.children.filter(function (node) {
+      return node.name === "rect" && node.attrs.tabindex === "0";
+    })[0];
+  }
+  function texts(card) {
+    var tip = globalThis.__env.cards[card].querySelector(".tooltip");
+    var node = overlay(card);
+    node.focus();
+    var first = tip.textContent;
+    node.dispatchEvent({ type: "keydown", key: "ArrowRight" });
+    var second = tip.textContent;
+    return { first: first, second: second };
+  }
+  return JSON.stringify({ age: texts("age"), cycle: texts("cycle") });
+})()"#,
+        );
+        // Exact tails, so a regression to "1 tasks" or "2 day" cannot pass on a
+        // substring: the singular and plural branches are both asserted.
+        for (card, noun) in [("age", "mean age"), ("cycle", "mean cycle")] {
+            let first = result[card]["first"].as_str().expect("first tooltip");
+            let second = result[card]["second"].as_str().expect("second tooltip");
+            assert!(
+                first.ends_with(&format!("{noun} 1 day · 1 task")),
+                "the {card} tooltip prints one day and one task: {first}"
+            );
+            assert!(
+                second.ends_with(&format!("{noun} 2 days · 2 tasks")),
+                "the {card} tooltip prints the plural: {second}"
+            );
+        }
+    }
+
     /// Covers: a calendar whose window opens in a month's last days keeps the
     /// following month's label instead of dropping it to the 24px guard.
     #[test]
@@ -10844,6 +11168,7 @@ mod tests {
             "calendar_peak_created": 2,
             "live_backlog": [{"date": "2026-01-05", "live": 1}],
             "mean_age": [{"date": "2026-01-05", "avg_age": 2, "n": 1}],
+            "cycle": [{"date": "2026-01-05", "avg_cycle": 3, "trend": 3, "n": 1}],
             "staleness": [
                 {"date": "2026-01-05", "over_30": 1, "over_90": 0, "over_180": 0},
                 {"date": "2026-01-12", "over_30": 2, "over_90": 1, "over_180": 0}
@@ -10914,6 +11239,13 @@ mod tests {
                 serde_json::json!({"date": date, "avg_age": index % 7, "n": index % 4})
             })
             .collect();
+        let cycle: Vec<serde_json::Value> = dates
+            .iter()
+            .enumerate()
+            .map(|(index, date)| {
+                serde_json::json!({"date": date, "avg_cycle": index % 9, "trend": index % 5, "n": index % 3})
+            })
+            .collect();
         let weekly: Vec<serde_json::Value> = dates
             .iter()
             .step_by(7)
@@ -10944,6 +11276,7 @@ mod tests {
             "calendar_peak_created": 1,
             "live_backlog": live_backlog,
             "mean_age": mean_age,
+            "cycle": cycle,
             "staleness": staleness,
             "radar_shipped": [
                 {"label": "alpha", "count": 6},
@@ -11197,6 +11530,7 @@ mod tests {
             "created_calendar",
             "live_backlog",
             "mean_age",
+            "cycle",
             "staleness",
         ]
         .iter()
@@ -11410,8 +11744,9 @@ mod tests {
         // the muted ticks (3); each calendar reads its colour, the track, and
         // the muted month labels (3); each radar reads its colour, the grid,
         // and the label colour (3); the staleness card reads three series
-        // colours, the grid, and the muted ticks (5).
-        assert_eq!(counts[0], 31, "one full render reads 31 theme colours");
+        // colours, the grid, and the muted ticks (5). The four line charts are
+        // cumulative, backlog, age, and cycle.
+        assert_eq!(counts[0], 34, "one full render reads 34 theme colours");
         assert_eq!(
             counts[1], counts[0],
             "the count does not grow with the rows"
@@ -12343,7 +12678,7 @@ mod tests {
             browser_config(false, false, Some(&plus_text), serde_json::json!("#123456"));
         let added = run_browser_with(COUNTING_DATE, &plus_config, assertion);
         let added = added["parses"].as_u64().expect("added parses");
-        assert_eq!(baseline, 10, "the fixture draws parse ten days");
+        assert_eq!(baseline, 11, "the fixture draws parse eleven days");
         assert_eq!(added, baseline + 1, "one extra week costs one more parse");
     }
 

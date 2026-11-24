@@ -526,23 +526,42 @@ pub async fn replace_tasks(
     Ok(())
 }
 
-/// The leave day and content hash the database already holds for each task path
-/// of one repository, loaded before harvest so an unchanged file can reuse its
-/// stored leave day instead of walking git again.
+/// The leave day, content hash, and stored task identity the database already
+/// holds for each task path of one repository, loaded before harvest so an
+/// unchanged file can reuse its stored leave day instead of walking git again
+/// and an Update run can tell a new row from one that newly shipped. A stored
+/// value that does not parse stays `None` rather than dropping the row, so its
+/// leave day still reaches the harvest.
 pub async fn load_prior_tasks(pool: &Pool<Sqlite>, repository_id: i64) -> Result<Vec<PriorTask>> {
-    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-        "SELECT path, leave_date, content_hash FROM tasks WHERE repository_id = ?",
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
+        "SELECT path, leave_date, content_hash, kind, created, ship_date
+         FROM tasks WHERE repository_id = ?",
     )
     .bind(repository_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(path, leave_date, content_hash)| PriorTask {
-            path,
-            leave_date: leave_date.and_then(|value| crate::dates::parse_iso_date(&value)),
-            content_hash,
-        })
+        .map(
+            |(path, leave_date, content_hash, kind, created, ship_date)| PriorTask {
+                path,
+                leave_date: leave_date.and_then(|value| crate::dates::parse_iso_date(&value)),
+                content_hash,
+                kind: crate::harvest::TaskKind::parse(&kind),
+                created: crate::dates::parse_iso_date(&created),
+                ship_date: ship_date.as_deref().and_then(crate::dates::parse_iso_date),
+            },
+        )
         .collect())
 }
 
