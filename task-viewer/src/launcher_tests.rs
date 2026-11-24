@@ -533,15 +533,50 @@ fn launcher_status_waits_for_the_lock_holder() {
     fs::remove_dir_all(&lock).expect("release the lock");
     let output = wait_for_output(child, Duration::from_secs(10));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "status failed ({:?})\nstdout: {stdout}\nstderr: {}",
+    // A stopped server is a non-zero status, so a script can branch on it.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a stopped status must exit 1 ({:?})\nstdout: {stdout}\nstderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
         stdout.contains("task-viewer is not running"),
         "status must read the released PID file: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Covers: `status` exits 0 while a server is running and 1 while it is not,
+/// so a script can branch on the command instead of parsing its text.
+#[test]
+fn launcher_status_exit_code_reports_whether_the_server_runs() {
+    let dir = unique_temp_dir("launcher_status_exit");
+    let launcher = stage_launcher(&dir);
+    // `is_running` is overridden rather than faked through `ps`, so the test
+    // measures `do_status`'s own contract and nothing about process lookup.
+    let driver = format!(
+        r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+. "{launcher}"
+get_pid() {{ echo 4242; }}
+is_running() {{ return 0; }}
+do_status >/dev/null || exit 10
+is_running() {{ return 1; }}
+if do_status >/dev/null; then exit 11; fi
+exit 0
+"#,
+        launcher = launcher.display(),
+    );
+    let output = run_driver(&dir, &driver, &[]);
+    assert!(
+        output.status.success(),
+        "status exit codes are wrong ({:?})\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
     );
 
     let _ = fs::remove_dir_all(&dir);

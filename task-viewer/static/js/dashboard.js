@@ -165,9 +165,27 @@
   function tipFor(frame) {
     var tip = frame.querySelector(".tooltip");
     tips.push(tip);
+    // The tooltip is fixed to the viewport, so a mark near the right or bottom
+    // edge would paint it off-window where it is clipped. The pointer's own
+    // offset stays 12px whenever there is room, and the measured box pulls the
+    // tooltip back inside the window otherwise. A browser that reports no
+    // viewport or no box size keeps the plain offset.
     function place(x, y) {
-      tip.style.left = x + 12 + "px";
-      tip.style.top = y + 12 + "px";
+      var offset = 12;
+      var viewWidth = window.innerWidth || 0;
+      var viewHeight = window.innerHeight || 0;
+      var tipWidth = tip.offsetWidth || 0;
+      var tipHeight = tip.offsetHeight || 0;
+      var left = x + offset;
+      var top = y + offset;
+      if (viewWidth > 0 && tipWidth > 0) {
+        left = Math.max(0, Math.min(left, viewWidth - tipWidth));
+      }
+      if (viewHeight > 0 && tipHeight > 0) {
+        top = Math.max(0, Math.min(top, viewHeight - tipHeight));
+      }
+      tip.style.left = left + "px";
+      tip.style.top = top + "px";
     }
     return {
       show: function (event, text) {
@@ -872,10 +890,16 @@
         return row.repository_id !== undefined && row.repository_id !== null;
       }));
     var slice = perProject ? "project" : "scope";
+    // The summary names what a spoke is, not the payload key that selects the
+    // rows: in project mode each spoke is one repository.
+    var spokeNoun = slice === "project" ? "repository" : "scope";
+    // The empty state needs a plural of its own, because "repository" takes
+    // "repositories" rather than a plain trailing "s".
+    var spokePlural = slice === "project" ? "repositories" : "scopes";
     var total = rows.reduce(function (sum, row) { return sum + row.count; }, 0);
-    summary(name, fmt(total) + " " + noun + " · one spoke per " + slice);
+    summary(name, fmt(total) + " " + noun + " · one spoke per " + spokeNoun);
     if (!rows.length) {
-      message(name, svg, "No " + slice + "s yet");
+      message(name, svg, "No " + spokePlural + " yet");
       return;
     }
     clear(svg);

@@ -202,6 +202,35 @@ case_desktop_database_failure_prints_no_checkmark() {
     fi
 }
 
+# The Dock pin needs python3. A host without it must hear why the install
+# stopped and where the bundle it just built lives, not bash's raw error.
+case_missing_python3_fails_install_with_explanation() {
+    local root="$TMP/installer-python" out status bundle cmd bash_bin
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    chmod +x "$root/bin/uname"
+    # Only the commands the Darwin branch reaches, so neither python3 nor
+    # dockutil can be found. bash itself is called by its absolute path.
+    for cmd in dirname chmod mkdir rm cat; do
+        ln -s "$(command -v "$cmd")" "$root/bin/$cmd"
+    done
+    bash_bin=$(command -v bash)
+    bundle="$root/home/Applications/Task Viewer.app"
+    out=$(HOME="$root/home" PATH="$root/bin" \
+        "$bash_bin" "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ] &&
+        printf '%s\n' "$out" | grep -q 'python3' &&
+        printf '%s\n' "$out" | grep -qF "$bundle" &&
+        ! printf '%s\n' "$out" | grep -q 'command not found'; then
+        pass "a missing python3 fails the install and names python3 and the bundle"
+    else
+        fail "a missing python3 fails the install and names python3 and the bundle (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
 case_detach_refuses_without_python3_or_setsid() {
     local root="$TMP/detach-refuse" out pidfile
     make_root "$root"
@@ -279,6 +308,7 @@ case_rustup_cargo_wins
 case_toggle_builds_once
 case_icon_cache_failure_prints_no_checkmark
 case_desktop_database_failure_prints_no_checkmark
+case_missing_python3_fails_install_with_explanation
 case_detach_refuses_without_python3_or_setsid
 case_detach_uses_setsid
 case_toolchain_is_pinned

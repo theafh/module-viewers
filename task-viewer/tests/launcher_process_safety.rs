@@ -411,9 +411,10 @@ fn a_reused_pid_lock_is_reclaimed() {
     let _ = squatter.kill();
     let _ = squatter.wait();
 
-    assert!(
-        status.status.success(),
-        "status failed: {}\n{}",
+    assert_eq!(
+        status.status.code(),
+        Some(1),
+        "a stopped status must exit 1: {}\n{}",
         stdout(&status),
         stderr(&status),
     );

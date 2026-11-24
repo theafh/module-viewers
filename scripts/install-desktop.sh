@@ -218,6 +218,13 @@ pin_to_dock() {
         return 0
     fi
 
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Cannot pin Task Viewer to the Dock: python3 is not available."
+        echo "The app bundle was created at: $app_bundle"
+        echo "To add it by hand, open that bundle once, then choose Options → Keep in Dock."
+        return 1
+    fi
+
     # Drop every existing Task Viewer tile first so reinstall never doubles icons.
     # defaults stores file:// URLs, so a raw path grep misses the live tile.
     python3 - "$app_bundle" <<'PY'

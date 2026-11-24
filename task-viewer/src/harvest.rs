@@ -290,6 +290,11 @@ type Candidate = ((u8, u8, i64), Option<String>, String, bool);
 type ChosenFile = (String, Option<String>, bool);
 
 /// Why a task file contributed no row.
+///
+/// The first three reasons are read-level: the file never reached the
+/// frontmatter reader. The rest are frontmatter-level, named for the field the
+/// file was missing or carried unreadably, so the reason-keyed tally stays
+/// honest about why a task left the charts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SkipReason {
     /// The file could not be opened or read.
@@ -298,6 +303,16 @@ pub enum SkipReason {
     NotUtf8,
     /// It is larger than `MAX_TASK_FILE_BYTES`.
     Oversized,
+    /// It carries no frontmatter block at all.
+    NoFrontmatter,
+    /// Its `created` value is not a date.
+    UnparseableCreated,
+    /// It carries no `created` value.
+    MissingCreated,
+    /// Its `status` value is empty.
+    EmptyStatus,
+    /// It carries no `status` value.
+    MissingStatus,
 }
 
 impl SkipReason {
@@ -307,6 +322,11 @@ impl SkipReason {
             Self::Unreadable => "could not be read",
             Self::NotUtf8 => "is not valid UTF-8",
             Self::Oversized => "is larger than the 4 MiB cap",
+            Self::NoFrontmatter => "has no frontmatter",
+            Self::UnparseableCreated => "has an unparseable created value",
+            Self::MissingCreated => "has no created value",
+            Self::EmptyStatus => "has an empty status value",
+            Self::MissingStatus => "has no status value",
         }
     }
 }
@@ -568,7 +588,7 @@ fn harvest_chosen(
             if blob.is_some() {
                 match content {
                     BlobContent::Text(text) => {
-                        state.harvest_file(&path, &text, path_is_lossy);
+                        state.harvest_file(&path, &text, path_is_lossy, &mut skipped);
                     }
                     BlobContent::Missing => vanished = Some(path.clone()),
                     BlobContent::Oversized => {
@@ -583,7 +603,7 @@ fn harvest_chosen(
                 break;
             }
             if let Some(text) = worktree_content(repo, &mut worktree, &path, &mut skipped) {
-                state.harvest_file(&path, &text, path_is_lossy);
+                state.harvest_file(&path, &text, path_is_lossy, &mut skipped);
             }
         }
     })?;
@@ -596,7 +616,7 @@ fn harvest_chosen(
     // working-tree ones.
     for (path, _, path_is_lossy) in rows {
         if let Some(text) = worktree_content(repo, &mut worktree, &path, &mut skipped) {
-            state.harvest_file(&path, &text, path_is_lossy);
+            state.harvest_file(&path, &text, path_is_lossy, &mut skipped);
         }
     }
     Ok(Harvested {
@@ -728,11 +748,15 @@ impl HarvestState {
     /// reason, so a task that vanishes from the charts is traceable. A file
     /// whose name lacks the task shape, such as a `README.md` under `tasks/`,
     /// logs that line at debug level instead, because it is not a task the
-    /// person lost. The returned rows stay the same: a file without the fields
-    /// a row needs is still skipped.
-    fn harvest_file(&mut self, rel: &str, text: &str, path_is_lossy: bool) {
+    /// person lost. A file with the task shape that is dropped here also counts
+    /// once in `tally` under the reason it was dropped, so the harvest's skip
+    /// count covers the frontmatter-level drops and not only the read-level
+    /// ones. The returned rows stay the same: a file without the fields a row
+    /// needs is still skipped.
+    fn harvest_file(&mut self, rel: &str, text: &str, path_is_lossy: bool, tally: &mut SkipTally) {
         let Some(fields) = frontmatter(text) else {
             if has_task_name_shape(rel) {
+                record_skip(tally, SkipReason::NoFrontmatter);
                 tracing::warn!(
                     path = %rel,
                     "task file has no frontmatter; skipping it"
@@ -752,6 +776,7 @@ impl HarvestState {
                 Some(created) => created,
                 None => {
                     if has_task_name_shape(rel) {
+                        record_skip(tally, SkipReason::UnparseableCreated);
                         tracing::warn!(
                             path = %rel,
                             field = "created",
@@ -771,6 +796,7 @@ impl HarvestState {
             },
             None => {
                 if has_task_name_shape(rel) {
+                    record_skip(tally, SkipReason::MissingCreated);
                     tracing::warn!(
                         path = %rel,
                         field = "created",
@@ -790,6 +816,7 @@ impl HarvestState {
             Some(status) if !status.is_empty() => status,
             Some(_) => {
                 if has_task_name_shape(rel) {
+                    record_skip(tally, SkipReason::EmptyStatus);
                     tracing::warn!(
                         path = %rel,
                         field = "status",
@@ -806,6 +833,7 @@ impl HarvestState {
             }
             None => {
                 if has_task_name_shape(rel) {
+                    record_skip(tally, SkipReason::MissingStatus);
                     tracing::warn!(
                         path = %rel,
                         field = "status",
@@ -1021,7 +1049,7 @@ fn harvest_files(
             }
         };
         if let Some(text) = text {
-            state.harvest_file(&row.path, &text, row.lossy);
+            state.harvest_file(&row.path, &text, row.lossy, &mut skipped);
         }
     }
     Ok(Harvested {
@@ -2963,14 +2991,14 @@ mod tests {
     use super::{
         BlobContent, CONTENT_HASH_REVISION, GIT_COMMAND_TIMEOUT, GitContext, GitFailure,
         HarvestError, HarvestState, LogLookup, MAX_TASK_FILE_BYTES, MAX_WORKTREE_CACHE_BYTES,
-        ParsedTask, PriorTask, RepositoryIdentity, SkipReason, TaskKind, archive_log_args,
-        archived_leave_lookup, blob_days, blob_days_log_args, content_hash, drain_reader,
-        enclosing_prefix, escape_posix_ere, first_status_commit_date, fnv1a_digest, frontmatter,
-        git_bin, git_deadline, git_dir_command, git_log_args, git_path, git_program, git_read,
-        git_timeout, harvest_repository, harvest_repository_with_prior, normalize_origin_url,
-        parse_archive_log, parse_batch, pickaxe_log_args, read_blobs, repository_identity,
-        run_git_command, run_git_log, run_git_streaming, scan_log_dates, scrub_git_env,
-        stream_blob_days, take_leave_walk_count, take_recursive_ls_tree_count,
+        ParsedTask, PriorTask, RepositoryIdentity, SkipReason, SkipTally, TaskKind,
+        archive_log_args, archived_leave_lookup, blob_days, blob_days_log_args, content_hash,
+        drain_reader, enclosing_prefix, escape_posix_ere, first_status_commit_date, fnv1a_digest,
+        frontmatter, git_bin, git_deadline, git_dir_command, git_log_args, git_path, git_program,
+        git_read, git_timeout, harvest_repository, harvest_repository_with_prior,
+        normalize_origin_url, parse_archive_log, parse_batch, pickaxe_log_args, read_blobs,
+        repository_identity, run_git_command, run_git_log, run_git_streaming, scan_log_dates,
+        scrub_git_env, stream_blob_days, take_leave_walk_count, take_recursive_ls_tree_count,
         take_worktree_cache_peak, take_worktree_read_bytes, take_worktree_read_count,
     };
     use crate::test_support::unique_temp_dir;
@@ -3264,13 +3292,14 @@ mod tests {
         let stream = batch_stream(&[first.clone(), second.clone()]);
         let (reader, exhausted) = ChunkedReader::new(bounded_chunks(&stream, 9));
         let mut state = HarvestState::default();
+        let mut tally = SkipTally::default();
         let mut first_arrival: Option<(String, bool, bool)> = None;
         parse_batch(reader, 2, |content| {
             let BlobContent::Text(text) = content else {
                 panic!("expected text, got {content:?}");
             };
             let path = format!("tasks/scope_{}.md", state.tasks.len());
-            state.harvest_file(&path, &text, false);
+            state.harvest_file(&path, &text, false, &mut tally);
             if first_arrival.is_none() {
                 first_arrival = Some((path, !state.tasks.is_empty(), exhausted.get()));
             }
@@ -7143,6 +7172,114 @@ mod tests {
         assert_eq!(harvested.skipped_count(), 2);
         assert_eq!(harvested.tasks.len(), 1, "the valid task still charts");
         assert_eq!(harvested.tasks[0].path, "tasks/scope_valid.md");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a task file dropped for an empty `status:` counts once in the
+    /// skip tally, while a stray `README.md` under `tasks/` is not a task and
+    /// adds nothing.
+    #[test]
+    fn harvest_tallies_a_task_file_with_an_empty_status() {
+        let repo = scratch("harvest_skip_empty_status");
+        write_task(&repo, "tasks/scope_valid.md", "2026-05-01", "open");
+        fs::write(
+            repo.join("tasks/scope_blank.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus:\n---\n\n# Task\n",
+        )
+        .expect("write an empty-status task");
+
+        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        assert_eq!(
+            harvested.tasks.len(),
+            1,
+            "only the valid task charts: {:?}",
+            harvested.tasks
+        );
+        assert_eq!(harvested.tasks[0].path, "tasks/scope_valid.md");
+        assert_eq!(
+            harvested.skipped.get(&SkipReason::EmptyStatus).copied(),
+            Some(1),
+            "the empty-status task is tallied: {:?}",
+            harvested.skipped
+        );
+        assert_eq!(harvested.skipped_count(), 1);
+
+        // A stray README.md under tasks/ is not a task the person lost, so it
+        // contributes no tally entry.
+        fs::write(repo.join("tasks/README.md"), "# Notes\n").expect("write a stray readme");
+        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        assert_eq!(
+            harvested.skipped_count(),
+            1,
+            "the README is not a task: {:?}",
+            harvested.skipped
+        );
+        assert_eq!(harvested.tasks.len(), 1);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a task file with no frontmatter, one whose `created` value is
+    /// not a date, one with no `created` value, and one with no `status` value
+    /// each count once in the skip tally, under their own reasons.
+    #[test]
+    fn harvest_tallies_a_task_file_with_no_frontmatter_and_one_with_a_bad_created() {
+        let repo = scratch("harvest_skip_frontmatter");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks dir");
+        fs::write(
+            repo.join("tasks/scope_none.md"),
+            "# Task\n\nThis file carries no frontmatter block.\n",
+        )
+        .expect("write a task with no frontmatter");
+        fs::write(
+            repo.join("tasks/scope_bad_date.md"),
+            "---\ncreated: not-a-date\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Task\n",
+        )
+        .expect("write a task with an unparseable created value");
+        fs::write(
+            repo.join("tasks/scope_no_created.md"),
+            "---\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Task\n",
+        )
+        .expect("write a task with no created value");
+        fs::write(
+            repo.join("tasks/scope_no_status.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\n---\n\n# Task\n",
+        )
+        .expect("write a task with no status value");
+
+        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        assert!(
+            harvested.tasks.is_empty(),
+            "no file charts a row: {:?}",
+            harvested.tasks
+        );
+        assert_eq!(
+            harvested.skipped.get(&SkipReason::NoFrontmatter).copied(),
+            Some(1),
+            "the file with no frontmatter is tallied: {:?}",
+            harvested.skipped
+        );
+        assert_eq!(
+            harvested
+                .skipped
+                .get(&SkipReason::UnparseableCreated)
+                .copied(),
+            Some(1),
+            "the file with an unparseable created value is tallied: {:?}",
+            harvested.skipped
+        );
+        assert_eq!(
+            harvested.skipped.get(&SkipReason::MissingCreated).copied(),
+            Some(1),
+            "the file with no created value is tallied: {:?}",
+            harvested.skipped
+        );
+        assert_eq!(
+            harvested.skipped.get(&SkipReason::MissingStatus).copied(),
+            Some(1),
+            "the file with no status value is tallied: {:?}",
+            harvested.skipped
+        );
+        assert_eq!(harvested.skipped_count(), 4);
         let _ = fs::remove_dir_all(&repo);
     }
 

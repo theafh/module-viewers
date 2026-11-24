@@ -170,6 +170,12 @@ input[type="search"] {
     font-size: 0.9rem;
 }
 
+.task-list td code {
+    /* A stored path is one unbroken token, so break it anywhere rather than
+       let it set the table's min-content width and scroll the page. */
+    overflow-wrap: anywhere;
+}
+
 .btn {
     display: inline-block;
     background: var(--accent);
@@ -283,6 +289,8 @@ input[type="search"] {
 .banner-error,
 .error-text {
     color: var(--danger);
+    overflow-wrap: anywhere;
+    min-width: 0;
 }
 
 .repo-list {

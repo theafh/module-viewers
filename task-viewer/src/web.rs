@@ -1501,8 +1501,9 @@ struct RepositoryRowView {
     created_at: String,
     scanned_at: Option<String>,
     last_error: String,
-    /// `N tasks · M live`, or empty for a repository that was never scanned, so
-    /// the row reads `not scanned yet` instead of a pair of zeros.
+    /// `N tasks · M live` with the task noun in the singular at one row, or
+    /// empty for a repository that was never scanned, so the row reads
+    /// `not scanned yet` instead of a pair of zeros.
     counts: String,
 }
 
@@ -1515,7 +1516,10 @@ impl RepositoryRowView {
     ) -> Self {
         let project = project_view_at(repo, now, zone);
         let counts = match project.scanned_at {
-            Some(_) => format!("{} tasks · {} live", counts.total, counts.live),
+            Some(_) => {
+                let noun = if counts.total == 1 { "task" } else { "tasks" };
+                format!("{} {noun} · {} live", counts.total, counts.live)
+            }
             None => String::new(),
         };
         Self {
@@ -1594,8 +1598,9 @@ fn dashboard_summary(counts: &series::Counts, repositories: usize, as_of: &str) 
     } else {
         "repositories"
     };
+    let task_noun = if counts.tasks == 1 { "task" } else { "tasks" };
     format!(
-        "{repositories} {noun} in scope · {} tasks · {} live · {} deferred · {} finished · as of {as_of}",
+        "{repositories} {noun} in scope · {} {task_noun} · {} live · {} deferred · {} finished · as of {as_of}",
         counts.tasks, counts.live, counts.deferred, counts.finished
     )
 }
@@ -3599,6 +3604,42 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Covers: a scope holding exactly one task names it in the singular in the
+    /// dashboard header, so the line reads `1 task`, not `1 tasks`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_dashboard_header_names_a_single_task_in_the_singular() {
+        let (state, path) = app_state("dashboard_header_single").await;
+        let folder = unique_temp_dir("dashboard_header_single_folder");
+        std::fs::create_dir_all(&folder).expect("repository folder");
+        let id = db::insert_repository(&state.pool, "single", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        db::replace_tasks(
+            &state.pool,
+            id,
+            &[parsed_task()],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("store rows");
+
+        let html = render_home(&state, &HomeQuery::default())
+            .await
+            .expect("render");
+
+        assert!(
+            html.contains("1 task ·"),
+            "a one-task scope names its single task in the singular"
+        );
+        assert!(
+            !html.contains("1 tasks"),
+            "a one-task scope never pluralizes its single task"
+        );
+
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
     /// Covers: the embedded chart payload is the JSON serialized with every
     /// `<` written as `\u003c` while the bytes pass, so a repository name that
     /// holds `</script><b>` cannot close the payload script element and the
@@ -4088,6 +4129,39 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(counted);
         let _ = std::fs::remove_dir_all(unscanned);
+        cleanup(&path);
+    }
+
+    /// Covers: a row storing exactly one task reads `1 task`, not `1 tasks`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_repositories_page_names_a_single_task_in_the_singular() {
+        let (state, path) = app_state("repo_counts_single").await;
+        let counted = live_repository("repo_counts_single_counted");
+        let id = db::insert_repository(&state.pool, "counted", &counted.to_string_lossy())
+            .await
+            .expect("insert");
+        db::replace_tasks(
+            &state.pool,
+            id,
+            &[parsed_task()],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("store rows");
+
+        let body =
+            body_text(send(state.clone(), get_page("/repositories", "127.0.0.1:7880")).await).await;
+
+        assert!(
+            body.contains("1 task · 1 live"),
+            "a one-row repository names its single task in the singular"
+        );
+        assert!(
+            !body.contains("1 tasks"),
+            "a one-row repository never pluralizes its single task"
+        );
+
+        let _ = std::fs::remove_dir_all(counted);
         cleanup(&path);
     }
 
@@ -6659,12 +6733,15 @@ mod tests {
     /// hand-written, so a new variant must be added to both.
     #[test]
     fn web_banner_codes_round_trip() {
-        const ALL: [Banner; 19] = [
+        const ALL: [Banner; 22] = [
             Banner::RepositoryAdded,
             Banner::RepositoryRemoved,
+            Banner::RepositoryScanned,
+            Banner::RepositoryRelocated,
             Banner::ChartsUpdated,
             Banner::NothingToUpdate,
             Banner::RepositoryExists,
+            Banner::RepositoryPathTaken,
             Banner::RepositoryListUnreadable,
             Banner::RepositorySaveFailed,
             Banner::RepositoryRemoveFailed,
@@ -10000,6 +10077,34 @@ mod tests {
         }
     }
 
+    /// Covers: a stored scan error can carry git's first stderr line cut at 200
+    /// characters, so the error span breaks an unbroken path and shrinks below
+    /// its content instead of pushing its row past the card.
+    #[test]
+    fn stylesheet_error_text_wraps_a_long_cause() {
+        let rule = css_rule(".banner-error,\n.error-text");
+        assert!(
+            rule.contains("overflow-wrap: anywhere"),
+            "the error text breaks an unbroken cause: {rule}"
+        );
+        assert!(
+            rule.contains("min-width: 0"),
+            "the error text shrinks below its content so it can wrap: {rule}"
+        );
+    }
+
+    /// Covers: a stored task path is one unbroken token, so the `/tasks` path
+    /// cell breaks it rather than setting the table's min-content width and
+    /// scrolling the page sideways.
+    #[test]
+    fn stylesheet_task_list_path_cell_wraps() {
+        let rule = css_rule(".task-list td code");
+        assert!(
+            rule.contains("overflow-wrap: anywhere"),
+            "the task path cell breaks an unbroken path: {rule}"
+        );
+    }
+
     /// Covers: `.tooltip` is fixed to the viewport; `tipFor` places it from the
     /// pointer's client coordinates with no frame offset, so the scrolling
     /// calendar frame neither clips nor shifts it; and a focused mark anchors
@@ -10018,8 +10123,12 @@ mod tests {
             "the tooltip follows the pointer's viewport coordinates: {tip_for}"
         );
         assert!(
-            tip_for.contains("tip.style.left = x + 12 + \"px\""),
-            "the tooltip sits 12px right of its anchor: {tip_for}"
+            tip_for.contains("var left = x + offset;"),
+            "the tooltip sits 12px right of its anchor when there is room: {tip_for}"
+        );
+        assert!(
+            tip_for.contains("tip.style.left = left + \"px\""),
+            "the tooltip is placed at the position the clamp settles: {tip_for}"
         );
         assert!(
             tip_for.contains("place(box.left + box.width / 2, box.top)"),
@@ -10028,6 +10137,67 @@ mod tests {
         assert!(
             !tip_for.contains("svg.getBoundingClientRect"),
             "the tooltip takes no frame offset lookup: {tip_for}"
+        );
+    }
+
+    /// Covers: a mark at the viewport's right or bottom edge keeps its tooltip
+    /// inside the window, where a fixed element is not clipped, while a mark
+    /// with room keeps the usual 12px offset.
+    #[test]
+    fn browser_tooltip_clamps_to_the_viewport() {
+        let payload = fixture_payload().to_string();
+        let config = browser_config(false, false, Some(&payload), serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["weekly"].querySelector("svg");
+  var mark = svg.children.filter(function (node) {
+    return node.name === "rect" && node.listeners.mousemove && node.listeners.mousemove.length;
+  })[0];
+  var tip = env.cards["weekly"].querySelector(".chart-frame").querySelector(".tooltip");
+  function px(value) { return Number(String(value).replace("px", "")); }
+  mark.listeners.mousemove[0]({
+    type: "mousemove",
+    clientX: env.window.innerWidth - 4,
+    clientY: env.window.innerHeight - 10
+  });
+  var edge = { left: px(tip.style.left), top: px(tip.style.top) };
+  mark.listeners.mousemove[0]({ type: "mousemove", clientX: 40, clientY: 30 });
+  var roomy = { left: px(tip.style.left), top: px(tip.style.top) };
+  return JSON.stringify({
+    innerWidth: env.window.innerWidth,
+    innerHeight: env.window.innerHeight,
+    tipWidth: tip.offsetWidth,
+    tipHeight: tip.offsetHeight,
+    edge: edge,
+    roomy: roomy
+  });
+})()"#,
+        );
+        let inner_width = result["innerWidth"].as_f64().expect("viewport width");
+        let inner_height = result["innerHeight"].as_f64().expect("viewport height");
+        let tip_width = result["tipWidth"].as_f64().expect("tooltip width");
+        let tip_height = result["tipHeight"].as_f64().expect("tooltip height");
+        let left = result["edge"]["left"].as_f64().expect("left");
+        let top = result["edge"]["top"].as_f64().expect("top");
+        assert!(
+            left >= 0.0 && left + tip_width <= inner_width,
+            "a mark at the right edge keeps the tooltip inside the window: {left} + {tip_width} <= {inner_width}"
+        );
+        assert!(
+            top >= 0.0 && top + tip_height <= inner_height,
+            "a mark at the bottom edge keeps the tooltip inside the window: {top} + {tip_height} <= {inner_height}"
+        );
+        assert_eq!(
+            result["roomy"]["left"].as_f64(),
+            Some(52.0),
+            "a mark with room keeps the 12px offset"
+        );
+        assert_eq!(
+            result["roomy"]["top"].as_f64(),
+            Some(42.0),
+            "a mark with room keeps the 12px offset"
         );
     }
 
@@ -11057,11 +11227,11 @@ mod tests {
         let project_rows = serde_json::json!([{"label": "Alpha", "count": 2, "repository_id": 7}]);
         let scope_rows = serde_json::json!([{"label": "alpha", "count": 2}]);
         let cases = [
-            ("project", &project_rows, "one spoke per project"),
+            ("project", &project_rows, "one spoke per repository"),
             ("scope", &scope_rows, "one spoke per scope"),
             // A payload that predates the mode field still names the right
             // spoke, because the rows carry the repository id.
-            ("", &project_rows, "one spoke per project"),
+            ("", &project_rows, "one spoke per repository"),
             ("", &scope_rows, "one spoke per scope"),
         ];
         for (mode, rows, expected) in cases {
@@ -11101,6 +11271,52 @@ mod tests {
                 assert!(
                     text.contains(expected),
                     "mode {mode:?} with {expected}: {card} read {text}"
+                );
+            }
+        }
+    }
+
+    /// Covers: an empty radar names its empty state with the plural of the
+    /// spoke it would draw, so project mode reads `No repositories yet` and
+    /// scope mode reads `No scopes yet`.
+    #[test]
+    fn browser_radar_empty_state_pluralizes_its_spoke() {
+        for (mode, expected) in [
+            ("project", "No repositories yet"),
+            ("scope", "No scopes yet"),
+        ] {
+            let mut payload = fixture_payload();
+            payload["radar_mode"] = serde_json::json!(mode);
+            payload["radar_shipped"] = serde_json::json!([]);
+            payload["radar_live"] = serde_json::json!([]);
+            let payload_text = payload.to_string();
+            let config = browser_config(
+                false,
+                false,
+                Some(&payload_text),
+                serde_json::json!("#123456"),
+            );
+            let result = run_browser(
+                &config,
+                r#"(function () {
+  var env = globalThis.__env;
+  function message(name) {
+    var texts = env.cards[name].querySelector("svg").children.filter(function (node) {
+      return node.name === "text";
+    });
+    return texts.length === 1 ? texts[0].textContent : null;
+  }
+  return JSON.stringify({
+    shipped: message("radar-shipped"),
+    live: message("radar-live")
+  });
+})()"#,
+            );
+            for card in ["shipped", "live"] {
+                assert_eq!(
+                    result[card].as_str(),
+                    Some(expected),
+                    "mode {mode:?} empty radar on the {card} card"
                 );
             }
         }
@@ -12643,7 +12859,8 @@ mod tests {
     }
 
     /// Covers: the weekly view picker redraws that card alone for each view, so
-    /// the bars carry only the chosen series and the summary names only those.
+    /// the bars carry only the chosen series, the summary names only those, and
+    /// another card's marks survive the redraw as the same nodes.
     #[test]
     fn browser_weekly_view_picker_redraws_the_bars() {
         let payload = fixture_payload().to_string();
@@ -12662,6 +12879,10 @@ mod tests {
   function summary() {
     return env.cards["weekly"].querySelector(".summary").textContent;
   }
+  // A card the picker does not own: its drawn marks must be the same node
+  // objects afterwards, not a redraw that happens to look alike.
+  var other = env.cards["cumulative"].querySelector("svg");
+  var before = other.children.slice();
   var views = {};
   views.initial = { bars: bars(), summary: summary() };
   [["shipped", "shipped"], ["deferred", "deferred"], ["stacked-ship-defer", "stacked"]].forEach(function (pair) {
@@ -12669,45 +12890,62 @@ mod tests {
     select.dispatchEvent({ type: "change" });
     views[pair[1]] = { bars: bars(), summary: summary() };
   });
-  return JSON.stringify(views);
+  return JSON.stringify({
+    views: views,
+    otherNodes: before.length,
+    otherSurvives: before.every(function (node) {
+      return other.children.indexOf(node) >= 0;
+    })
+  });
 })()"#,
         );
+        let views = &result["views"];
         assert_eq!(
-            result["initial"]["bars"].as_u64(),
+            views["initial"]["bars"].as_u64(),
             Some(5),
             "the stacked default draws every non-zero segment"
         );
         assert_eq!(
-            result["shipped"]["bars"].as_u64(),
+            views["shipped"]["bars"].as_u64(),
             Some(2),
             "only shipped leaves one bar per week"
         );
         assert_eq!(
-            result["shipped"]["summary"],
+            views["shipped"]["summary"],
             serde_json::json!("3 shipped · Monday weeks")
         );
         assert_eq!(
-            result["deferred"]["bars"].as_u64(),
+            views["deferred"]["bars"].as_u64(),
             Some(1),
             "only deferred draws the one week with a deferred count"
         );
         assert_eq!(
-            result["deferred"]["summary"],
+            views["deferred"]["summary"],
             serde_json::json!("1 deferred · Monday weeks")
         );
         assert_eq!(
-            result["stacked"]["bars"].as_u64(),
+            views["stacked"]["bars"].as_u64(),
             Some(3),
             "shipped and deferred stack without created"
         );
         assert_eq!(
-            result["stacked"]["summary"],
+            views["stacked"]["summary"],
             serde_json::json!("3 shipped · 1 deferred · Monday weeks")
+        );
+        assert!(
+            result["otherNodes"].as_u64().unwrap_or(0) > 0,
+            "the untouched card had marks to preserve"
+        );
+        assert_eq!(
+            result["otherSurvives"].as_bool(),
+            Some(true),
+            "the picker redraws the weekly card alone, so another card's marks are the same nodes"
         );
     }
 
     /// Covers: the weekly deferred bar draws in its own theme colour and names
-    /// its count on hover, without claiming a drill-down link.
+    /// its count on hover, without claiming a drill-down link, and a zero week
+    /// keeps a one-pixel hit that still names its `deferred 0`.
     #[test]
     fn browser_weekly_deferred_bar_names_its_count() {
         let payload = fixture_payload().to_string();
@@ -12720,15 +12958,30 @@ mod tests {
   var deferred = svg.children.filter(function (node) {
     return node.name === "rect" && String(node.attrs["data-tip"] || "").indexOf("deferred") >= 0;
   });
-  deferred[0].listeners.mousemove[0]({ type: "mousemove", clientX: 100, clientY: 100 });
   var tip = env.cards["weekly"].querySelector(".chart-frame").querySelector(".tooltip");
-  return JSON.stringify({ bars: deferred.length, text: tip.textContent });
+  deferred[0].listeners.mousemove[0]({ type: "mousemove", clientX: 100, clientY: 100 });
+  var text = tip.textContent;
+  deferred[1].listeners.mousemove[0]({ type: "mousemove", clientX: 100, clientY: 100 });
+  return JSON.stringify({
+    bars: deferred.length,
+    text: text,
+    zeroHeight: deferred[1].attrs.height,
+    zeroText: tip.textContent
+  });
 })()"#,
         );
         assert_eq!(result["bars"], 2, "one deferred hit mark per week");
         assert_eq!(
             result["text"], "Week of Jan 5, 2026 · deferred 1",
             "the deferred bar names its own count"
+        );
+        assert_eq!(
+            result["zeroHeight"], "1",
+            "a zero week keeps a one-pixel hit at its base"
+        );
+        assert_eq!(
+            result["zeroText"], "Week of Jan 12, 2026 · deferred 0",
+            "the zero week's hit still names its deferred 0"
         );
     }
 

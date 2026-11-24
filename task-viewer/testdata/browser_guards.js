@@ -86,6 +86,19 @@
       return CHART_HEIGHT[this.chart] || 190;
     }
   });
+  // A laid-out border box, which the tooltip clamp reads. The tooltip is a
+  // small fixed box near the pointer rather than a frame-wide one, so it
+  // reports its own measured size; every other node matches its client box.
+  Object.defineProperty(Node.prototype, "offsetWidth", {
+    get: function () {
+      return this.name === "tip" ? 160 : this.clientWidth;
+    }
+  });
+  Object.defineProperty(Node.prototype, "offsetHeight", {
+    get: function () {
+      return this.name === "tip" ? 24 : this.clientHeight;
+    }
+  });
   Node.prototype.setAttribute = function (key, value) {
     this.attrs[key] = String(value);
     // The line chart's overlay converts a pointer position through the
@@ -376,6 +389,10 @@
   // dashboard's next status poll itself.
   var timeouts = [];
   var window = {
+    // The viewport the tooltip clamp measures against: as wide as the frame
+    // config sets and tall enough for a chart column.
+    innerWidth: width,
+    innerHeight: 800,
     addEventListener: function (type, handler) {
       events.push([type, handler]);
     },

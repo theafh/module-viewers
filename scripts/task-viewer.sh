@@ -488,6 +488,10 @@ do_status() {
         echo "Access at: http://127.0.0.1:$PORT"
     else
         echo "task-viewer is not running"
+        # A stopped server is a non-zero status, so a script can branch on
+        # `make status` the way it would on `systemctl is-active`. The text
+        # stays the same; only the exit code carries the answer.
+        return 1
     fi
 }
 
