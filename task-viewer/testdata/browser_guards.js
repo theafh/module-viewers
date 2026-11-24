@@ -99,6 +99,9 @@
   Node.prototype.getAttribute = function (key) {
     return Object.prototype.hasOwnProperty.call(this.attrs, key) ? this.attrs[key] : null;
   };
+  Node.prototype.removeAttribute = function (key) {
+    delete this.attrs[key];
+  };
   Node.prototype.appendChild = function (child) {
     this.children.push(child);
     child.parent = this;
@@ -265,6 +268,25 @@
   var themeButton = new Node("button");
   themeButton.textContent = "Dark theme";
   themeButton.attrs["aria-pressed"] = "true";
+  // The dashboard's Update form and its submit button, so a test can dispatch
+  // `submit` and read the busy state the shipped script applies. The form's own
+  // `querySelector` finds the button the way the page does.
+  var updateButton = new Node("button");
+  updateButton.textContent = "Update";
+  updateButton.disabled = false;
+  var updateForm = new Node("form");
+  updateForm.attrs.id = "update-form";
+  updateForm.appendChild(updateButton);
+  updateForm.querySelector = function (selector) {
+    return selector === "button" ? updateButton : null;
+  };
+  // The charts section the busy state is set on.
+  var chartsSection = new Node("section");
+  chartsSection.attrs.class = "charts";
+  // The dashboard header's scan-status line, which the poll fills with the
+  // repository count while a scan runs.
+  var scanStatusNode = new Node("p");
+  scanStatusNode.attrs.id = "scan-status";
   var store = {};
   if (config.storedTheme !== undefined && config.storedTheme !== null) {
     store["task-viewer-theme"] = String(config.storedTheme);
@@ -286,6 +308,8 @@
     getElementById: function (id) {
       if (id === "payload") return payloadNode;
       if (id === "theme-toggle") return themeButton;
+      if (id === "update-form") return updateForm;
+      if (id === "scan-status") return scanStatusNode;
       return null;
     },
     createElementNS: function (namespace, name) {
@@ -296,6 +320,7 @@
       return new Node(name);
     },
     querySelector: function (selector) {
+      if (selector === ".charts") return chartsSection;
       return Object.prototype.hasOwnProperty.call(registry, selector) ? registry[selector] : null;
     },
     // A page-level listener such as the dashboard's pointerdown hide and the
@@ -323,6 +348,9 @@
   // Every confirm message the shipped scripts build, in order, so a test can
   // assert the text a Remove submit produced.
   var confirms = [];
+  // Every callback a shipped script scheduled, in order, so a test can run the
+  // dashboard's next status poll itself.
+  var timeouts = [];
   var window = {
     addEventListener: function (type, handler) {
       events.push([type, handler]);
@@ -345,8 +373,11 @@
       confirms.push(String(message));
       return config.confirmResult !== false;
     },
-    setTimeout: function () {
-      return 1;
+    // Scheduled callbacks are recorded instead of run, so a test can drive a
+    // poll's next tick by hand and assert that a finished poll schedules none.
+    setTimeout: function (handler, delay) {
+      timeouts.push({ handler: handler, delay: delay });
+      return timeouts.length;
     },
     clearTimeout: function () {}
   };
@@ -386,6 +417,11 @@
     chartHeights: CHART_HEIGHT,
     html: html,
     themeButton: themeButton,
+    updateForm: updateForm,
+    updateButton: updateButton,
+    chartsSection: chartsSection,
+    scanStatus: scanStatusNode,
+    timeouts: timeouts,
     confirms: confirms
   };
 })();

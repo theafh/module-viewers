@@ -9394,7 +9394,10 @@ mod tests {
                 git_bin()
             ),
         );
-        register_fake_git(&repo, &script);
+        // The stand-in delegates every non-`log` command to the real git, so the
+        // deadline must cover a real process start under parallel test load; a
+        // 100 ms budget made this test flake.
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(10));
 
         let tasks = harvest_repository(&repo).expect("no blob-day walk may run");
         let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();

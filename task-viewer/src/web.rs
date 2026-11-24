@@ -1,5 +1,5 @@
 use axum::{
-    Router,
+    Json, Router,
     extract::{Form, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
@@ -335,6 +335,8 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks", get(tasks_page))
         .route("/repositories", get(repositories_page).post(add_repository))
         .route("/repositories/{id}/delete", post(remove_repository))
+        .route("/repositories/{id}/scan", post(scan_repository))
+        .route("/status", get(scan_status))
         .route("/scan", post(scan_all))
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
@@ -356,7 +358,8 @@ pub fn router(state: AppState) -> Router {
         // The security headers sit outside the host check, so the 403 that
         // rejects a foreign Host carries them too. The CSP holds only
         // `frame-ancestors`, which restricts no script source: the theme
-        // bootstrap, the inline handlers, and the static scripts keep running.
+        // bootstrap, the Show button and the delegated Remove confirm, and the
+        // static scripts keep running.
         .layer(SetResponseHeaderLayer::overriding(
             header::X_FRAME_OPTIONS,
             HeaderValue::from_static("DENY"),
@@ -623,6 +626,7 @@ fn is_local_host(host: &str) -> bool {
 enum Banner {
     RepositoryAdded,
     RepositoryRemoved,
+    RepositoryScanned,
     ChartsUpdated,
     NothingToUpdate,
     RepositoryExists,
@@ -648,6 +652,7 @@ impl Banner {
         match self {
             Self::RepositoryAdded => "repository-added",
             Self::RepositoryRemoved => "repository-removed",
+            Self::RepositoryScanned => "repository-scanned",
             Self::ChartsUpdated => "charts-updated",
             Self::NothingToUpdate => "nothing-to-update",
             Self::RepositoryExists => "repository-exists",
@@ -673,6 +678,7 @@ impl Banner {
         match self {
             Self::RepositoryAdded => "Repository added.",
             Self::RepositoryRemoved => "Repository removed.",
+            Self::RepositoryScanned => "Repository rescanned.",
             Self::ChartsUpdated => "Charts updated.",
             Self::NothingToUpdate => "Nothing to update.",
             Self::RepositoryExists => "That repository is already on the dashboard.",
@@ -700,6 +706,7 @@ impl Banner {
             self,
             Self::RepositoryAdded
                 | Self::RepositoryRemoved
+                | Self::RepositoryScanned
                 | Self::ChartsUpdated
                 | Self::NothingToUpdate
         )
@@ -715,6 +722,7 @@ impl Banner {
         let banner = match code {
             "repository-added" => Self::RepositoryAdded,
             "repository-removed" => Self::RepositoryRemoved,
+            "repository-scanned" => Self::RepositoryScanned,
             "charts-updated" => Self::ChartsUpdated,
             "nothing-to-update" => Self::NothingToUpdate,
             "repository-exists" => Self::RepositoryExists,
@@ -1533,6 +1541,78 @@ async fn remove_repository(State(state): State<AppState>, Path(id): Path<i64>) -
     redirect_repositories(Banner::RepositoryRemoved)
 }
 
+/// Re-harvest and store one repository's rows without touching any other. The
+/// scan lock is taken before the repository is read, so a concurrent Remove
+/// cannot delete the row between the lookup and the store, and an unknown id
+/// answers the existing not-found code instead of harvesting anything.
+async fn scan_repository(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let _guard = state.scan.lock().await;
+    let repositories = match db::list_repositories(&state.pool).await {
+        Ok(repositories) => repositories,
+        Err(error) => {
+            tracing::error!(%error, "list failed");
+            return redirect_repositories(Banner::RepositoryListUnreadable);
+        }
+    };
+    let Some(repository) = repositories
+        .iter()
+        .find(|repository| repository.repository_id == id)
+    else {
+        return redirect_repositories(Banner::RepositoryNotFound);
+    };
+    let path = PathBuf::from(&repository.path);
+    match refresh_one(&state.pool, &state.store_hook, id, &path).await {
+        Some(banner) => redirect_repositories(banner),
+        None => redirect_repositories(Banner::RepositoryScanned),
+    }
+}
+
+/// The JSON the dashboard polls while a scan runs. It reads the lock without
+/// waiting, so a status read never queues behind the scan it reports.
+#[derive(Serialize)]
+struct StatusPage {
+    scanning: bool,
+    worker_cap: usize,
+    repositories: usize,
+    last_scan: Option<String>,
+    failed_repositories: usize,
+}
+
+async fn scan_status(State(state): State<AppState>) -> Response {
+    let scanning = state.scan.try_lock().is_err();
+    let repositories = match db::list_repositories(&state.pool).await {
+        Ok(repositories) => repositories,
+        Err(error) => {
+            tracing::error!(%error, "list failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The scan status could not be read.",
+            )
+                .into_response();
+        }
+    };
+    // The newest parseable stamp, chosen the way `scan_label` chooses the oldest
+    // in scope, so a stamp an older build wrote still names its own instant.
+    let last_scan = repositories
+        .iter()
+        .filter_map(|repository| repository.scanned_at.as_deref())
+        .filter_map(|stamp| scan_instant(stamp).map(|instant| (instant, stamp)))
+        .max_by_key(|(instant, _)| *instant)
+        .map(|(_, stamp)| stamp.to_string());
+    let failed_repositories = repositories
+        .iter()
+        .filter(|repository| repository.last_error.is_some())
+        .count();
+    Json(StatusPage {
+        scanning,
+        worker_cap: state.scan_workers,
+        repositories: repositories.len(),
+        last_scan,
+        failed_repositories,
+    })
+    .into_response()
+}
+
 async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) -> Response {
     let project = safe_project(&form.project);
     // A click that arrives while a follow-up is queued joins that run instead
@@ -2053,8 +2133,9 @@ mod tests {
         ScanFailure, ScanReport, StoreHookFn, add_repository, claim_banner, encode_query,
         flash_banner, init_templates, is_local_host, osascript_outcome, query_banner,
         record_scan_error, remaining, remove_repository, render_blocking_thread, render_home,
-        router, scan_all, scan_core, scan_flash, scan_label, scan_response, scan_worker_cap, serve,
-        serve_until_stopped, static_version, store_hook_from, zenity_outcome,
+        router, scan_all, scan_core, scan_flash, scan_instant, scan_label, scan_response,
+        scan_worker_cap, serve, serve_until_stopped, static_version, store_hook_from,
+        zenity_outcome,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -6478,6 +6559,272 @@ mod tests {
         cleanup(&path);
     }
 
+    /// One `/status` read through the router, with the JSON body and the
+    /// uncached page header the dashboard's poll relies on.
+    async fn status_json(state: &AppState) -> serde_json::Value {
+        let response = send(state.clone(), get_page("/status", "127.0.0.1:7880")).await;
+        assert_eq!(
+            header_text(&response, header::CACHE_CONTROL),
+            "no-store",
+            "the status route is never cached"
+        );
+        assert_eq!(
+            header_text(&response, header::CONTENT_TYPE),
+            "application/json"
+        );
+        let body = body_text(response).await;
+        serde_json::from_str(&body).expect("status json")
+    }
+
+    /// Covers: `POST /repositories/{id}/scan` harvests only the named repository
+    /// and leaves the other repository's rows and scan stamp alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rescan_harvests_only_the_named_repository() {
+        let (state, path) = app_state("rescan_one").await;
+        let folder_alpha = live_repository("rescan_one_alpha");
+        let folder_beta = live_repository("rescan_one_beta");
+        let alpha = db::insert_repository(&state.pool, "Alpha", &folder_alpha.to_string_lossy())
+            .await
+            .expect("alpha");
+        let beta = db::insert_repository(&state.pool, "Beta", &folder_beta.to_string_lossy())
+            .await
+            .expect("beta");
+        scan_all(State(state.clone()), Form(ProjectForm::default())).await;
+
+        let before = db::list_repositories(&state.pool).await.expect("list");
+        let beta_before = before
+            .iter()
+            .find(|repository| repository.repository_id == beta)
+            .expect("beta is listed")
+            .clone();
+        assert!(
+            beta_before.scanned_at.is_some(),
+            "the seed scan stamped the other repository"
+        );
+
+        // The new file exists only under Alpha, so only Alpha's rescan sees it.
+        std::fs::write(
+            folder_alpha.join("tasks/scope_extra.md"),
+            "---\ncreated: 2026-05-02T10:00:00\nupdated: 2026-05-02T10:00:00\nstatus: open\n---\n\n# Extra\n",
+        )
+        .expect("extra task");
+
+        let response = send(
+            state.clone(),
+            form_post(&format!("/repositories/{alpha}/scan"), None, None),
+        )
+        .await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=repository-scanned"
+        );
+
+        let after = db::list_repositories(&state.pool).await.expect("list");
+        let beta_after = after
+            .iter()
+            .find(|repository| repository.repository_id == beta)
+            .expect("beta is listed");
+        assert_eq!(
+            beta_after.scanned_at, beta_before.scanned_at,
+            "the other repository keeps its scan stamp"
+        );
+        let beta_rows = db::load_tasks(&state.pool, Some(beta))
+            .await
+            .expect("beta rows");
+        assert_eq!(
+            beta_rows.len(),
+            1,
+            "the other repository keeps exactly its own rows"
+        );
+        let alpha_rows = db::load_tasks(&state.pool, Some(alpha))
+            .await
+            .expect("alpha rows");
+        assert_eq!(
+            alpha_rows.len(),
+            2,
+            "the rescanned repository picks up the file written after the seed scan"
+        );
+        let _ = std::fs::remove_dir_all(folder_alpha);
+        let _ = std::fs::remove_dir_all(folder_beta);
+        cleanup(&path);
+    }
+
+    /// Covers: a rescan of a repository whose folder holds no `tasks/` reports
+    /// the harvest's own error code and stores its scan error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rescan_reports_a_missing_tasks_directory() {
+        let (state, path) = app_state("rescan_missing_tasks").await;
+        let folder = unique_temp_dir("rescan_missing_tasks_repo");
+        std::fs::create_dir_all(&folder).expect("empty folder");
+        let id = db::insert_repository(&state.pool, "Empty", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+
+        let response = send(
+            state.clone(),
+            form_post(&format!("/repositories/{id}/scan"), None, None),
+        )
+        .await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?error=no-tasks-directory"
+        );
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert!(
+            repositories[0].last_error.is_some(),
+            "the failed rescan stores its scan error"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Covers: the rescan route answers an unknown id with the existing
+    /// not-found code and harvests nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_rescan_reports_a_missing_repository() {
+        let (state, path) = app_state("rescan_unknown").await;
+
+        let response = send(
+            state.clone(),
+            form_post("/repositories/4242/scan", None, None),
+        )
+        .await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?error=repository-not-found"
+        );
+        assert!(
+            db::list_repositories(&state.pool)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        assert!(
+            db::load_tasks(&state.pool, None)
+                .await
+                .expect("rows")
+                .is_empty()
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: `GET /status` reports `scanning`, `worker_cap`, `repositories`,
+    /// `last_scan`, and `failed_repositories` before, during, and after a scan,
+    /// with the store hook holding the scan lock open mid-run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_status_reports_the_scan_state_before_during_and_after_a_run() {
+        let (mut state, path) = app_state("status_scan").await;
+        let live = live_repository("status_scan_live");
+        let empty = unique_temp_dir("status_scan_empty");
+        std::fs::create_dir_all(&empty).expect("empty folder");
+        db::insert_repository(&state.pool, "Live", &live.to_string_lossy())
+            .await
+            .expect("live");
+        db::insert_repository(&state.pool, "Empty", &empty.to_string_lossy())
+            .await
+            .expect("empty");
+
+        let before = status_json(&state).await;
+        assert_eq!(before["scanning"], serde_json::json!(false));
+        assert_eq!(before["worker_cap"], serde_json::json!(state.scan_workers));
+        assert_eq!(before["repositories"], serde_json::json!(2));
+        assert_eq!(before["last_scan"], serde_json::Value::Null);
+        assert_eq!(before["failed_repositories"], serde_json::json!(0));
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let store_hook: Arc<StoreHookFn> = Arc::new(move || {
+            let entered_tx = entered_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let _ = entered_tx.send(()).await;
+                let release = release_rx.lock().await.take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+            })
+        });
+        state.store_hook = store_hook;
+
+        let scan = tokio::spawn(scan_all(State(state.clone()), Form(ProjectForm::default())));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the store is entered")
+            .expect("the store signalled");
+
+        let during = status_json(&state).await;
+        assert_eq!(
+            during["scanning"],
+            serde_json::json!(true),
+            "the held scan lock reads as a running scan"
+        );
+        assert_eq!(during["repositories"], serde_json::json!(2));
+
+        release_tx.send(()).expect("release the store");
+        tokio::time::timeout(Duration::from_secs(10), scan)
+            .await
+            .expect("the scan finishes")
+            .expect("the scan task joins");
+
+        let after = status_json(&state).await;
+        assert_eq!(after["scanning"], serde_json::json!(false));
+        assert_eq!(after["repositories"], serde_json::json!(2));
+        assert_eq!(
+            after["failed_repositories"],
+            serde_json::json!(1),
+            "the repository without tasks/ counts as failed"
+        );
+        assert!(
+            after["last_scan"]
+                .as_str()
+                .is_some_and(|stamp| scan_instant(stamp).is_some()),
+            "the newest successful stamp is reported: {}",
+            after["last_scan"]
+        );
+        let _ = std::fs::remove_dir_all(live);
+        let _ = std::fs::remove_dir_all(empty);
+        cleanup(&path);
+    }
+
+    /// Covers: every repository row carries a Rescan button whose form posts to
+    /// that repository's own scan route.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_repositories_page_renders_a_rescan_button_per_row() {
+        let (state, path) = app_state("rescan_buttons").await;
+        let folder_alpha = unique_temp_dir("rescan_buttons_alpha");
+        let folder_beta = unique_temp_dir("rescan_buttons_beta");
+        std::fs::create_dir_all(&folder_alpha).expect("alpha folder");
+        std::fs::create_dir_all(&folder_beta).expect("beta folder");
+        let alpha = db::insert_repository(&state.pool, "Alpha", &folder_alpha.to_string_lossy())
+            .await
+            .expect("alpha");
+        let beta = db::insert_repository(&state.pool, "Beta", &folder_beta.to_string_lossy())
+            .await
+            .expect("beta");
+
+        let body =
+            body_text(send(state.clone(), get_page("/repositories", "127.0.0.1:7880")).await).await;
+        assert_eq!(
+            body.matches(&format!("action=\"/repositories/{alpha}/scan\""))
+                .count(),
+            1
+        );
+        assert_eq!(
+            body.matches(&format!("action=\"/repositories/{beta}/scan\""))
+                .count(),
+            1
+        );
+        assert_eq!(
+            body.matches(">Rescan ").count(),
+            2,
+            "each row's button reads Rescan and its repository name"
+        );
+        let _ = std::fs::remove_dir_all(folder_alpha);
+        let _ = std::fs::remove_dir_all(folder_beta);
+        cleanup(&path);
+    }
+
     /// One stored row with explicit dates, so a task-list test can seed the
     /// filters it drives.
     fn stored_row(
@@ -9234,6 +9581,191 @@ mod tests {
         let mut payload = fixture_payload();
         payload["weekly"] = serde_json::json!([{"week": "2026-01-05", "shipped": max, "created": 1, "deferred": 0}]);
         payload
+    }
+
+    /// Covers: submitting Update disables the button, labels it `Updating…`,
+    /// and marks the charts section busy; `pageshow` restores all three.
+    #[test]
+    fn browser_update_submit_marks_the_page_busy() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  env.updateForm.dispatchEvent({ type: "submit" });
+  var busy = {
+    disabled: env.updateButton.disabled,
+    label: env.updateButton.textContent,
+    ariaBusy: env.chartsSection.getAttribute("aria-busy")
+  };
+  // A plain initial `pageshow` must not clear the busy state.
+  env.window.dispatchEvent({ type: "pageshow" });
+  var afterInitial = {
+    disabled: env.updateButton.disabled,
+    label: env.updateButton.textContent,
+    ariaBusy: env.chartsSection.getAttribute("aria-busy")
+  };
+  // Only a back-forward-cache restore clears it.
+  env.window.dispatchEvent({ type: "pageshow", persisted: true });
+  return JSON.stringify({
+    busy: busy,
+    afterInitial: afterInitial,
+    restored: {
+      disabled: env.updateButton.disabled,
+      label: env.updateButton.textContent,
+      ariaBusy: env.chartsSection.getAttribute("aria-busy")
+    }
+  });
+})()"#,
+        );
+        assert_eq!(result["busy"]["disabled"], serde_json::json!(true));
+        assert_eq!(result["busy"]["label"], serde_json::json!("Updating…"));
+        assert_eq!(result["busy"]["ariaBusy"], serde_json::json!("true"));
+        assert_eq!(
+            result["afterInitial"]["disabled"],
+            serde_json::json!(true),
+            "an initial pageshow leaves the busy state alone"
+        );
+        assert_eq!(
+            result["afterInitial"]["ariaBusy"],
+            serde_json::json!("true")
+        );
+        assert_eq!(result["restored"]["disabled"], serde_json::json!(false));
+        assert_eq!(result["restored"]["label"], serde_json::json!("Update"));
+        assert_eq!(result["restored"]["ariaBusy"], serde_json::Value::Null);
+    }
+
+    /// A stub `fetch` whose thenables resolve synchronously, so the dashboard's
+    /// first `/status` poll completes inside the load and a test can drive the
+    /// next tick by hand. The first payload reports a running scan, the second a
+    /// finished one.
+    const SCAN_STATUS_FETCH: &str = r#"(function () {
+  globalThis.__fetchCalls = 0;
+  function resolved(value) {
+    if (value && typeof value.then === "function") return value;
+    return {
+      then: function (onFulfilled) {
+        try { return resolved(onFulfilled ? onFulfilled(value) : value); }
+        catch (error) { return rejected(error); }
+      },
+      catch: function () { return this; }
+    };
+  }
+  function rejected(error) {
+    return {
+      then: function () { return this; },
+      catch: function (onRejected) { if (onRejected) onRejected(error); return this; }
+    };
+  }
+  globalThis.fetch = function () {
+    globalThis.__fetchCalls += 1;
+    var payload = {
+      scanning: globalThis.__fetchCalls === 1,
+      worker_cap: 4,
+      repositories: 3,
+      last_scan: null,
+      failed_repositories: 0
+    };
+    return resolved({ ok: true, json: function () { return resolved(payload); } });
+  };
+})();"#;
+
+    /// Covers: a dashboard load that finds `scanning: true` marks the page busy,
+    /// names the repository count, and schedules one more poll; a poll that finds
+    /// the scan finished restores the page and schedules none.
+    #[test]
+    fn browser_dashboard_polls_scan_status_until_the_scan_ends() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser_with(
+            SCAN_STATUS_FETCH,
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var busy = {
+    calls: globalThis.__fetchCalls,
+    ariaBusy: env.chartsSection.getAttribute("aria-busy"),
+    label: env.updateButton.textContent,
+    status: env.scanStatus.textContent,
+    scheduled: env.timeouts.length
+  };
+  var tick = env.timeouts[0];
+  if (tick) tick.handler();
+  return JSON.stringify({
+    busy: busy,
+    after: {
+      calls: globalThis.__fetchCalls,
+      ariaBusy: env.chartsSection.getAttribute("aria-busy"),
+      label: env.updateButton.textContent,
+      status: env.scanStatus.textContent,
+      scheduled: env.timeouts.length
+    }
+  });
+})()"#,
+        );
+        assert_eq!(result["busy"]["calls"], serde_json::json!(1));
+        assert_eq!(result["busy"]["ariaBusy"], serde_json::json!("true"));
+        assert_eq!(result["busy"]["label"], serde_json::json!("Updating…"));
+        assert!(
+            result["busy"]["status"]
+                .as_str()
+                .is_some_and(|text| text.contains('3')),
+            "the poll names the repository count: {}",
+            result["busy"]["status"]
+        );
+        assert_eq!(
+            result["busy"]["scheduled"],
+            serde_json::json!(1),
+            "a running scan schedules its next poll"
+        );
+        assert_eq!(result["after"]["calls"], serde_json::json!(2));
+        assert_eq!(result["after"]["ariaBusy"], serde_json::Value::Null);
+        assert_eq!(result["after"]["label"], serde_json::json!("Update"));
+        assert_eq!(result["after"]["status"], serde_json::json!(""));
+        assert_eq!(
+            result["after"]["scheduled"],
+            serde_json::json!(1),
+            "a finished scan schedules no poll"
+        );
+    }
+
+    /// Covers: a `/status` tick that reports no scan does not clear the busy
+    /// state a submit has just set, because the browser owns that navigation.
+    #[test]
+    fn browser_submit_keeps_the_busy_state_across_a_poll_tick() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser_with(
+            SCAN_STATUS_FETCH,
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var form = env.updateForm;
+  form.dispatchEvent({ type: "submit" });
+  var afterSubmit = {
+    ariaBusy: env.chartsSection.getAttribute("aria-busy"),
+    label: env.updateButton.textContent
+  };
+  var tick = env.timeouts[0];
+  if (tick) tick.handler();
+  return JSON.stringify({
+    afterSubmit: afterSubmit,
+    afterTick: {
+      ariaBusy: env.chartsSection.getAttribute("aria-busy"),
+      label: env.updateButton.textContent
+    }
+  });
+})()"#,
+        );
+        assert_eq!(result["afterSubmit"]["ariaBusy"], serde_json::json!("true"));
+        assert_eq!(
+            result["afterSubmit"]["label"],
+            serde_json::json!("Updating…")
+        );
+        assert_eq!(
+            result["afterTick"]["ariaBusy"],
+            serde_json::json!("true"),
+            "a poll tick must not clear an in-flight submit's busy state"
+        );
+        assert_eq!(result["afterTick"]["label"], serde_json::json!("Updating…"));
     }
 
     /// Counts only the six-argument `Date` constructions `parseDay` makes, so a

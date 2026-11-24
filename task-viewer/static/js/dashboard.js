@@ -1190,7 +1190,105 @@
 
   window.addEventListener("task-viewer-theme", recolor);
   document.addEventListener("pointerdown", hideAllTips);
+
+  // Update runs as a native form submit, so the browser follows the redirect and
+  // claims the one-shot banner exactly once. While that navigation is in flight
+  // the button reports the work and the charts section carries `aria-busy`. A
+  // back-navigation from the browser's cache re-enters the page on `pageshow`,
+  // which is where the button and the busy state are restored.
+  var updateForm = document.getElementById("update-form");
+  var updateButton = updateForm && typeof updateForm.querySelector === "function"
+    ? updateForm.querySelector("button")
+    : null;
+  var updateLabel = updateButton ? updateButton.textContent : "";
+  var chartsSection = document.querySelector(".charts");
+  var scanStatus = document.getElementById("scan-status");
+
+  function setBusy(busy) {
+    if (updateButton) {
+      updateButton.disabled = busy;
+      updateButton.textContent = busy ? "Updating…" : updateLabel;
+    }
+    if (chartsSection) {
+      if (busy) {
+        chartsSection.setAttribute("aria-busy", "true");
+      } else {
+        chartsSection.removeAttribute("aria-busy");
+      }
+    }
+  }
+
+  function setScanStatus(text) {
+    if (scanStatus) {
+      scanStatus.textContent = text;
+    }
+  }
+
+  // A submit starts a navigation the browser owns, so a `/status` tick that
+  // reports no scan must not re-enable the button while that navigation is in
+  // flight; only the navigation itself ends the busy state.
+  var submitting = false;
+  if (updateForm) {
+    updateForm.addEventListener("submit", function () {
+      submitting = true;
+      setBusy(true);
+    });
+  }
+
+  // Only a back-forward-cache restore clears the busy state. The initial
+  // `pageshow` fires on every load, so clearing there would undo the busy
+  // state the first `/status` poll just set on a page opened during a scan.
+  window.addEventListener("pageshow", function (event) {
+    if (event && event.persisted) {
+      setBusy(false);
+      setScanStatus("");
+    }
+  });
+
+  // One `/status` read on load, then one per second while the payload reports a
+  // scan, so a page opened during a run shows it and names how many repositories
+  // are configured. A browser without `fetch` keeps the native form.
+  function showScanning(data) {
+    var scanning = !!(data && data.scanning);
+    if (!scanning && submitting) {
+      return false;
+    }
+    setBusy(scanning);
+    if (!scanning) {
+      setScanStatus("");
+      return false;
+    }
+    var count = typeof data.repositories === "number" ? data.repositories : 0;
+    setScanStatus("Updating… " + count + (count === 1 ? " repository configured" : " repositories configured"));
+    return true;
+  }
+
+  function pollScanStatus() {
+    if (typeof fetch !== "function") {
+      return;
+    }
+    fetch("/status", { cache: "no-store", headers: { Accept: "application/json" } })
+      .then(function (response) {
+        return response.json();
+      })
+      .then(function (data) {
+        if (showScanning(data)) {
+          window.setTimeout(pollScanStatus, 1000);
+        }
+      })
+      .catch(function () {
+        // A failed read must not leave the page disabled: restore the idle
+        // state so the person can act, and stop polling. A submit in flight
+        // owns the busy state, so leave it alone.
+        if (!submitting) {
+          setBusy(false);
+          setScanStatus("");
+        }
+      });
+  }
+
   renderAll();
+  pollScanStatus();
   var resizeTimer = 0;
   window.addEventListener("resize", function () {
     window.clearTimeout(resizeTimer);

@@ -11,7 +11,7 @@
     </select>
     <button class="btn btn-secondary" type="submit">Show</button>
 </form>
-<form method="post" action="/scan">
+<form method="post" action="/scan" id="update-form">
     <input type="hidden" name="project" value="{{ selected }}">
     <button class="btn btn-secondary" type="submit">Update</button>
 </form>
@@ -29,6 +29,7 @@
         <p class="muted">{{ scan_label }}</p>
     </div>
     <p class="muted">{{ summary }}</p>
+    <p class="muted" id="scan-status" role="status" aria-live="polite"></p>
 </header>
 {% if failures %}
 <ul class="repo-list">
