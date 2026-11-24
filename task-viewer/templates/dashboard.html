@@ -49,17 +49,21 @@
 <section class="charts">
     <article class="chart-card" data-chart="weekly">
         <header>
-            <h2 id="weekly-title">Tasks shipped vs created by week</h2>
+            <div class="chart-head">
+                <h2 id="weekly-title">Tasks shipped vs created by week</h2>
+                <label class="chart-view" for="weekly-mode">View
+                    <select id="weekly-mode">
+                        <option value="stacked-all">All three stacked</option>
+                        <option value="shipped">Only shipped</option>
+                        <option value="created">Only created</option>
+                        <option value="deferred">Only deferred</option>
+                        <option value="stacked-ship-defer">Shipped + deferred</option>
+                    </select>
+                </label>
+            </div>
             <p class="muted summary" id="weekly-summary"></p>
         </header>
         <div class="chart-frame"><svg role="group" aria-labelledby="weekly-title" aria-describedby="weekly-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
-        <details class="chart-data">
-            <summary>Show data</summary>
-            <table class="data-table">
-                <thead><tr><th scope="col">Week</th><th scope="col">Shipped</th><th scope="col">Created</th><th scope="col">Deferred</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </details>
     </article>
     <article class="chart-card" data-chart="cumulative">
         <header>
@@ -67,13 +71,6 @@
             <p class="muted summary" id="cumulative-summary"></p>
         </header>
         <div class="chart-frame"><svg role="group" aria-labelledby="cumulative-title" aria-describedby="cumulative-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
-        <details class="chart-data">
-            <summary>Show data</summary>
-            <table class="data-table">
-                <thead><tr><th scope="col">Day</th><th scope="col">Shipped</th><th scope="col">Cumulative</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </details>
     </article>
     <article class="chart-card wide" data-chart="shipped-calendar">
         <header>
@@ -81,13 +78,6 @@
             <p class="muted summary" id="shipped-calendar-summary"></p>
         </header>
         <div class="chart-frame calendar"><svg role="group" aria-labelledby="shipped-calendar-title" aria-describedby="shipped-calendar-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
-        <details class="chart-data">
-            <summary>Show data</summary>
-            <table class="data-table">
-                <thead><tr><th scope="col">Day</th><th scope="col">Shipped</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </details>
     </article>
     <article class="chart-card wide" data-chart="created-calendar">
         <header>
@@ -95,13 +85,6 @@
             <p class="muted summary" id="created-calendar-summary"></p>
         </header>
         <div class="chart-frame calendar"><svg role="group" aria-labelledby="created-calendar-title" aria-describedby="created-calendar-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
-        <details class="chart-data">
-            <summary>Show data</summary>
-            <table class="data-table">
-                <thead><tr><th scope="col">Day</th><th scope="col">Created</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </details>
     </article>
     <article class="chart-card" data-chart="backlog">
         <header>
@@ -109,13 +92,6 @@
             <p class="muted summary" id="backlog-summary"></p>
         </header>
         <div class="chart-frame"><svg role="group" aria-labelledby="backlog-title" aria-describedby="backlog-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
-        <details class="chart-data">
-            <summary>Show data</summary>
-            <table class="data-table">
-                <thead><tr><th scope="col">Day</th><th scope="col">Live</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </details>
     </article>
     <article class="chart-card" data-chart="age">
         <header>
@@ -123,13 +99,6 @@
             <p class="muted summary" id="age-summary"></p>
         </header>
         <div class="chart-frame"><svg role="group" aria-labelledby="age-title" aria-describedby="age-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
-        <details class="chart-data">
-            <summary>Show data</summary>
-            <table class="data-table">
-                <thead><tr><th scope="col">Day</th><th scope="col">Mean age</th><th scope="col">Tasks</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </details>
     </article>
     <article class="chart-card" data-chart="cycle">
         <header>
@@ -137,13 +106,6 @@
             <p class="muted summary" id="cycle-summary"></p>
         </header>
         <div class="chart-frame"><svg role="group" aria-labelledby="cycle-title" aria-describedby="cycle-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
-        <details class="chart-data">
-            <summary>Show data</summary>
-            <table class="data-table">
-                <thead><tr><th scope="col">Day</th><th scope="col">Mean cycle</th><th scope="col">Tasks</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </details>
     </article>
     <article class="chart-card" data-chart="staleness">
         <header>
@@ -151,13 +113,6 @@
             <p class="muted summary" id="staleness-summary"></p>
         </header>
         <div class="chart-frame"><svg role="group" aria-labelledby="staleness-title" aria-describedby="staleness-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
-        <details class="chart-data">
-            <summary>Show data</summary>
-            <table class="data-table">
-                <thead><tr><th scope="col">Day</th><th scope="col">Over 30</th><th scope="col">Over 90</th><th scope="col">Over 180</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </details>
     </article>
     <article class="chart-card" data-chart="radar-shipped">
         <header>
@@ -165,13 +120,6 @@
             <p class="muted summary" id="radar-shipped-summary"></p>
         </header>
         <div class="chart-frame radar"><svg role="group" aria-labelledby="radar-shipped-title" aria-describedby="radar-shipped-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
-        <details class="chart-data">
-            <summary>Show data</summary>
-            <table class="data-table">
-                <thead><tr><th scope="col">Slice</th><th scope="col">Shipped</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </details>
     </article>
     <article class="chart-card" data-chart="radar-live">
         <header>
@@ -179,13 +127,6 @@
             <p class="muted summary" id="radar-live-summary"></p>
         </header>
         <div class="chart-frame radar"><svg role="group" aria-labelledby="radar-live-title" aria-describedby="radar-live-summary"><text class="chart-loading" x="50%" y="50%" text-anchor="middle">Loading chart…</text></svg><div class="tooltip" hidden></div></div>
-        <details class="chart-data">
-            <summary>Show data</summary>
-            <table class="data-table">
-                <thead><tr><th scope="col">Slice</th><th scope="col">Live</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </details>
     </article>
 </section>
 {% endblock %}

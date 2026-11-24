@@ -2258,21 +2258,37 @@ struct StoredOutcome {
 /// shipped when the row it replaces carried no ship day and was not already
 /// finished. A repository with no prior rows reports every fresh row as new and
 /// none as shipped.
+/// A task's identity inside one repository: its file name. Finishing a task
+/// moves its file from `tasks/` to `tasks/archive/`, so the stored path changes
+/// while the task does not; comparing by path alone would report every finished
+/// task as new and none as shipped.
+fn task_file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Count the fresh rows that appeared since the prior scan and the stored rows
+/// that gained a ship day, matching each task by its file name so the move into
+/// `tasks/archive/` reads as a ship instead of a new task.
 fn scan_delta(prior: &[PriorTask], fresh: &[harvest::ParsedTask]) -> (usize, usize) {
-    let mut by_path: HashMap<&str, &PriorTask> = HashMap::with_capacity(prior.len());
+    let by_path: HashMap<&str, &PriorTask> =
+        prior.iter().map(|row| (row.path.as_str(), row)).collect();
+    let mut by_name: HashMap<&str, &PriorTask> = HashMap::with_capacity(prior.len());
     for row in prior {
-        by_path.insert(row.path.as_str(), row);
+        by_name.entry(task_file_name(&row.path)).or_insert(row);
     }
     let mut new_tasks = 0_usize;
     let mut shipped = 0_usize;
     for task in fresh {
-        // A path that now holds a task with a different `created` day holds a
-        // different task, so its fresh row counts as new instead of as an
-        // evolution of the stored one.
-        match by_path
+        // The exact path wins when a repository holds both a live and an
+        // archived copy of one name, so the copy that did not move is compared
+        // with its own stored row. A name that now holds a task with a different
+        // `created` day holds a different task, so its fresh row counts as new
+        // instead of as an evolution of the stored one.
+        let stored = by_path
             .get(task.path.as_str())
-            .filter(|row| row.created == Some(task.created))
-        {
+            .copied()
+            .or_else(|| by_name.get(task_file_name(&task.path)).copied());
+        match stored.filter(|row| row.created == Some(task.created)) {
             Some(row)
                 if row.kind != Some(TaskKind::Finished)
                     && row.ship_date.is_none()
@@ -4435,9 +4451,10 @@ mod tests {
     }
 
     /// The CSP carries `frame-ancestors` alone, so it restricts no script
-    /// source: the theme bootstrap, the project filter's Show button, the
-    /// Remove form's delegated confirm, and the static scripts all stay in the
-    /// pages, with no inline handler left to block.
+    /// source: the theme bootstrap, the project filter's no-script Show button
+    /// and its submit-on-change listener, the Remove form's delegated confirm,
+    /// and the static scripts all stay in the pages, with no inline handler
+    /// left to block.
     #[tokio::test(flavor = "current_thread")]
     async fn web_csp_restricts_only_framing_and_pages_keep_their_scripts() {
         let (state, path, folder, _id) = state_with_repository("security_csp_pages").await;
@@ -5676,11 +5693,12 @@ mod tests {
             .await
             .expect("prior store");
 
-        // The fresh harvest: the first task ships, the second is unchanged, and
-        // a third path appears for the first time.
+        // The fresh harvest: the first task ships, which moves its file under
+        // `archive/`, the second is unchanged, and a third path appears for the
+        // first time.
         let fresh = vec![
             scan_row(
-                "tasks/delta_ships.md",
+                "tasks/archive/delta_ships.md",
                 TaskKind::Finished,
                 day(5, 1),
                 Some(day(5, 9)),
@@ -5716,6 +5734,78 @@ mod tests {
             message, "Charts updated. 1 new task, 1 shipped since the last scan.",
             "the banner names both counts"
         );
+        cleanup(&path);
+    }
+
+    /// Covers: a reused file name holding a different task counts as new, while
+    /// an archived task that stays in place and finishes counts as shipped. The
+    /// stored name, not the stored path, is what a task is matched on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_update_matches_a_task_by_its_name_not_its_path() {
+        let path = temp_database("scan_delta_name");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let id = db::insert_repository(&pool, "delta", "/tmp/delta")
+            .await
+            .expect("insert");
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        let day = |month, day_of_month| {
+            chrono::NaiveDate::from_ymd_opt(2026, month, day_of_month).expect("day")
+        };
+
+        let prior = vec![
+            scan_row(
+                "tasks/delta_reused.md",
+                TaskKind::Live,
+                day(5, 1),
+                None,
+                None,
+            ),
+            scan_row(
+                "tasks/archive/delta_parked.md",
+                TaskKind::Deferred,
+                day(5, 2),
+                None,
+                Some(day(5, 2)),
+            ),
+        ];
+        db::replace_tasks(&pool, id, &prior, immediate_store_hook().as_ref())
+            .await
+            .expect("prior store");
+
+        let fresh = vec![
+            // Same path, same name, but a different task now lives there.
+            scan_row(
+                "tasks/delta_reused.md",
+                TaskKind::Live,
+                day(5, 10),
+                None,
+                None,
+            ),
+            // Same path, so the ship is an evolution of the stored row.
+            scan_row(
+                "tasks/archive/delta_parked.md",
+                TaskKind::Finished,
+                day(5, 2),
+                Some(day(5, 12)),
+                Some(day(5, 12)),
+            ),
+        ];
+        let harvest: Arc<HarvestFn> =
+            Arc::new(move |_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(fresh.clone())));
+        let report = scan_core(
+            &pool,
+            &repositories,
+            1,
+            harvest,
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+
+        assert!(report.failures.is_empty());
+        assert_eq!(report.new_tasks, 1, "the reused name holds a new task");
+        assert_eq!(report.shipped, 1, "the parked task gained a ship day");
         cleanup(&path);
     }
 
@@ -9154,52 +9244,6 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Covers: every chart card's "Show data" table holds one row per payload
-    /// series row for that card.
-    #[test]
-    fn browser_show_data_tables_match_the_series_length() {
-        let config = browser_config(false, false, None, serde_json::json!("#123456"));
-        let result = run_browser(
-            &config,
-            r#"(function () {
-  var env = globalThis.__env;
-  var counts = {};
-  var firstWeek = null;
-  env.cardNames.forEach(function (name) {
-    var body = env.cards[name].querySelector(".data-table tbody");
-    counts[name] = body.children.length;
-  });
-  var weekly = env.cards["weekly"].querySelector(".data-table tbody").children[0];
-  firstWeek = weekly.children.map(function (cell) { return cell.textContent; });
-  return JSON.stringify({ counts: counts, firstWeek: firstWeek });
-})()"#,
-        );
-        let counts = result["counts"].as_object().expect("table row counts");
-        let expected = [
-            ("weekly", 2),
-            ("cumulative", 2),
-            ("shipped-calendar", 1),
-            ("created-calendar", 1),
-            ("backlog", 1),
-            ("age", 1),
-            ("staleness", 1),
-            ("radar-shipped", 1),
-            ("radar-live", 1),
-        ];
-        for (name, rows) in expected {
-            assert_eq!(
-                counts.get(name).and_then(serde_json::Value::as_u64),
-                Some(rows),
-                "the {name} table has one row per series row"
-            );
-        }
-        assert_eq!(
-            result["firstWeek"],
-            serde_json::json!(["2026-01-05", "1", "2", "1"]),
-            "the weekly table prints the exact series numbers"
-        );
-    }
-
     /// Covers: a line chart's overlay is one tab stop, and the arrow keys step
     /// the highlighted row so every drawn day is reachable.
     #[test]
@@ -10963,13 +11007,12 @@ mod tests {
         assert_eq!(dot["fill"], "#123456", "the dot carries the series colour");
     }
 
-    /// Covers: two radars whose maxima differ share one ring scale, so both
-    /// cards carry the same four ring labels and the outermost reads the
-    /// larger maximum.
+    /// Covers: each radar scales to its own peak, so a live count of 8 fills
+    /// its own rings instead of being crushed by a shipped peak of 300.
     #[test]
-    fn browser_two_radars_share_one_ring_scale() {
+    fn browser_each_radar_scales_to_its_own_peak() {
         let mut payload = fixture_payload();
-        payload["radar_shipped"] = serde_json::json!([{"label": "alpha", "count": 2}]);
+        payload["radar_shipped"] = serde_json::json!([{"label": "alpha", "count": 300}]);
         payload["radar_live"] = serde_json::json!([{"label": "alpha", "count": 8}]);
         let payload_text = payload.to_string();
         let config = browser_config(
@@ -10995,26 +11038,72 @@ mod tests {
   });
 })()"#,
         );
-        let shipped = result["shipped"].as_array().expect("shipped rings");
         assert_eq!(
-            shipped,
-            &vec![
-                serde_json::json!("2"),
-                serde_json::json!("4"),
-                serde_json::json!("6"),
-                serde_json::json!("8"),
-            ],
-            "the shipped radar draws the shared scale"
+            result["shipped"],
+            serde_json::json!(["75", "150", "225", "300"]),
+            "the shipped radar labels its own peak in whole steps"
         );
         assert_eq!(
-            result["live"], result["shipped"],
-            "both radars draw the same four ring labels"
+            result["live"],
+            serde_json::json!(["2", "4", "6", "8"]),
+            "the live radar labels its own peak instead of the shipped peak"
         );
-        assert_eq!(
-            shipped.last().and_then(|label| label.as_str()),
-            Some("8"),
-            "the outermost ring reads the larger maximum"
-        );
+    }
+
+    /// Covers: the radar summary names the kind of spoke its rows carry, in both
+    /// modes and when the payload omits `radar_mode`.
+    #[test]
+    fn browser_radar_summary_names_the_spoke_kind() {
+        let project_rows = serde_json::json!([{"label": "Alpha", "count": 2, "repository_id": 7}]);
+        let scope_rows = serde_json::json!([{"label": "alpha", "count": 2}]);
+        let cases = [
+            ("project", &project_rows, "one spoke per project"),
+            ("scope", &scope_rows, "one spoke per scope"),
+            // A payload that predates the mode field still names the right
+            // spoke, because the rows carry the repository id.
+            ("", &project_rows, "one spoke per project"),
+            ("", &scope_rows, "one spoke per scope"),
+        ];
+        for (mode, rows, expected) in cases {
+            let mut payload = fixture_payload();
+            payload["radar_shipped"] = rows.clone();
+            payload["radar_live"] = rows.clone();
+            if mode.is_empty() {
+                payload
+                    .as_object_mut()
+                    .expect("object")
+                    .remove("radar_mode");
+            } else {
+                payload["radar_mode"] = serde_json::json!(mode);
+            }
+            let payload_text = payload.to_string();
+            let config = browser_config(
+                false,
+                false,
+                Some(&payload_text),
+                serde_json::json!("#123456"),
+            );
+            let result = run_browser(
+                &config,
+                r#"(function () {
+  var env = globalThis.__env;
+  function summary(name) {
+    return env.cards[name].querySelector(".summary").textContent;
+  }
+  return JSON.stringify({
+    shipped: summary("radar-shipped"),
+    live: summary("radar-live")
+  });
+})()"#,
+            );
+            for card in ["shipped", "live"] {
+                let text = result[card].as_str().expect("summary");
+                assert!(
+                    text.contains(expected),
+                    "mode {mode:?} with {expected}: {card} read {text}"
+                );
+            }
+        }
     }
 
     /// A payload whose weekly series carries `count` Monday weeks from
@@ -11303,6 +11392,47 @@ mod tests {
         let mut payload = fixture_payload();
         payload["weekly"] = serde_json::json!([{"week": "2026-01-05", "shipped": max, "created": 1, "deferred": 0}]);
         payload
+    }
+
+    /// Covers: choosing a project submits the filter form at once, the Show
+    /// button a page without scripting keeps is hidden once that listener is
+    /// attached, and a change from another control submits nothing.
+    #[test]
+    fn browser_project_picker_submits_on_change() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var doc = globalThis.document;
+  var select = doc.getElementById("project");
+  var form = doc.querySelector(".nav-form");
+  var show = form.querySelector("button");
+  var hiddenAtLoad = show.style.display === "none";
+  doc.dispatchEvent({ type: "change", target: null });
+  var afterOther = form.submitted;
+  doc.dispatchEvent({ type: "change", target: select });
+  return JSON.stringify({
+    hidden: hiddenAtLoad,
+    afterOther: afterOther,
+    afterSelect: form.submitted
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["hidden"].as_bool(),
+            Some(true),
+            "the Show button is hidden once scripting takes over"
+        );
+        assert_eq!(
+            result["afterOther"].as_u64(),
+            Some(0),
+            "a change from another control submits nothing"
+        );
+        assert_eq!(
+            result["afterSelect"].as_u64(),
+            Some(1),
+            "choosing a project submits the filter form"
+        );
     }
 
     /// Covers: submitting Update disables the button, labels it `Updating…`,
@@ -11871,8 +12001,8 @@ mod tests {
         let small_result = run_browser(&small_config, assertion);
         assert_eq!(
             small_result["labels"],
-            serde_json::json!(["-15", "-10", "-5", "0", "5", "10", "15"]),
-            "a busiest week of 18 keeps the step-5 labels, signed below zero"
+            serde_json::json!(["0", "5", "10", "15"]),
+            "a busiest week of 18 keeps the step-5 labels, unsigned from zero"
         );
     }
 
@@ -12036,8 +12166,8 @@ mod tests {
         payload
     }
 
-    /// Covers: at a 54-week payload a shipped hit rect spans the slot and a created
-    /// one takes half, and hovering a bar's own region reports that bar
+    /// Covers: at a 54-week payload each bar's hit rect spans the slot, and
+    /// hovering a bar's own region reports that bar
     /// rather than the neighbour drawn over it.
     #[test]
     fn browser_weekly_hit_rects_stay_within_their_own_column() {
@@ -12099,16 +12229,11 @@ mod tests {
             slot < 18.0,
             "the fixture's pitch is below the minimum width"
         );
-        for (index, width) in result["widths"]
-            .as_array()
-            .expect("region widths")
-            .iter()
-            .enumerate()
-        {
-            let expected = if index % 2 == 0 { slot } else { slot / 2.0 };
+        for width in result["widths"].as_array().expect("region widths") {
+            let width = width.as_f64().expect("region width");
             assert!(
-                (width.as_f64().expect("region width") - expected).abs() < 1e-6,
-                "a shipped link region spans the slot and a created one takes its left half"
+                (width - slot).abs() < 1e-6,
+                "each bar's link region spans the slot, so a narrow column never shares one"
             );
         }
         assert_eq!(
@@ -12412,10 +12537,11 @@ mod tests {
         );
     }
 
-    /// Covers: the staleness card draws one line per threshold, summarises the
-    /// last day's counts, and its single overlay names all three thresholds.
+    /// Covers: the staleness card draws a line only for a threshold above zero
+    /// somewhere in the window, names those thresholds in the summary and the
+    /// overlay, and puts a tiny colour dot before each legend label.
     #[test]
-    fn browser_staleness_card_draws_three_threshold_lines() {
+    fn browser_staleness_card_draws_only_the_thresholds_above_zero() {
         let payload = fixture_payload().to_string();
         let config = browser_config(false, false, Some(&payload), serde_json::json!("#123456"));
         let result = run_browser(
@@ -12427,25 +12553,156 @@ mod tests {
   var overlay = svg.children.filter(function (node) {
     return node.name === "rect" && node.attrs.fill === "transparent";
   })[0];
+  var dots = svg.children.filter(function (node) {
+    return node.name === "circle" && node.attrs.r === "4";
+  });
+  var labels = svg.children.filter(function (node) {
+    return node.name === "text" && String(node.textContent).indexOf("over ") === 0;
+  }).map(function (node) { return node.textContent; });
   return JSON.stringify({
     summary: env.cards["staleness"].querySelector(".summary").textContent,
     paths: paths.length,
-    label: overlay.attrs["aria-label"]
+    label: overlay.attrs["aria-label"],
+    dots: dots.map(function (node) { return node.attrs.fill; }),
+    labels: labels
   });
 })()"#,
         );
-        assert_eq!(result["paths"], 3, "one line per threshold");
+        assert_eq!(
+            result["paths"].as_u64(),
+            Some(2),
+            "the all-zero 180-day series draws no line"
+        );
         let summary = result["summary"].as_str().expect("the summary");
         assert!(
-            summary.contains("2 over 30 days")
-                && summary.contains("1 over 90 days")
-                && summary.contains("0 over 180 days"),
-            "the summary states the last day's counts: {summary}"
+            summary.contains("2 over 30 days") && summary.contains("1 over 90 days"),
+            "the summary states the drawn thresholds: {summary}"
+        );
+        assert!(
+            !summary.contains("over 180"),
+            "the summary leaves the empty threshold out: {summary}"
         );
         let label = result["label"].as_str().expect("the overlay label");
         assert!(
-            label.contains("over 30") && label.contains("over 90") && label.contains("over 180"),
-            "the tooltip names every threshold: {label}"
+            label.contains("over 30 days") && label.contains("over 90 days"),
+            "the tooltip names the drawn thresholds: {label}"
+        );
+        assert!(
+            !label.contains("over 180"),
+            "the tooltip leaves the empty threshold out: {label}"
+        );
+        assert_eq!(
+            result["labels"],
+            serde_json::json!(["over 30 days", "over 90 days"]),
+            "the legend names the drawn thresholds"
+        );
+        let dots = result["dots"].as_array().expect("legend dots");
+        assert_eq!(dots.len(), 2, "one colour dot per legend label");
+        assert_eq!(
+            dots[0], dots[1],
+            "both dots take the test theme's one colour"
+        );
+    }
+
+    /// Covers: when no live task is stale in the window the card says so
+    /// instead of drawing three flat lines.
+    #[test]
+    fn browser_staleness_card_says_when_nothing_is_stale() {
+        let mut payload = fixture_payload();
+        payload["staleness"] = serde_json::json!([
+            {"date": "2026-01-05", "over_30": 0, "over_90": 0, "over_180": 0},
+            {"date": "2026-01-12", "over_30": 0, "over_90": 0, "over_180": 0}
+        ]);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["staleness"].querySelector("svg");
+  return JSON.stringify({
+    summary: env.cards["staleness"].querySelector(".summary").textContent,
+    paths: svg.children.filter(function (node) { return node.name === "path"; }).length,
+    message: svg.children.some(function (node) {
+      return node.name === "text" && node.textContent === "No stale live tasks yet";
+    })
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["summary"],
+            serde_json::json!("No live task is 30 or more days stale")
+        );
+        assert_eq!(result["paths"].as_u64(), Some(0), "no flat lines are drawn");
+        assert_eq!(result["message"].as_bool(), Some(true), "the card says why");
+    }
+
+    /// Covers: the weekly view picker redraws that card alone for each view, so
+    /// the bars carry only the chosen series and the summary names only those.
+    #[test]
+    fn browser_weekly_view_picker_redraws_the_bars() {
+        let payload = fixture_payload().to_string();
+        let config = browser_config(false, false, Some(&payload), serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var select = globalThis.document.getElementById("weekly-mode");
+  function bars() {
+    var svg = env.cards["weekly"].querySelector("svg");
+    return svg.children.filter(function (node) {
+      return node.name === "rect" && node.attrs.fill !== "transparent";
+    }).length;
+  }
+  function summary() {
+    return env.cards["weekly"].querySelector(".summary").textContent;
+  }
+  var views = {};
+  views.initial = { bars: bars(), summary: summary() };
+  [["shipped", "shipped"], ["deferred", "deferred"], ["stacked-ship-defer", "stacked"]].forEach(function (pair) {
+    select.value = pair[0];
+    select.dispatchEvent({ type: "change" });
+    views[pair[1]] = { bars: bars(), summary: summary() };
+  });
+  return JSON.stringify(views);
+})()"#,
+        );
+        assert_eq!(
+            result["initial"]["bars"].as_u64(),
+            Some(5),
+            "the stacked default draws every non-zero segment"
+        );
+        assert_eq!(
+            result["shipped"]["bars"].as_u64(),
+            Some(2),
+            "only shipped leaves one bar per week"
+        );
+        assert_eq!(
+            result["shipped"]["summary"],
+            serde_json::json!("3 shipped · Monday weeks")
+        );
+        assert_eq!(
+            result["deferred"]["bars"].as_u64(),
+            Some(1),
+            "only deferred draws the one week with a deferred count"
+        );
+        assert_eq!(
+            result["deferred"]["summary"],
+            serde_json::json!("1 deferred · Monday weeks")
+        );
+        assert_eq!(
+            result["stacked"]["bars"].as_u64(),
+            Some(3),
+            "shipped and deferred stack without created"
+        );
+        assert_eq!(
+            result["stacked"]["summary"],
+            serde_json::json!("3 shipped · 1 deferred · Monday weeks")
         );
     }
 
@@ -12579,8 +12836,8 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Covers: the project filter submits through a Show button and carries no
-    /// inline onchange.
+    /// Covers: the project filter keeps a no-script Show button and carries no
+    /// inline onchange; the shipped script submits the form on change.
     #[tokio::test(flavor = "current_thread")]
     async fn web_project_filter_offers_a_submit_button() {
         let (state, path) = app_state("a11y_filter_submit").await;
@@ -12595,6 +12852,36 @@ mod tests {
             !html.contains("onchange="),
             "the filter carries no inline onchange"
         );
+        cleanup(&path);
+    }
+
+    /// Covers: the weekly card carries its view picker, one option per view.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_weekly_card_offers_the_view_picker() {
+        let (state, path) = app_state("weekly_view_picker").await;
+        let html = render_home(&state, &HomeQuery::default())
+            .await
+            .expect("render");
+        assert!(
+            html.contains(r#"<label class="chart-view" for="weekly-mode">"#),
+            "the picker is labelled for its select"
+        );
+        assert!(
+            html.contains(r#"<select id="weekly-mode">"#),
+            "the card carries the view select"
+        );
+        for value in [
+            "stacked-all",
+            "shipped",
+            "created",
+            "deferred",
+            "stacked-ship-defer",
+        ] {
+            assert!(
+                html.contains(&format!(r#"<option value="{value}">"#)),
+                "the picker carries the {value} option"
+            );
+        }
         cleanup(&path);
     }
 

@@ -761,7 +761,7 @@
           "attrs": {
             "fill": "#123456",
             "opacity": "0.22",
-            "points": "500,68",
+            "points": "500,155",
             "stroke": "#123456",
             "stroke-width": "1.5"
           },
@@ -781,7 +781,7 @@
           "children": [],
           "name": "text",
           "style": {},
-          "text": "0.25"
+          "text": "1"
         },
         {
           "attrs": {
@@ -794,7 +794,7 @@
           "children": [],
           "name": "text",
           "style": {},
-          "text": "0.5"
+          "text": "2"
         },
         {
           "attrs": {
@@ -807,7 +807,7 @@
           "children": [],
           "name": "text",
           "style": {},
-          "text": "0.75"
+          "text": "3"
         },
         {
           "attrs": {
@@ -820,7 +820,7 @@
           "children": [],
           "name": "text",
           "style": {},
-          "text": "1"
+          "text": "4"
         },
         {
           "attrs": {
@@ -834,7 +834,7 @@
             {
               "attrs": {
                 "cx": "500",
-                "cy": "68",
+                "cy": "155",
                 "fill": "#123456",
                 "r": "4"
               },
@@ -943,7 +943,7 @@
           "attrs": {
             "fill": "#123456",
             "opacity": "0.22",
-            "points": "500,68",
+            "points": "500,155",
             "stroke": "#123456",
             "stroke-width": "1.5"
           },
@@ -963,7 +963,7 @@
           "children": [],
           "name": "text",
           "style": {},
-          "text": "0.25"
+          "text": "1"
         },
         {
           "attrs": {
@@ -976,7 +976,7 @@
           "children": [],
           "name": "text",
           "style": {},
-          "text": "0.5"
+          "text": "2"
         },
         {
           "attrs": {
@@ -989,7 +989,7 @@
           "children": [],
           "name": "text",
           "style": {},
-          "text": "0.75"
+          "text": "3"
         },
         {
           "attrs": {
@@ -1002,7 +1002,7 @@
           "children": [],
           "name": "text",
           "style": {},
-          "text": "1"
+          "text": "4"
         },
         {
           "attrs": {
@@ -1016,7 +1016,7 @@
             {
               "attrs": {
                 "cx": "500",
-                "cy": "68",
+                "cy": "155",
                 "fill": "#123456",
                 "r": "4"
               },
@@ -1099,6 +1099,30 @@
       "children": [
         {
           "attrs": {
+            "cx": "48",
+            "cy": "12",
+            "fill": "#123456",
+            "r": "4"
+          },
+          "children": [],
+          "name": "circle",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "x": "58",
+            "y": "16"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "over 30 days"
+        },
+        {
+          "attrs": {
             "stroke": "#123456",
             "x1": "44",
             "x2": "984",
@@ -1128,8 +1152,8 @@
             "stroke": "#123456",
             "x1": "44",
             "x2": "984",
-            "y1": "16",
-            "y2": "16"
+            "y1": "34",
+            "y2": "34"
           },
           "children": [],
           "name": "line",
@@ -1142,7 +1166,7 @@
             "font-size": "11",
             "text-anchor": "end",
             "x": "38",
-            "y": "20"
+            "y": "38"
           },
           "children": [],
           "name": "text",
@@ -1151,7 +1175,7 @@
         },
         {
           "attrs": {
-            "d": "M44 16",
+            "d": "M44 34",
             "fill": "none",
             "stroke": "#123456",
             "stroke-width": "2"
@@ -1164,55 +1188,7 @@
         {
           "attrs": {
             "cx": "44",
-            "cy": "16",
-            "fill": "#123456",
-            "r": "4"
-          },
-          "children": [],
-          "name": "circle",
-          "style": {},
-          "text": ""
-        },
-        {
-          "attrs": {
-            "d": "M44 248",
-            "fill": "none",
-            "stroke": "#123456",
-            "stroke-width": "2"
-          },
-          "children": [],
-          "name": "path",
-          "style": {},
-          "text": ""
-        },
-        {
-          "attrs": {
-            "cx": "44",
-            "cy": "248",
-            "fill": "#123456",
-            "r": "4"
-          },
-          "children": [],
-          "name": "circle",
-          "style": {},
-          "text": ""
-        },
-        {
-          "attrs": {
-            "d": "M44 248",
-            "fill": "none",
-            "stroke": "#123456",
-            "stroke-width": "2"
-          },
-          "children": [],
-          "name": "path",
-          "style": {},
-          "text": ""
-        },
-        {
-          "attrs": {
-            "cx": "44",
-            "cy": "248",
+            "cy": "34",
             "fill": "#123456",
             "r": "4"
           },
@@ -1235,14 +1211,14 @@
         },
         {
           "attrs": {
-            "aria-label": "Jan 5, 2026 · over 30 1 · over 90 0 · over 180 0",
+            "aria-label": "Jan 5, 2026 · over 30 days 1",
             "fill": "transparent",
-            "height": "232",
+            "height": "214",
             "role": "img",
             "tabindex": "0",
             "width": "940",
             "x": "44",
-            "y": "16"
+            "y": "34"
           },
           "children": [],
           "name": "rect",
@@ -1265,8 +1241,8 @@
             "stroke-width": "1.5",
             "x1": "40",
             "x2": "984",
-            "y1": "132",
-            "y2": "132"
+            "y1": "248",
+            "y2": "248"
           },
           "children": [],
           "name": "line",
@@ -1276,36 +1252,10 @@
         {
           "attrs": {
             "fill": "#123456",
-            "height": "38.66666666666666",
+            "height": "46.400000000000006",
             "width": "16",
             "x": "268",
-            "y": "93.33333333333334"
-          },
-          "children": [],
-          "name": "rect",
-          "style": {},
-          "text": ""
-        },
-        {
-          "attrs": {
-            "fill": "#123456",
-            "height": "77.33333333333334",
-            "width": "8",
-            "x": "268",
-            "y": "132"
-          },
-          "children": [],
-          "name": "rect",
-          "style": {},
-          "text": ""
-        },
-        {
-          "attrs": {
-            "fill": "#123456",
-            "height": "38.666666666666686",
-            "width": "8",
-            "x": "276",
-            "y": "132"
+            "y": "201.6"
           },
           "children": [],
           "name": "rect",
@@ -1324,10 +1274,10 @@
             {
               "attrs": {
                 "fill": "transparent",
-                "height": "38.66666666666666",
+                "height": "46.400000000000006",
                 "width": "18",
                 "x": "267",
-                "y": "93.33333333333334"
+                "y": "201.6"
               },
               "children": [],
               "name": "rect",
@@ -1336,6 +1286,19 @@
             }
           ],
           "name": "a",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "height": "92.79999999999998",
+            "width": "16",
+            "x": "268",
+            "y": "108.80000000000001"
+          },
+          "children": [],
+          "name": "rect",
           "style": {},
           "text": ""
         },
@@ -1351,10 +1314,10 @@
             {
               "attrs": {
                 "fill": "transparent",
-                "height": "77.33333333333334",
-                "width": "9",
+                "height": "92.79999999999998",
+                "width": "18",
                 "x": "267",
-                "y": "132"
+                "y": "108.80000000000001"
               },
               "children": [],
               "name": "rect",
@@ -1368,15 +1331,28 @@
         },
         {
           "attrs": {
+            "fill": "#123456",
+            "height": "46.400000000000034",
+            "width": "16",
+            "x": "268",
+            "y": "62.39999999999998"
+          },
+          "children": [],
+          "name": "rect",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
             "aria-label": "Week of Jan 5, 2026 · deferred 1",
             "data-tip": "Week of Jan 5, 2026 · deferred 1",
             "fill": "transparent",
-            "height": "38.666666666666686",
+            "height": "46.400000000000034",
             "role": "img",
             "tabindex": "-1",
-            "width": "9",
-            "x": "276",
-            "y": "132"
+            "width": "18",
+            "x": "267",
+            "y": "62.39999999999998"
           },
           "children": [],
           "name": "rect",
@@ -1386,36 +1362,10 @@
         {
           "attrs": {
             "fill": "#123456",
-            "height": "77.33333333333334",
+            "height": "92.80000000000001",
             "width": "16",
             "x": "740",
-            "y": "54.66666666666666"
-          },
-          "children": [],
-          "name": "rect",
-          "style": {},
-          "text": ""
-        },
-        {
-          "attrs": {
-            "fill": "#123456",
-            "height": "116",
-            "width": "8",
-            "x": "740",
-            "y": "132"
-          },
-          "children": [],
-          "name": "rect",
-          "style": {},
-          "text": ""
-        },
-        {
-          "attrs": {
-            "fill": "#123456",
-            "height": "0",
-            "width": "8",
-            "x": "748",
-            "y": "132"
+            "y": "155.2"
           },
           "children": [],
           "name": "rect",
@@ -1434,10 +1384,10 @@
             {
               "attrs": {
                 "fill": "transparent",
-                "height": "77.33333333333334",
+                "height": "92.80000000000001",
                 "width": "18",
                 "x": "739",
-                "y": "54.66666666666666"
+                "y": "155.2"
               },
               "children": [],
               "name": "rect",
@@ -1446,6 +1396,19 @@
             }
           ],
           "name": "a",
+          "style": {},
+          "text": ""
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "height": "139.2",
+            "width": "16",
+            "x": "740",
+            "y": "16"
+          },
+          "children": [],
+          "name": "rect",
           "style": {},
           "text": ""
         },
@@ -1461,10 +1424,10 @@
             {
               "attrs": {
                 "fill": "transparent",
-                "height": "116",
-                "width": "9",
+                "height": "139.2",
+                "width": "18",
                 "x": "739",
-                "y": "132"
+                "y": "16"
               },
               "children": [],
               "name": "rect",
@@ -1484,9 +1447,9 @@
             "height": "1",
             "role": "img",
             "tabindex": "-1",
-            "width": "9",
-            "x": "748",
-            "y": "132"
+            "width": "18",
+            "x": "739",
+            "y": "15.5"
           },
           "children": [],
           "name": "rect",
@@ -1516,45 +1479,6 @@
           "children": [],
           "name": "text",
           "style": {},
-          "text": "-3"
-        },
-        {
-          "attrs": {
-            "fill": "#123456",
-            "font-size": "11",
-            "text-anchor": "end",
-            "x": "34",
-            "y": "213.33333333333334"
-          },
-          "children": [],
-          "name": "text",
-          "style": {},
-          "text": "-2"
-        },
-        {
-          "attrs": {
-            "fill": "#123456",
-            "font-size": "11",
-            "text-anchor": "end",
-            "x": "34",
-            "y": "174.66666666666669"
-          },
-          "children": [],
-          "name": "text",
-          "style": {},
-          "text": "-1"
-        },
-        {
-          "attrs": {
-            "fill": "#123456",
-            "font-size": "11",
-            "text-anchor": "end",
-            "x": "34",
-            "y": "136"
-          },
-          "children": [],
-          "name": "text",
-          "style": {},
           "text": "0"
         },
         {
@@ -1563,7 +1487,7 @@
             "font-size": "11",
             "text-anchor": "end",
             "x": "34",
-            "y": "97.33333333333334"
+            "y": "205.6"
           },
           "children": [],
           "name": "text",
@@ -1576,7 +1500,7 @@
             "font-size": "11",
             "text-anchor": "end",
             "x": "34",
-            "y": "58.66666666666666"
+            "y": "159.2"
           },
           "children": [],
           "name": "text",
@@ -1589,12 +1513,38 @@
             "font-size": "11",
             "text-anchor": "end",
             "x": "34",
-            "y": "20"
+            "y": "112.80000000000001"
           },
           "children": [],
           "name": "text",
           "style": {},
           "text": "3"
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "34",
+            "y": "66.39999999999998"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "4"
+        },
+        {
+          "attrs": {
+            "fill": "#123456",
+            "font-size": "11",
+            "text-anchor": "end",
+            "x": "34",
+            "y": "20"
+          },
+          "children": [],
+          "name": "text",
+          "style": {},
+          "text": "5"
         }
       ],
       "name": "svg",

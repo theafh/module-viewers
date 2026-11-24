@@ -193,9 +193,6 @@
     var frame = new Node("frame");
     var tip = new Node("tip");
     var summary = new Node("summary");
-    // The card's "Show data" table body, so the shipped script fills a node a
-    // test can count the rows of.
-    var tableBody = new Node("tbody");
     // A scrolling frame reports its chart's laid-out width as its content
     // width, so a chart wider than the frame scrolls, and `scrollLeft` clamps
     // to the range a browser allows.
@@ -221,7 +218,6 @@
       if (selector === ".summary") return summary;
       if (selector === ".chart-frame") return frame;
       if (selector === ".tooltip") return tip;
-      if (selector === ".data-table tbody") return tableBody;
       return null;
     };
     // The page puts `.tooltip` inside `.chart-frame`, so a draw that reaches
@@ -283,6 +279,28 @@
   updateForm.querySelector = function (selector) {
     return selector === "button" ? updateButton : null;
   };
+  // The dashboard's project filter: the picker the shipped script submits on
+  // change, and the Show button it hides once that listener is attached.
+  var projectSelect = new Node("select");
+  projectSelect.attrs.id = "project";
+  var projectShow = new Node("button");
+  projectShow.textContent = "Show";
+  projectShow.hidden = false;
+  var projectForm = new Node("form");
+  projectForm.attrs.class = "nav-form";
+  projectForm.appendChild(projectSelect);
+  projectForm.appendChild(projectShow);
+  projectForm.submitted = 0;
+  projectForm.submit = function () {
+    projectForm.submitted += 1;
+  };
+  projectForm.querySelector = function (selector) {
+    return selector === "button" ? projectShow : null;
+  };
+  // The weekly card's view picker, so a test can switch the drawn series.
+  var weeklySelect = new Node("select");
+  weeklySelect.attrs.id = "weekly-mode";
+  weeklySelect.value = "stacked-all";
   // The charts section the busy state is set on.
   var chartsSection = new Node("section");
   chartsSection.attrs.class = "charts";
@@ -312,6 +330,8 @@
       if (id === "payload") return payloadNode;
       if (id === "theme-toggle") return themeButton;
       if (id === "update-form") return updateForm;
+      if (id === "project") return projectSelect;
+      if (id === "weekly-mode") return weeklySelect;
       if (id === "scan-status") return scanStatusNode;
       return null;
     },
@@ -324,6 +344,7 @@
     },
     querySelector: function (selector) {
       if (selector === ".charts") return chartsSection;
+      if (selector === ".nav-form") return projectForm;
       return Object.prototype.hasOwnProperty.call(registry, selector) ? registry[selector] : null;
     },
     // A page-level listener such as the dashboard's pointerdown hide and the

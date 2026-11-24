@@ -299,14 +299,36 @@
     return px <= (xs[before] + xs[lo]) / 2 ? before : lo;
   }
 
+  // The weekly card's views. Each names the series the bars carry, in stacking
+  // order from the baseline up, so a one-series view is a one-segment stack.
+  var WEEKLY_VIEWS = {
+    "stacked-all": ["shipped", "created", "deferred"],
+    "shipped": ["shipped"],
+    "created": ["created"],
+    "deferred": ["deferred"],
+    "stacked-ship-defer": ["shipped", "deferred"]
+  };
+  var WEEKLY_SERIES = {
+    shipped: { color: "--chart-ship", noun: "shipped" },
+    created: { color: "--chart-create", noun: "created" },
+    deferred: { color: "--chart-defer", noun: "deferred" }
+  };
+  var weeklyView = "stacked-all";
+
   function drawWeekly() {
     var root = card("weekly");
     var svg = root.querySelector("svg");
     var rows = payload.weekly || [];
+    var keys = WEEKLY_VIEWS[weeklyView] || WEEKLY_VIEWS["stacked-all"];
+    var counts = payload.counts || {};
     summary(
       "weekly",
-      fmt(payload.counts.shipped_events) + " shipped · " + fmt(payload.counts.created_events) + " created · " +
-        fmt(payload.counts.deferred) + " deferred · Monday weeks"
+      keys.map(function (key) {
+        var total = key === "shipped" ? counts.shipped_events
+          : key === "created" ? counts.created_events
+          : counts.deferred;
+        return fmt(total) + " " + WEEKLY_SERIES[key].noun;
+      }).join(" · ") + " · Monday weeks"
     );
     if (!rows.length) {
       message("weekly", svg, "No weeks yet");
@@ -315,15 +337,23 @@
     clear(svg);
     resetMarks("weekly");
     var zeroColor = cssVar("--chart-zero");
-    var shipColor = cssVar("--chart-ship");
-    var createColor = cssVar("--chart-create");
-    var deferColor = cssVar("--chart-defer");
     var muted = cssVar("--chart-muted");
+    // Every series colour is read once per draw, whatever the view shows, so a
+    // view switch costs no extra theme reads.
+    var colors = {
+      shipped: cssVar(WEEKLY_SERIES.shipped.color),
+      created: cssVar(WEEKLY_SERIES.created.color),
+      deferred: cssVar(WEEKLY_SERIES.deferred.color)
+    };
     var frame = frameOf(svg, { top: 16, right: 16, bottom: 32, left: 40 });
     var dates = rows.map(function (row) { return parseDay(row.week); });
-    var maxAbs = 1;
+    // The bars stack from the baseline, so the axis runs from zero to the
+    // tallest week's total instead of through zero in both directions.
+    var maxTotal = 1;
     rows.forEach(function (row) {
-      maxAbs = Math.max(maxAbs, row.shipped, row.created, row.deferred);
+      var total = 0;
+      keys.forEach(function (key) { total += row[key]; });
+      maxTotal = Math.max(maxTotal, total);
     });
     // Each week owns a slot centred on its Monday, so the domain reaches half a
     // slot past the first and last week. Without that, the first bar starts
@@ -335,7 +365,7 @@
       frame.left,
       frame.right
     );
-    var y = scale(-maxAbs, maxAbs, frame.bottom, frame.top);
+    var y = scale(0, maxTotal, frame.bottom, frame.top);
     var zero = y(0);
     mark("weekly", el(svg, "line", {
       x1: frame.left, x2: frame.right, y1: zero, y2: zero,
@@ -354,24 +384,6 @@
       // A slot narrower than the band would push the outermost bars past the
       // plot, so each bar's left edge clamps inside the frame instead.
       var barLeft = Math.min(Math.max(dx - band / 2, frame.left), frame.right - band);
-      // The two below-axis series share the slot: created takes the left half
-      // and deferred the right, so neither bar hides the other.
-      var halfBand = Math.max(1, Math.floor(band / 2));
-      var shipY = y(row.shipped);
-      mark("weekly", el(svg, "rect", {
-        x: barLeft, y: shipY, width: band, height: Math.max(0, zero - shipY),
-        fill: shipColor
-      }), { fill: "--chart-ship" });
-      mark("weekly", el(svg, "rect", {
-        x: barLeft, y: zero, width: halfBand, height: Math.max(0, y(-row.created) - zero),
-        fill: createColor
-      }), { fill: "--chart-create" });
-      mark("weekly", el(svg, "rect", {
-        x: barLeft + halfBand, y: zero, width: band - halfBand,
-        height: Math.max(0, y(-row.deferred) - zero), fill: deferColor
-      }), { fill: "--chart-defer" });
-      // One link region per bar, so the shipped bar and the created bar each
-      // carry their own tooltip and their own drill-down target.
       var weekEnd = isoDay(new Date(dates[index].getTime() + 6 * 86400000));
       // `weekly_points` folds every event before the first charted week into
       // that row and every after-today event into the last row, so those two
@@ -379,49 +391,54 @@
       // lets the list reach the folded events instead of clipping them.
       var from = index === 0 ? null : row.week;
       var to = index === rows.length - 1 ? null : weekEnd;
-      var shipText = "Week of " + dateLabel(dates[index]) + " · shipped " + fmt(row.shipped);
-      var ship = linkMark(
-        svg,
-        taskLink({ kind: "finished", date: "shipped", from: from, to: to }),
-        shipText
-      );
-      el(ship, "rect", {
-        x: dx - hitWidth / 2, y: Math.min(shipY, zero), width: hitWidth,
-        height: Math.max(1, Math.abs(zero - shipY)), fill: "transparent"
+      var stacked = 0;
+      keys.forEach(function (key) {
+        var value = row[key];
+        var bottom = y(stacked);
+        stacked += value;
+        var top = y(stacked);
+        var height = Math.max(0, bottom - top);
+        if (height > 0) {
+          mark("weekly", el(svg, "rect", {
+            x: barLeft, y: top, width: band, height: height, fill: colors[key]
+          }), { fill: WEEKLY_SERIES[key].color });
+        }
+        var text = "Week of " + dateLabel(dates[index]) + " · " + key + " " + fmt(value);
+        // One focusable mark per segment. A zero segment keeps a one-pixel hit
+        // at its base so a week whose count is zero still names it on hover.
+        var hitHeight = Math.max(1, height);
+        var hitTop = height > 0 ? top : bottom - 0.5;
+        if (key === "deferred") {
+          // The deferred bar names its count but carries no drill-down link:
+          // the task list filters on created and ship days, and no filter
+          // reproduces a leave-day count. It stays one focusable mark.
+          var defer = el(svg, "rect", {
+            x: dx - hitWidth / 2, y: hitTop, width: hitWidth, height: hitHeight,
+            fill: "transparent", "data-tip": text
+          });
+          defer.addEventListener("mousemove", function (event) { tip.show(event, text); });
+          defer.addEventListener("mouseleave", tip.hide);
+          hits.push(defer);
+        } else {
+          var link = linkMark(svg, taskLink({
+            kind: key === "shipped" ? "finished" : "all",
+            date: key === "shipped" ? "shipped" : "created",
+            from: from,
+            to: to
+          }), text);
+          el(link, "rect", {
+            x: dx - hitWidth / 2, y: hitTop, width: hitWidth, height: hitHeight,
+            fill: "transparent"
+          });
+          link.addEventListener("mousemove", function (event) { tip.show(event, text); });
+          link.addEventListener("mouseleave", tip.hide);
+          hits.push(link);
+        }
       });
-      ship.addEventListener("mousemove", function (event) { tip.show(event, shipText); });
-      ship.addEventListener("mouseleave", tip.hide);
-      hits.push(ship);
-      var createText = "Week of " + dateLabel(dates[index]) + " · created " + fmt(row.created);
-      var create = linkMark(
-        svg,
-        taskLink({ kind: "all", date: "created", from: from, to: to }),
-        createText
-      );
-      el(create, "rect", {
-        x: dx - hitWidth / 2, y: Math.min(zero, y(-row.created)),
-        width: hitWidth / 2, height: Math.max(1, Math.abs(y(-row.created) - zero)),
-        fill: "transparent"
-      });
-      create.addEventListener("mousemove", function (event) { tip.show(event, createText); });
-      create.addEventListener("mouseleave", tip.hide);
-      hits.push(create);
-      // The deferred bar names its count but carries no drill-down link: the
-      // task list filters on created and ship days, and no filter reproduces a
-      // leave-day count. It stays one focusable mark like the others.
-      var deferText = "Week of " + dateLabel(dates[index]) + " · deferred " + fmt(row.deferred);
-      var defer = el(svg, "rect", {
-        x: dx, y: Math.min(zero, y(-row.deferred)),
-        width: hitWidth / 2, height: Math.max(1, Math.abs(y(-row.deferred) - zero)),
-        fill: "transparent", "data-tip": deferText
-      });
-      defer.addEventListener("mousemove", function (event) { tip.show(event, deferText); });
-      defer.addEventListener("mouseleave", tip.hide);
-      hits.push(defer);
     });
     roving(hits, tip);
     monthTicks("weekly", svg, dates[0], dates[dates.length - 1], x, frame.bottom + 16, muted);
-    yTicks("weekly", svg, -maxAbs, maxAbs, y, frame.left, muted);
+    yTicks("weekly", svg, 0, maxTotal, y, frame.left, muted);
   }
 
   function drawLine(name, rows, colorName, yOf, tipText, subtitle) {
@@ -540,32 +557,84 @@
     var root = card("staleness");
     var svg = root.querySelector("svg");
     var rows = payload.staleness || [];
-    var series = [
-      { key: "over_30", color: "--chart-create" },
-      { key: "over_90", color: "--chart-age" },
-      { key: "over_180", color: "--chart-defer" }
+    var all = [
+      { key: "over_30", color: "--chart-create", label: "over 30 days" },
+      { key: "over_90", color: "--chart-age", label: "over 90 days" },
+      { key: "over_180", color: "--chart-defer", label: "over 180 days" }
     ];
     if (!rows.length) {
       summary("staleness", "No live tasks yet");
       message("staleness", svg, "No live tasks yet");
       return;
     }
+    // A threshold that never rises above zero in the window gets no line: an
+    // all-zero series would sit on the axis and say nothing. Every series
+    // colour is read once per draw, whatever is drawn, so a switch of the
+    // visible lines costs no extra theme reads.
+    var colors = all.map(function (entry) { return cssVar(entry.color); });
+    var series = all.filter(function (entry) {
+      return rows.some(function (row) { return row[entry.key] > 0; });
+    });
+    if (!series.length) {
+      summary("staleness", "No live task is 30 or more days stale");
+      message("staleness", svg, "No stale live tasks yet");
+      return;
+    }
     var last = rows[rows.length - 1];
     summary(
       "staleness",
-      fmt(last.over_30) + " over 30 days · " + fmt(last.over_90) + " over 90 days · " +
-        fmt(last.over_180) + " over 180 days · live tasks by days since last edit"
+      series.map(function (entry) {
+        return fmt(last[entry.key]) + " " + entry.label;
+      }).join(" · ") + " · live tasks by days since last edit"
     );
     clear(svg);
     resetMarks("staleness");
     var grid = cssVar("--chart-grid");
     var muted = cssVar("--chart-muted");
-    var colors = series.map(function (entry) { return cssVar(entry.color); });
-    var frame = frameOf(svg, { top: 16, right: 16, bottom: 32, left: 44 });
+    // The legend sits above the plot: a tiny dot in the series colour names
+    // what each line stands for, so the colour mapping needs no guesswork. It
+    // wraps onto a second row on a narrow card instead of running off the
+    // viewBox, and the plot starts below however many rows it took.
+    var width = svg.clientWidth || 640;
+    var available = width - 60;
+    var legend = [];
+    var legendRow = [];
+    var legendUsed = 0;
+    series.forEach(function (entry) {
+      var entryWidth = 14 + entry.label.length * 6.2 + 18;
+      if (legendRow.length && legendUsed + entryWidth > available) {
+        legend.push(legendRow);
+        legendRow = [];
+        legendUsed = 0;
+      }
+      legendRow.push(entry);
+      legendUsed += entryWidth;
+    });
+    if (legendRow.length) {
+      legend.push(legendRow);
+    }
+    var frame = frameOf(svg, {
+      top: 16 + legend.length * 18, right: 16, bottom: 32, left: 44
+    });
+    var legendY = 12;
+    legend.forEach(function (entries) {
+      var legendX = frame.left;
+      entries.forEach(function (entry) {
+        var index = all.indexOf(entry);
+        mark("staleness", el(svg, "circle", {
+          cx: legendX + 4, cy: legendY, r: 4, fill: colors[index]
+        }), { fill: entry.color });
+        mark("staleness", el(svg, "text", {
+          x: legendX + 14, y: legendY + 4, fill: muted, "font-size": "11"
+        }), { fill: "--chart-muted" }).textContent = entry.label;
+        legendX += 14 + entry.label.length * 6.2 + 18;
+      });
+      legendY += 18;
+    });
     var dates = rows.map(function (row) { return parseDay(row.date); });
     var maxY = 1;
-    rows.forEach(function (row) {
-      series.forEach(function (entry) { maxY = Math.max(maxY, row[entry.key]); });
+    series.forEach(function (entry) {
+      rows.forEach(function (row) { maxY = Math.max(maxY, row[entry.key]); });
     });
     var x = scale(dates[0].getTime(), dates[dates.length - 1].getTime(), frame.left, frame.right);
     var y = scale(0, maxY, frame.bottom, frame.top);
@@ -580,24 +649,26 @@
         x: frame.left - 6, y: py + 4, "text-anchor": "end", fill: muted, "font-size": "11"
       }), { fill: "--chart-muted" }).textContent = fmt(value);
     }
-    series.forEach(function (entry, seriesIndex) {
-      var line = rows.map(function (row, index) {
-        return (index === 0 ? "M" : "L") + xs[index] + " " + y(row[entry.key]);
+    series.forEach(function (entry) {
+      var index = all.indexOf(entry);
+      var line = rows.map(function (row, position) {
+        return (position === 0 ? "M" : "L") + xs[position] + " " + y(row[entry.key]);
       }).join(" ");
       mark("staleness", el(svg, "path", {
-        d: line, fill: "none", stroke: colors[seriesIndex], "stroke-width": "2"
+        d: line, fill: "none", stroke: colors[index], "stroke-width": "2"
       }), { stroke: entry.color });
       if (rows.length === 1) {
         mark("staleness", el(svg, "circle", {
-          cx: xs[0], cy: y(rows[0][entry.key]), r: "4", fill: colors[seriesIndex]
+          cx: xs[0], cy: y(rows[0][entry.key]), r: "4", fill: colors[index]
         }), { fill: entry.color });
       }
     });
     monthTicks("staleness", svg, dates[0], dates[dates.length - 1], x, frame.bottom + 16, muted);
     var tip = tipFor(root.querySelector(".chart-frame"));
     function tipText(row, date) {
-      return dateLabel(date) + " · over 30 " + fmt(row.over_30) +
-        " · over 90 " + fmt(row.over_90) + " · over 180 " + fmt(row.over_180);
+      return dateLabel(date) + series.map(function (entry) {
+        return " · " + entry.label + " " + fmt(row[entry.key]);
+      }).join("");
     }
     var overlay = el(svg, "rect", {
       x: frame.left, y: frame.top, width: frame.right - frame.left, height: frame.bottom - frame.top, fill: "transparent"
@@ -781,7 +852,7 @@
     }
   }
 
-  function drawRadar(name, rows, colorName, noun, mode, kind, max) {
+  function drawRadar(name, rows, colorName, noun, mode, kind) {
     var root = card(name);
     var svg = root.querySelector("svg");
     // Radar: fit the frame by expanding the viewBox rather than shrinking the
@@ -791,7 +862,16 @@
     // back into the next measurement.
     svg.style.width = "";
     svg.style.height = "";
-    var slice = mode === "project" ? "project" : "scope";
+    // A project spoke names its repository id and a scope spoke names none, so
+    // the rows settle the noun even when a payload omits `radar_mode`; the mode
+    // still wins when it is present. A live count is far smaller than a shipped
+    // count, so each radar scales to its own peak instead of borrowing the
+    // other's, which would crush every live spoke into the centre.
+    var perProject = mode === "project" ||
+      (mode !== "scope" && rows.some(function (row) {
+        return row.repository_id !== undefined && row.repository_id !== null;
+      }));
+    var slice = perProject ? "project" : "scope";
     var total = rows.reduce(function (sum, row) { return sum + row.count; }, 0);
     summary(name, fmt(total) + " " + noun + " · one spoke per " + slice);
     if (!rows.length) {
@@ -817,6 +897,14 @@
         cx: cx, cy: cy, r: (radius * ring) / 4, fill: "none", stroke: grid
       }), { stroke: "--chart-grid" });
     }
+    // The outer ring is the smallest multiple of four that holds the peak, so
+    // each ring label is a whole number and the peak spoke nearly fills the
+    // chart. A count that is not a number keeps NaN here, which the caller's
+    // fallback catches instead of drawing a NaN mark.
+    var max = 4;
+    rows.forEach(function (row) {
+      max = Math.max(max, Math.ceil(row.count / 4) * 4);
+    });
     var points = [];
     var dots = [];
     var tip = tipFor(root.querySelector(".chart-frame"));
@@ -886,7 +974,6 @@
     // paint after the polygon so the shape never dims the scale it annotates.
     // The 9px inset keeps every value's text box inside the ring the spoke
     // labels start from, so a scale label never collides with a spoke label.
-    // Both radars are handed one maximum, so their rings read on one scale.
     for (var scaleRing = 1; scaleRing <= 4; scaleRing += 1) {
       mark(name, el(svg, "text", {
         x: cx, y: cy + (radius * scaleRing) / 4 - 9, "text-anchor": "middle",
@@ -1034,63 +1121,6 @@
     console.error(error);
   }
 
-  // The per-card "Show data" table: one row per drawn series row, filled from
-  // the same payload the chart draws, so the exact numbers are readable without
-  // hover and without a server read.
-  function clearNode(node) {
-    while (node.firstChild) {
-      node.removeChild(node.firstChild);
-    }
-  }
-
-  // A table cell's text. A count formats like every other number; a missing
-  // field stays empty instead of throwing the whole table away.
-  function cellText(value) {
-    if (typeof value === "number") {
-      return fmt(value);
-    }
-    return value === undefined || value === null ? "" : String(value);
-  }
-
-  function showData(name, rows, cells) {
-    var root = card(name);
-    if (!root) return;
-    var body = root.querySelector(".data-table tbody");
-    if (!body) return;
-    clearNode(body);
-    rows.forEach(function (row) {
-      var tr = document.createElement("tr");
-      cells(row).forEach(function (value) {
-        var td = document.createElement("td");
-        td.textContent = cellText(value);
-        tr.appendChild(td);
-      });
-      body.appendChild(tr);
-    });
-  }
-
-  function renderData() {
-    if (!payload) return;
-    [
-      ["weekly", payload.weekly, function (row) { return [row.week, row.shipped, row.created, row.deferred]; }],
-      ["cumulative", payload.cumulative, function (row) { return [row.date, row.shipped, row.cumulative]; }],
-      ["shipped-calendar", payload.shipped_calendar, function (row) { return [row.date, row.count]; }],
-      ["created-calendar", payload.created_calendar, function (row) { return [row.date, row.count]; }],
-      ["backlog", payload.live_backlog, function (row) { return [row.date, row.live]; }],
-      ["age", payload.mean_age, function (row) { return [row.date, row.avg_age, row.n]; }],
-      ["cycle", payload.cycle, function (row) { return [row.date, row.avg_cycle, row.n]; }],
-      ["staleness", payload.staleness, function (row) { return [row.date, row.over_30, row.over_90, row.over_180]; }],
-      ["radar-shipped", payload.radar_shipped, function (row) { return [row.label, row.count]; }],
-      ["radar-live", payload.radar_live, function (row) { return [row.label, row.count]; }]
-    ].forEach(function (entry) {
-      try {
-        showData(entry[0], entry[1] || [], entry[2]);
-      } catch (error) {
-        logError(error);
-      }
-    });
-  }
-
   function renderUnavailable(name) {
     var root = card(name);
     if (!root) return;
@@ -1182,25 +1212,47 @@
       );
     });
     renderCard("staleness", drawStaleness);
-    // One maximum across both radars, so the shipped and live charts read on
-    // the same ring scale instead of each card rescaling to its own peak.
-    var radarMax = 1;
-    [payload.radar_shipped, payload.radar_live].forEach(function (rows) {
-      (rows || []).forEach(function (row) {
-        radarMax = Math.max(radarMax, row.count);
-      });
-    });
     renderCard("radar-shipped", function () {
-      drawRadar("radar-shipped", payload.radar_shipped, "--chart-ship", "shipped", payload.radar_mode, "finished", radarMax);
+      drawRadar("radar-shipped", payload.radar_shipped, "--chart-ship", "shipped", payload.radar_mode, "finished");
     });
     renderCard("radar-live", function () {
-      drawRadar("radar-live", payload.radar_live, "--chart-create", "live", payload.radar_mode, "live", radarMax);
+      drawRadar("radar-live", payload.radar_live, "--chart-create", "live", payload.radar_mode, "live");
     });
-    renderData();
   }
 
   window.addEventListener("task-viewer-theme", recolor);
   document.addEventListener("pointerdown", hideAllTips);
+
+  // The project picker submits as soon as a project is chosen, so changing the
+  // filter is one click. The form keeps its Show button for a page without
+  // scripting, and the button is hidden only after this listener is attached,
+  // so a script that fails earlier leaves the button usable.
+  // The weekly view picker redraws that card alone, so switching what the bars
+  // carry costs no page load and leaves every other chart as it is.
+  var weeklySelect = document.getElementById("weekly-mode");
+  if (weeklySelect) {
+    weeklySelect.value = weeklyView;
+    weeklySelect.addEventListener("change", function () {
+      weeklyView = weeklySelect.value;
+      renderCard("weekly", drawWeekly);
+    });
+  }
+
+  var projectForm = document.querySelector(".nav-form");
+  var projectSelect = document.getElementById("project");
+  if (projectForm && projectSelect) {
+    document.addEventListener("change", function (event) {
+      if (event && event.target === projectSelect) {
+        projectForm.submit();
+      }
+    });
+    var projectShow = projectForm.querySelector("button");
+    if (projectShow) {
+      // The `.btn` rule sets its own display, which beats the user-agent
+      // `[hidden]` style, so the button is hidden inline instead.
+      projectShow.style.display = "none";
+    }
+  }
 
   // Update runs as a native form submit, so the browser follows the redirect and
   // claims the one-shot banner exactly once. While that navigation is in flight
