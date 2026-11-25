@@ -2,8 +2,8 @@
 description: "Give every page one main landmark so a screen reader can jump to the page content instead of the page header."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T14:51:52Z
-status: implemented
+updated: 2026-11-25T14:54:38Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -23,7 +23,7 @@ Every page exposes exactly one main landmark, so a screen-reader user can jump t
 <div class="container">
 ```
 
-No template carries `<main>` or `role="main"`. The site bar is a `<nav class="navbar">`, and each page opens with a `<header class="page-header">` directly inside the container, so that header maps to the banner landmark and the page offers no main landmark. The archived [keyboard and no-script task](archive/task-viewer_a11y-and-noscript.md) added `aria-current`, `aria-pressed`, focusable marks, and named Remove buttons, but did not add a landmark.
+No template carries `<main>` or `role="main"`. The site bar is a `<nav class="navbar">`, and each page opens with a `<header class="page-header">` directly inside the container, so that header maps to the banner landmark and the page offers no main landmark. The archived [keyboard and no-script task](task-viewer_a11y-and-noscript.md) added `aria-current`, `aria-pressed`, focusable marks, and named Remove buttons, but did not add a landmark.
 
 ## Approach
 
