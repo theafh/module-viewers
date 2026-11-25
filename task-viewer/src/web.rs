@@ -388,7 +388,10 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks", get(tasks_page))
         .route("/tasks.csv", get(tasks_csv))
         .route("/repositories", get(repositories_page).post(add_repository))
-        .route("/repositories/{id}/delete", post(remove_repository))
+        .route(
+            "/repositories/{id}/delete",
+            get(confirm_remove_repository).post(remove_repository),
+        )
         .route("/repositories/{id}/scan", post(scan_repository))
         .route("/repositories/{id}/path", post(relocate_repository))
         .route("/repositories/confirm/{token}", post(confirm_repository))
@@ -414,8 +417,7 @@ pub fn router(state: AppState) -> Router {
         // The security headers sit outside the host check, so the 403 that
         // rejects a foreign Host carries them too. The CSP holds only
         // `frame-ancestors`, which restricts no script source: the theme
-        // bootstrap, the Show button and the delegated Remove confirm, and the
-        // static scripts keep running.
+        // bootstrap, the Show button, and the static scripts keep running.
         .layer(SetResponseHeaderLayer::overriding(
             header::X_FRAME_OPTIONS,
             HeaderValue::from_static("DENY"),
@@ -1195,6 +1197,37 @@ async fn render_repositories_at(
     Ok(state.templates.render("repositories.html", &context)?)
 }
 
+/// Render the Remove confirmation page. An id that is no longer configured
+/// renders the not-found message on the same page with no Remove form, so the
+/// page never offers a removal the POST would refuse.
+async fn render_remove_confirmation(state: &AppState, id: i64) -> anyhow::Result<String> {
+    let repositories = db::list_repositories(&state.pool).await?;
+    let repository = repositories
+        .iter()
+        .find(|repository| repository.repository_id == id);
+    let (repository, error) = match repository {
+        Some(repository) => (
+            Some(RemoveConfirmView {
+                id_str: repository.repository_id.to_string(),
+                name: repository.name.clone(),
+                path: repository.path.clone(),
+            }),
+            String::new(),
+        ),
+        None => (None, Banner::RepositoryNotFound.message().to_string()),
+    };
+    let page = RemoveConfirmPage {
+        version: state.static_version.clone(),
+        page: "repositories",
+        repository,
+        error,
+    };
+    let context = Context::from_serialize(page)?;
+    Ok(state
+        .templates
+        .render("repository_confirm.html", &context)?)
+}
+
 /// The day axis a `from`/`to` window bounds on the task list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DateAxis {
@@ -1797,6 +1830,23 @@ struct ConfirmView {
     existing: String,
 }
 
+/// The Remove confirmation page: the repository it names, or the not-found
+/// message when the id is no longer configured.
+#[derive(Serialize)]
+struct RemoveConfirmPage {
+    version: String,
+    page: &'static str,
+    repository: Option<RemoveConfirmView>,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct RemoveConfirmView {
+    id_str: String,
+    name: String,
+    path: String,
+}
+
 #[derive(Serialize)]
 struct TasksPage {
     version: String,
@@ -2151,6 +2201,23 @@ async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<()
     match refresh_one(&state.pool, &state.store_hook, id, path).await {
         Some(banner) => Err(banner),
         None => Ok(()),
+    }
+}
+
+/// `GET /repositories/{id}/delete` renders the confirmation page, so a browser
+/// without scripting asks before the POST that deletes a repository and its
+/// rows. The page and the delete share one path and split by method.
+async fn confirm_remove_repository(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match render_remove_confirmation(&state, id).await {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "remove confirmation render failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The confirmation page could not be rendered.",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -4964,12 +5031,13 @@ mod tests {
 
     /// The CSP carries `frame-ancestors` alone, so it restricts no script
     /// source: the theme bootstrap, the project filter's no-script Show button
-    /// and its submit-on-change listener, the Remove form's delegated confirm,
-    /// and the static scripts all stay in the pages, with no inline handler
-    /// left to block.
+    /// and its submit-on-change listener, and the static scripts all stay in
+    /// the pages, with no inline handler left to block. The Remove control is a
+    /// plain link to the server-rendered confirmation page, so it needs no
+    /// script at all.
     #[tokio::test(flavor = "current_thread")]
     async fn web_csp_restricts_only_framing_and_pages_keep_their_scripts() {
-        let (state, path, folder, _id) = state_with_repository("security_csp_pages").await;
+        let (state, path, folder, id) = state_with_repository("security_csp_pages").await;
 
         let rejected = send(state.clone(), get_page("/", "example.com")).await;
         assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
@@ -5013,16 +5081,22 @@ mod tests {
             "the theme bootstrap script still renders"
         );
         assert!(
-            repositories_body.contains("data-repository=\"repo\""),
-            "the Remove form carries its repository name"
+            repositories_body.contains(&format!(
+                "href=\"/repositories/{id}/delete\">Remove repo</a>"
+            )),
+            "the Remove control links to the confirmation page"
+        );
+        assert!(
+            !repositories_body.contains("data-repository="),
+            "the Remove control carries no repository attribute"
         );
         assert!(
             !repositories_body.contains("onsubmit="),
-            "the Remove form no longer carries an inline onsubmit"
+            "the Remove control carries no inline handler"
         );
         assert!(
-            repositories_body.contains("/static/js/repositories.js"),
-            "the repositories script still loads"
+            !repositories_body.contains("repositories.js"),
+            "the repositories page loads no Remove script"
         );
         assert!(
             repositories_body.contains("/static/js/theme.js"),
@@ -8439,6 +8513,175 @@ mod tests {
         cleanup(&path);
     }
 
+    /// `GET /repositories/{id}/delete` renders the repository name and folder, a
+    /// form posting to the delete route, and a Cancel link.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_remove_confirmation_page_names_the_repository_and_its_folder() {
+        let (state, path, folder, id) = state_with_repository("remove_confirm_page").await;
+
+        let response = send(
+            state.clone(),
+            get_page(&format!("/repositories/{id}/delete"), "127.0.0.1:7880"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header_text(&response, header::CACHE_CONTROL),
+            "no-store",
+            "the confirmation page is never cached"
+        );
+        let body = body_text(response).await;
+        assert!(
+            body.contains("<strong>repo</strong>"),
+            "the page names the repository"
+        );
+        let folder_name = folder
+            .file_name()
+            .expect("folder name")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            body.contains(&folder_name),
+            "the page names the repository's folder: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "<form method=\"post\" action=\"/repositories/{id}/delete\">"
+            )),
+            "the page carries a form posting to the delete route"
+        );
+        assert!(
+            body.contains("<a class=\"btn btn-secondary\" href=\"/repositories\">Cancel</a>"),
+            "the page carries a Cancel link back to Repositories"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// An id that is no longer configured renders the not-found outcome and no
+    /// Remove form, so the page offers no removal the POST would refuse.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_remove_confirmation_page_reports_a_missing_repository() {
+        let (state, path) = app_state("remove_confirm_missing").await;
+
+        let response = send(
+            state.clone(),
+            get_page("/repositories/9999/delete", "127.0.0.1:7880"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        assert!(
+            body.contains("The repository was not found."),
+            "the page renders the not-found outcome"
+        );
+        assert!(
+            !body.contains("<form"),
+            "an unknown id carries no Remove form"
+        );
+        assert!(
+            !body.contains("type=\"submit\""),
+            "an unknown id carries no submit control"
+        );
+        cleanup(&path);
+    }
+
+    /// Posting the confirmation form deletes the repository and its rows and
+    /// lands on `/repositories` with the existing banner.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_remove_confirmation_form_deletes_the_repository_and_its_rows() {
+        let (state, path) = app_state("remove_confirm_post").await;
+        let folder = live_repository("remove_confirm_post_repo");
+        let id = db::insert_repository(&state.pool, "removed", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        db::replace_tasks(
+            &state.pool,
+            id,
+            &[parsed_task()],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("rows");
+
+        let response = send(
+            state.clone(),
+            form_post(&format!("/repositories/{id}/delete"), None, None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=repository-removed"
+        );
+        let after = db::list_repositories(&state.pool).await.expect("after");
+        assert!(after.is_empty(), "the repository is gone");
+        let rows = db::load_tasks(&state.pool, Some(id)).await.expect("rows");
+        assert!(rows.is_empty(), "the repository's rows are gone");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// A no-script flow: the Repositories page links to the confirmation page,
+    /// reading that page deletes nothing, and only the posted form removes the
+    /// repository and its rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_no_script_remove_flow_deletes_nothing_until_the_form_posts() {
+        let (state, path) = app_state("remove_noscript_flow").await;
+        let folder = live_repository("remove_noscript_flow_repo");
+        let id = db::insert_repository(&state.pool, "kept", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        db::replace_tasks(
+            &state.pool,
+            id,
+            &[parsed_task()],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("rows");
+        let link = format!("/repositories/{id}/delete");
+
+        let page =
+            body_text(send(state.clone(), get_page("/repositories", "127.0.0.1:7880")).await).await;
+        assert!(
+            page.contains(&format!("href=\"{link}\">Remove kept</a>")),
+            "the Remove control is a link to the confirmation page"
+        );
+        assert!(
+            !page.contains(&format!("action=\"{link}\"")),
+            "the Repositories page posts nothing to the delete route"
+        );
+
+        let confirm = body_text(send(state.clone(), get_page(&link, "127.0.0.1:7880")).await).await;
+        assert!(
+            confirm.contains(&format!("action=\"{link}\"")),
+            "the confirmation page carries the delete form"
+        );
+        let still = db::list_repositories(&state.pool).await.expect("list");
+        assert!(
+            still
+                .iter()
+                .any(|repository| repository.repository_id == id),
+            "reading the confirmation page deletes nothing"
+        );
+        let rows = db::load_tasks(&state.pool, Some(id)).await.expect("rows");
+        assert_eq!(rows.len(), 1, "the repository's rows stay until the post");
+
+        let response = send(state.clone(), form_post(&link, None, None)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=repository-removed"
+        );
+        let after = db::list_repositories(&state.pool).await.expect("after");
+        assert!(after.is_empty(), "the posted form removes the repository");
+        let rows = db::load_tasks(&state.pool, Some(id)).await.expect("rows");
+        assert!(rows.is_empty(), "the posted form removes the rows");
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
     /// One `/status` read through the router, with the JSON body and the
     /// uncached page header the dashboard's poll relies on.
     async fn status_json(state: &AppState) -> serde_json::Value {
@@ -9339,7 +9582,6 @@ mod tests {
     const THEME_BOOT_SCRIPT: &str = include_str!("../static/js/theme-boot.js");
     const THEME_SCRIPT: &str = include_str!("../static/js/theme.js");
     const DASHBOARD_SCRIPT: &str = include_str!("../static/js/dashboard.js");
-    const REPOSITORIES_SCRIPT: &str = include_str!("../static/js/repositories.js");
     const STYLE_SHEET: &str = include_str!("../static/style.css");
 
     /// Run the real shipped scripts against the stub DOM, then evaluate
@@ -9370,8 +9612,6 @@ mod tests {
             ctx.eval::<(), _>(THEME_SCRIPT).expect("theme.js loads");
             ctx.eval::<(), _>(DASHBOARD_SCRIPT)
                 .expect("dashboard.js loads");
-            ctx.eval::<(), _>(REPOSITORIES_SCRIPT)
-                .expect("repositories.js loads");
             let json: String = ctx.eval(assertion).expect("assertion script");
             serde_json::from_str(&json).expect("assertion json")
         })
@@ -9974,56 +10214,6 @@ mod tests {
         assert_eq!(
             stored["theme"], "dark",
             "an explicit choice outranks the OS preference"
-        );
-    }
-
-    /// Covers: the delegated Remove confirmation names the repository, even one
-    /// whose name holds an apostrophe, and a declined confirm cancels the
-    /// submit.
-    #[test]
-    fn browser_remove_confirmation_names_the_repository() {
-        let config = browser_config(false, false, None, serde_json::json!("#123456"));
-        let result = run_browser(
-            &config,
-            r#"(function () {
-  var env = globalThis.__env;
-  var form = {
-    getAttribute: function (name) {
-      return name === "data-repository" ? "bob's repo" : null;
-    }
-  };
-  var event = { type: "submit", target: form };
-  env.document.dispatchEvent(event);
-  return JSON.stringify({ confirms: env.confirms.slice(), prevented: !!event.defaultPrevented });
-})()"#,
-        );
-        assert_eq!(
-            result["confirms"],
-            serde_json::json!(["Remove bob's repo from the dashboard?"]),
-            "the confirmation names the repository"
-        );
-        assert_eq!(result["prevented"], serde_json::json!(false));
-
-        let mut declined = browser_config(false, false, None, serde_json::json!("#123456"));
-        declined["confirmResult"] = serde_json::json!(false);
-        let cancelled = run_browser(
-            &declined,
-            r#"(function () {
-  var env = globalThis.__env;
-  var form = {
-    getAttribute: function (name) {
-      return name === "data-repository" ? "bob's repo" : null;
-    }
-  };
-  var event = { type: "submit", target: form };
-  env.document.dispatchEvent(event);
-  return JSON.stringify({ prevented: !!event.defaultPrevented });
-})()"#,
-        );
-        assert_eq!(
-            cancelled["prevented"],
-            serde_json::json!(true),
-            "a declined confirmation cancels the submit"
         );
     }
 
@@ -13814,24 +14004,27 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Covers: each Remove button names its repository and the form carries the
-    /// name for the delegated confirmation.
+    /// Covers: the Remove control names its repository and links to that
+    /// repository's server-rendered confirmation page, with no attribute or
+    /// script left behind for a delegated confirm.
     #[tokio::test(flavor = "current_thread")]
-    async fn web_remove_button_names_its_repository() {
-        let (state, path, folder, _id) = state_with_repository("a11y_remove_name").await;
+    async fn web_remove_links_to_the_confirmation_page() {
+        let (state, path, folder, id) = state_with_repository("a11y_remove_name").await;
         let body =
             body_text(send(state.clone(), get_page("/repositories", "127.0.0.1:7880")).await).await;
         assert!(
-            body.contains(">Remove repo</button>"),
-            "the Remove button names its repository"
+            body.contains(&format!(
+                "href=\"/repositories/{id}/delete\">Remove repo</a>"
+            )),
+            "the Remove control names its repository and links to its confirmation page"
         );
         assert!(
-            body.contains("data-repository=\"repo\""),
-            "the form carries the repository name for the confirm text"
+            !body.contains("data-repository="),
+            "the Remove control carries no repository attribute"
         );
         assert!(
-            !body.contains("onsubmit="),
-            "the Remove form carries no inline onsubmit"
+            !body.contains("repositories.js"),
+            "the Repositories page loads no Remove script"
         );
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);

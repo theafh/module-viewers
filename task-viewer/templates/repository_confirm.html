@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Remove a repository · Task viewer{% endblock %}
+{% block content %}
+<header class="page-header">
+    <div class="page-header-row">
+        <h1 class="page-title">Remove a repository</h1>
+    </div>
+</header>
+{% if repository %}
+<section class="card">
+    <p>Removing <strong>{{ repository.name }}</strong> drops it and its parsed rows from the dashboard. Its folder <span class="muted repo-path">{{ repository.path }}</span> stays on this machine.</p>
+    <div class="repo-actions">
+        <form method="post" action="/repositories/{{ repository.id_str }}/delete">
+            <button class="btn" type="submit">Remove {{ repository.name }}</button>
+        </form>
+        <a class="btn btn-secondary" href="/repositories">Cancel</a>
+    </div>
+</section>
+{% else %}
+<p class="banner banner-error">{{ error }}</p>
+<p><a class="btn btn-secondary" href="/repositories">Back to Repositories</a></p>
+{% endif %}
+{% endblock %}

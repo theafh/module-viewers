@@ -52,9 +52,7 @@
                 <form method="post" action="/repositories/{{ project.id }}/path">
                     <button class="btn btn-secondary btn-small" type="submit">Relocate {{ project.name }}</button>
                 </form>
-                <form method="post" action="/repositories/{{ project.id }}/delete" data-repository="{{ project.name }}">
-                    <button class="btn btn-secondary btn-small" type="submit">Remove {{ project.name }}</button>
-                </form>
+                <a class="btn btn-secondary btn-small" href="/repositories/{{ project.id }}/delete">Remove {{ project.name }}</a>
             </div>
         </li>
         {% endfor %}
@@ -66,7 +64,4 @@
     <p>Choose a project folder that keeps its task files in <code>tasks/</code>. The dashboard reads those files on this machine and stores the parsed rows in your home directory.</p>
 </section>
 {% endif %}
-{% endblock %}
-{% block scripts %}
-<script src="/static/js/repositories.js?v={{ version }}"></script>
 {% endblock %}
