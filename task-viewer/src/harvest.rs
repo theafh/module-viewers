@@ -1874,13 +1874,18 @@ fn scrub_git_env(command: &mut Command) {
 ///
 /// A user `log.showSignature=true` would add signature lines to the walk and a
 /// `log.decorate` setting would add ref names, so both are pinned off before
-/// any flag the caller supplies.
+/// any flag the caller supplies. A `log.showRoot=false` setting would drop the
+/// root commit's name-only and raw lines, which in a one-commit repository
+/// hides the commit that archives a task and its blob, so the root commit is
+/// pinned back on.
 fn git_log_args(flags: &[&str]) -> Vec<String> {
     let mut args = vec![
         "-c".to_string(),
         "log.showSignature=false".to_string(),
         "-c".to_string(),
         "log.decorate=false".to_string(),
+        "-c".to_string(),
+        "log.showRoot=true".to_string(),
         "log".to_string(),
     ];
     args.extend(flags.iter().map(|flag| (*flag).to_string()));
@@ -3809,7 +3814,11 @@ mod tests {
             .iter()
             .position(|arg| arg == "log")
             .expect("a log subcommand");
-        for setting in ["log.showSignature=false", "log.decorate=false"] {
+        for setting in [
+            "log.showSignature=false",
+            "log.decorate=false",
+            "log.showRoot=true",
+        ] {
             let pair = config_pair_index(args, setting)
                 .unwrap_or_else(|| panic!("{setting} must be configured with -c"));
             assert!(
@@ -6197,6 +6206,142 @@ mod tests {
         assert_ne!(
             task.ship_date,
             Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_a_root_commit_archive_under_show_root_false() {
+        // A repository config that drops root commits must not move the ship
+        // day of a task archived by a one-commit history's root commit to the
+        // frontmatter `updated` day.
+        let repo = scratch("harvest_show_root_false_chart");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["config", "log.showRoot", "false"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive finished"],
+            "2026-05-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day")),
+            "the root commit that archives the task must date it"
+        );
+        assert_ne!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_root_commit_blob_under_show_root_false() {
+        // The pickaxe and blob-day walks read the same history, so the root
+        // commit's blob must still reach the blob-day lookup.
+        let repo = scratch("harvest_show_root_false_blob");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["config", "log.showRoot", "false"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive finished"],
+            "2026-05-10T12:00:00+00:00",
+        );
+
+        let blob = git_stdout(
+            &repo,
+            &["rev-parse", "main:tasks/archive/scope_done.md"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        let commit_time = git_stdout(
+            &repo,
+            &["log", "-1", "--format=%ct", "main"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        let mut blobs = HashSet::new();
+        blobs.insert(blob.clone());
+        let dir = repo.join(".git");
+        let days = blob_days(&repo, &dir, &blobs, "tasks").expect("blob days");
+        assert_eq!(
+            days.get(&blob).copied(),
+            Some(commit_time.parse::<i64>().expect("commit time")),
+            "the root commit's blob must keep the commit day"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_keeps_a_root_commit_archive_day_without_the_setting() {
+        // A repository that carries no `log.showRoot` setting keeps its commit
+        // day, whatever the ambient global config says.
+        let repo = scratch("harvest_show_root_unset");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-10T12:00:00+00:00",
+        );
+        let config = fs::read_to_string(repo.join(".git/config")).expect("repo config");
+        assert!(
+            !config.to_lowercase().contains("showroot"),
+            "the fixture must carry no log.showRoot setting: {config}"
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive finished"],
+            "2026-05-10T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
         );
         assert_eq!(task.leave_date, task.ship_date);
         let _ = fs::remove_dir_all(&repo);
