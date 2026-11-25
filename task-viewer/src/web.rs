@@ -3065,11 +3065,12 @@ mod tests {
         HarvestFn, HomeQuery, MISSING_TASKS_ERROR, PickerFn, PickerResult, PriorReadHookFn,
         ProjectForm, STOPPED_ERROR, ScanFailure, ScanReport, StoreHookFn, add_repository,
         canonical_path_text, claim_banner, confirm_repository, encode_query, flash_banner,
-        human_stamp, init_templates, is_local_host, local_offset, osascript_outcome, query_banner,
-        record_scan_error, relocate_repository, remaining, remove_repository,
-        render_blocking_thread, render_home, render_repositories_at, router, scan_all, scan_core,
-        scan_flash, scan_instant, scan_label_at, scan_response, scan_worker_cap, serve,
-        serve_until_stopped, static_version, store_hook_from, store_repository, zenity_outcome,
+        git_scan_message, human_stamp, init_templates, is_local_host, local_offset,
+        osascript_outcome, query_banner, record_scan_error, relocate_repository, remaining,
+        remove_repository, render_blocking_thread, render_home, render_repositories_at, router,
+        scan_all, scan_core, scan_flash, scan_instant, scan_label_at, scan_response,
+        scan_worker_cap, serve, serve_until_stopped, static_version, store_hook_from,
+        store_repository, zenity_outcome,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -4510,6 +4511,44 @@ mod tests {
         assert!(
             !body.contains("2026-11-08T23:45:00Z"),
             "no raw ISO stamp reaches the page"
+        );
+
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Covers: a stored scan stamp that does not parse keeps its raw text on the
+    /// Repositories page instead of a formatted time, so a spelling an older
+    /// build stored still shows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_repositories_page_keeps_an_unparseable_stamp_raw() {
+        let (state, path) = app_state("repo_unparseable_stamp").await;
+        let folder = live_repository("repo_unparseable_stamp_folder");
+        let id = db::insert_repository(&state.pool, "odd", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        sqlx::query("UPDATE repositories SET scanned_at = ? WHERE repository_id = ?")
+            .bind("pending scan")
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .expect("stamp the repository");
+
+        let now = DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
+            .expect("reference instant")
+            .with_timezone(&Utc);
+        let zone = FixedOffset::east_opt(3600).expect("one hour east");
+        let body = render_repositories_at(&state, &FlashQuery::default(), now, &zone)
+            .await
+            .expect("render");
+
+        assert!(
+            body.contains("scanned pending scan"),
+            "the unparseable stamp keeps its raw text: {body}"
+        );
+        assert!(
+            !body.contains("Last scan unknown"),
+            "the page renders the raw stamp, not the unknown-time label: {body}"
         );
 
         let _ = std::fs::remove_dir_all(folder);
@@ -8123,6 +8162,33 @@ mod tests {
         assert!(rows.is_empty(), "a failed first harvest stores no rows");
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
+    }
+
+    /// Covers: a failed git read stores only the failure's first line, trimmed,
+    /// cut at 200 characters, behind the fixed git sentence; an empty reason
+    /// stores the fixed sentence alone.
+    #[test]
+    fn web_git_scan_message_keeps_the_first_line_trimmed_and_cut() {
+        let first_line = "  fatal: bad revision  \nsecond line\nthird line";
+        assert_eq!(
+            git_scan_message(first_line),
+            format!("{GIT_ERROR} fatal: bad revision"),
+            "only the first line survives, trimmed"
+        );
+
+        let long = "x".repeat(260);
+        let reason = format!("{long}\ntrailing line");
+        assert_eq!(
+            git_scan_message(&reason),
+            format!("{GIT_ERROR} {}", "x".repeat(200)),
+            "the first line is cut at 200 characters"
+        );
+
+        assert_eq!(
+            git_scan_message("\n   \n"),
+            GIT_ERROR,
+            "an empty reason stores the fixed sentence alone"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12601,6 +12667,50 @@ mod tests {
             result["live"],
             serde_json::json!(["2", "4", "6", "8"]),
             "the live radar labels its own peak instead of the shipped peak"
+        );
+    }
+
+    /// Covers: a radar peak that is not a multiple of four rounds up to the
+    /// next multiple, so a peak of 5 labels 2, 4, 6, 8, while a peak below four
+    /// keeps the floor of four and labels 1, 2, 3, 4.
+    #[test]
+    fn browser_radar_rings_round_a_non_multiple_peak_up_to_a_multiple_of_four() {
+        let mut payload = fixture_payload();
+        payload["radar_shipped"] = serde_json::json!([{"label": "alpha", "count": 5}]);
+        payload["radar_live"] = serde_json::json!([{"label": "beta", "count": 0}]);
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function rings(name) {
+    return env.cards[name].querySelector("svg").children
+      .filter(function (node) {
+        return node.name === "text" && node.attrs["font-size"] === "10";
+      })
+      .map(function (node) { return node.textContent; });
+  }
+  return JSON.stringify({
+    shipped: rings("radar-shipped"),
+    live: rings("radar-live")
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["shipped"],
+            serde_json::json!(["2", "4", "6", "8"]),
+            "a peak of 5 rounds up to 8, so the rings are its quarters"
+        );
+        assert_eq!(
+            result["live"],
+            serde_json::json!(["1", "2", "3", "4"]),
+            "a zero peak keeps the floor of four, so the rings are 1, 2, 3, 4"
         );
     }
 

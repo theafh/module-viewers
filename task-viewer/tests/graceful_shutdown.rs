@@ -371,13 +371,9 @@ fn task_viewer_exits_on_sigterm_and_sigint() {
     }
 }
 
-/// Covers: a store that is in flight when the signal arrives finishes inside
-/// the grace and commits its rows, while a store held past the grace rolls
-/// back, leaving the repository's rows exactly as they stood before the run.
-#[test]
-fn task_viewer_finishes_an_in_flight_store_and_rolls_back_one_held_past_the_grace() {
-    let scratch = Scratch::new("shutdown_in_flight");
-    let db = scratch.path().join("test.db");
+/// One scratch repository folder carrying one live task, so the Update the
+/// test triggers has something to harvest and store.
+fn in_flight_folder(scratch: &Scratch) -> PathBuf {
     let folder = scratch.path().join("repo");
     std::fs::create_dir_all(folder.join("tasks")).expect("tasks");
     std::fs::write(
@@ -385,37 +381,60 @@ fn task_viewer_finishes_an_in_flight_store_and_rolls_back_one_held_past_the_grac
         "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Live\n",
     )
     .expect("task file");
+    folder
+}
 
-    // Run one: the store pause sits inside the grace, so the drain waits for
-    // the store and its rows commit before the server exits.
-    let mut inside = Server::start(&scratch, "inside", &db, Some(2_500));
-    seed_repository(&db, "repo", &folder);
+/// Run the in-flight-store case for one signal: the store pause sits inside the
+/// grace, so the signal lands while the store is observed open, the drain waits
+/// for it, its rows commit, and the process exits on its own inside the stop
+/// window. The committed rows are returned so the caller can compare them.
+fn finish_an_in_flight_store(
+    scratch: &Scratch,
+    db: &Path,
+    folder: &Path,
+    signal: &str,
+) -> Vec<StoredTask> {
+    let mut inside = Server::start(scratch, "inside", db, Some(2_500));
+    seed_repository(db, "repo", folder);
     trigger_update(inside.port);
     let marker = inside.marker().expect("the in-flight run pauses its store");
     wait_for_marker(marker, Instant::now() + START_WINDOW);
     let started = Instant::now();
-    send_signal(inside.child.id(), "TERM");
+    send_signal(inside.child.id(), signal);
     let status = inside.wait_for_exit(STOP_WINDOW);
     let elapsed = started.elapsed();
     assert!(
         status.success(),
-        "the server exited with {status:?} on SIGTERM\n{}",
+        "the server exited with {status:?} on SIG{signal}\n{}",
         inside.log_text()
     );
     assert!(
         elapsed < GRACE,
-        "the in-flight store outlived the {GRACE:?} grace: {elapsed:?}"
+        "the in-flight store outlived the {GRACE:?} grace on SIG{signal}: {elapsed:?}"
     );
     // The store was still open when the signal landed, so the drain had to wait
     // for it. A run that exited before the pause could elapse would leave the
     // same committed rows yet prove nothing about the drain.
     assert!(
         elapsed >= Duration::from_millis(1_000),
-        "the drain did not wait for the in-flight store: exited after {elapsed:?}"
+        "the drain did not wait for the in-flight store on SIG{signal}: exited after {elapsed:?}"
     );
     drop(inside);
+    read_tasks(db)
+}
 
-    let committed = read_tasks(&db);
+/// Covers: a store that is in flight when SIGTERM arrives finishes inside the
+/// grace and commits its rows, while a store held past the grace rolls back,
+/// leaving the repository's rows exactly as they stood before the run.
+#[test]
+fn task_viewer_finishes_an_in_flight_store_and_rolls_back_one_held_past_the_grace() {
+    let scratch = Scratch::new("shutdown_in_flight");
+    let db = scratch.path().join("test.db");
+    let folder = in_flight_folder(&scratch);
+
+    // Run one: the store pause sits inside the grace, so the drain waits for
+    // the store and its rows commit before the server exits.
+    let committed = finish_an_in_flight_store(&scratch, &db, &folder, "TERM");
     assert_eq!(
         committed,
         vec![(
@@ -456,6 +475,29 @@ fn task_viewer_finishes_an_in_flight_store_and_rolls_back_one_held_past_the_grac
         read_tasks(&db),
         committed,
         "the store held past the grace rolled back, leaving the repository's rows exactly as they stood"
+    );
+}
+
+/// Covers: a store that is in flight when SIGINT arrives finishes inside the
+/// grace, commits its rows, and the process exits on its own inside the stop
+/// window. The SIGINT arm holds a store open, so a drain that dropped one only
+/// on Ctrl-C would fail here instead of passing on a server with no store.
+#[test]
+fn task_viewer_finishes_an_in_flight_store_on_sigint() {
+    let scratch = Scratch::new("shutdown_in_flight_sigint");
+    let db = scratch.path().join("test.db");
+    let folder = in_flight_folder(&scratch);
+
+    let committed = finish_an_in_flight_store(&scratch, &db, &folder, "INT");
+    assert_eq!(
+        committed,
+        vec![(
+            "tasks/scope_live.md".to_string(),
+            "live".to_string(),
+            "2026-05-01".to_string(),
+            None,
+        )],
+        "the in-flight store's rows are in the child's database after it exits on SIGINT"
     );
 }
 
