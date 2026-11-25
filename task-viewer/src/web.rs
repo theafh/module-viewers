@@ -17487,8 +17487,8 @@ mod tests {
     }
 
     /// A working tree whose `tasks/` holds no markdown file and no ref that
-    /// holds `tasks/` charts no rows and clears the repository's stored rows and
-    /// its recorded error.
+    /// holds `tasks/` charts no rows and clears the repository's stored rows,
+    /// keeping the recorded error as history.
     #[tokio::test(flavor = "current_thread")]
     async fn web_scan_clears_rows_when_the_tasks_tree_holds_no_markdown() {
         let path = temp_database("scan_empty_tasks");
@@ -17578,7 +17578,7 @@ mod tests {
 
     /// A folder whose working tree lacks `tasks/` and whose only ref holding it
     /// lists a markdown file that cannot be charted charts no rows and clears
-    /// the repository's stored rows and recorded error.
+    /// the repository's stored rows, keeping the recorded error as history.
     #[tokio::test(flavor = "current_thread")]
     async fn web_scan_clears_rows_when_the_only_ref_task_is_skipped() {
         let path = temp_database("scan_skipped_ref");

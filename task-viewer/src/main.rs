@@ -50,10 +50,11 @@ async fn serve_until_stopped() -> anyhow::Result<Instant> {
     let pool = db::init().await?;
     let state = web::AppState::new(pool, web::init_templates()?)?;
     let app = web::router(state.clone());
-    // Test-only override: an isolated test runs the built binary on a free
-    // loopback port beside a running dashboard. The host allowlist, the
-    // same-origin `Origin` check, and every documented `7880` stay derived
-    // from `web::PORT`, so what a browser reaches stays unchanged.
+    // The variable is read on every build, release included, and the launcher
+    // drops an inherited value and exports its own port. A non-default port is
+    // for an isolated run beside a running dashboard: the host allowlist, the
+    // same-origin `Origin` check, and every documented `7880` stay derived from
+    // `web::PORT`, so a server on another port rejects a `Host` naming it.
     let port = configured_port(std::env::var_os("TASK_VIEWER_PORT").as_deref())?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = bind_and_log(addr).await?;
