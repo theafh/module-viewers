@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="{{ theme }}">
 
 <head>
     <meta charset="UTF-8">
@@ -8,6 +8,8 @@
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{ version }}">
     <link rel="stylesheet" href="/static/style.css?v={{ version }}">
     <script src="/static/js/theme-boot.js?v={{ version }}"></script>
+    {# Without scripting the button's click handler never attaches, so the no-script form beside it is the only theme control and the button is hidden. #}
+    <noscript><style>#theme-toggle{display:none}</style></noscript>
 </head>
 
 <body>
@@ -22,6 +24,8 @@
         <div class="nav-actions">
             {% block nav %}{% endblock %}
             <button class="btn btn-secondary" id="theme-toggle" type="button">Light Mode</button>
+            {# The no-script path: post the opposite theme, then return to this page. #}
+            <noscript><form class="nav-form" method="post" action="/theme"><input type="hidden" name="theme" value="{% if theme == "light" %}dark{% else %}light{% endif %}"><input type="hidden" name="next" value="{{ next }}"><button class="btn btn-secondary" type="submit">{% if theme == "light" %}Dark Mode{% else %}Light Mode{% endif %}</button></form></noscript>
         </div>
     </nav>
     <main class="container">

@@ -371,6 +371,13 @@
       store[key] = String(value);
     }
   };
+  // A cookie jar the shipped scripts read through `document.cookie` and write
+  // when the theme toggle runs. The config seeds a server-set choice, so a boot
+  // test can model the cookie `POST /theme` left behind.
+  var cookies = {};
+  if (config.cookieTheme !== undefined && config.cookieTheme !== null) {
+    cookies["task_viewer_theme"] = String(config.cookieTheme);
+  }
 
   var documentListeners = {};
   var document = {
@@ -419,6 +426,27 @@
       return !event.defaultPrevented;
     }
   };
+
+  // The cookie jar `document.cookie` reads and writes, so a boot test can seed
+  // the choice `POST /theme` left behind and a toggle test can read the cookie
+  // the shipped script writes.
+  Object.defineProperty(document, "cookie", {
+    get: function () {
+      return Object.keys(cookies)
+        .map(function (name) {
+          return name + "=" + cookies[name];
+        })
+        .join("; ");
+    },
+    set: function (value) {
+      var pair = String(value).split(";")[0];
+      var index = pair.indexOf("=");
+      if (index <= 0) return;
+      cookies[pair.slice(0, index).replace(/^\s+|\s+$/g, "")] = pair
+        .slice(index + 1)
+        .replace(/^\s+|\s+$/g, "");
+    }
+  });
 
   var events = [];
   // Every confirm message the shipped scripts build, in order, so a test can
@@ -497,6 +525,7 @@
     chartHeights: CHART_HEIGHT,
     html: html,
     themeButton: themeButton,
+    cookies: cookies,
     updateForm: updateForm,
     updateButton: updateButton,
     chartsSection: chartsSection,

@@ -14,7 +14,7 @@ Durable state is the SQLite file `~/.task-viewer`, or the file named by `TASK_VI
 
 **Repository files are read-only input.** Frontmatter and git history are parsed into rows. The program does not write into the selected folder.
 
-**The database file is local state.** It is created on launch when missing. Rows are replaced only by Update, by adding a repository, by rescanning one repository, and by relocating one repository to a new folder, and deleted only by Remove.
+**The database file and the theme cookie are local state.** The database is created on launch when missing. Rows are replaced only by Update, by adding a repository, by rescanning one repository, and by relocating one repository to a new folder, and deleted only by Remove. The theme cookie `task_viewer_theme` holds `light` or `dark`, carries `Path=/`, a one-year `Max-Age`, and `SameSite=Lax`, and is set only by `POST /theme`, which passes the same-origin POST guard, or by the page's own theme script, so a page on another origin cannot set it.
 
 **HTTP names repositories by id.** Add repository takes its path from the folder picker running on this machine. A request body cannot choose an arbitrary path.
 

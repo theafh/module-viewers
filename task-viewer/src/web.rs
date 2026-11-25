@@ -479,6 +479,7 @@ pub fn router(state: AppState) -> Router {
         .route("/repositories/confirm/{token}", post(confirm_repository))
         .route("/status", get(scan_status))
         .route("/scan", post(scan_all))
+        .route("/theme", post(set_theme))
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
@@ -913,6 +914,108 @@ fn split_banner(key: &str, message: String) -> (String, String) {
     }
 }
 
+/// The cookie a page renders its theme from and `POST /theme` writes.
+const THEME_COOKIE: &str = "task_viewer_theme";
+
+/// One year, in seconds, the theme cookie lives.
+const THEME_COOKIE_MAX_AGE: i64 = 31_536_000;
+
+/// The theme and self path every page renders: the cookie's theme, and the
+/// request's own path plus query, which the no-script form posts back as
+/// `next` so the choice returns the browser to the page it sat on.
+struct PageChrome {
+    theme: &'static str,
+    next: String,
+}
+
+impl PageChrome {
+    fn from_request(headers: &HeaderMap, uri: &axum::http::Uri) -> Self {
+        Self {
+            theme: page_theme(headers),
+            next: page_next(uri),
+        }
+    }
+}
+
+impl Default for PageChrome {
+    fn default() -> Self {
+        Self {
+            theme: "dark",
+            next: "/".to_string(),
+        }
+    }
+}
+
+/// The theme a page renders: the cookie's value when it names `light` or
+/// `dark`, otherwise dark, so a missing or unrecognised cookie keeps the
+/// page's original theme.
+fn page_theme(headers: &HeaderMap) -> &'static str {
+    match cookie_value(headers, THEME_COOKIE) {
+        Some("light") => "light",
+        _ => "dark",
+    }
+}
+
+/// The request's path plus query, which a page renders as the no-script form's
+/// `next`. A request with no path renders `/`.
+fn page_next(uri: &axum::http::Uri) -> String {
+    uri.path_and_query()
+        .map_or_else(|| "/".to_string(), |path| path.as_str().to_string())
+}
+
+/// The value of cookie `name` in the request's `Cookie` headers, or `None`.
+/// The first matching pair wins, and a pair without a value names no cookie.
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(key, _)| key.trim() == name)
+        .map(|(_, value)| value.trim())
+}
+
+/// The local path a theme post may return to: a value that starts with one
+/// `/`, does not start with `//`, and carries no scheme. Anything else falls
+/// back to `/`, so the form cannot bounce the browser to another origin. A
+/// backslash and a control character are refused for the same reason, because
+/// a browser reads `\` as `/` and drops a control character from the URL.
+fn safe_theme_next(next: &str) -> &str {
+    let local = next.starts_with('/')
+        && !next.starts_with("//")
+        && !next.contains("://")
+        && !next.contains('\\')
+        && !next.chars().any(char::is_control);
+    if local { next } else { "/" }
+}
+
+/// The two fields the no-script theme form posts.
+#[derive(Debug, Deserialize, Default)]
+struct ThemeForm {
+    #[serde(default)]
+    theme: String,
+    #[serde(default)]
+    next: String,
+}
+
+/// `POST /theme` records the no-script theme choice in a cookie and returns to
+/// the page the form sat on. It runs behind the same-origin POST guard every
+/// other form route uses, so only this page's own form sets it. A `theme` that
+/// names neither theme sets no cookie and still redirects to the safe `next`.
+async fn set_theme(Form(form): Form<ThemeForm>) -> Response {
+    let mut response = Redirect::to(safe_theme_next(form.next.trim())).into_response();
+    let theme = form.theme.trim();
+    if theme == "light" || theme == "dark" {
+        let cookie =
+            format!("{THEME_COOKIE}={theme}; Path=/; Max-Age={THEME_COOKIE_MAX_AGE}; SameSite=Lax");
+        if let Ok(value) = HeaderValue::try_from(cookie) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+    response
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct HomeQuery {
     #[serde(default)]
@@ -973,8 +1076,14 @@ struct ChartQuery {
     project: String,
 }
 
-async fn home(State(state): State<AppState>, Query(query): Query<HomeQuery>) -> Response {
-    match render_home(&state, &query).await {
+async fn home(
+    State(state): State<AppState>,
+    Query(query): Query<HomeQuery>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let chrome = PageChrome::from_request(&headers, &uri);
+    match render_home(&state, &query, &chrome).await {
         Ok(html) => Html(html).into_response(),
         Err(error) => {
             tracing::error!(%error, "dashboard render failed");
@@ -990,8 +1099,11 @@ async fn home(State(state): State<AppState>, Query(query): Query<HomeQuery>) -> 
 async fn repositories_page(
     State(state): State<AppState>,
     Query(query): Query<FlashQuery>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
-    match render_repositories(&state, &query).await {
+    let chrome = PageChrome::from_request(&headers, &uri);
+    match render_repositories(&state, &query, &chrome).await {
         Ok(html) => Html(html).into_response(),
         Err(error) => {
             tracing::error!(%error, "repositories render failed");
@@ -1004,8 +1116,14 @@ async fn repositories_page(
     }
 }
 
-async fn tasks_page(State(state): State<AppState>, Query(query): Query<TasksQuery>) -> Response {
-    match render_tasks(&state, &query).await {
+async fn tasks_page(
+    State(state): State<AppState>,
+    Query(query): Query<TasksQuery>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let chrome = PageChrome::from_request(&headers, &uri);
+    match render_tasks(&state, &query, &chrome).await {
         Ok(html) => Html(html).into_response(),
         Err(error) => {
             tracing::error!(%error, "task list render failed");
@@ -1098,10 +1216,14 @@ async fn charts_csv(State(state): State<AppState>, Query(query): Query<ChartQuer
     }
 }
 
-async fn render_home(state: &AppState, query: &HomeQuery) -> anyhow::Result<String> {
+async fn render_home(
+    state: &AppState,
+    query: &HomeQuery,
+    chrome: &PageChrome,
+) -> anyhow::Result<String> {
     let mut banner = BannerGuard::new(state, claim_banner(state, query));
     let (notice, error) = banner_text(banner.claimed(), query);
-    match render_dashboard(state, query, notice, error).await {
+    match render_dashboard(state, query, notice, error, chrome).await {
         Ok(html) => {
             // The render produced its response, so the slot stays consumed.
             banner.disarm();
@@ -1337,6 +1459,7 @@ async fn render_dashboard(
     query: &HomeQuery,
     notice: String,
     error: String,
+    chrome: &PageChrome,
 ) -> anyhow::Result<String> {
     let ChartSelection {
         repositories,
@@ -1366,6 +1489,8 @@ async fn render_dashboard(
     let has_projects = !repositories.is_empty();
     let templates = Arc::clone(&state.templates);
     let version = state.static_version.clone();
+    let theme = chrome.theme;
+    let next = chrome.next.clone();
     // The chart computation, the JSON payload, the page assembly, and the
     // template render are CPU work over every stored row and every chart day,
     // so they run on a blocking thread instead of a tokio worker. Only the
@@ -1379,6 +1504,8 @@ async fn render_dashboard(
         let page = DashboardPage {
             version,
             page: "dashboard",
+            theme,
+            next,
             projects,
             selected,
             notice,
@@ -1398,8 +1525,12 @@ async fn render_dashboard(
     Ok(html)
 }
 
-async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Result<String> {
-    render_repositories_at(state, query, Utc::now(), &local_offset()).await
+async fn render_repositories(
+    state: &AppState,
+    query: &FlashQuery,
+    chrome: &PageChrome,
+) -> anyhow::Result<String> {
+    render_repositories_at(state, query, chrome, Utc::now(), &local_offset()).await
 }
 
 /// Render the Repositories page against a fixed reference instant and zone, so
@@ -1407,6 +1538,7 @@ async fn render_repositories(state: &AppState, query: &FlashQuery) -> anyhow::Re
 async fn render_repositories_at(
     state: &AppState,
     query: &FlashQuery,
+    chrome: &PageChrome,
     now: DateTime<Utc>,
     zone: &FixedOffset,
 ) -> anyhow::Result<String> {
@@ -1447,6 +1579,8 @@ async fn render_repositories_at(
     let page = RepositoriesPage {
         version: state.static_version.clone(),
         page: "repositories",
+        theme: chrome.theme,
+        next: chrome.next.clone(),
         projects,
         notice,
         error,
@@ -1460,7 +1594,11 @@ async fn render_repositories_at(
 /// Render the Remove confirmation page. An id that is no longer configured
 /// renders the not-found message on the same page with no Remove form, so the
 /// page never offers a removal the POST would refuse.
-async fn render_remove_confirmation(state: &AppState, id: i64) -> anyhow::Result<String> {
+async fn render_remove_confirmation(
+    state: &AppState,
+    id: i64,
+    chrome: &PageChrome,
+) -> anyhow::Result<String> {
     let repositories = db::list_repositories(&state.pool).await?;
     let repository = repositories
         .iter()
@@ -1479,6 +1617,8 @@ async fn render_remove_confirmation(state: &AppState, id: i64) -> anyhow::Result
     let page = RemoveConfirmPage {
         version: state.static_version.clone(),
         page: "repositories",
+        theme: chrome.theme,
+        next: chrome.next.clone(),
         repository,
         error,
     };
@@ -1742,7 +1882,11 @@ async fn select_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<Ta
     })
 }
 
-async fn render_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<String> {
+async fn render_tasks(
+    state: &AppState,
+    query: &TasksQuery,
+    chrome: &PageChrome,
+) -> anyhow::Result<String> {
     let selection = select_tasks(state, query).await?;
     let rows = selection.rows.iter().map(task_row_view).collect::<Vec<_>>();
     let project = match selection.selected {
@@ -1753,6 +1897,8 @@ async fn render_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<St
     let page = TasksPage {
         version: state.static_version.clone(),
         page: "tasks",
+        theme: chrome.theme,
+        next: chrome.next.clone(),
         count: rows.len(),
         back_href: format!("/?project={project}"),
         project: project.clone(),
@@ -2423,6 +2569,8 @@ fn scan_instant(stamp: &str) -> Option<DateTime<Utc>> {
 struct DashboardPage {
     version: String,
     page: &'static str,
+    theme: &'static str,
+    next: String,
     projects: Vec<ProjectView>,
     selected: String,
     notice: String,
@@ -2438,6 +2586,8 @@ struct DashboardPage {
 struct RepositoriesPage {
     version: String,
     page: &'static str,
+    theme: &'static str,
+    next: String,
     projects: Vec<RepositoryRowView>,
     notice: String,
     error: String,
@@ -2458,6 +2608,8 @@ struct ConfirmView {
 struct RemoveConfirmPage {
     version: String,
     page: &'static str,
+    theme: &'static str,
+    next: String,
     repository: Option<RemoveConfirmView>,
     error: String,
 }
@@ -2473,6 +2625,8 @@ struct RemoveConfirmView {
 struct TasksPage {
     version: String,
     page: &'static str,
+    theme: &'static str,
+    next: String,
     count: usize,
     back_href: String,
     /// The active project filter, as `all` or a repository id.
@@ -2842,8 +2996,14 @@ async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<()
 /// `GET /repositories/{id}/delete` renders the confirmation page, so a browser
 /// without scripting asks before the POST that deletes a repository and its
 /// rows. The page and the delete share one path and split by method.
-async fn confirm_remove_repository(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    match render_remove_confirmation(&state, id).await {
+async fn confirm_remove_repository(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let chrome = PageChrome::from_request(&headers, &uri);
+    match render_remove_confirmation(&state, id, &chrome).await {
         Ok(html) => Html(html).into_response(),
         Err(error) => {
             tracing::error!(%error, "remove confirmation render failed");
@@ -3641,13 +3801,13 @@ fn encode_query(value: &str) -> String {
 mod tests {
     use super::{
         AppState, Banner, BannerGuard, FLASH_CAPACITY, FlashQuery, FlashStore, GIT_ERROR,
-        HarvestFn, HomeQuery, MISSING_TASKS_ERROR, PickerFn, PickerResult, PriorReadHookFn,
-        ProjectForm, STOPPED_ERROR, ScanFailure, ScanReport, StoreHookFn, add_repository,
-        canonical_path_text, charts_csv_text, claim_banner, confirm_repository, encode_query,
-        flash_banner, git_scan_message, human_stamp, init_templates, is_local_host, local_offset,
-        osascript_outcome, query_banner, record_scan_error, relocate_repository, remaining,
-        remove_repository, render_blocking_thread, render_home, render_repositories_at, router,
-        scan_all, scan_core, scan_flash, scan_instant, scan_label_at, scan_response,
+        HarvestFn, HomeQuery, MISSING_TASKS_ERROR, PageChrome, PickerFn, PickerResult,
+        PriorReadHookFn, ProjectForm, STOPPED_ERROR, ScanFailure, ScanReport, StoreHookFn,
+        add_repository, canonical_path_text, charts_csv_text, claim_banner, confirm_repository,
+        encode_query, flash_banner, git_scan_message, human_stamp, init_templates, is_local_host,
+        local_offset, osascript_outcome, query_banner, record_scan_error, relocate_repository,
+        remaining, remove_repository, render_blocking_thread, render_home, render_repositories_at,
+        router, scan_all, scan_core, scan_flash, scan_instant, scan_label_at, scan_response,
         scan_worker_cap, serve, serve_until_stopped, static_version, store_hook_from,
         store_repository, zenity_outcome,
     };
@@ -4362,7 +4522,7 @@ mod tests {
         .expect("store rows");
 
         let runtime_thread = std::thread::current().id();
-        let html = render_home(&state, &HomeQuery::default())
+        let html = render_home(&state, &HomeQuery::default(), &PageChrome::default())
             .await
             .expect("render");
         let blocking_thread =
@@ -4466,7 +4626,7 @@ mod tests {
         .await
         .expect("store rows");
 
-        let html = render_home(&state, &HomeQuery::default())
+        let html = render_home(&state, &HomeQuery::default(), &PageChrome::default())
             .await
             .expect("render");
         let as_of = crate::dates::format_date(crate::dates::today());
@@ -4510,7 +4670,7 @@ mod tests {
         .await
         .expect("store rows");
 
-        let html = render_home(&state, &HomeQuery::default())
+        let html = render_home(&state, &HomeQuery::default(), &PageChrome::default())
             .await
             .expect("render");
 
@@ -4549,7 +4709,7 @@ mod tests {
         .await
         .expect("store rows");
 
-        let html = render_home(&state, &HomeQuery::default())
+        let html = render_home(&state, &HomeQuery::default(), &PageChrome::default())
             .await
             .expect("render");
         let marker = "<script id=\"payload\" type=\"application/json\">";
@@ -5076,9 +5236,15 @@ mod tests {
             .expect("reference instant")
             .with_timezone(&Utc);
         let zone = FixedOffset::east_opt(3600).expect("one hour east");
-        let body = render_repositories_at(&state, &FlashQuery::default(), now, &zone)
-            .await
-            .expect("render");
+        let body = render_repositories_at(
+            &state,
+            &FlashQuery::default(),
+            &PageChrome::default(),
+            now,
+            &zone,
+        )
+        .await
+        .expect("render");
 
         assert!(
             body.contains("2026-11-01 10:30 (10 days ago)"),
@@ -5118,9 +5284,15 @@ mod tests {
             .expect("reference instant")
             .with_timezone(&Utc);
         let zone = FixedOffset::east_opt(3600).expect("one hour east");
-        let body = render_repositories_at(&state, &FlashQuery::default(), now, &zone)
-            .await
-            .expect("render");
+        let body = render_repositories_at(
+            &state,
+            &FlashQuery::default(),
+            &PageChrome::default(),
+            now,
+            &zone,
+        )
+        .await
+        .expect("render");
 
         assert!(
             body.contains("last success pending scan"),
@@ -5158,9 +5330,15 @@ mod tests {
             .expect("reference instant")
             .with_timezone(&Utc);
         let zone = FixedOffset::east_opt(3600).expect("one hour east");
-        let body = render_repositories_at(&state, &FlashQuery::default(), now, &zone)
-            .await
-            .expect("render");
+        let body = render_repositories_at(
+            &state,
+            &FlashQuery::default(),
+            &PageChrome::default(),
+            now,
+            &zone,
+        )
+        .await
+        .expect("render");
 
         assert!(
             body.contains("last success 2026-11-09 00:45 (3 days ago)"),
@@ -5182,9 +5360,15 @@ mod tests {
             .execute(&state.pool)
             .await
             .expect("record a new failure");
-        let body = render_repositories_at(&state, &FlashQuery::default(), now, &zone)
-            .await
-            .expect("render");
+        let body = render_repositories_at(
+            &state,
+            &FlashQuery::default(),
+            &PageChrome::default(),
+            now,
+            &zone,
+        )
+        .await
+        .expect("render");
         assert!(
             body.contains("class=\"error-text\">last error"),
             "a failing repository renders its error as a current failure: {body}"
@@ -5229,7 +5413,7 @@ mod tests {
             .await
             .expect("scan error");
 
-        let html = render_home(&state, &HomeQuery::default())
+        let html = render_home(&state, &HomeQuery::default(), &PageChrome::default())
             .await
             .expect("render");
         assert!(
@@ -5251,7 +5435,7 @@ mod tests {
             .execute(&state.pool)
             .await
             .expect("write a legacy error");
-        let html = render_home(&state, &HomeQuery::default())
+        let html = render_home(&state, &HomeQuery::default(), &PageChrome::default())
             .await
             .expect("render");
         assert!(
@@ -8680,7 +8864,7 @@ mod tests {
             ..HomeQuery::default()
         };
 
-        render_home(&state, &query)
+        render_home(&state, &query, &PageChrome::default())
             .await
             .expect("the dashboard renders");
         assert!(
@@ -8748,6 +8932,203 @@ mod tests {
             WEB_SOURCE.contains(field),
             "the flash field carries the synchronous lock: {field}"
         );
+    }
+
+    /// One form POST with a caller-supplied body and optional `Origin`,
+    /// carrying the loopback Host a same-machine browser sends.
+    fn themed_post(uri: &str, body: &str, origin: Option<&str>) -> axum::extract::Request {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:7880")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        request
+            .body(Body::from(body.to_string()))
+            .expect("form request")
+    }
+
+    /// One GET carrying an optional `Cookie` header.
+    fn get_with_cookie(uri: &str, cookie: Option<&str>) -> axum::extract::Request {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:7880");
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        request.body(Body::empty()).expect("get request")
+    }
+
+    /// The `Set-Cookie` header a response carries, when it carries one.
+    fn set_cookie(response: &axum::response::Response) -> Option<String> {
+        response
+            .headers()
+            .get(header::SET_COOKIE)
+            .map(|value| value.to_str().expect("cookie text").to_string())
+    }
+
+    /// The value of the hidden form field `name` in an HTML body, with the two
+    /// escapes Tera writes in an attribute (`&#x2F;` for `/` and `&amp;` for
+    /// `&`) decoded back, so a test reads the value the browser posts.
+    fn form_value(body: &str, name: &str) -> String {
+        let marker = format!("name=\"{name}\" value=\"");
+        let rest = body
+            .split(&marker)
+            .nth(1)
+            .unwrap_or_else(|| panic!("the body carries a {name} field"));
+        let raw = rest
+            .split('"')
+            .next()
+            .unwrap_or_else(|| panic!("the {name} value closes"));
+        raw.replace("&#x2F;", "/").replace("&amp;", "&")
+    }
+
+    /// Covers: every page renders the cookie's theme, and a missing or
+    /// unrecognised cookie keeps the dark default.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_theme_cookie_sets_the_rendered_theme() {
+        let (state, path, folder, id) = state_with_repository("theme_cookie").await;
+        let remove_route = format!("/repositories/{id}/delete");
+        for (cookie, expected) in [
+            (Some("task_viewer_theme=light"), "light"),
+            (Some("task_viewer_theme=dark"), "dark"),
+            (None, "dark"),
+            (Some("task_viewer_theme=purple"), "dark"),
+        ] {
+            for route in ["/", "/repositories", "/tasks", remove_route.as_str()] {
+                let body =
+                    body_text(send(state.clone(), get_with_cookie(route, cookie)).await).await;
+                assert!(
+                    body.contains(&format!("<html lang=\"en\" data-theme=\"{expected}\">")),
+                    "{route} with {cookie:?} renders the {expected} theme"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Covers: `POST /theme` sets the theme cookie for a safe local `next` and
+    /// redirects there, while an absolute URL, a scheme, a `//` prefix, a
+    /// backslash, and an empty value all fall back to `/`. A theme naming
+    /// neither theme sets no cookie, and a cross-origin post is refused before
+    /// the route runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_theme_post_sets_the_cookie_and_returns_to_a_safe_next() {
+        let (state, path) = app_state("theme_post").await;
+        let safe = [
+            (
+                "theme=light&next=%2Ftasks%3Fkind%3Dlive",
+                "/tasks?kind=live",
+            ),
+            ("theme=dark&next=%2Frepositories", "/repositories"),
+            ("theme=light&next=%2F", "/"),
+            ("theme=dark&next=", "/"),
+            ("theme=light&next=https%3A%2F%2Fevil.example%2Fx", "/"),
+            ("theme=light&next=%2F%2Fevil.example%2Fx", "/"),
+            ("theme=light&next=%2Fhttp%3A%2F%2Fevil.example", "/"),
+            ("theme=light&next=%2F%5Cevil.example", "/"),
+        ];
+        for (body, target) in safe {
+            let response = send(state.clone(), themed_post("/theme", body, None)).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{body}");
+            assert_eq!(redirect_location(&response), target, "{body}");
+            let expected = if body.starts_with("theme=light") {
+                "task_viewer_theme=light; Path=/; Max-Age=31536000; SameSite=Lax"
+            } else {
+                "task_viewer_theme=dark; Path=/; Max-Age=31536000; SameSite=Lax"
+            };
+            assert_eq!(set_cookie(&response).as_deref(), Some(expected), "{body}");
+        }
+
+        let unknown = send(
+            state.clone(),
+            themed_post("/theme", "theme=blue&next=%2Ftasks", None),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::SEE_OTHER);
+        assert_eq!(redirect_location(&unknown), "/tasks");
+        assert_eq!(
+            set_cookie(&unknown),
+            None,
+            "a theme that names neither theme sets no cookie"
+        );
+
+        let cross_origin = send(
+            state.clone(),
+            themed_post(
+                "/theme",
+                "theme=light&next=%2F",
+                Some("https://example.com"),
+            ),
+        )
+        .await;
+        assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            set_cookie(&cross_origin),
+            None,
+            "a cross-origin post sets no cookie"
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: the nav's no-script form carries the opposite theme and the
+    /// page's own path plus query, its button names the target theme, and the
+    /// inert script button is hidden without scripting on every page.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_theme_noscript_form_carries_the_opposite_theme_and_the_page_path() {
+        let (state, path) = app_state("theme_noscript").await;
+        let light = body_text(
+            send(
+                state.clone(),
+                get_with_cookie("/tasks?kind=live&dir=desc", Some("task_viewer_theme=light")),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            light.contains("<noscript><form class=\"nav-form\" method=\"post\" action=\"/theme\">"),
+            "the no-script form posts to /theme"
+        );
+        assert!(
+            light.contains("name=\"theme\" value=\"dark\""),
+            "the form carries the opposite theme"
+        );
+        assert_eq!(
+            form_value(&light, "next"),
+            "/tasks?kind=live&dir=desc",
+            "the form returns to the page's own path and query"
+        );
+        assert!(
+            light.contains(">Dark Mode</button>"),
+            "the button names the target theme"
+        );
+
+        let dark = body_text(send(state.clone(), get_with_cookie("/", None)).await).await;
+        assert!(
+            dark.contains("name=\"theme\" value=\"light\""),
+            "a dark page offers the light theme"
+        );
+        assert_eq!(
+            form_value(&dark, "next"),
+            "/",
+            "the dashboard form returns to /"
+        );
+        assert!(
+            dark.contains(">Light Mode</button>"),
+            "the button names the light theme"
+        );
+
+        for body in [&light, &dark] {
+            assert!(
+                body.contains("<noscript><style>#theme-toggle{display:none}</style></noscript>"),
+                "the inert script button is hidden without scripting"
+            );
+        }
+        cleanup(&path);
     }
 
     async fn app_state(name: &str) -> (AppState, PathBuf) {
@@ -9724,12 +10105,12 @@ mod tests {
             "the page renders the not-found outcome"
         );
         assert!(
-            !body.contains("<form"),
+            !body.contains("action=\"/repositories/9999/delete\""),
             "an unknown id carries no Remove form"
         );
         assert!(
-            !body.contains("type=\"submit\""),
-            "an unknown id carries no submit control"
+            !body.contains("class=\"repo-actions\""),
+            "an unknown id carries no Remove action block"
         );
         cleanup(&path);
     }
@@ -11562,6 +11943,73 @@ mod tests {
         assert_eq!(
             kept["theme"], "dark",
             "a storage that throws keeps the default theme"
+        );
+    }
+
+    /// Covers: the boot script reads the theme cookie after `localStorage` and
+    /// before the operating system preference, so a no-script choice survives
+    /// scripting and an explicit stored choice still wins.
+    #[test]
+    fn browser_theme_boot_prefers_storage_then_the_cookie_then_the_os() {
+        let cases = [
+            (
+                "stored wins over the cookie",
+                serde_json::json!({"storedTheme": "dark", "cookieTheme": "light", "prefersLight": true}),
+                "dark",
+            ),
+            (
+                "the cookie applies when no choice is stored",
+                serde_json::json!({"cookieTheme": "light", "prefersLight": false}),
+                "light",
+            ),
+            (
+                "the cookie wins over the OS preference",
+                serde_json::json!({"cookieTheme": "dark", "prefersLight": true}),
+                "dark",
+            ),
+            (
+                "an unrecognised cookie falls back to the OS preference",
+                serde_json::json!({"cookieTheme": "purple", "prefersLight": true}),
+                "light",
+            ),
+        ];
+        for (name, extra, expected) in cases {
+            let mut config = browser_config(false, false, None, serde_json::json!("#123456"));
+            for (key, value) in extra.as_object().expect("case config") {
+                config[key.clone()] = value.clone();
+            }
+            let result = run_browser(
+                &config,
+                r#"JSON.stringify({ theme: globalThis.__env.html.getAttribute("data-theme") })"#,
+            );
+            assert_eq!(result["theme"], expected, "{name}");
+        }
+    }
+
+    /// Covers: the toggle writes the same cookie the no-script form sets, so
+    /// the script and no-script paths agree on the remembered theme.
+    #[test]
+    fn browser_theme_toggle_writes_the_cookie() {
+        let mut config = browser_config(false, false, None, serde_json::json!("#123456"));
+        config["cookieTheme"] = serde_json::Value::String("dark".to_string());
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  env.themeButton.click();
+  return JSON.stringify({
+    theme: env.html.getAttribute("data-theme"),
+    cookie: env.cookies["task_viewer_theme"] || null
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["theme"], "light",
+            "the toggle still applies the theme"
+        );
+        assert_eq!(
+            result["cookie"], "light",
+            "the toggle writes the theme cookie"
         );
     }
 
@@ -16040,7 +16488,7 @@ mod tests {
         }
 
         let (state, path) = app_state("chart_a11y").await;
-        let html = render_home(&state, &HomeQuery::default())
+        let html = render_home(&state, &HomeQuery::default(), &PageChrome::default())
             .await
             .expect("render");
 
@@ -16094,16 +16542,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn web_dashboard_explains_the_charts_need_scripting() {
         let (state, path) = app_state("a11y_noscript").await;
-        let html = render_home(&state, &HomeQuery::default())
+        let html = render_home(&state, &HomeQuery::default(), &PageChrome::default())
             .await
             .expect("render");
         let noscript = html
             .split("<noscript>")
-            .nth(1)
-            .expect("the dashboard carries a noscript block")
-            .split("</noscript>")
-            .next()
-            .expect("the noscript block closes");
+            .skip(1)
+            .filter_map(|block| block.split("</noscript>").next())
+            .find(|block| block.contains("href=\"/repositories\""))
+            .expect("the dashboard carries a noscript block naming the Repositories link");
         assert!(
             noscript.contains("href=\"/repositories\""),
             "the no-script block names the Repositories link: {noscript}"
@@ -16130,7 +16577,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn web_project_filter_offers_a_submit_button() {
         let (state, path) = app_state("a11y_filter_submit").await;
-        let html = render_home(&state, &HomeQuery::default())
+        let html = render_home(&state, &HomeQuery::default(), &PageChrome::default())
             .await
             .expect("render");
         assert!(
@@ -16148,7 +16595,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn web_weekly_card_offers_the_view_picker() {
         let (state, path) = app_state("weekly_view_picker").await;
-        let html = render_home(&state, &HomeQuery::default())
+        let html = render_home(&state, &HomeQuery::default(), &PageChrome::default())
             .await
             .expect("render");
         assert!(

@@ -17,6 +17,13 @@
     } catch (error) {
       // A restricted browser blocks storage; the in-memory theme still applies.
     }
+    // Write the cookie the no-script form sets too, so the two paths agree and
+    // a no-script choice keeps the theme this switch left behind.
+    try {
+      document.cookie = "task_viewer_theme=" + next + "; Path=/; Max-Age=31536000; SameSite=Lax";
+    } catch (error) {
+      // A browser that blocks cookies still applies the theme for the session.
+    }
     syncThemeButton();
     window.dispatchEvent(new Event("task-viewer-theme"));
   });
