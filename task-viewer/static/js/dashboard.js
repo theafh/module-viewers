@@ -1273,14 +1273,16 @@
   // it was drawn in instead of landing on an unknown backdrop.
   var DOWNLOAD_SCALE = 2;
 
+  // The exported box is the SVG's viewBox, origin included: a radar whose
+  // labels outgrow the frame carries a non-zero minX/minY, so the background
+  // rectangle starts where the chart does instead of at the SVG's corner.
   function chartSize(svg) {
     var viewBox = svg.getAttribute("viewBox");
     var parts = viewBox ? viewBox.trim().split(/\s+/).map(Number) : [];
-    if (parts.length === 4 && isFinite(parts[2]) && isFinite(parts[3]) &&
-        parts[2] > 0 && parts[3] > 0) {
-      return { width: parts[2], height: parts[3] };
+    if (parts.length === 4 && parts.every(isFinite) && parts[2] > 0 && parts[3] > 0) {
+      return { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
     }
-    return { width: svg.clientWidth || 640, height: svg.clientHeight || 280 };
+    return { x: 0, y: 0, width: svg.clientWidth || 640, height: svg.clientHeight || 280 };
   }
 
   // The clone is detached, so the computed colours are read from the drawn
@@ -1319,8 +1321,8 @@
     var clone = svg.cloneNode(true);
     inlineThemeColors(svg, clone);
     var background = document.createElementNS(NS, "rect");
-    background.setAttribute("x", "0");
-    background.setAttribute("y", "0");
+    background.setAttribute("x", String(size.x));
+    background.setAttribute("y", String(size.y));
     background.setAttribute("width", String(size.width));
     background.setAttribute("height", String(size.height));
     background.setAttribute("fill", cssVar("--chart-card"));
@@ -1330,8 +1332,10 @@
     var image = new Image();
     image.onload = function () {
       var canvas = document.createElement("canvas");
-      canvas.width = size.width * DOWNLOAD_SCALE;
-      canvas.height = size.height * DOWNLOAD_SCALE;
+      // A radar viewBox can land on fractional bounds, so the canvas takes the
+      // whole pixel below twice the SVG's size rather than a fractional size.
+      canvas.width = Math.floor(size.width * DOWNLOAD_SCALE);
+      canvas.height = Math.floor(size.height * DOWNLOAD_SCALE);
       canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
       var anchor = document.createElement("a");
       anchor.href = canvas.toDataURL("image/png");

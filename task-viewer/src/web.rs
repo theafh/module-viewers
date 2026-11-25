@@ -13123,6 +13123,123 @@ mod tests {
         );
     }
 
+    /// Covers: a radar whose long labels outgrow a narrow frame carries a
+    /// viewBox with a non-zero origin, and the download's background rectangle
+    /// starts at that origin and spans the whole viewBox, so the exported PNG
+    /// backs every part of the chart rather than the frame's corner.
+    #[test]
+    fn browser_chart_download_background_follows_a_shifted_viewbox() {
+        let mut payload = fixture_payload();
+        payload["radar_live"] = serde_json::json!([
+            {"label": "an-extremely-long-scope", "count": 3},
+            {"label": "another-very-long-scope", "count": 2},
+            {"label": "a-third-long-scope-name", "count": 1},
+            {"label": "a-fourth-long-scope-name", "count": 4}
+        ]);
+        let payload_text = payload.to_string();
+        let mut config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        config["width"] = serde_json::json!(120);
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["radar-live"].querySelector("svg");
+  var drawnBefore = svg.children.length;
+  var box = String(svg.getAttribute("viewBox")).trim().split(/\s+/).map(Number);
+  env.downloadButtons["radar-live"].click();
+  var download = env.downloads[0] || {};
+  var canvas = env.canvases[0] || {};
+  var xml = env.serialized[0] || "";
+  var match = /<rect ([^>]*)\/>/.exec(xml);
+  var rect = {};
+  if (match) {
+    match[1].replace(/([a-z-]+)="([^"]*)"/g, function (whole, key, value) {
+      rect[key] = value;
+      return whole;
+    });
+  }
+  return JSON.stringify({
+    viewBoxX: box[0],
+    viewBoxY: box[1],
+    viewBoxWidth: box[2],
+    viewBoxHeight: box[3],
+    rectX: Number(rect.x),
+    rectY: Number(rect.y),
+    rectWidth: Number(rect.width),
+    rectHeight: Number(rect.height),
+    name: download.name || null,
+    canvasWidth: canvas.width,
+    canvasHeight: canvas.height,
+    expectedWidth: Math.floor(box[2] * 2),
+    expectedHeight: Math.floor(box[3] * 2),
+    drawnBefore: drawnBefore,
+    drawnAfter: svg.children.length
+  });
+})()"#,
+        );
+        let view_box_x = result["viewBoxX"].as_f64().expect("viewBox x");
+        let view_box_y = result["viewBoxY"].as_f64().expect("viewBox y");
+        let view_box_width = result["viewBoxWidth"].as_f64().expect("viewBox width");
+        let view_box_height = result["viewBoxHeight"].as_f64().expect("viewBox height");
+        assert!(
+            view_box_x < 0.0,
+            "the long labels push the viewBox left of the frame: {view_box_x}"
+        );
+        assert!(
+            view_box_y != 0.0,
+            "the long labels shift the viewBox vertically: {view_box_y}"
+        );
+        assert_eq!(
+            result["rectX"].as_f64(),
+            Some(view_box_x),
+            "the background starts at the viewBox's x"
+        );
+        assert_eq!(
+            result["rectY"].as_f64(),
+            Some(view_box_y),
+            "the background starts at the viewBox's y"
+        );
+        assert_eq!(
+            result["rectWidth"].as_f64(),
+            Some(view_box_width),
+            "the background spans the viewBox's width"
+        );
+        assert_eq!(
+            result["rectHeight"].as_f64(),
+            Some(view_box_height),
+            "the background spans the viewBox's height"
+        );
+        assert_eq!(
+            result["name"],
+            serde_json::json!("task-viewer-radar-live-2026-01-12.png"),
+            "the download is named for the radar and the as-of day"
+        );
+        assert_eq!(
+            result["canvasWidth"].as_f64(),
+            result["expectedWidth"].as_f64(),
+            "the canvas takes the whole pixel below twice the viewBox width"
+        );
+        assert_eq!(
+            result["canvasHeight"].as_f64(),
+            result["expectedHeight"].as_f64(),
+            "the canvas takes the whole pixel below twice the viewBox height"
+        );
+        assert_eq!(
+            result["canvasWidth"].as_f64(),
+            result["canvasWidth"].as_f64().map(f64::floor),
+            "the canvas width is a whole pixel count"
+        );
+        assert_eq!(
+            result["drawnBefore"], result["drawnAfter"],
+            "the drawn radar keeps every mark after the download"
+        );
+    }
+
     /// Covers: every chart card carries one PNG control, and each ships hidden
     /// so a page without scripting offers no download that cannot work.
     #[tokio::test(flavor = "current_thread")]
