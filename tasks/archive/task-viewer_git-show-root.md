@@ -2,8 +2,8 @@
 description: "Pin log.showRoot so a user or repo setting cannot drop the root commit from a harvest walk and move a ship day to the updated fallback."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T10:22:36Z
-status: implemented
+updated: 2026-11-25T10:26:03Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
