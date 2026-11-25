@@ -32,8 +32,9 @@ pub const SCHEMA_VERSION: i64 = 4;
 
 /// The statements that move a database from version `version - 1` to
 /// `version`, or `None` when no such migration exists. The caller guards
-/// version 3 on the table's own columns, so a database stamped below 3 that
-/// already carries `content_hash` migrates without repeating the `ALTER`.
+/// version 3 on the table's own column, so a database stamped below 3 that
+/// already carries `content_hash` migrates without repeating the `ALTER`, and
+/// guards each version-4 `ALTER` on its own column the same way.
 fn migration(version: i64) -> Option<&'static [&'static str]> {
     match version {
         2 => Some(&["DROP INDEX IF EXISTS tasks_repository_id"]),
@@ -45,6 +46,10 @@ fn migration(version: i64) -> Option<&'static [&'static str]> {
         _ => None,
     }
 }
+
+/// The version-4 columns, in the order `migration(4)` adds them, so the
+/// migration step can guard each `ALTER` on its own column.
+const VERSION_FOUR_COLUMNS: [&str; 2] = ["last_error_at", "last_outcome"];
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Repository {
@@ -295,13 +300,29 @@ async fn migrate_step(conn: &mut SqliteConnection, version: i64) -> Result<()> {
         // its stamp, so the `ALTER` stays idempotent.
         return stamp_version(conn, version).await;
     }
-    // The version-4 step adds both columns in one transaction, so a file that
-    // already carries them (stamped back by a test or a repaired copy) only
-    // needs its stamp instead of a duplicate `ALTER`.
-    if version == 4
-        && column_exists(conn, "repositories", "last_error_at").await?
-        && column_exists(conn, "repositories", "last_outcome").await?
-    {
+    // The version-4 step adds two columns, and each `ALTER` is guarded on its
+    // own column, so a file that already carries one of them (stamped back by a
+    // test or a repaired copy) gains only the missing one and is stamped
+    // instead of failing on a duplicate `ALTER`.
+    // The column list beside those statements is hand-kept, and `zip` stops at
+    // the shorter one, so a third `ALTER` added without its column would be
+    // skipped and the file still stamped 4 with that column missing. The guard
+    // fails the step instead, naming both counts.
+    if version == 4 && VERSION_FOUR_COLUMNS.len() != statements.len() {
+        anyhow::bail!(
+            "the version-4 migration lists {} statements but {} guarded columns; the two \
+             lists must name one column per statement, so a later statement cannot be \
+             skipped and the file stamped 4 with its column missing",
+            statements.len(),
+            VERSION_FOUR_COLUMNS.len()
+        );
+    }
+    if version == 4 {
+        for (column, statement) in VERSION_FOUR_COLUMNS.iter().zip(statements) {
+            if !column_exists(conn, "repositories", column).await? {
+                sqlx::query(statement).execute(&mut *conn).await?;
+            }
+        }
         return stamp_version(conn, version).await;
     }
     for statement in statements {
@@ -1465,6 +1486,77 @@ mod tests {
             .filter(|name| name == "content_hash")
             .count();
         assert_eq!(content_hash_columns, 1);
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a version-3 database that already carries one of the two
+    /// version-4 columns (here `last_error_at`) migrates to version 4 with both
+    /// columns present and no duplicate-column error, because each version-4
+    /// `ALTER` is guarded on its own column.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_migrates_a_version_three_database_that_already_has_one_history_column() {
+        let dir = unique_temp_dir("db_migrates_v3_half");
+        std::fs::create_dir_all(&dir).expect("db scratch");
+        let path = dir.join("test.db");
+        let version_three = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("version three");
+        sqlx::query(SCHEMA)
+            .execute(&version_three)
+            .await
+            .expect("baseline schema");
+        sqlx::query("DROP INDEX IF EXISTS tasks_repository_id")
+            .execute(&version_three)
+            .await
+            .expect("version two migration");
+        sqlx::query("ALTER TABLE tasks ADD COLUMN content_hash TEXT")
+            .execute(&version_three)
+            .await
+            .expect("version three migration");
+        // Only one of the two version-4 columns, the state a half-applied
+        // migration leaves behind.
+        sqlx::query("ALTER TABLE repositories ADD COLUMN last_error_at TEXT")
+            .execute(&version_three)
+            .await
+            .expect("half of the version four migration");
+        sqlx::query("PRAGMA user_version = 3")
+            .execute(&version_three)
+            .await
+            .expect("version stamp");
+        version_three.close().await;
+
+        let pool = init_at(&path)
+            .await
+            .expect("the guarded migration reaches the latest version");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
+        let columns = sqlx::query("PRAGMA table_info('repositories')")
+            .fetch_all(&pool)
+            .await
+            .expect("table info");
+        let names: Vec<String> = columns
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("name").ok())
+            .collect();
+        for column in ["last_error_at", "last_outcome"] {
+            assert!(
+                names.iter().any(|name| name == column),
+                "the upgraded table carries {column}: {names:?}"
+            );
+        }
+        let last_error_at_columns = names.iter().filter(|name| *name == "last_error_at").count();
+        assert_eq!(last_error_at_columns, 1);
         pool.close().await;
         remove_scratch(&path);
     }
