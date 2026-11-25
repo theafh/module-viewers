@@ -2,8 +2,8 @@
 description: "Re-pin both calendars to their newest cells when a narrow frame first gains a scroll range, instead of leaving them on the oldest months after a resize."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-25T04:58:43Z
-status: implemented
+updated: 2026-11-25T05:01:49Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: "Andreas Hoffmann"
 design-extended: false
