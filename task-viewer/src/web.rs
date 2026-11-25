@@ -10494,6 +10494,44 @@ mod tests {
         );
     }
 
+    /// Covers: an action label carries the whole repository name, so the action
+    /// column shrinks below its content and each button breaks its label rather
+    /// than widening the row past the container at a narrow window.
+    #[test]
+    fn stylesheet_repo_action_column_shrinks_and_labels_wrap() {
+        let actions = css_rule(".repo-list .repo-actions");
+        assert!(
+            actions.contains("flex-shrink: 1"),
+            "the action column shrinks below its content: {actions}"
+        );
+        assert!(
+            !actions.contains("flex-shrink: 0"),
+            "the action column does not keep its max-content width: {actions}"
+        );
+        assert!(
+            actions.contains("flex-direction: column"),
+            "the action forms stay in one column: {actions}"
+        );
+        assert!(
+            actions.contains("align-items: flex-end"),
+            "the action column stays at the row end: {actions}"
+        );
+        let cell = css_rule(".repo-list div");
+        assert!(
+            cell.contains("min-width: 0"),
+            "the row's own column still shrinks below its content: {cell}"
+        );
+        let button = css_rule(".repo-list .repo-actions .btn");
+        assert!(
+            button.contains("white-space: normal"),
+            "an action label may wrap: {button}"
+        );
+        assert!(
+            button.contains("overflow-wrap: anywhere"),
+            "an action label breaks an unbroken folder name: {button}"
+        );
+    }
+
     /// Covers: `.tooltip` is fixed to the viewport; `tipFor` places it from the
     /// pointer's client coordinates with no frame offset, so the scrolling
     /// calendar frame neither clips nor shifts it; and a focused mark anchors

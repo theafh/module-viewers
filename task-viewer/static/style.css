@@ -318,7 +318,17 @@ input[type="search"] {
     flex-direction: column;
     gap: 0.5rem;
     align-items: flex-end;
-    flex-shrink: 0;
+    /* The shared `.repo-actions` rule above keeps the column at its
+       max-content width; a long repository name would then widen the row past
+       the container, so let this column shrink below its content. */
+    flex-shrink: 1;
+}
+
+.repo-list .repo-actions .btn {
+    /* A label carries the whole repository name, one unbreakable token, so the
+       button breaks it instead of setting the column's min-content width. */
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .repo-list li {
