@@ -11699,6 +11699,168 @@ mod tests {
         }
     }
 
+    /// Covers: the calendar's one roving tab stop sits on the newest cell when
+    /// the frame has a scroll range, so tabbing in lands on a cell the
+    /// right-edge pin leaves visible, and stays on the first cell when the
+    /// frame fits the whole calendar. Arrow keys still step the stop and
+    /// reveal each cell's tooltip.
+    #[test]
+    fn browser_calendar_tab_stop_starts_on_the_newest_day() {
+        let payload = year_of_calendar_rows();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function marks(name) {
+    return env.cards[name].querySelector("svg").children.filter(function (node) {
+      return node.attrs.tabindex !== undefined;
+    });
+  }
+  function stopOf(name) {
+    return marks(name).filter(function (node) {
+      return node.attrs.tabindex === "0";
+    })[0];
+  }
+  function probe(name) {
+    var frame = env.cards[name].querySelector(".chart-frame");
+    var group = marks(name);
+    var stop = stopOf(name);
+    var rect = stop.children[0];
+    return {
+      stops: group.filter(function (node) { return node.attrs.tabindex === "0"; }).length,
+      index: group.indexOf(stop),
+      count: group.length,
+      left: Number(rect.attrs.x),
+      width: Number(rect.attrs.width),
+      scrollLeft: frame.scrollLeft,
+      clientWidth: frame.clientWidth,
+      scrollWidth: frame.scrollWidth
+    };
+  }
+  function redraw() {
+    env.window.dispatchEvent(new env.Event("resize"));
+    env.timeouts[env.timeouts.length - 1].handler();
+  }
+  var wide = { shipped: probe("shipped-calendar"), created: probe("created-calendar") };
+  env.cards["shipped-calendar"].querySelector(".chart-frame").clientWidth = 120;
+  env.cards["created-calendar"].querySelector(".chart-frame").clientWidth = 120;
+  redraw();
+  var narrow = { shipped: probe("shipped-calendar"), created: probe("created-calendar") };
+  var tip = env.cards["shipped-calendar"].querySelector(".tooltip");
+  var group = marks("shipped-calendar");
+  var stop = stopOf("shipped-calendar");
+  stop.focus();
+  var focused = { hidden: tip.hidden, text: tip.textContent, index: group.indexOf(stop) };
+  stop.dispatchEvent({ type: "keydown", key: "ArrowLeft" });
+  var left = { hidden: tip.hidden, text: tip.textContent, index: group.indexOf(stopOf("shipped-calendar")) };
+  group[left.index].dispatchEvent({ type: "keydown", key: "ArrowRight" });
+  var right = { hidden: tip.hidden, text: tip.textContent, index: group.indexOf(stopOf("shipped-calendar")) };
+  return JSON.stringify({ wide: wide, narrow: narrow, focused: focused, left: left, right: right });
+})()"#,
+        );
+        for card in ["shipped", "created"] {
+            let wide = &result["wide"][card];
+            assert_eq!(
+                wide["stops"].as_u64(),
+                Some(1),
+                "the fitting {card} calendar is one tab stop: {wide:?}"
+            );
+            assert_eq!(
+                wide["index"].as_u64(),
+                Some(0),
+                "a frame that fits the whole {card} calendar keeps the first cell as its tab stop: {wide:?}"
+            );
+            assert_eq!(
+                wide["scrollWidth"].as_f64(),
+                wide["clientWidth"].as_f64(),
+                "the wide {card} frame has no horizontal scroll range: {wide:?}"
+            );
+            let wide_left = wide["left"].as_f64().expect("wide cell left");
+            let wide_width = wide["width"].as_f64().expect("wide cell width");
+            assert!(
+                wide_left >= 0.0 && wide_left + wide_width <= wide["clientWidth"].as_f64().unwrap(),
+                "the first {card} cell lies inside the fitting frame: {wide:?}"
+            );
+
+            let narrow = &result["narrow"][card];
+            let count = narrow["count"].as_u64().expect("narrow cell count");
+            assert_eq!(
+                narrow["stops"].as_u64(),
+                Some(1),
+                "the scrolling {card} calendar stays one tab stop: {narrow:?}"
+            );
+            assert_eq!(
+                narrow["index"].as_u64(),
+                Some(count - 1),
+                "the scrolling {card} calendar's tab stop is its newest cell: {narrow:?}"
+            );
+            let left = narrow["left"].as_f64().expect("narrow cell left");
+            let width = narrow["width"].as_f64().expect("narrow cell width");
+            let scroll_left = narrow["scrollLeft"].as_f64().expect("narrow scrollLeft");
+            let client_width = narrow["clientWidth"].as_f64().expect("narrow clientWidth");
+            assert!(
+                left >= scroll_left && left + width <= scroll_left + client_width,
+                "the {card} tab-stop cell lies inside the frame's right-edge window: {narrow:?}"
+            );
+        }
+        let focused = &result["focused"];
+        let newest = result["narrow"]["shipped"]["index"]
+            .as_u64()
+            .expect("newest index");
+        assert_eq!(
+            focused["hidden"],
+            serde_json::json!(false),
+            "focusing the tab stop reveals its tooltip"
+        );
+        assert_eq!(
+            focused["index"].as_u64(),
+            Some(newest),
+            "focus lands on the newest cell's tab stop"
+        );
+        assert!(
+            focused["text"]
+                .as_str()
+                .expect("newest tooltip")
+                .contains("Nov 5, 2026"),
+            "the newest cell names its day: {focused:?}"
+        );
+        let left = &result["left"];
+        assert_eq!(
+            left["hidden"],
+            serde_json::json!(false),
+            "ArrowLeft reveals the previous cell's tooltip"
+        );
+        assert_eq!(
+            left["index"].as_u64(),
+            Some(newest - 1),
+            "ArrowLeft moves the tab stop one cell back"
+        );
+        assert!(
+            left["text"]
+                .as_str()
+                .expect("previous tooltip")
+                .contains("Nov 4, 2026"),
+            "the previous cell names its own day: {left:?}"
+        );
+        let right = &result["right"];
+        assert_eq!(
+            right["index"].as_u64(),
+            Some(newest),
+            "ArrowRight returns the tab stop to the newest cell"
+        );
+        assert_eq!(
+            right["text"], focused["text"],
+            "ArrowRight reveals the newest cell's tooltip again"
+        );
+    }
+
     /// Covers: at a 120px frame the rendered month labels sit at least
     /// 24px apart.
     #[test]
