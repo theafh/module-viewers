@@ -2,8 +2,8 @@
 description: "Let every task-list column sort the list in either direction, with the sort carried through the header links and the CSV export."
 scope: task-viewer
 created: 2026-11-25T09:49:49Z
-updated: 2026-11-25T19:43:53Z
-status: implemented
+updated: 2026-11-25T19:46:33Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
