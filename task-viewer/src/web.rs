@@ -110,6 +110,11 @@ pub struct AppState {
     /// token the Repositories redirect carries.
     held_clone: Arc<Mutex<HeldCloneStore>>,
     static_version: String,
+    /// The project and thread each chart export's blocking closure ran on, held
+    /// on the state rather than in a process-global slot so a test reads only
+    /// the exports its own requests made. Production never reads it.
+    #[cfg(test)]
+    export_threads: Arc<std::sync::Mutex<Vec<(String, std::thread::ThreadId)>>>,
 }
 
 impl AppState {
@@ -132,7 +137,28 @@ impl AppState {
             flash: Arc::new(std::sync::Mutex::new(FlashStore::default())),
             held_clone: Arc::new(Mutex::new(HeldCloneStore::default())),
             static_version,
+            #[cfg(test)]
+            export_threads: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
+    }
+
+    /// The projects and threads the chart exports on this state recorded.
+    #[cfg(test)]
+    fn recorded_export_threads(&self) -> Vec<(String, std::thread::ThreadId)> {
+        self.export_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Drop the recorded exports so a test reads only what its next request
+    /// writes.
+    #[cfg(test)]
+    fn clear_export_threads(&self) {
+        self.export_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Take the flash store's synchronous lock. A render that panicked while
@@ -1252,24 +1278,58 @@ fn chart_project(selected: Option<i64>) -> String {
 
 async fn render_charts_json(state: &AppState, project: &str) -> anyhow::Result<String> {
     let selection = chart_selection(state, project).await?;
-    let board = chart_board(
-        &selection.tasks,
-        selection.mode,
-        &selection.label,
-        &chart_project(selection.selected),
-    );
-    chart_payload(&board)
+    let ChartSelection {
+        tasks,
+        mode,
+        label,
+        selected,
+        ..
+    } = selection;
+    let project = chart_project(selected);
+    #[cfg(test)]
+    let recorded = Arc::clone(&state.export_threads);
+    // The chart computation and the JSON serialization are CPU work over every
+    // stored row and every chart day, so they run on a blocking thread instead
+    // of a tokio worker, the way the dashboard render already does. Only the
+    // sqlx loads above stay on the worker.
+    tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        #[cfg(test)]
+        recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((project.clone(), std::thread::current().id()));
+        let board = chart_board(&tasks, mode, &label, &project);
+        chart_payload(&board)
+    })
+    .await?
 }
 
 async fn render_charts_csv(state: &AppState, project: &str) -> anyhow::Result<String> {
     let selection = chart_selection(state, project).await?;
-    let board = chart_board(
-        &selection.tasks,
-        selection.mode,
-        &selection.label,
-        &chart_project(selection.selected),
-    );
-    Ok(charts_csv_text(&board))
+    let ChartSelection {
+        tasks,
+        mode,
+        label,
+        selected,
+        ..
+    } = selection;
+    let project = chart_project(selected);
+    #[cfg(test)]
+    let recorded = Arc::clone(&state.export_threads);
+    // The chart computation and the CSV text are CPU work over every stored row
+    // and every chart day, so they run on a blocking thread instead of a tokio
+    // worker, the way the dashboard render already does. Only the sqlx loads
+    // above stay on the worker.
+    tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        #[cfg(test)]
+        recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((project.clone(), std::thread::current().id()));
+        let board = chart_board(&tasks, mode, &label, &project);
+        Ok(charts_csv_text(&board))
+    })
+    .await?
 }
 
 async fn render_dashboard(
@@ -1867,17 +1927,14 @@ fn csv_field(value: &str) -> String {
 }
 
 /// One long-format chart CSV record: the series name, the point's key, and its
-/// value, each written through `csv_field` so a label holding a comma, a quote,
-/// or a line break survives the round trip and a label a spreadsheet would read
-/// as a formula opens as text.
+/// value. The series and key go through `csv_field`, so a label holding a
+/// comma, a quote, or a line break survives the round trip and a label a
+/// spreadsheet would read as a formula opens as text. The value is a number
+/// written straight into the row: a leading minus sign on a value is its sign,
+/// not a formula lead, so it must never take the guard apostrophe that would
+/// turn a negative number into text.
 fn push_chart_row(out: &mut String, series: &str, key: &str, value: &str) {
-    let _ = writeln!(
-        out,
-        "{},{},{}",
-        csv_field(series),
-        csv_field(key),
-        csv_field(value)
-    );
+    let _ = writeln!(out, "{},{},{}", csv_field(series), csv_field(key), value);
 }
 
 /// A chart value as CSV text. An integer series writes its digits and a fitted
@@ -3586,8 +3643,8 @@ mod tests {
         AppState, Banner, BannerGuard, FLASH_CAPACITY, FlashQuery, FlashStore, GIT_ERROR,
         HarvestFn, HomeQuery, MISSING_TASKS_ERROR, PickerFn, PickerResult, PriorReadHookFn,
         ProjectForm, STOPPED_ERROR, ScanFailure, ScanReport, StoreHookFn, add_repository,
-        canonical_path_text, claim_banner, confirm_repository, encode_query, flash_banner,
-        git_scan_message, human_stamp, init_templates, is_local_host, local_offset,
+        canonical_path_text, charts_csv_text, claim_banner, confirm_repository, encode_query,
+        flash_banner, git_scan_message, human_stamp, init_templates, is_local_host, local_offset,
         osascript_outcome, query_banner, record_scan_error, relocate_repository, remaining,
         remove_repository, render_blocking_thread, render_home, render_repositories_at, router,
         scan_all, scan_core, scan_flash, scan_instant, scan_label_at, scan_response,
@@ -11150,6 +11207,72 @@ mod tests {
             has_row("radar_shipped", "alpha", "1"),
             "the shipped radar uses the scope as its spoke label: {csv}"
         );
+        cleanup(&path);
+    }
+
+    /// Covers: a negative chart value is written as a plain negative number, so
+    /// the value column never takes the formula-guard apostrophe. A minus sign
+    /// on a number is its sign, and a leading quote would turn it into text a
+    /// spreadsheet cannot sum.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_charts_csv_writes_a_negative_trend_as_a_plain_number() {
+        let (state, path, _alpha, _beta) = seeded_task_list("charts_negative_trend").await;
+        let tasks = db::load_tasks(&state.pool, None).await.expect("tasks");
+        let mut board = series::dashboard(
+            &tasks,
+            crate::dates::today(),
+            RadarMode::Project,
+            "All projects",
+        );
+        let first = board
+            .cumulative
+            .first_mut()
+            .expect("the seeded rows chart at least one cumulative day");
+        let day = first.date.clone();
+        first.trend = -0.06;
+
+        let csv = charts_csv_text(&board);
+        assert!(
+            csv.lines()
+                .any(|line| line == format!("cumulative_trend,{day},-0.06")),
+            "a negative trend value is a plain negative number: {csv}"
+        );
+        assert!(
+            !csv.contains("'-0.06"),
+            "the value column never takes the formula-guard apostrophe: {csv}"
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: both chart exports build the board and serialize it off the tokio
+    /// worker, the way the dashboard render does, so a large export cannot stall
+    /// the async runtime. The read comes from the export closures' own slot and
+    /// must name the project the request asked for, so a dashboard render or
+    /// another test's export in the same process cannot satisfy it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_charts_exports_render_off_the_async_worker() {
+        let (state, path, alpha, beta) = seeded_task_list("charts_export_blocking").await;
+        let runtime_thread = std::thread::current().id();
+        for (uri, project) in [
+            (format!("/charts.csv?project={alpha}"), alpha.to_string()),
+            (format!("/charts.json?project={beta}"), beta.to_string()),
+        ] {
+            state.clear_export_threads();
+            let response = send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let recorded: Vec<_> = state
+                .recorded_export_threads()
+                .into_iter()
+                .filter(|(name, _)| *name == project)
+                .collect();
+            let (_, blocking_thread) = recorded
+                .first()
+                .unwrap_or_else(|| panic!("{uri} records its own export on this state"));
+            assert_ne!(
+                *blocking_thread, runtime_thread,
+                "{uri} must leave the async worker"
+            );
+        }
         cleanup(&path);
     }
 
