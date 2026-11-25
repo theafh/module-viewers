@@ -2,8 +2,10 @@
 description: "Run Relocate's path write and re-harvest in a detached task that keeps the scan lock, so a dropped request still stores the new folder's rows and a fresh scan stamp."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-24T22:41:46Z
-status: ready
+updated: 2026-11-25T04:05:00Z
+status: implemented
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 reported-by: Andreas Hoffmann
 ---
 
@@ -46,8 +48,8 @@ The lock must keep covering the `repository-path-taken` check as well as the wri
 2. Move everything after the pick into one `tokio::spawn`: taking `state.scan`, the repository-list lookup, the not-found answer, the `repository-path-taken` check, `update_repository_path`, and `refresh_one`. The task holds the lock until the last row is stored and returns the banner its outcome names, including the `Ok(0)` not-found arm that today sits on the write.
 3. Await only the join handle in the handler, and map a join error to the fixed save-failure banner, as Add does.
 4. Update the sentences the change makes stale: `ARCHITECTURE.md`'s load-bearing decisions name Relocate as a detached store and add it to the shutdown grace list, `FEATURES.md` section 3 gains the same disconnect sentence Add already has, `TESTING.md`'s Repositories bullet records the disconnect case, and the `serve` and `relocate_repository` doc comments in `task-viewer/src/web.rs` name the detached store beside Add's.
-5. Keep the `repository-path-taken` check inside the detached task's lock, so a second concurrent relocate to one path still waits and is refused with that code rather than hitting the `path` column's UNIQUE constraint and reporting a save failure.
-6. Add a test that pauses a store through the store-pause hook, drops the relocate request future while the marker file exists, releases the pause, and then asserts the stored rows and scan stamp match the new folder. Add a second relocate test for an id that no longer exists, and one for a picker failure.
+5. Keep the `repository-path-taken` check inside the detached task's lock, so a second repository relocated to the first repository's new path still waits and is refused with that code rather than hitting the `path` column's UNIQUE constraint and reporting a save failure.
+6. Add an in-process test that mirrors `web_add_store_survives_a_dropped_request`: inject `state.store_hook` with an entered channel and a release oneshot, `drop_request` the relocate request future once the store is entered, release the pause, then acquire `state.scan` — which the detached task holds until its last row is stored — and only then assert the stored rows and scan stamp match the new folder. Add a second relocate test for an id that no longer exists, and one for a picker failure.
 
 **Out of scope:**
 
@@ -56,8 +58,8 @@ The lock must keep covering the `repository-path-taken` check as well as the wri
 
 ## Acceptance
 
-- [ ] A test pauses the store, drops the Relocate request future while the store is open, releases it, and asserts the repository's rows and scan stamp match the new folder; it fails on the current code because the cancelled store rolls back the path's re-harvest.
+- [ ] A test sets the repository's `scanned_at` to a fixed earlier stamp (`2026-01-01T00:00:00Z`, as `web_relocate_writes_the_new_path_and_keeps_the_rows` does), pauses the store, drops the Relocate request future while the store is open, releases it, acquires `state.scan` under a timeout so it observes the detached store finish, and then asserts the repository's rows match the new folder and its scan stamp is later than that fixed stamp; it fails on the current code because the cancelled store rolls back the path's re-harvest and leaves the aged stamp in place.
 - [ ] A relocate for an id that no longer exists reports `repository-not-found`, and a picker failure reports its fixed code, each with a test.
 - [ ] `ARCHITECTURE.md`, `FEATURES.md`, `TESTING.md`, and the two `web.rs` doc comments describe Relocate as a detached store that survives a disconnect.
-- [ ] The `repository-path-taken` refusal still runs under the scan lock, proven by a concurrent-relocate test that reports that code rather than a save failure.
+- [ ] A concurrent-relocate test adds two repositories and parks the first repository's relocate inside its store through the injected `state.store_hook`, after its path write has committed, while that task holds the scan lock; it then picks the first repository's new path for the second repository's relocate, asserts that second relocate has not answered while the first is parked, and asserts it reports `repository-path-taken` after the release. A check moved out of the lock answers the second during the pause, so that assertion fails on the design `## Approach` step 5 forbids.
 - [ ] `make lint` and `make test` pass.

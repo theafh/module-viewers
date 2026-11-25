@@ -450,8 +450,9 @@ pub fn remaining(deadline: Instant) -> Duration {
 ///
 /// The deadline is taken when the shutdown future resolves. `axum`'s graceful
 /// shutdown stops accepting and drains the open connections; a store that holds
-/// `state.scan` from listing through the last store — an Update scan or Add's
-/// detached store — is waited for under the same deadline. The database close
+/// `state.scan` from listing through the last store — an Update scan, Add's or
+/// Relocate's detached store — is waited for under the same deadline. The
+/// database close
 /// then runs under
 /// the time the deadline has left and is dropped once it is spent, leaving an
 /// unfinished store to the WAL rollback on the next open. A listener that ends
@@ -2068,53 +2069,83 @@ async fn scan_repository(State(state): State<AppState>, Path(id): Path<i64>) -> 
 }
 
 /// Move one repository to a folder the person picks, keeping its id and its
-/// stored rows. The pick passes the same canonicalize-and-probe step Add uses,
-/// a path another repository already stores is refused, and only the relocated
-/// repository is re-harvested, under the scan lock, so its rows read the new
-/// folder and its scan stamp is fresh.
+/// stored rows. The pick passes the same canonicalize-and-probe step Add uses.
+/// The lookup, the collision check, the path write, and the re-harvest run in
+/// their own task that takes the scan lock itself, so a request that
+/// disconnects drops only the handler: the store keeps the lock and finishes
+/// storing the new folder's rows and a fresh scan stamp before the next Add,
+/// Update, Rescan, Remove, or Relocate can touch the same repository.
 async fn relocate_repository(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let (canonical, path_text) = match choose_folder(&state).await {
         Ok(ChosenFolder::Chosen { path, text }) => (path, text),
         Ok(ChosenFolder::Cancelled) => return Redirect::to("/repositories").into_response(),
         Err(banner) => return redirect_repositories(banner),
     };
-    let _guard = state.scan.lock().await;
+
+    // The store takes the lock itself rather than the handler holding it, so a
+    // dropped request leaves the path write and its re-harvest running.
+    let store_state = state.clone();
+    let store = tokio::spawn(async move {
+        let _guard = store_state.scan.lock().await;
+        store_relocated(&store_state, id, &canonical, &path_text).await
+    });
+    match store.await {
+        Ok(banner) => redirect_repositories(banner),
+        Err(error) => {
+            tracing::error!(%error, "the Relocate store task stopped");
+            redirect_repositories(Banner::RepositorySaveFailed)
+        }
+    }
+}
+
+/// Store one already-picked folder as the new path of `id` and re-harvest only
+/// that repository. The caller's detached task holds the scan lock across this
+/// call, so the `repository-path-taken` check and the write stay serialized with
+/// every other path write, and a second Relocate to the same path waits and is
+/// refused with that code instead of hitting the `path` column's UNIQUE
+/// constraint. Returns the banner the outcome names.
+async fn store_relocated(
+    state: &AppState,
+    id: i64,
+    canonical: &std::path::Path,
+    path_text: &str,
+) -> Banner {
     let repositories = match db::list_repositories(&state.pool).await {
         Ok(repositories) => repositories,
         Err(error) => {
             tracing::error!(%error, "list failed");
-            return redirect_repositories(Banner::RepositoryListUnreadable);
+            return Banner::RepositoryListUnreadable;
         }
     };
     let Some(repository) = repositories
         .iter()
         .find(|repository| repository.repository_id == id)
     else {
-        return redirect_repositories(Banner::RepositoryNotFound);
+        return Banner::RepositoryNotFound;
     };
     // Relocating to the folder the repository already stores re-harvests it
     // rather than reporting a collision with itself.
-    if repository.path.as_str() != path_text.as_str() {
-        match db::path_exists(&state.pool, &path_text).await {
-            Ok(true) => return redirect_repositories(Banner::RepositoryPathTaken),
+    if repository.path.as_str() != path_text {
+        match db::path_exists(&state.pool, path_text).await {
+            Ok(true) => return Banner::RepositoryPathTaken,
             Ok(false) => {}
             Err(error) => {
                 tracing::error!(%error, "path lookup failed");
-                return redirect_repositories(Banner::RepositoryListUnreadable);
+                return Banner::RepositoryListUnreadable;
             }
         }
     }
-    match db::update_repository_path(&state.pool, id, &path_text).await {
-        Ok(0) => return redirect_repositories(Banner::RepositoryNotFound),
+    match db::update_repository_path(&state.pool, id, path_text).await {
+        Ok(0) => return Banner::RepositoryNotFound,
         Ok(_) => {}
         Err(error) => {
             tracing::error!(%error, repository_id = id, "the path could not be updated");
-            return redirect_repositories(Banner::RepositorySaveFailed);
+            return Banner::RepositorySaveFailed;
         }
     }
-    match refresh_one(&state.pool, &state.store_hook, id, &canonical).await {
-        Some(banner) => redirect_repositories(banner),
-        None => redirect_repositories(Banner::RepositoryRelocated),
+    match refresh_one(&state.pool, &state.store_hook, id, canonical).await {
+        Some(banner) => banner,
+        None => Banner::RepositoryRelocated,
     }
 }
 
@@ -4341,6 +4372,258 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(first);
+        let _ = std::fs::remove_dir_all(second);
+        cleanup(&path);
+    }
+
+    /// Relocate's path write and re-harvest run in a detached task that takes the
+    /// scan lock itself, so dropping the request future leaves the store running:
+    /// the new folder's rows and a fresh scan stamp are stored, and the lock is
+    /// free afterwards.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_relocate_store_survives_a_dropped_request() {
+        let (mut state, path) = app_state("relocate_detached_store").await;
+        let folder = live_repository("relocate_detached_store_repo");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        add_repository(State(state.clone())).await;
+        let repository = db::list_repositories(&state.pool).await.expect("list")[0].clone();
+        sqlx::query("UPDATE repositories SET scanned_at = ? WHERE repository_id = ?")
+            .bind("2026-01-01T00:00:00Z")
+            .bind(repository.repository_id)
+            .execute(&state.pool)
+            .await
+            .expect("age the stamp");
+
+        let moved = unique_temp_dir("relocate_detached_store_moved");
+        std::fs::rename(&folder, &moved).expect("move the folder");
+        std::fs::write(
+            moved.join("tasks/moved_task.md"),
+            "---\ncreated: 2026-05-02T10:00:00\nupdated: 2026-05-02T10:00:00\nstatus: open\n---\n\n# Moved\n",
+        )
+        .expect("moved task");
+        let picked = moved.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let store_hook: Arc<StoreHookFn> = Arc::new(move || {
+            let entered_tx = entered_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let _ = entered_tx.send(()).await;
+                let release = release_rx.lock().await.take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+            })
+        });
+        state.store_hook = store_hook;
+
+        let relocate = tokio::spawn(relocate_repository(
+            State(state.clone()),
+            UrlPath(repository.repository_id),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the detached store is entered")
+            .expect("the store signalled");
+
+        // The client goes away while the store is parked inside its write.
+        drop_request(relocate).await;
+
+        // The path write is already committed, so the aged stamp still reads the
+        // old folder until the detached re-harvest finishes.
+        let parked = db::list_repositories(&state.pool).await.expect("list")[0].clone();
+        assert_eq!(
+            parked.scanned_at.as_deref(),
+            Some("2026-01-01T00:00:00Z"),
+            "the re-harvest has not stored yet"
+        );
+
+        release_tx.send(()).expect("release the detached store");
+
+        // The detached task holds the scan lock until its last row is stored, so
+        // taking the lock observes the store finished.
+        let guard = tokio::time::timeout(Duration::from_secs(10), state.scan.lock())
+            .await
+            .expect("the detached relocate releases the scan lock");
+        let relocated = db::list_repositories(&state.pool).await.expect("list")[0].clone();
+        let mut scopes = db::load_tasks(&state.pool, Some(relocated.repository_id))
+            .await
+            .expect("rows")
+            .into_iter()
+            .map(|row| row.scope)
+            .collect::<Vec<_>>();
+        scopes.sort();
+        assert_eq!(
+            scopes,
+            vec!["moved", "scope"],
+            "the rows read the new folder, not the previous one"
+        );
+        assert!(
+            relocated.scanned_at.as_deref().unwrap_or_default() > "2026-01-01T00:00:00Z",
+            "the detached re-harvest leaves a fresh scan stamp"
+        );
+        drop(guard);
+
+        let _ = std::fs::remove_dir_all(moved);
+        cleanup(&path);
+    }
+
+    /// A relocate for an id that no longer exists reports the not-found code and
+    /// stores nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_relocate_reports_a_missing_repository() {
+        let (mut state, path) = app_state("relocate_missing").await;
+        let folder = live_repository("relocate_missing_repo");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+
+        let response = relocate_repository(State(state.clone()), UrlPath(9999)).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?error=repository-not-found"
+        );
+        assert!(
+            db::list_repositories(&state.pool)
+                .await
+                .expect("list")
+                .is_empty(),
+            "no repository is stored"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// A relocate whose picker fails reports the fixed picker code and leaves the
+    /// repository and its rows as they were.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_relocate_reports_a_picker_error() {
+        let (mut state, path) = app_state("relocate_picker_error").await;
+        let folder = live_repository("relocate_picker_error_repo");
+        let picked = folder.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        add_repository(State(state.clone())).await;
+        let repository = db::list_repositories(&state.pool).await.expect("list")[0].clone();
+        state.picker = Arc::new(|| Ok(PickerResult::Failed(b"Failed to open display".to_vec())));
+
+        let response =
+            relocate_repository(State(state.clone()), UrlPath(repository.repository_id)).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?error=picker-failed"
+        );
+        let after = db::list_repositories(&state.pool).await.expect("list")[0].clone();
+        assert_eq!(after.path, repository.path, "the failed pick moves nothing");
+        assert_eq!(
+            db::load_tasks(&state.pool, Some(repository.repository_id))
+                .await
+                .expect("rows")
+                .len(),
+            1,
+            "the stored rows stay"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Two relocates to one path serialize on the scan lock: the second waits for
+    /// the first's parked store and then reports the taken code, instead of
+    /// passing the check and hitting the `path` column's UNIQUE constraint.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_relocate_waits_for_a_parked_store_before_refusing_the_taken_path() {
+        let (mut state, path) = app_state("relocate_concurrent").await;
+        let first = live_repository("relocate_concurrent_first");
+        let second = live_repository("relocate_concurrent_second");
+        for folder in [&first, &second] {
+            let picked = folder.clone();
+            state.picker = Arc::new(move || Ok(picked_path(&picked)));
+            add_repository(State(state.clone())).await;
+        }
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        let first_repo = repositories
+            .iter()
+            .find(|repository| repository.path.contains("relocate_concurrent_first"))
+            .expect("first repository")
+            .clone();
+        let second_repo = repositories
+            .iter()
+            .find(|repository| repository.path.contains("relocate_concurrent_second"))
+            .expect("second repository")
+            .clone();
+
+        let moved = unique_temp_dir("relocate_concurrent_moved");
+        std::fs::rename(&first, &moved).expect("move the first folder");
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let store_hook: Arc<StoreHookFn> = Arc::new(move || {
+            let entered_tx = entered_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let _ = entered_tx.send(()).await;
+                let release = release_rx.lock().await.take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+            })
+        });
+        state.store_hook = store_hook;
+
+        let picked = moved.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        let first_relocate = tokio::spawn(relocate_repository(
+            State(state.clone()),
+            UrlPath(first_repo.repository_id),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the first relocate is parked in its store")
+            .expect("the store signalled");
+
+        let picked = moved.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        let second_relocate = tokio::spawn(relocate_repository(
+            State(state.clone()),
+            UrlPath(second_repo.repository_id),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !second_relocate.is_finished(),
+            "the second relocate waits for the parked store instead of answering"
+        );
+
+        release_tx.send(()).expect("release the parked store");
+        let first_response = tokio::time::timeout(Duration::from_secs(10), first_relocate)
+            .await
+            .expect("the first relocate finishes")
+            .expect("the first relocate joins");
+        assert_eq!(
+            redirect_location(&first_response),
+            "/repositories?notice=repository-relocated"
+        );
+        let second_response = tokio::time::timeout(Duration::from_secs(10), second_relocate)
+            .await
+            .expect("the second relocate finishes")
+            .expect("the second relocate joins");
+        assert_eq!(
+            redirect_location(&second_response),
+            "/repositories?error=repository-path-taken"
+        );
+        let after = db::list_repositories(&state.pool).await.expect("list");
+        let second_after = after
+            .iter()
+            .find(|repository| repository.repository_id == second_repo.repository_id)
+            .expect("second repository");
+        assert_eq!(
+            second_after.path, second_repo.path,
+            "the second move is refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&moved);
         let _ = std::fs::remove_dir_all(second);
         cleanup(&path);
     }
