@@ -2,8 +2,8 @@
 description: "Keep the last successful scan and the last scan error per repository, and show both on Repositories after a later success."
 scope: task-viewer
 created: 2026-11-25T09:49:49Z
-updated: 2026-11-25T16:58:41Z
-status: implemented
+updated: 2026-11-25T17:04:30Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
