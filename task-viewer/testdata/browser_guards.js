@@ -50,6 +50,7 @@
   function Node(name, chart) {
     this.name = name;
     this.chart = chart || null;
+    this.parent = null;
     this.children = [];
     this.attrs = {};
     this.textContent = "";
@@ -123,7 +124,20 @@
   };
   Node.prototype.removeChild = function (child) {
     this.children = this.children.filter(function (node) { return node !== child; });
+    // A detached node has no parent, so a later `contains` and event bubble
+    // stop at it the way a browser's removed node does.
+    if (child.parent === this) child.parent = null;
     return child;
+  };
+  // Whether `other` is this node or one of its descendants, walking the real
+  // parent chain a removed node no longer belongs to.
+  Node.prototype.contains = function (other) {
+    var node = other || null;
+    while (node) {
+      if (node === this) return true;
+      node = node.parent || null;
+    }
+    return false;
   };
   Node.prototype.addEventListener = function (type, handler) {
     (this.listeners[type] = this.listeners[type] || []).push(handler);
@@ -151,10 +165,16 @@
     }
     return !event.defaultPrevented;
   };
+  // Focus tracking, so a redraw can read `document.activeElement` and ask
+  // whether the calendar still holds focus through `contains`.
   Node.prototype.focus = function () {
+    if (globalThis.document) globalThis.document.activeElement = this;
     this.dispatchEvent({ type: "focus" });
   };
   Node.prototype.blur = function () {
+    if (globalThis.document && globalThis.document.activeElement === this) {
+      globalThis.document.activeElement = null;
+    }
     this.dispatchEvent({ type: "blur" });
   };
   Node.prototype.getBoundingClientRect = function () {
@@ -254,6 +274,9 @@
       if (selector === ".tooltip") return tip;
       return null;
     };
+    // The page nests the chart inside the card, so `contains` reaches a mark
+    // through the card root, the SVG, and the mark's own parent chain.
+    root.appendChild(svg);
     cards[name] = root;
   });
   CARD_NAMES.forEach(function (name) {
@@ -353,6 +376,9 @@
   var documentListeners = {};
   var document = {
     documentElement: html,
+    // No element holds focus until a script focuses one, which `focus` and
+    // `blur` on the node prototype keep in step.
+    activeElement: null,
     getElementById: function (id) {
       if (id === "payload") return payloadNode;
       if (id === "theme-toggle") return themeButton;

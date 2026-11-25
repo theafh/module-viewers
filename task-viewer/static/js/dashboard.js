@@ -743,8 +743,9 @@
       return;
     }
     // A redraw rebuilds every mark, so capture whether the calendar itself held
-    // focus before the clear drops it. The tab stop then keeps the reader's
-    // place instead of pulling focus from elsewhere on the page.
+    // focus before the clear drops it. When it did, the redraw returns focus to
+    // the calendar's newest tab stop when the frame scrolls, and to the first
+    // day when the frame fits; focus elsewhere on the page is left alone.
     var active = document.activeElement;
     var heldFocus = !!active && active !== svg &&
       typeof root.contains === "function" && root.contains(active);
@@ -880,7 +881,9 @@
     // tabbing in lands on a cell the right-edge pin leaves visible instead of
     // the oldest months. A frame that fits the whole calendar keeps the first
     // cell. Focus follows the stop only when the calendar already held it, so a
-    // redraw never pulls focus from elsewhere on the page.
+    // redraw never pulls focus from elsewhere on the page; a redraw that holds
+    // focus also brings the newest day back into view, so the scroll-position
+    // rule above reads as the pin it describes.
     roving(marks, tip, scrolled ? marks.length - 1 : 0, heldFocus);
     var previous = calendarOpened[name];
     if (!previous || (scrolled && !previous.scrolled)) {

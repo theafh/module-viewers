@@ -11861,6 +11861,108 @@ mod tests {
         );
     }
 
+    /// Covers: a redraw that already held the calendar's focus returns that
+    /// focus to the calendar's one roving tab stop, while a redraw with focus
+    /// elsewhere on the page leaves that focus alone.
+    #[test]
+    fn browser_calendar_redraw_keeps_focus_only_when_it_held_it() {
+        let payload = year_of_calendar_rows();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function marks(name) {
+    return env.cards[name].querySelector("svg").children.filter(function (node) {
+      return node.attrs.tabindex !== undefined;
+    });
+  }
+  function stopOf(name) {
+    return marks(name).filter(function (node) {
+      return node.attrs.tabindex === "0";
+    })[0];
+  }
+  function redraw() {
+    env.window.dispatchEvent(new env.Event("resize"));
+    env.timeouts[env.timeouts.length - 1].handler();
+  }
+  var card = env.cards["shipped-calendar"];
+  var group = marks("shipped-calendar");
+  var middle = group[Math.floor(group.length / 2)];
+  middle.focus();
+  var before = {
+    activeIsMiddle: env.document.activeElement === middle,
+    contained: card.contains(middle)
+  };
+  redraw();
+  var stop = stopOf("shipped-calendar");
+  var after = marks("shipped-calendar");
+  var held = {
+    activeIsStop: env.document.activeElement === stop,
+    activeIndex: after.indexOf(env.document.activeElement),
+    stopIndex: after.indexOf(stop),
+    stopTabindex: stop.attrs.tabindex,
+    contained: card.contains(env.document.activeElement)
+  };
+  env.themeButton.focus();
+  redraw();
+  var outside = {
+    activeIsTheme: env.document.activeElement === env.themeButton,
+    contained: card.contains(env.themeButton)
+  };
+  return JSON.stringify({ before: before, held: held, outside: outside });
+})()"#,
+        );
+        let before = &result["before"];
+        assert_eq!(
+            before["activeIsMiddle"],
+            serde_json::json!(true),
+            "focusing a calendar cell makes it the active element: {before:?}"
+        );
+        assert_eq!(
+            before["contained"],
+            serde_json::json!(true),
+            "the focused cell is inside the calendar card: {before:?}"
+        );
+        let held = &result["held"];
+        assert_eq!(
+            held["activeIsStop"],
+            serde_json::json!(true),
+            "a redraw that held the calendar's focus returns it to the tab stop: {held:?}"
+        );
+        assert_eq!(
+            held["stopTabindex"],
+            serde_json::json!("0"),
+            "the focused node is the calendar's one tab stop: {held:?}"
+        );
+        assert_eq!(
+            held["activeIndex"], held["stopIndex"],
+            "the active element is the calendar's tab stop: {held:?}"
+        );
+        assert_eq!(
+            held["contained"],
+            serde_json::json!(true),
+            "the redrawn tab stop stays inside the calendar card: {held:?}"
+        );
+        let outside = &result["outside"];
+        assert_eq!(
+            outside["activeIsTheme"],
+            serde_json::json!(true),
+            "a redraw with focus outside the card leaves that focus alone: {outside:?}"
+        );
+        assert_eq!(
+            outside["contained"],
+            serde_json::json!(false),
+            "the outside focus target is not inside the calendar card: {outside:?}"
+        );
+    }
+
     /// Covers: at a 120px frame the rendered month labels sit at least
     /// 24px apart.
     #[test]
