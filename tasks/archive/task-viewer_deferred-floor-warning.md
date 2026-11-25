@@ -2,8 +2,8 @@
 description: "Warn for a deferred leave day before the plausible floor, as ARCHITECTURE promises for every row dated before it."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T15:55:59Z
-status: implemented
+updated: 2026-11-25T15:57:56Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -24,7 +24,7 @@ let ship = task.ship_date.filter(|_| task.kind == TaskKind::Finished);
 let earliest = [Some(task.created), ship]
 ```
 
-A deferred row's leave day is the event the weekly deferred bar plots, and it can lie before the floor when it comes from the frontmatter `updated` fallback for a folder outside git. `weekly_points` folds that event into the first charted week, but no warning names it, while `ARCHITECTURE.md` says a row dated before 2005-04-07 keeps its real values, folds into the first charted point, and logs one warning naming its repository, path, and date. The [deferred-and-staleness task](archive/task-viewer_deferred-and-staleness.md) added the deferred bar and its pre-floor carry but did not add this warning.
+A deferred row's leave day is the event the weekly deferred bar plots, and it can lie before the floor when it comes from the frontmatter `updated` fallback for a folder outside git. `weekly_points` folds that event into the first charted week, but no warning names it, while `ARCHITECTURE.md` says a row dated before 2005-04-07 keeps its real values, folds into the first charted point, and logs one warning naming its repository, path, and date. The [deferred-and-staleness task](task-viewer_deferred-and-staleness.md) added the deferred bar and its pre-floor carry but did not add this warning.
 
 ## Approach
 
