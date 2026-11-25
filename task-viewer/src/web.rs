@@ -12994,12 +12994,15 @@ mod tests {
     #[test]
     fn browser_chart_download_serializes_the_card_and_names_the_png() {
         let payload_text = fixture_payload().to_string();
-        let config = browser_config(
+        let mut config = browser_config(
             false,
             false,
             Some(&payload_text),
             serde_json::json!("#123456"),
         );
+        // A marker family the fixture reports as the page's computed font, so
+        // the export assertion names it instead of the stylesheet's list.
+        config["pageFontFamily"] = serde_json::json!("Fixture Sans");
         let result = run_browser(
             &config,
             r#"(function () {
@@ -13031,6 +13034,7 @@ mod tests {
     drawnWidth: canvas.drawn ? canvas.drawn.width : null,
     drawnHeight: canvas.drawn ? canvas.drawn.height : null,
     serialized: env.serialized[0] || "",
+    textFont: /<text\b[^>]*font-family="Fixture Sans"/.test(env.serialized[0] || ""),
     drawnBefore: drawnBefore,
     drawnAfter: svg.children.length,
     summaryBefore: summaryBefore,
@@ -13088,6 +13092,11 @@ mod tests {
         assert!(
             serialized.contains("fill=\"#123456\""),
             "the drawn marks carry the inlined theme colour: {serialized}"
+        );
+        assert_eq!(
+            result["textFont"],
+            serde_json::json!(true),
+            "the exported text keeps the page's font family: {serialized}"
         );
         assert_eq!(
             result["canvasWidth"].as_f64(),
@@ -13260,6 +13269,20 @@ mod tests {
             body.matches("data-download hidden").count(),
             10,
             "each PNG control ships hidden"
+        );
+        let labels: Vec<&str> = body
+            .match_indices("aria-label=\"Download PNG: ")
+            .map(|(at, _)| {
+                let rest = &body[at + "aria-label=\"".len()..];
+                &rest[..rest.find('"').expect("the label closes")]
+            })
+            .collect();
+        assert_eq!(labels.len(), 10, "each PNG control names its own chart");
+        let unique: std::collections::BTreeSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            10,
+            "no two PNG controls share an accessible name: {labels:?}"
         );
         let rule = css_rule(".chart-download");
         assert!(

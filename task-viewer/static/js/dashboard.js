@@ -1296,11 +1296,17 @@
         return;
       }
       var style = getComputedStyle(node);
-      ["fill", "stroke", "color"].forEach(function (property) {
+      ["fill", "stroke", "color", "font-family", "font-weight"].forEach(function (property) {
         var value = style.getPropertyValue(property);
-        if (value && value !== "none") {
-          copy.setAttribute(property, value);
+        if (!value || value === "none") {
+          return;
         }
+        // The default weight inherits from the page as well, but writing it
+        // on every node would only add noise; a diverging weight is kept.
+        if (property === "font-weight" && (value === "400" || value === "normal")) {
+          return;
+        }
+        copy.setAttribute(property, value);
       });
     });
   }

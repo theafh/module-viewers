@@ -9,6 +9,12 @@
   var width = typeof config.width === "number" ? config.width : narrow ? 120 : 1000;
   var storageThrows = !!config.storageThrows;
   var cssValue = config.cssValue === undefined ? "#123456" : config.cssValue;
+  // The page's computed font, which the chart text inherits; the download path
+  // inlines it so the exported SVG keeps the page's typeface.
+  var pageFontFamily = config.pageFontFamily === undefined
+    ? '"Source Sans 3", "Segoe UI", system-ui, sans-serif'
+    : String(config.pageFontFamily);
+  var pageFontWeight = config.pageFontWeight === undefined ? "400" : String(config.pageFontWeight);
   // The chart-download path's records, filled by the stubs below: the anchors
   // that carried a `download` name, the blobs and object URLs it made, the URLs
   // it revoked, the canvases it drew to, and every serialized SVG.
@@ -623,6 +629,8 @@
   function getComputedStyle(node) {
     return {
       getPropertyValue: function (property) {
+        if (property === "font-family") return pageFontFamily;
+        if (property === "font-weight") return pageFontWeight;
         if (property === "fill" || property === "stroke" || property === "color") {
           if (node && typeof node.getAttribute === "function") {
             var value = node.getAttribute(property);
