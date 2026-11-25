@@ -14,6 +14,8 @@
     <input type="hidden" name="date" value="{{ date }}">
     <input type="hidden" name="from" value="{{ from }}">
     <input type="hidden" name="to" value="{{ to }}">
+    <input type="hidden" name="sort" value="{{ sort }}">
+    <input type="hidden" name="dir" value="{{ dir }}">
     <label for="q">Search</label>
     <input type="search" id="q" name="q" value="{{ q }}" placeholder="Filename fragment">
     <label for="scope">Scope</label>
@@ -29,12 +31,9 @@
 <table class="task-list">
     <thead>
         <tr>
-            <th scope="col">Repository</th>
-            <th scope="col">Scope</th>
-            <th scope="col">Path</th>
-            <th scope="col">Kind</th>
-            <th scope="col">Created</th>
-            <th scope="col">Ship or leave day</th>
+            {% for header in headers %}
+            <th scope="col"{% if header.active %} aria-sort="{{ header.aria_sort }}"{% endif %}><a href="{{ header.href }}">{{ header.label }}{% if header.arrow %} <span class="sort-arrow" aria-hidden="true">{{ header.arrow }}</span>{% endif %}</a></th>
+            {% endfor %}
         </tr>
     </thead>
     <tbody>

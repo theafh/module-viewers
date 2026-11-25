@@ -924,6 +924,10 @@ struct TasksQuery {
     from: String,
     #[serde(default)]
     to: String,
+    #[serde(default)]
+    sort: String,
+    #[serde(default)]
+    dir: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1354,6 +1358,157 @@ impl TaskFilter {
     }
 }
 
+/// The column a `/tasks` request sorts by. The default is `Scope`, which with
+/// the path tie-break reproduces the list's original scope-then-path order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    Repository,
+    Scope,
+    Path,
+    Kind,
+    Created,
+    Day,
+}
+
+impl SortKey {
+    const ALL: [Self; 6] = [
+        Self::Repository,
+        Self::Scope,
+        Self::Path,
+        Self::Kind,
+        Self::Created,
+        Self::Day,
+    ];
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "repository" => Some(Self::Repository),
+            "scope" => Some(Self::Scope),
+            "path" => Some(Self::Path),
+            "kind" => Some(Self::Kind),
+            "created" => Some(Self::Created),
+            "day" => Some(Self::Day),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::Scope => "scope",
+            Self::Path => "path",
+            Self::Kind => "kind",
+            Self::Created => "created",
+            Self::Day => "day",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Repository => "Repository",
+            Self::Scope => "Scope",
+            Self::Path => "Path",
+            Self::Kind => "Kind",
+            Self::Created => "Created",
+            Self::Day => "Ship or leave day",
+        }
+    }
+}
+
+/// The direction a column sorts in. The default is ascending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "asc" => Some(Self::Asc),
+            "desc" => Some(Self::Desc),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+
+    fn opposite(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+
+    fn aria_sort(self) -> &'static str {
+        match self {
+            Self::Asc => "ascending",
+            Self::Desc => "descending",
+        }
+    }
+
+    fn arrow(self) -> &'static str {
+        match self {
+            Self::Asc => "↑",
+            Self::Desc => "↓",
+        }
+    }
+}
+
+/// The resolved sort a `/tasks` request asks for. An unknown key or direction
+/// falls back to the default, so a hand-typed query still renders the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaskSort {
+    key: SortKey,
+    dir: SortDir,
+}
+
+impl TaskSort {
+    fn from_query(query: &TasksQuery) -> Self {
+        Self {
+            key: SortKey::parse(query.sort.trim()).unwrap_or(SortKey::Scope),
+            dir: SortDir::parse(query.dir.trim()).unwrap_or(SortDir::Asc),
+        }
+    }
+}
+
+/// The ship or leave day a row shows: a finished row's ship day, a deferred
+/// row's leave day, and no day for a live row.
+fn task_day(task: &series::TaskRecord) -> Option<NaiveDate> {
+    match task.kind {
+        TaskKind::Finished => task.ship_date.or(task.leave_date),
+        TaskKind::Deferred => task.leave_date,
+        TaskKind::Live => None,
+    }
+}
+
+/// Order the filtered rows by the chosen column, reversing for a descending
+/// request and breaking every tie on the path so one order is always defined.
+/// A row with no day sorts last ascending and first descending.
+fn sort_task_rows(rows: &mut [series::TaskRecord], sort: TaskSort) {
+    rows.sort_by(|left, right| {
+        let ordering = match sort.key {
+            SortKey::Repository => left.project.cmp(&right.project),
+            SortKey::Scope => left.scope.cmp(&right.scope),
+            SortKey::Path => left.path.cmp(&right.path),
+            SortKey::Kind => left.kind.as_str().cmp(right.kind.as_str()),
+            SortKey::Created => left.created.cmp(&right.created),
+            SortKey::Day => (task_day(left).is_none(), task_day(left))
+                .cmp(&(task_day(right).is_none(), task_day(right))),
+        };
+        let ordering = match sort.dir {
+            SortDir::Asc => ordering,
+            SortDir::Desc => ordering.reverse(),
+        };
+        ordering.then_with(|| left.path.cmp(&right.path))
+    });
+}
+
 /// The rows one `/tasks` request selects, shared by the HTML list and the CSV
 /// export so both read one filter.
 struct TaskSelection {
@@ -1379,11 +1534,7 @@ async fn select_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<Ta
         .into_iter()
         .filter(|task| filter.matches(task))
         .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        left.scope
-            .cmp(&right.scope)
-            .then_with(|| left.path.cmp(&right.path))
-    });
+    sort_task_rows(&mut rows, TaskSort::from_query(query));
     Ok(TaskSelection {
         rows,
         selected,
@@ -1398,6 +1549,7 @@ async fn render_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<St
         Some(id) => id.to_string(),
         None => "all".to_string(),
     };
+    let sort = TaskSort::from_query(query);
     let page = TasksPage {
         version: state.static_version.clone(),
         page: "tasks",
@@ -1410,19 +1562,22 @@ async fn render_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<St
         date: query.date.trim().to_string(),
         from: query.from.trim().to_string(),
         to: query.to.trim().to_string(),
+        sort: sort.key.as_str().to_string(),
+        dir: sort.dir.as_str().to_string(),
         scopes: selection.scopes,
-        export_query: export_query(query, &project),
+        headers: task_sort_headers(query, &project, sort),
+        export_query: export_query(query, &project, sort),
         rows,
     };
     let context = Context::from_serialize(page)?;
     Ok(state.templates.render("tasks.html", &context)?)
 }
 
-/// The query string the Export CSV link carries: the project filter plus every
-/// non-empty filter the request set, each value percent-encoded so it can sit
-/// in an `href`. The template escapes the result for HTML.
-fn export_query(query: &TasksQuery, project: &str) -> String {
-    let mut pairs = vec![format!("project={}", encode_query(project))];
+/// The filter pairs a `/tasks` request carries onto a header link or the export
+/// link: the project always, then every non-empty filter. Each value is
+/// percent-encoded when the pairs join into a query string.
+fn filtered_pairs(query: &TasksQuery, project: &str) -> Vec<(&'static str, String)> {
+    let mut pairs = vec![("project", project.to_string())];
     for (name, value) in [
         ("kind", query.kind.trim()),
         ("scope", query.scope.trim()),
@@ -1432,10 +1587,66 @@ fn export_query(query: &TasksQuery, project: &str) -> String {
         ("to", query.to.trim()),
     ] {
         if !value.is_empty() {
-            pairs.push(format!("{name}={}", encode_query(value)));
+            pairs.push((name, value.to_string()));
         }
     }
-    pairs.join("&")
+    pairs
+}
+
+fn encode_pairs(pairs: &[(&'static str, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={}", encode_query(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// The query string the Export CSV link carries: every filter the request set
+/// plus the resolved sort, so the CSV body follows the list's order.
+fn export_query(query: &TasksQuery, project: &str, sort: TaskSort) -> String {
+    let mut pairs = filtered_pairs(query, project);
+    pairs.push(("sort", sort.key.as_str().to_string()));
+    pairs.push(("dir", sort.dir.as_str().to_string()));
+    encode_pairs(&pairs)
+}
+
+/// One sortable table header: its label, the link that sorts by it, and the
+/// state the template marks when it is the active column. A column that is not
+/// active links to an ascending sort; the active column links to the opposite
+/// direction, so a second click reverses the order.
+#[derive(Serialize)]
+struct TaskSortHeader {
+    label: &'static str,
+    href: String,
+    active: bool,
+    /// `ascending` or `descending` on the active header, empty otherwise.
+    aria_sort: &'static str,
+    /// The visible arrow on the active header, empty otherwise.
+    arrow: &'static str,
+}
+
+fn task_sort_headers(query: &TasksQuery, project: &str, sort: TaskSort) -> Vec<TaskSortHeader> {
+    SortKey::ALL
+        .into_iter()
+        .map(|key| {
+            let active = key == sort.key;
+            let dir = if active {
+                sort.dir.opposite()
+            } else {
+                SortDir::Asc
+            };
+            let mut pairs = filtered_pairs(query, project);
+            pairs.push(("sort", key.as_str().to_string()));
+            pairs.push(("dir", dir.as_str().to_string()));
+            TaskSortHeader {
+                label: key.label(),
+                href: format!("/tasks?{}", encode_pairs(&pairs)),
+                active,
+                aria_sort: if active { sort.dir.aria_sort() } else { "" },
+                arrow: if active { sort.dir.arrow() } else { "" },
+            }
+        })
+        .collect()
 }
 
 async fn render_tasks_csv(state: &AppState, query: &TasksQuery) -> anyhow::Result<String> {
@@ -1934,8 +2145,14 @@ struct TasksPage {
     date: String,
     from: String,
     to: String,
+    /// The resolved sort key and direction, so the filter form carries them
+    /// back on submit.
+    sort: String,
+    dir: String,
     /// The distinct scopes of the current project filter, for the scope select.
     scopes: Vec<String>,
+    /// The six sortable headers, with their links and active state.
+    headers: Vec<TaskSortHeader>,
     /// The percent-encoded query the Export CSV link carries.
     export_query: String,
     rows: Vec<TaskRowView>,
@@ -9723,6 +9940,242 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Covers: the default view keeps the scope-then-path order when neither
+    /// `sort` nor `dir` is present, and an explicit `scope`/`asc` request
+    /// reproduces it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_default_order_is_scope_then_path() {
+        let (state, path, _alpha, _beta) = seeded_task_list("tasks_default_order").await;
+        let default = vec![
+            "alpha_done.md",
+            "alpha_live.md",
+            "beta_defer.md",
+            "gamma_live.md",
+        ];
+        let body = task_list_body(&state, "").await;
+        assert_eq!(task_paths(&body), default, "{body}");
+        let body = task_list_body(&state, "sort=scope&dir=asc").await;
+        assert_eq!(task_paths(&body), default, "{body}");
+        cleanup(&path);
+    }
+
+    /// Covers: each of the six headers sorts by its column, and each direction
+    /// orders the seeded rows as its column dictates.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_each_header_sorts_in_both_directions() {
+        let (state, path, _alpha, _beta) = seeded_task_list("tasks_sort").await;
+        let cases: [(&str, [&str; 4], [&str; 4]); 6] = [
+            (
+                "repository",
+                [
+                    "alpha_done.md",
+                    "alpha_live.md",
+                    "beta_defer.md",
+                    "gamma_live.md",
+                ],
+                [
+                    "beta_defer.md",
+                    "gamma_live.md",
+                    "alpha_done.md",
+                    "alpha_live.md",
+                ],
+            ),
+            (
+                "scope",
+                [
+                    "alpha_done.md",
+                    "alpha_live.md",
+                    "beta_defer.md",
+                    "gamma_live.md",
+                ],
+                [
+                    "gamma_live.md",
+                    "beta_defer.md",
+                    "alpha_done.md",
+                    "alpha_live.md",
+                ],
+            ),
+            (
+                "path",
+                [
+                    "alpha_done.md",
+                    "alpha_live.md",
+                    "beta_defer.md",
+                    "gamma_live.md",
+                ],
+                [
+                    "gamma_live.md",
+                    "beta_defer.md",
+                    "alpha_live.md",
+                    "alpha_done.md",
+                ],
+            ),
+            (
+                "kind",
+                [
+                    "beta_defer.md",
+                    "alpha_done.md",
+                    "alpha_live.md",
+                    "gamma_live.md",
+                ],
+                [
+                    "alpha_live.md",
+                    "gamma_live.md",
+                    "alpha_done.md",
+                    "beta_defer.md",
+                ],
+            ),
+            (
+                "created",
+                [
+                    "beta_defer.md",
+                    "alpha_live.md",
+                    "alpha_done.md",
+                    "gamma_live.md",
+                ],
+                [
+                    "gamma_live.md",
+                    "alpha_done.md",
+                    "alpha_live.md",
+                    "beta_defer.md",
+                ],
+            ),
+            (
+                "day",
+                [
+                    "beta_defer.md",
+                    "alpha_done.md",
+                    "alpha_live.md",
+                    "gamma_live.md",
+                ],
+                [
+                    "alpha_live.md",
+                    "gamma_live.md",
+                    "alpha_done.md",
+                    "beta_defer.md",
+                ],
+            ),
+        ];
+        for (key, ascending, descending) in cases {
+            let body = task_list_body(&state, &format!("sort={key}&dir=asc")).await;
+            assert_eq!(task_paths(&body), ascending, "{key} ascending: {body}");
+            let body = task_list_body(&state, &format!("sort={key}&dir=desc")).await;
+            assert_eq!(task_paths(&body), descending, "{key} descending: {body}");
+        }
+        cleanup(&path);
+    }
+
+    /// Covers: a second click on the active header follows its link to the
+    /// opposite direction, reversing the order and flipping `aria-sort` and the
+    /// arrow.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_second_header_click_reverses_the_order() {
+        let (state, path, _alpha, _beta) = seeded_task_list("tasks_sort_toggle").await;
+        let body = task_list_body(&state, "sort=created&dir=asc").await;
+        assert_eq!(
+            header_aria_sort(&body, "Created").as_deref(),
+            Some("ascending"),
+            "{body}"
+        );
+        assert!(
+            body.contains("↑"),
+            "the active header shows an up arrow: {body}"
+        );
+        let href = header_href(&body, "Created");
+        assert!(href.ends_with("sort=created&dir=desc"), "{href}");
+
+        let query = href.strip_prefix("/tasks?").expect("task list href");
+        let clicked = task_list_body(&state, query).await;
+        assert_eq!(
+            task_paths(&clicked),
+            vec![
+                "gamma_live.md",
+                "alpha_done.md",
+                "alpha_live.md",
+                "beta_defer.md"
+            ],
+            "{clicked}"
+        );
+        assert_eq!(
+            header_aria_sort(&clicked, "Created").as_deref(),
+            Some("descending"),
+            "{clicked}"
+        );
+        assert!(
+            clicked.contains("↓"),
+            "the active header shows a down arrow: {clicked}"
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: every header link carries every current filter, the active
+    /// column toggles its own direction, and the form's hidden inputs carry the
+    /// resolved sort so it survives a Show submit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_header_links_preserve_filters_and_mark_active() {
+        let (state, path, alpha, _beta) = seeded_task_list("tasks_sort_headers").await;
+        let filters = format!(
+            "project={alpha}&kind=finished&scope=alpha&q=done&date=created&from=2026-05-01&to=2026-05-31"
+        );
+        let body = task_list_body(&state, &format!("{filters}&sort=path&dir=desc")).await;
+        assert_eq!(
+            header_aria_sort(&body, "Path").as_deref(),
+            Some("descending"),
+            "{body}"
+        );
+        assert!(body.contains("↓"), "{body}");
+        assert_eq!(header_aria_sort(&body, "Created"), None, "{body}");
+        for label in [
+            "Repository",
+            "Scope",
+            "Path",
+            "Kind",
+            "Created",
+            "Ship or leave day",
+        ] {
+            let href = header_href(&body, label);
+            assert!(
+                href.starts_with(&format!("/tasks?{filters}&sort=")),
+                "{label} link carries every filter: {href}"
+            );
+        }
+        assert_eq!(
+            header_href(&body, "Path"),
+            format!("/tasks?{filters}&sort=path&dir=asc")
+        );
+        assert_eq!(
+            header_href(&body, "Created"),
+            format!("/tasks?{filters}&sort=created&dir=asc")
+        );
+        assert_eq!(hidden_input_value(&body, "sort"), "path");
+        assert_eq!(hidden_input_value(&body, "dir"), "desc");
+        cleanup(&path);
+    }
+
+    /// Covers: an unknown `sort` or `dir` value falls back to the default
+    /// instead of failing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_unknown_sort_falls_back_to_the_default() {
+        let (state, path, _alpha, _beta) = seeded_task_list("tasks_sort_unknown").await;
+        let body = task_list_body(&state, "sort=bogus&dir=sideways").await;
+        assert_eq!(
+            task_paths(&body),
+            vec![
+                "alpha_done.md",
+                "alpha_live.md",
+                "beta_defer.md",
+                "gamma_live.md"
+            ],
+            "{body}"
+        );
+        assert_eq!(
+            header_aria_sort(&body, "Scope").as_deref(),
+            Some("ascending"),
+            "{body}"
+        );
+        cleanup(&path);
+    }
+
     /// The value a hidden input carries, HTML-decoded, so a round-trip test
     /// re-requests with exactly what the form would submit.
     fn hidden_input_value(body: &str, name: &str) -> String {
@@ -9832,6 +10285,43 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// The paths the task-list table renders, in row order.
+    fn task_paths(body: &str) -> Vec<String> {
+        task_table_rows(body)
+            .into_iter()
+            .map(|row| row[2].clone())
+            .collect()
+    }
+
+    /// One task-list header cell's raw HTML, found by its visible label.
+    fn header_cell(body: &str, label: &str) -> String {
+        for chunk in body.split("<th ").skip(1) {
+            let cell = chunk.split("</th>").next().unwrap_or("");
+            if cell.contains(&format!(">{label}")) {
+                return cell.to_string();
+            }
+        }
+        panic!("no header labelled {label}: {body}");
+    }
+
+    /// A task-list header link's target, HTML-decoded.
+    fn header_href(body: &str, label: &str) -> String {
+        let cell = header_cell(body, label);
+        let start = cell.find("href=\"").expect("header href") + "href=\"".len();
+        let rest = &cell[start..];
+        let end = rest.find('"').expect("header href end");
+        html_unescape(&rest[..end])
+    }
+
+    /// A task-list header's `aria-sort` value, when it carries one.
+    fn header_aria_sort(body: &str, label: &str) -> Option<String> {
+        let cell = header_cell(body, label);
+        let start = cell.find("aria-sort=\"")? + "aria-sort=\"".len();
+        let rest = &cell[start..];
+        let end = rest.find('"').expect("aria-sort end");
+        Some(rest[..end].to_string())
     }
 
     /// Parse a CSV body with the export's quoting rule: a double quote opens a
@@ -10057,9 +10547,47 @@ mod tests {
         assert_eq!(
             export_href(&body),
             format!(
-                "/tasks.csv?project={alpha}&kind=finished&scope=alpha&q=done&date=created&from=2026-05-01&to=2026-05-31"
+                "/tasks.csv?project={alpha}&kind=finished&scope=alpha&q=done&date=created&from=2026-05-01&to=2026-05-31&sort=scope&dir=asc"
             )
         );
+        cleanup(&path);
+    }
+
+    /// Covers: `GET /tasks.csv` returns the rows in the list's order for the
+    /// requested sort, and the Export CSV link carries `sort` and `dir`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_csv_follows_the_list_order_and_its_link_carries_the_sort() {
+        let (state, path, _alpha, _beta) = seeded_task_list("tasks_csv_sort").await;
+        let body = task_list_body(&state, "sort=created&dir=desc").await;
+        let list_paths = task_paths(&body);
+        assert_eq!(
+            list_paths,
+            vec![
+                "gamma_live.md",
+                "alpha_done.md",
+                "alpha_live.md",
+                "beta_defer.md"
+            ],
+            "{body}"
+        );
+        assert_eq!(
+            export_href(&body),
+            "/tasks.csv?project=all&sort=created&dir=desc"
+        );
+
+        let response = send(
+            state.clone(),
+            get_page("/tasks.csv?sort=created&dir=desc", "127.0.0.1:7880"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let csv = body_text(response).await;
+        let rows = csv_rows(&csv);
+        let csv_paths = rows[1..]
+            .iter()
+            .map(|row| row[2].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(csv_paths, list_paths, "{csv}");
         cleanup(&path);
     }
 
