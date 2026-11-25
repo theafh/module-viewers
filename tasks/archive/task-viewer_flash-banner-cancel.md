@@ -2,8 +2,8 @@
 description: "Restore a claimed Update banner when a dashboard read is cancelled before it renders, so the next read shows it."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T15:43:08Z
-status: implemented
+updated: 2026-11-25T15:46:49Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
