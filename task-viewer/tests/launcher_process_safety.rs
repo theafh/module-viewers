@@ -84,7 +84,15 @@ struct Root {
 
 impl Root {
     fn new(name: &str, port: u16) -> Root {
-        let dir = unique_temp_dir(name);
+        Root::from_dir(unique_temp_dir(name), port)
+    }
+
+    /// A root whose own path holds a space, as `install-desktop.sh` supports.
+    fn new_under_a_space(name: &str, port: u16) -> Root {
+        Root::from_dir(unique_temp_dir(name).join("My Projects"), port)
+    }
+
+    fn from_dir(dir: PathBuf, port: u16) -> Root {
         let home = dir.join("home");
         let xdg = dir.join("state");
         fs::create_dir_all(home.join(".cargo/bin")).expect("fake tool dir");
@@ -730,6 +738,44 @@ fn inherited_task_viewer_port_does_not_move_the_bind() {
     );
 
     let pid = root.read_pid().expect("the started server's PID file");
+    stop_and_assert(&root, pid);
+
+    let _ = fs::remove_dir_all(&root.dir);
+}
+
+/// Covers: a checkout whose path holds a space still lets the launcher recognize
+/// the server it started, so `status` exits 0 while it serves and `stop` takes it
+/// down and leaves no listener on the port.
+#[test]
+fn a_checkout_path_with_a_space_recognizes_its_server() {
+    let port = free_loopback_port();
+    let root = Root::new_under_a_space("launcher_space_path", port);
+
+    let start = wait_output(root.spawn("start"), COMMAND_WINDOW);
+    assert!(
+        start.status.success(),
+        "start failed: {}\n{}",
+        stdout(&start),
+        stderr(&start),
+    );
+    wait_for_server(port, SERVER_WINDOW);
+    let pid = root.read_pid().expect("the started server's PID file");
+    assert!(process_alive(pid), "the started server must be alive");
+
+    let status = wait_output(root.spawn("status"), COMMAND_WINDOW);
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "a running server under a space path must read as running: {}\n{}",
+        stdout(&status),
+        stderr(&status),
+    );
+    assert!(
+        stdout(&status).contains("task-viewer is running"),
+        "status must name the running server: {}",
+        stdout(&status),
+    );
+
     stop_and_assert(&root, pid);
 
     let _ = fs::remove_dir_all(&root.dir);

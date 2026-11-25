@@ -3,6 +3,7 @@
 
 use crate::test_support::unique_temp_dir;
 use std::fs;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -186,6 +187,32 @@ fn stage_root(dir: &Path) -> PathBuf {
     stage_launcher(dir)
 }
 
+/// A free loopback port, so a staged launcher never shares a running dashboard.
+fn free_loopback_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+    listener.local_addr().expect("listener addr").port()
+}
+
+/// True when something accepts connections on the port.
+fn answers(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(500),
+    )
+    .is_ok()
+}
+
+/// Stage a checkout-shaped root whose launcher copy names `port` in its `PORT`
+/// line, so a probe and a bind agree and a test can watch that port.
+fn stage_root_on_port(dir: &Path, port: u16) -> PathBuf {
+    let launcher = stage_root(dir);
+    let source = fs::read_to_string(&launcher).expect("read the staged launcher");
+    let staged = source.replacen("PORT=7880\n", &format!("PORT={port}\n"), 1);
+    assert_ne!(staged, source, "the launcher must carry one PORT line");
+    fs::write(&launcher, staged).expect("write the staged launcher");
+    launcher
+}
+
 /// Drive `is_ours` with a staged `ps` line for every printed form.
 const IS_OURS_DRIVER: &str = r#"#!/bin/bash
 set -u
@@ -266,8 +293,47 @@ fn launcher_is_ours_resolves_every_printed_form() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Aim a stop at a live unrelated process and record every signal the launcher
-/// sends. The real `kill` stays available for the liveness check.
+/// Covers: every printed form `is_ours` accepts still resolves when the checkout
+/// path holds a space, so the whole-line comparison carries the absolute forms
+/// and the token walk keeps the relative and bare forms.
+#[test]
+fn launcher_is_ours_accepts_a_checkout_path_with_a_space() {
+    let dir = unique_temp_dir("launcher_is_ours_space").join("My Projects");
+    let launcher = stage_root(&dir);
+
+    let output = run_driver(
+        &dir,
+        IS_OURS_DRIVER,
+        &[(
+            "SCRIPT_PATH",
+            launcher.to_str().expect("the temp path is valid UTF-8"),
+        )],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    for marker in [
+        "absolute-ok",
+        "absolute-arg-ok",
+        "relative-ok",
+        "relative-plain-ok",
+        "bare-ok",
+        "foreign-absolute-ok",
+        "foreign-relative-ok",
+        "empty-ok",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == marker),
+            "missing {marker} under a space path in: {stdout}",
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
 const FOREIGN_STOP_DRIVER: &str = r#"#!/bin/bash
 set -u
 set -- source-guard-probe
@@ -495,9 +561,67 @@ fn launcher_start_timeout_terminates_the_server() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Covers: a `status` invocation run while another invocation holds the lock
-/// waits for the holder to release it before reading the PID file, so it never
-/// reads a concurrent start's half-written file.
+/// Covers: a failed start under a checkout path holding a space signals the
+/// process it launched and leaves no listener on the launcher's port. The
+/// whole-line comparison is what lets the cleanup recognize that process; a
+/// token split at the path's space never matches, so the server would survive.
+#[cfg(unix)]
+#[test]
+fn launcher_start_timeout_under_a_space_path_terminates_the_server() {
+    let dir = unique_temp_dir("launcher_space_start_timeout").join("My Projects");
+    let port = free_loopback_port();
+    let launcher = stage_root_on_port(&dir, port);
+    // A binary that blocks without arguments, so the timeout has a live process
+    // to clean up. `ps` prints the argv path, which is what `is_ours` reads.
+    let sleep_binary = ["/bin/sleep", "/usr/bin/sleep"]
+        .iter()
+        .find(|path| Path::new(path).exists())
+        .expect("a system sleep binary");
+    fs::remove_file(dir.join("target/release/task-viewer")).expect("replace the staged binary");
+    std::os::unix::fs::symlink(sleep_binary, dir.join("target/release/task-viewer"))
+        .expect("stage a blocking binary");
+
+    let pid_log = dir.join("pid.log");
+    let output = run_driver(
+        &dir,
+        START_TIMEOUT_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            (
+                "PID_LOG",
+                pid_log.to_str().expect("the temp path is valid UTF-8"),
+            ),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=1"),
+        "a timed-out start must fail: {stdout}",
+    );
+    assert!(
+        stdout.contains("Failed to start"),
+        "the timeout must be reported: {stdout}",
+    );
+    assert!(
+        stdout.lines().any(|line| line == "server-dead"),
+        "the timed-out server under a space path must be gone: {stdout}",
+    );
+    assert!(
+        !answers(port),
+        "a failed start under a space path must leave no listener on port {port}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
 #[test]
 fn launcher_status_waits_for_the_lock_holder() {
     let dir = unique_temp_dir("launcher_lock_wait");

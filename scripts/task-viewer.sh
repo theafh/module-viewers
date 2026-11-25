@@ -298,11 +298,12 @@ notify() {
 
 # True when the PID is this checkout's release binary. A live PID alone is not
 # enough: PIDs are reused, and another program may own the port. `ps` prints the
-# argv the process was started with, so compare its first token: an absolute
-# path as written, a path holding a `/` resolved against this checkout (every
-# launcher-started server inherits it as its working directory), or a bare name
-# resolved on PATH. A trailing argument is allowed, and a token that resolves
-# to nothing is not ours.
+# argv the process was started with, so compare the whole line against this
+# checkout's binary first, which keeps a checkout path holding a space intact,
+# then fall back to its first token: an absolute path as written, a path holding
+# a `/` resolved against this checkout (every launcher-started server inherits
+# it as its working directory), or a bare name resolved on PATH. A trailing
+# argument is allowed, and a token that resolves to nothing is not ours.
 is_ours() {
     local candidate="$1"
     [ -n "$candidate" ] || return 1
@@ -310,6 +311,11 @@ is_ours() {
     # -ww keeps procps from truncating a long command line to the terminal
     # width, so Linux reads the same full path macOS prints.
     args=$(ps -ww -p "$candidate" -o args= 2>/dev/null) || return 1
+    # Compare the whole line at an argument boundary before splitting it, so a
+    # path whose own name holds a space still matches the binary it names.
+    case "$args" in
+        "$BINARY"|"$BINARY "*) return 0 ;;
+    esac
     token=${args%%[[:space:]]*}
     [ -n "$token" ] || return 1
     case "$token" in
