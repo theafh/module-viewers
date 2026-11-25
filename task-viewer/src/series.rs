@@ -200,7 +200,11 @@ pub fn dashboard(
     // visible while the series stay bounded.
     for task in tasks {
         let ship = task.ship_date.filter(|_| task.kind == TaskKind::Finished);
-        let earliest = [Some(task.created), ship]
+        // A deferred row leaves the backlog on its leave day, so that day is the
+        // event the weekly deferred bar plots and the one a mistyped year can
+        // push before the floor.
+        let leave = task.leave_date.filter(|_| task.kind == TaskKind::Deferred);
+        let earliest = [Some(task.created), ship, leave]
             .into_iter()
             .flatten()
             .filter(|day| *day < PLAUSIBLE_FLOOR)
@@ -1915,6 +1919,113 @@ mod tests {
             board.weekly.iter().map(|point| point.shipped).sum::<i64>(),
             board.counts.shipped_events as i64,
             "the weekly shipped bars reach the shipped count"
+        );
+    }
+
+    /// Covers: a deferred row whose `created` is in range and whose leave day
+    /// lies before the floor logs one warning naming its repository, path, and
+    /// leave day, while its deferred bar still folds into the first charted
+    /// week and the weekly deferred bars reach the deferred count.
+    #[test]
+    fn series_warns_for_a_deferred_leave_day_before_the_plausible_floor() {
+        let today = day(2026, 6, 15);
+        let tasks = vec![task(
+            "alpha",
+            "ancient",
+            TaskKind::Deferred,
+            day(2026, 5, 25),
+            None,
+            Some(day(26, 3, 5)),
+        )];
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        drop(guard);
+        let warnings = captured.take();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one warning for the one pre-floor leave day: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("repository=alpha")
+                && warnings[0].contains("path=tasks/alpha_ancient.md")
+                && warnings[0].contains("date=0026-03-05"),
+            "the warning names the row's repository, path, and leave day: {warnings:?}"
+        );
+        let first = board.weekly.first().expect("first week");
+        assert_eq!(
+            first.week,
+            crate::dates::format_date(monday(PLAUSIBLE_FLOOR)),
+            "the pre-floor leave week folds into the first charted week"
+        );
+        assert_eq!(
+            first.deferred, 1,
+            "the pre-floor leave day folds into the first week's deferred bar"
+        );
+        assert_eq!(
+            board.weekly.iter().map(|point| point.deferred).sum::<i64>(),
+            board.counts.deferred as i64,
+            "the weekly deferred bars reach the deferred count"
+        );
+    }
+
+    /// Covers: a row whose only pre-floor date is `created` and a finished row
+    /// whose only pre-floor date is `ship_date` each keep exactly one warning.
+    #[test]
+    fn series_keeps_one_warning_for_a_created_only_or_ship_only_pre_floor_date() {
+        let today = day(2026, 6, 15);
+        let tasks = vec![
+            task(
+                "alpha",
+                "created_early",
+                TaskKind::Live,
+                day(26, 3, 1),
+                None,
+                None,
+            ),
+            task(
+                "alpha",
+                "shipped_early",
+                TaskKind::Finished,
+                day(2026, 5, 25),
+                Some(day(26, 3, 2)),
+                Some(day(26, 3, 2)),
+            ),
+        ];
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let _board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        drop(guard);
+        let warnings = captured.take();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "one warning per row, not one per pre-floor date: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("path=tasks/alpha_created_early.md"))
+                .count()
+                == 1
+                && warnings.iter().any(|warning| warning
+                    .contains("path=tasks/alpha_created_early.md")
+                    && warning.contains("date=0026-03-01")),
+            "the created-only row names its created day once: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("path=tasks/alpha_shipped_early.md"))
+                .count()
+                == 1
+                && warnings.iter().any(|warning| warning
+                    .contains("path=tasks/alpha_shipped_early.md")
+                    && warning.contains("date=0026-03-02")),
+            "the ship-only row names its ship day once: {warnings:?}"
         );
     }
 
