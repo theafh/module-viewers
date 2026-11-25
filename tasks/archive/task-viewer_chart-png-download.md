@@ -2,8 +2,8 @@
 description: "Add a PNG download to each chart card, rasterized in the browser from the drawn SVG in the current theme."
 scope: task-viewer
 created: 2026-11-25T09:49:49Z
-updated: 2026-11-25T21:54:22Z
-status: implemented
+updated: 2026-11-25T22:05:40Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
