@@ -29,6 +29,7 @@ restart:
 test:
 	RUSTFLAGS="$(TEST_RUSTFLAGS)" CARGO_TARGET_DIR="$(CURDIR)/target" cargo test -p task-viewer
 	./scripts/tests/launcher-build-truth.sh
+	./scripts/tests/launcher-state-dir.sh
 	./scripts/tests/audit-gate.sh
 
 lint:

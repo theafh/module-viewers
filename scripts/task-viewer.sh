@@ -28,8 +28,18 @@ LOCK_DIR="$STATE_DIR/task-viewer.lock"
 
 # Files this launcher creates are private to the person who runs it.
 umask 077
-mkdir -p "$STATE_DIR"
-chmod 700 "$STATE_DIR"
+# A state directory that cannot be created or made private has to fail here:
+# the lock loop below can neither take the lock nor reclaim a stale one in it,
+# so it would otherwise spin with no output and no exit.
+if ! mkdir -p "$STATE_DIR"; then
+    echo "Cannot create the task-viewer state directory: $STATE_DIR" >&2
+    echo "Check that its parent is writable and that the path is a directory, then try again." >&2
+    exit 1
+fi
+if ! chmod 700 "$STATE_DIR"; then
+    echo "Cannot set permissions on the task-viewer state directory: $STATE_DIR" >&2
+    exit 1
+fi
 
 # Earlier launchers kept both files at the repository root; adopt the PID of a
 # server started that way and drop the old log.
@@ -153,6 +163,13 @@ require_lock_ownership() {
     done
 }
 
+# How many consecutive passes may fail to take the lock and fail to reclaim it
+# before the launcher gives up. A state directory that turns unwritable after
+# start-up reaches this, and each pass sleeps LOCK_RETRY_SLEEP, so the bound is
+# about two seconds instead of an endless silent loop.
+LOCK_FAILURE_LIMIT=20
+LOCK_RETRY_SLEEP=0.1
+
 # Reclaim a stale lock by renaming it aside first: exactly one waiter wins the
 # rename, and a check-then-delete would let two waiters both act on one stale
 # observation and the loser delete the fresh lock the winner just created. The
@@ -161,6 +178,7 @@ require_lock_ownership() {
 # created puts that lock back instead of deleting it.
 acquire_lock() {
     local holder holder_cmd self_cmd stale missing_retries=0 live_cmd
+    local failed_passes=0
     while :; do
         if mkdir "$LOCK_DIR" 2>/dev/null; then
             LOCK_HELD=1
@@ -184,21 +202,27 @@ acquire_lock() {
             kill -0 "$holder" 2>/dev/null; then
             live_cmd=$(ps -ww -p "$holder" -o args= 2>/dev/null)
             if [ -z "$live_cmd" ] || names_launcher "$live_cmd"; then
-                sleep 0.1
+                # A real holder is building or waiting; it is never aborted.
+                failed_passes=0
+                sleep "$LOCK_RETRY_SLEEP"
                 continue
             fi
         fi
         # No recorded PID or command line is the short window between `mkdir` and
-        # the writes, so give the holder a moment before treating it as stale.
-        if { [ -z "$holder" ] || [ -z "$holder_cmd" ]; } &&
+        # the writes, so give the holder a moment before treating it as stale. An
+        # absent lock directory is not that window: the failed `mkdir` above could
+        # not create it, so there is nothing to wait for.
+        if [ -d "$LOCK_DIR" ] &&
+            { [ -z "$holder" ] || [ -z "$holder_cmd" ]; } &&
             [ "$missing_retries" -lt 50 ]; then
             missing_retries=$((missing_retries + 1))
-            sleep 0.1
+            sleep "$LOCK_RETRY_SLEEP"
             continue
         fi
         missing_retries=0
         stale="$LOCK_DIR.stale.$$.$RANDOM"
         if mv "$LOCK_DIR" "$stale" 2>/dev/null; then
+            failed_passes=0
             if [ "$(cat "$stale/pid" 2>/dev/null)" = "$holder" ]; then
                 rm -rf "$stale"
             elif [ ! -e "$LOCK_DIR" ]; then
@@ -208,6 +232,16 @@ acquire_lock() {
                 # renamed copy is discarded rather than nested inside it.
                 rm -rf "$stale"
             fi
+        else
+            # Neither the lock nor its reclaim could be created: the state
+            # directory is unwritable or full. Stop instead of spinning.
+            failed_passes=$((failed_passes + 1))
+            if [ "$failed_passes" -ge "$LOCK_FAILURE_LIMIT" ]; then
+                echo "Cannot take or reclaim the task-viewer lock in: $STATE_DIR" >&2
+                echo "Check that the state directory is writable, then try again." >&2
+                exit 1
+            fi
+            sleep "$LOCK_RETRY_SLEEP"
         fi
     done
 }
