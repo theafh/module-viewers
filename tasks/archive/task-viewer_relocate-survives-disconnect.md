@@ -2,8 +2,8 @@
 description: "Run Relocate's path write and re-harvest in a detached task that keeps the scan lock, so a dropped request still stores the new folder's rows and a fresh scan stamp."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-25T04:05:00Z
-status: implemented
+updated: 2026-11-25T03:31:36Z
+status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: true
 reported-by: Andreas Hoffmann
