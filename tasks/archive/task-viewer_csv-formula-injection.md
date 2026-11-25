@@ -2,8 +2,8 @@
 description: "Neutralize spreadsheet formula prefixes in the CSV export so a hostile task or folder name cannot become a live formula."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T10:05:40Z
-status: implemented
+updated: 2026-11-25T10:08:12Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
