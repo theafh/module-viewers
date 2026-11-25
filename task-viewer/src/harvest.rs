@@ -5203,9 +5203,10 @@ mod tests {
         let error = harvest_repository(&repo).expect_err("an outside link fails the scan");
         assert!(matches!(error, HarvestError::Io(_)), "{error:?}");
         let message = error.to_string();
+        let tasks_path = repo.join("tasks").display().to_string();
         assert!(
-            message.contains("tasks/"),
-            "the error names the stored tasks path: {message}"
+            message.contains(&tasks_path),
+            "the error names the repository's tasks path: {message}"
         );
         let target = fs::canonicalize(&outside).expect("canonical outside");
         assert!(
