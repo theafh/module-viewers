@@ -1386,20 +1386,87 @@ fn tasks_csv_text(tasks: &[series::TaskRecord]) -> String {
     out
 }
 
-/// One CSV field: a value holding a comma, a quote, or a line break is wrapped
-/// in double quotes, and each inner quote is doubled, so a path with any of
-/// them survives the round trip instead of splitting the record.
+/// The characters a spreadsheet reads as the start of a formula. A cell that
+/// opens with one of them is evaluated even when its CSV field is quoted, so
+/// `csv_field` prefixes such a value with one single quote and the spreadsheet
+/// shows the original text instead.
+fn opens_a_formula(value: &str) -> bool {
+    matches!(
+        value.chars().next(),
+        Some('=' | '+' | '-' | '@' | '\t' | '\r')
+    )
+}
+
+/// One CSV field: a value a spreadsheet would read as a formula is prefixed
+/// with one single quote, and a value holding a comma, a quote, or a line break
+/// is wrapped in double quotes with each inner quote doubled, so a hostile
+/// repository, scope, or path opens as text and any path survives the round
+/// trip instead of splitting the record.
 fn csv_field(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
+    let neutralized = opens_a_formula(value);
+    let quoted =
+        value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r');
+    if !neutralized && !quoted {
+        return value.to_string();
     }
+    let mut out = String::with_capacity(value.len() + 3);
+    if quoted {
+        out.push('"');
+    }
+    if neutralized {
+        out.push('\'');
+    }
+    if quoted {
+        out.push_str(&value.replace('"', "\"\""));
+        out.push('"');
+    } else {
+        out.push_str(value);
+    }
+    out
 }
 
 #[cfg(test)]
 mod csv_field_tests {
     use super::csv_field;
+
+    /// Read one exported CSV record back into its cells: a field that opens
+    /// with a double quote runs to the next single quote, a doubled quote
+    /// inside it reads as one quote, and every other comma separates two cells.
+    /// A test compares a cell's text with what a spreadsheet shows in the cell.
+    fn read_csv_record(line: &str) -> Vec<String> {
+        let mut cells = Vec::new();
+        let mut chars = line.chars().peekable();
+        loop {
+            let mut cell = String::new();
+            if chars.peek() == Some(&'"') {
+                let _ = chars.next();
+                while let Some(ch) = chars.next() {
+                    if ch != '"' {
+                        cell.push(ch);
+                        continue;
+                    }
+                    if chars.peek() == Some(&'"') {
+                        let _ = chars.next();
+                        cell.push('"');
+                        continue;
+                    }
+                    break;
+                }
+            } else {
+                while let Some(&ch) = chars.peek() {
+                    if ch == ',' {
+                        break;
+                    }
+                    let _ = chars.next();
+                    cell.push(ch);
+                }
+            }
+            cells.push(cell);
+            if chars.next() != Some(',') {
+                return cells;
+            }
+        }
+    }
 
     #[test]
     fn csv_field_quotes_a_line_break_so_a_path_cannot_split_the_record() {
@@ -1408,6 +1475,66 @@ mod csv_field_tests {
         assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
         assert_eq!(csv_field("a\nb"), "\"a\nb\"");
         assert_eq!(csv_field("a\rb"), "\"a\rb\"");
+    }
+
+    #[test]
+    fn csv_field_prefixes_every_formula_lead_character_with_one_quote() {
+        for lead in ['=', '+', '-', '@', '\t', '\r'] {
+            let value = format!("{lead}name");
+            let exported = csv_field(&value);
+            let cells = read_csv_record(&exported);
+            assert_eq!(cells.len(), 1, "{lead:?} exported one cell: {exported:?}");
+            let cell = &cells[0];
+            assert_eq!(
+                cell.chars().next(),
+                Some('\''),
+                "{lead:?} cell opens with one quote: {exported:?}"
+            );
+            assert_eq!(
+                cell,
+                &format!("'{value}"),
+                "{lead:?} cell keeps the original characters after the quote"
+            );
+        }
+    }
+
+    #[test]
+    fn csv_field_both_prefixes_and_quotes_a_formula_holding_a_comma() {
+        let exported = csv_field("=a,b");
+        assert_eq!(exported, "\"'=a,b\"");
+        let cells = read_csv_record(&exported);
+        assert_eq!(cells, vec!["'=a,b".to_string()]);
+    }
+
+    #[test]
+    fn csv_field_exports_a_plain_path_and_a_date_unchanged() {
+        assert_eq!(csv_field("tasks/scope_name.md"), "tasks/scope_name.md");
+        assert_eq!(csv_field("2026-11-25"), "2026-11-25");
+        assert_eq!(csv_field(""), "");
+        let header = "repository,scope,path,kind,created,ship day,leave day";
+        let cells = read_csv_record(header);
+        assert_eq!(cells.join(","), header);
+    }
+
+    #[test]
+    fn read_csv_record_reads_a_hostile_field_beside_ordinary_ones() {
+        let line = [
+            csv_field("repo"),
+            csv_field("=scope"),
+            csv_field("tasks/@name.md"),
+            csv_field("live"),
+        ]
+        .join(",");
+        assert_eq!(line, "repo,'=scope,tasks/@name.md,live");
+        assert_eq!(
+            read_csv_record(&line),
+            vec![
+                "repo".to_string(),
+                "'=scope".to_string(),
+                "tasks/@name.md".to_string(),
+                "live".to_string(),
+            ]
+        );
     }
 }
 
