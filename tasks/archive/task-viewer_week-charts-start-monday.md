@@ -2,8 +2,8 @@
 description: "Lay every week-shaped chart out Monday first: both 365-day calendars pad to a Monday-to-Sunday row order instead of a Sunday-first one, and the audit confirms the weekly bars already do."
 scope: task-viewer
 created: 2026-11-25T11:06:16Z
-updated: 2026-11-25T16:30:58Z
-status: implemented
+updated: 2026-11-25T16:33:17Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -23,7 +23,7 @@ Every dashboard chart that lays days out in weeks begins each week on Monday. Bo
 
 `browser_chart_markup_matches_the_pre_change_snapshots` compares every card's serialized SVG against `task-viewer/testdata/dashboard_draw_snapshots.json`. For the default payload only the two calendar entries move: their single cell sits at `y=18` once Monday leads the row order instead of `y=34`.
 
-The shipped [calendar tab-stop task](archive/task-viewer_calendar-tab-stop.md) also edited `drawCalendar`, changing which mark takes the roving tab stop. This task changes only the pad and the cell rows, so the two compose without an ordering.
+The shipped [calendar tab-stop task](task-viewer_calendar-tab-stop.md) also edited `drawCalendar`, changing which mark takes the roving tab stop. This task changes only the pad and the cell rows, so the two compose without an ordering.
 
 `ARCHITECTURE.md`'s **Extraction Rules** already states "Weeks start on Monday." and describes the calendars as "the last 365 days through today" without naming their weekday order. `FEATURES.md` section 4 likewise leaves the calendar row order unstated.
 
