@@ -2,8 +2,8 @@
 description: "Correct two guardrail claims that overstate: the static URL byte guarantee and the release-build read of TASK_VIEWER_PORT."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T17:11:20Z
-status: implemented
+updated: 2026-11-25T17:18:01Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
