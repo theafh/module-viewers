@@ -6,9 +6,11 @@
 # launcher is sourced where a case needs to replace ps, lsof, kill, or the
 # detach step, which is the same hook its own dispatch guard offers.
 #
-# Every launcher case also pins XDG_STATE_HOME under its own root and puts
-# failing notification stubs first on PATH, so neither a notification nor a
-# state write reaches the person's live desktop or launcher directory.
+# Every launcher case pins XDG_STATE_HOME under its own root, and each case
+# that keeps /usr/bin on PATH also keeps failing notification stubs first on
+# it, so neither a notification nor a state write reaches the person's live
+# desktop or launcher directory. The two detach cases instead drop the desktop
+# tools entirely by running with only their own minimal bin directory on PATH.
 
 set -u
 
@@ -23,7 +25,8 @@ FAILURES=0
 
 # A decoy XDG_STATE_HOME stands in for the live one a person's environment may
 # export. Every launcher case overrides it with a path under its own root, so a
-# case that forgets to writes here instead and the sentinel case fails.
+# case that forgets writes here instead and the sentinel case fails on Linux,
+# while the throwaway HOME keeps macOS state under the root either way.
 SENTINEL_STATE="$TMP/sentinel-state"
 mkdir -p "$SENTINEL_STATE"
 export XDG_STATE_HOME="$SENTINEL_STATE"
