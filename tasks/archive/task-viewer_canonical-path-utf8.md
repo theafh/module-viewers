@@ -2,8 +2,8 @@
 description: "Refuse a canonical folder path that is not valid UTF-8 instead of storing a lossy path that fails every later scan, and check UTF-8 after canonicalization."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-25T02:56:00Z
-status: implemented
+updated: 2026-11-25T02:58:35Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: false
