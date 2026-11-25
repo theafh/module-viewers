@@ -599,6 +599,9 @@ fn harvest_chosen(
                         record_skip(&mut skipped, SkipReason::NotUtf8);
                         warn_skipped_task(&path, SkipReason::NotUtf8);
                     }
+                    // The listing named a blob, so `cat-file` cannot answer a
+                    // directory here; treat it like a vanished object.
+                    BlobContent::Tree => vanished = Some(path.clone()),
                 }
                 break;
             }
@@ -1102,10 +1105,10 @@ fn markdown_blobs(listing: &[u8], prefix: &str) -> (Vec<String>, Vec<String>, Ve
     (paths, blobs, lossy)
 }
 
-/// Read many blobs in one `git cat-file` process, in the order they are given,
+/// Read many objects in one `git cat-file` process, in the order they are given,
 /// handing each record's `BlobContent` to `on_content` as it arrives. An
 /// expression that names no object answers `missing` and delivers
-/// `BlobContent::Missing`.
+/// `BlobContent::Missing`; a directory answers `BlobContent::Tree`.
 fn read_blobs(
     repo: &Path,
     dir: Option<&Path>,
@@ -1174,6 +1177,11 @@ enum BlobContent {
     Oversized,
     /// A present object whose bytes are not valid UTF-8.
     NotUtf8,
+    /// A present object that is not a blob, such as a directory. The archive
+    /// walk probes a candidate directory's `tasks` entry this way, so a
+    /// directory counts as holding a `tasks` tree while a file named `tasks`
+    /// does not.
+    Tree,
     /// The expression names no object.
     Missing,
 }
@@ -1183,9 +1191,10 @@ enum BlobContent {
 ///
 /// A header that ends in ` missing` names no object, so it delivers
 /// `BlobContent::Missing`. A present object larger than `MAX_TASK_FILE_BYTES`
-/// is drained and delivers `BlobContent::Oversized`, and a blob whose bytes are
-/// not valid UTF-8 delivers `BlobContent::NotUtf8`, so each skip carries its own
-/// reason instead of a synthesized empty string.
+/// is drained and delivers `BlobContent::Oversized`, a blob whose bytes are
+/// not valid UTF-8 delivers `BlobContent::NotUtf8`, and an object that is not a
+/// blob is drained and delivers `BlobContent::Tree`, so each skip carries its
+/// own reason instead of a synthesized empty string.
 fn parse_batch<R: BufRead>(
     mut reader: R,
     expected: usize,
@@ -1214,15 +1223,26 @@ fn parse_batch<R: BufRead>(
             on_content(BlobContent::Missing);
             continue;
         }
-        let size = header_text
-            .split_whitespace()
-            .nth(2)
+        let mut fields = header_text.split_whitespace();
+        let object_type = fields.nth(1).unwrap_or("");
+        let size = fields
+            .next()
             .and_then(|field| field.parse::<usize>().ok())
             .ok_or_else(|| {
                 GitFailure::Other(format!(
                     "git printed an unreadable object header: {header_text}"
                 ))
             })?;
+        if object_type != "blob" {
+            // A non-blob object's body is its raw tree or commit bytes, so drain
+            // it and report the type instead of decoding it as task text.
+            let mut body = reader.by_ref().take(size as u64);
+            std::io::copy(&mut body, &mut std::io::sink()).map_err(read_failure)?;
+            let mut trailing = [0_u8; 1];
+            let _ = reader.read(&mut trailing).map_err(read_failure)?;
+            on_content(BlobContent::Tree);
+            continue;
+        }
         if size > MAX_TASK_FILE_BYTES {
             // Drain the oversized body in fixed-size chunks instead of
             // allocating what git announced, so a huge or hostile size cannot
@@ -2472,8 +2492,12 @@ fn leave_dates(
 /// A deferred task counts from the commit whose path lies under `archive` and
 /// whose content carries `status: deferred`, so a deferral made while the task
 /// was live does not move its leave day. The resolved `git` context supplies the
-/// folder's place inside the repository that holds it, so only an `archive`
-/// directory inside the folder counts.
+/// folder's current place inside the repository that holds it; a record dates
+/// the task by the folder's place *at that commit*, which is the current prefix
+/// when it held a `tasks` tree there and otherwise its nearest ancestor that
+/// did, so a folder renamed or moved inside the repository keeps its first
+/// archive day and an `archive` directory above the folder still counts for
+/// nothing.
 fn first_archived_commit_date(
     repo: &Path,
     git: &GitContext,
@@ -2503,6 +2527,18 @@ fn first_archived_commit_date(
     }
 }
 
+/// One record of the archive walk: the commit it came from, the path it named,
+/// and the directory that held the record's `tasks` tree at that commit.
+struct ArchiveRecord {
+    day: NaiveDate,
+    commit: String,
+    path: String,
+    /// The directory before the last `tasks` component whose remainder is an
+    /// archived path: `""` at the repository root, `"proj"` for
+    /// `proj/tasks/archive/x.md`.
+    leading: String,
+}
+
 fn archived_leave_lookup(
     repo: &Path,
     rel: &str,
@@ -2522,8 +2558,10 @@ fn archived_leave_lookup(
     };
     scrub_git_env(&mut command);
     command.args(archive_log_args(rel));
-    let mut exprs = Vec::new();
-    let mut days = Vec::new();
+    // `--show-prefix` ends in `/` while a walk record's leading part has none,
+    // so compare the folder's place without the trailing slash.
+    let prefix = prefix.trim_end_matches('/');
+    let mut records = Vec::new();
     run_git_streaming(command, None, git_deadline(repo), |reader| {
         parse_archive_log(reader, |day, commit, path| {
             // `cat-file` reads one expression per line, so a path that holds a
@@ -2532,26 +2570,99 @@ fn archived_leave_lookup(
             if path.contains('\n') {
                 return;
             }
-            // `--name-only` names paths from the repository root. A path
-            // outside this folder belongs to no archive of it.
-            if !path.strip_prefix(prefix).is_some_and(is_archived_path) {
+            // A record dates the task only when its path holds a `tasks` tree
+            // above an `archive` directory. That tree's root names the
+            // directory that held the folder at that commit, whatever the
+            // folder and the file were called then; the folder's place at each
+            // commit, not only its current prefix, decides below.
+            let Some(leading) = archived_leading(path) else {
                 return;
-            }
-            exprs.push(format!("{commit}:{path}"));
-            days.push(day);
+            };
+            records.push(ArchiveRecord {
+                day,
+                commit: commit.to_string(),
+                path: path.to_string(),
+                leading,
+            });
         })
     })?;
-    // Consume one content at a time as the batch stream delivers it, folding
-    // each archived status into the earliest day instead of holding the set.
-    // An expression that names no object answers `missing`, and an oversized or
-    // non-UTF-8 blob carries its own reason; each counts as no qualifying
-    // commit, so its day is skipped like a content without the expected status.
-    let mut next = days.iter();
+    // The folder's place at each commit decides whether a leading part above
+    // the folder dates the task, and that question is answered from the same
+    // `cat-file --batch` pass that reads the archived blobs. Probe expressions
+    // come first, so every answer is known before the first blob streams.
+    let mut probes: Vec<(String, String)> = Vec::new();
+    let mut probe_slots = std::collections::HashMap::new();
+    for record in &records {
+        // A record whose leading part is the current prefix or lies inside it
+        // is accepted on its shape alone, so it needs no probe.
+        if record.leading == prefix
+            || (!prefix.is_empty() && record.leading.starts_with(&format!("{prefix}/")))
+        {
+            continue;
+        }
+        push_probe(
+            &mut probes,
+            &mut probe_slots,
+            &record.commit,
+            &record.leading,
+        );
+        if is_ancestor(&record.leading, prefix) {
+            // A leading part above the folder is rejected only when it sits
+            // above the folder's place, so probe the place chain at that commit.
+            let mut candidate = prefix;
+            loop {
+                push_probe(&mut probes, &mut probe_slots, &record.commit, candidate);
+                let Some((parent, _)) = candidate.rsplit_once('/') else {
+                    break;
+                };
+                candidate = parent;
+                if candidate.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    let probe_count = probes.len();
+    let mut exprs = Vec::with_capacity(probe_count + records.len());
+    for (commit, directory) in &probes {
+        if directory.is_empty() {
+            exprs.push(format!("{commit}:tasks"));
+        } else {
+            exprs.push(format!("{commit}:{directory}/tasks"));
+        }
+    }
+    for record in &records {
+        exprs.push(format!("{}:{}", record.commit, record.path));
+    }
+    let mut holds_tasks_tree = vec![false; probe_count];
+    // Consume one record at a time as the batch stream delivers it, folding
+    // each accepted archived status into the earliest day instead of holding
+    // the set. An expression that names no object answers `missing`, and an
+    // oversized or non-UTF-8 blob carries its own reason; each counts as no
+    // qualifying commit, so its day is skipped like a content without the
+    // expected status.
+    let mut position = 0usize;
     let mut earliest: Option<NaiveDate> = None;
     read_blobs(repo, dir, &exprs, |content| {
-        let Some(&day) = next.next() else {
+        let slot = position;
+        position += 1;
+        if slot < probe_count {
+            holds_tasks_tree[slot] = content == BlobContent::Tree;
+            return;
+        }
+        let Some(record) = records.get(slot - probe_count) else {
             return;
         };
+        let holds = |commit: &str, directory: &str| {
+            probe_slots
+                .get(&(commit.to_string(), directory.to_string()))
+                .and_then(|slot| holds_tasks_tree.get(*slot))
+                .copied()
+                .unwrap_or(false)
+        };
+        if !record_dates_folder(record, prefix, &holds) {
+            return;
+        }
         let BlobContent::Text(text) = content else {
             return;
         };
@@ -2559,11 +2670,121 @@ fn archived_leave_lookup(
             return;
         }
         earliest = Some(match earliest {
-            Some(current) => current.min(day),
-            None => day,
+            Some(current) => current.min(record.day),
+            None => record.day,
         });
     })?;
     Ok(earliest)
+}
+
+/// Record one `(commit, directory)` probe unless an earlier record already
+/// asked for it, so one `cat-file --batch` expression answers each question.
+fn push_probe(
+    probes: &mut Vec<(String, String)>,
+    slots: &mut std::collections::HashMap<(String, String), usize>,
+    commit: &str,
+    directory: &str,
+) {
+    let key = (commit.to_string(), directory.to_string());
+    if slots.contains_key(&key) {
+        return;
+    }
+    slots.insert(key, probes.len());
+    probes.push((commit.to_string(), directory.to_string()));
+}
+
+/// The directory that held the record's `tasks` tree at that commit: the part
+/// before the last `tasks` component whose remainder lies under an `archive`
+/// directory. `None` when the path holds no `tasks` tree above an `archive`
+/// directory, so the record cannot date the folder's task.
+fn archived_leading(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let index = (0..parts.len()).rev().find(|&index| {
+        parts[index] == "tasks" && is_archived_path(&parts[index + 1..].join("/"))
+    })?;
+    Some(parts[..index].join("/"))
+}
+
+/// Whether `ancestor` names a directory that holds `path` at a path-component
+/// boundary, and is not `path` itself. The empty string is the repository root.
+fn is_ancestor(ancestor: &str, path: &str) -> bool {
+    if ancestor == path {
+        return false;
+    }
+    if ancestor.is_empty() {
+        return !path.is_empty();
+    }
+    path.strip_prefix(ancestor)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a walk record's path can date the folder's task.
+///
+/// The record's leading part is the directory that held its `tasks` tree at
+/// that commit. It dates the task when it is the folder's own place under the
+/// current name, lies inside the folder (a nested `tasks/` tree charts no row
+/// of its own), or is another directory that holds a `tasks` tree at that
+/// commit, such as the folder's former name or a sibling tree. A `tasks` tree
+/// above the folder's place at that commit never dates it, so an `archive`
+/// directory above the folder dates nothing; a leading part that is the
+/// folder's place itself dates the task even when that place is an ancestor of
+/// the current prefix, because the folder was that directory then.
+///
+/// Two earlier-archive cases date the task from the commit that first archived
+/// the file. A folder-name swap, where the current name exists at an older
+/// commit as a different directory, dates from the commit that first archived
+/// the file under the old folder name. A file moved into the folder from a
+/// `tasks` tree that is not an ancestor of the current prefix, such as a
+/// sibling tree, dates from that other tree's archive commit. In both the
+/// leading part is neither the current prefix nor an ancestor of it at a
+/// path-component boundary, which is what keeps the above-folder reject to
+/// that one shape.
+fn record_dates_folder(
+    record: &ArchiveRecord,
+    prefix: &str,
+    holds_tasks_tree: &impl Fn(&str, &str) -> bool,
+) -> bool {
+    let leading = record.leading.as_str();
+    if leading == prefix {
+        return true;
+    }
+    if !prefix.is_empty() && leading.starts_with(&format!("{prefix}/")) {
+        return true;
+    }
+    if !holds_tasks_tree(&record.commit, leading) {
+        return false;
+    }
+    if !is_ancestor(leading, prefix) {
+        return true;
+    }
+    folder_place(&record.commit, prefix, holds_tasks_tree)
+        .is_some_and(|place| !is_ancestor(leading, &place))
+}
+
+/// The folder's place inside the repository at `commit`: the current prefix
+/// when it holds a `tasks` tree there, otherwise the nearest ancestor at a
+/// path-component boundary that holds one. The repository root is never a
+/// subdirectory folder's former place, so a folder below it with no such
+/// ancestor has no place at that commit.
+fn folder_place(
+    commit: &str,
+    prefix: &str,
+    holds_tasks_tree: &impl Fn(&str, &str) -> bool,
+) -> Option<String> {
+    if holds_tasks_tree(commit, prefix) {
+        return Some(prefix.to_string());
+    }
+    let mut candidate = prefix;
+    while let Some((parent, _)) = candidate.rsplit_once('/') {
+        candidate = parent;
+        if candidate.is_empty() {
+            return None;
+        }
+        if holds_tasks_tree(commit, candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 /// Report each record of a `git log -z --format=%cI %H --name-only` walk as it
@@ -2682,8 +2903,10 @@ fn is_not_a_repository_answer(line: &str) -> bool {
 /// so a row stored by r2 must not keep the Berlin wall-time leave day. r4 reads
 /// an opener with trailing whitespace, trims a quoted status before it
 /// classifies and before the archive walk matches it, skips an empty status,
-/// and warns on an unparseable `updated` instead of dropping it silently.
-const CONTENT_HASH_REVISION: &str = "r4";
+/// and warns on an unparseable `updated` instead of dropping it silently. r5
+/// dates a record by the folder's place at that commit, so a row stored before
+/// it kept a folder rename's commit day and must re-walk its leave day once.
+const CONTENT_HASH_REVISION: &str = "r5";
 
 /// The bare 64-bit FNV-1a digest of `text`. Only equality matters: a changed
 /// file changes the digest.
@@ -4305,7 +4528,7 @@ mod tests {
             "the reader revision must move past r3 so stored rows re-parse"
         );
         assert!(
-            stored.starts_with("r4:"),
+            stored.starts_with(&format!("{CONTENT_HASH_REVISION}:")),
             "the stored hash carries the current reader revision: {stored}"
         );
         assert_eq!(done.content_hash, Some(content_hash(&text)));
@@ -6899,6 +7122,522 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
         );
         assert!(task.ship_date.is_none());
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    fn utc_day(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("day")
+    }
+
+    fn commit_all(repo: &Path, message: &str, date: &str) {
+        git(repo, &["add", "-A"], date);
+        git(repo, &["commit", "-m", message], date);
+    }
+
+    #[test]
+    fn harvest_dates_a_renamed_nested_folder_from_its_first_archive_commit() {
+        // The configured folder was `proj` when the task was archived and is
+        // `proj2` now, so the archive record still carries the old prefix. The
+        // ship day stays the commit that first archived the task.
+        let parent = scratch("harvest_folder_rename");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-05T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "proj/tasks/archive/scope_one.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        commit_all(&parent, "archive", "2026-01-05T12:00:00+00:00");
+        git(
+            &parent,
+            &["mv", "proj", "proj2"],
+            "2026-02-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "rename folder", "2026-02-01T12:00:00+00:00");
+
+        let tasks = harvest_repository(&parent.join("proj2")).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Finished);
+        assert_eq!(
+            task.ship_date,
+            Some(utc_day(2026, 1, 5)),
+            "the first archive commit dates the task, not the folder rename"
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_dates_a_deeper_and_shallower_folder_move_from_its_first_archive_commit() {
+        // The folder is renamed, then moved deeper so its former name becomes
+        // an ancestor of the new prefix, then moved back to a shallower path.
+        // Each configured place dates the task from the archive commit.
+        let parent = scratch("harvest_folder_move_depth");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-05T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "proj/tasks/archive/scope_one.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        commit_all(&parent, "archive", "2026-01-05T12:00:00+00:00");
+        let at_origin = harvest_repository(&parent.join("proj")).expect("harvest at origin");
+        assert_eq!(
+            at_origin.first().expect("task").ship_date,
+            Some(utc_day(2026, 1, 5))
+        );
+
+        git(
+            &parent,
+            &["mv", "proj", "proj2"],
+            "2026-02-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "rename folder", "2026-02-01T12:00:00+00:00");
+        fs::create_dir_all(parent.join("proj2/b")).expect("deeper parent");
+        git(
+            &parent,
+            &["mv", "proj2/tasks", "proj2/b/tasks"],
+            "2026-03-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "deeper", "2026-03-01T12:00:00+00:00");
+        let deeper = harvest_repository(&parent.join("proj2/b")).expect("harvest deeper");
+        assert_eq!(
+            deeper.first().expect("task").ship_date,
+            Some(utc_day(2026, 1, 5)),
+            "the deeper move keeps the archive commit's day"
+        );
+
+        git(
+            &parent,
+            &["mv", "proj2/b/tasks", "proj2/tasks"],
+            "2026-04-01T12:00:00+00:00",
+        );
+        fs::remove_dir(parent.join("proj2/b")).expect("remove empty dir");
+        commit_all(&parent, "shallower", "2026-04-01T12:00:00+00:00");
+        let shallower = harvest_repository(&parent.join("proj2")).expect("harvest shallower");
+        assert_eq!(
+            shallower.first().expect("task").ship_date,
+            Some(utc_day(2026, 1, 5)),
+            "the shallower move keeps the archive commit's day"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_dates_a_file_renamed_inside_archive_before_the_folder_rename() {
+        let parent = scratch("harvest_archive_file_rename");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-05T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "proj/tasks/archive/scope_one.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        commit_all(&parent, "archive", "2026-01-05T12:00:00+00:00");
+        git(
+            &parent,
+            &[
+                "mv",
+                "proj/tasks/archive/scope_one.md",
+                "proj/tasks/archive/scope_one_renamed.md",
+            ],
+            "2026-01-20T12:00:00+00:00",
+        );
+        commit_all(&parent, "rename file", "2026-01-20T12:00:00+00:00");
+        git(
+            &parent,
+            &["mv", "proj", "proj2"],
+            "2026-02-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "rename folder", "2026-02-01T12:00:00+00:00");
+
+        let tasks = harvest_repository(&parent.join("proj2")).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(utc_day(2026, 1, 5)),
+            "the file's earlier name still dates from the first archive commit"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_rewalks_a_prior_row_that_kept_a_folder_renames_day() {
+        // A row stored before this walk kept the rename commit's day. Its `r4`
+        // hash mismatches the current revision, so the row re-walks once and
+        // stores the first archive commit's day.
+        let parent = scratch("harvest_folder_rename_prior");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-05T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "proj/tasks/archive/scope_one.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        commit_all(&parent, "archive", "2026-01-05T12:00:00+00:00");
+        git(
+            &parent,
+            &["mv", "proj", "proj2"],
+            "2026-02-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "rename folder", "2026-02-01T12:00:00+00:00");
+        let text = fs::read_to_string(parent.join("proj2/tasks/archive/scope_one.md"))
+            .expect("read task bytes");
+        let prior = vec![PriorTask {
+            path: "tasks/archive/scope_one.md".to_string(),
+            leave_date: Some(utc_day(2026, 2, 1)),
+            content_hash: Some(format!("r4:{}", fnv1a_digest(&text))),
+            kind: Some(TaskKind::Finished),
+            created: Some(utc_day(2026, 1, 1)),
+            ship_date: Some(utc_day(2026, 2, 1)),
+        }];
+
+        let tasks = harvest_repository_with_prior(&parent.join("proj2"), &prior)
+            .expect("harvest")
+            .tasks;
+        assert_eq!(
+            take_leave_walk_count(&parent.join("proj2")),
+            1,
+            "the stale row must re-walk its leave day once"
+        );
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(utc_day(2026, 1, 5)),
+            "the re-walk stores the first archive commit's day"
+        );
+        assert_eq!(task.leave_date, task.ship_date);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_rejects_the_repository_root_archive_for_a_nested_folder() {
+        // The file sat in the repository root's archive before it moved under
+        // `nested`, so the root archive is above the folder's place and dates
+        // nothing. The move commit dates the task.
+        let parent = scratch("harvest_root_archive_move");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-05T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "tasks/archive/x_1.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        commit_all(&parent, "root archive", "2026-01-05T12:00:00+00:00");
+        fs::create_dir_all(parent.join("nested/tasks/archive")).expect("nested archive");
+        git(
+            &parent,
+            &["mv", "tasks/archive/x_1.md", "nested/tasks/archive/x_1.md"],
+            "2026-02-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "move into nested", "2026-02-01T12:00:00+00:00");
+
+        let tasks = harvest_repository(&parent.join("nested")).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(utc_day(2026, 2, 1)),
+            "the root archive commit must not date a folder below it"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_rejects_an_ancestor_archive_for_a_folder_that_held_its_own_tasks_tree() {
+        // `a/b` held its own `tasks/` tree at the earlier commit, so `a`'s
+        // archive lies above the folder's place and the move dates the task.
+        let parent = scratch("harvest_ancestor_archive_move");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-05T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "a/tasks/archive/x_1.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        write_task_dated(
+            &parent,
+            "a/b/tasks/archive/y_1.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        commit_all(&parent, "two trees", "2026-01-05T12:00:00+00:00");
+        git(
+            &parent,
+            &["mv", "a/tasks/archive/x_1.md", "a/b/tasks/archive/x_1.md"],
+            "2026-02-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "move into a/b", "2026-02-01T12:00:00+00:00");
+
+        let tasks = harvest_repository(&parent.join("a/b")).expect("harvest");
+        let moved = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/x_1.md")
+            .expect("the moved task charts");
+        assert_eq!(
+            moved.ship_date,
+            Some(utc_day(2026, 2, 1)),
+            "the ancestor's archive must not date the folder's own tree"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_dates_a_rename_then_deeper_move_from_the_archive_commit() {
+        // `a` is renamed to `a2` while the task is archived, then the folder
+        // moves deeper to `a2/b`. The `a2` archive commit dates the task, not
+        // the deeper move.
+        let parent = scratch("harvest_rename_then_deeper");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-01T12:00:00+00:00",
+        );
+        write_task(&parent, "a/tasks/scope_x.md", "2026-01-01", "open");
+        commit_all(&parent, "live task", "2026-01-01T12:00:00+00:00");
+        git(&parent, &["mv", "a", "a2"], "2026-02-01T12:00:00+00:00");
+        fs::create_dir_all(parent.join("a2/tasks/archive")).expect("archive");
+        git(
+            &parent,
+            &["mv", "a2/tasks/scope_x.md", "a2/tasks/archive/scope_x.md"],
+            "2026-02-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "a2/tasks/archive/scope_x.md",
+            "2026-01-01",
+            "2026-02-01",
+            "finished",
+        );
+        commit_all(&parent, "rename and archive", "2026-02-01T12:00:00+00:00");
+        fs::create_dir_all(parent.join("a2/b")).expect("deeper parent");
+        git(
+            &parent,
+            &["mv", "a2/tasks", "a2/b/tasks"],
+            "2026-03-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "deeper", "2026-03-01T12:00:00+00:00");
+
+        let tasks = harvest_repository(&parent.join("a2/b")).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(utc_day(2026, 2, 1)),
+            "the former place dates the task, not the deeper move"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_dates_a_deeper_move_from_the_archive_commit_when_the_destination_lacked_tasks() {
+        // `a/b` existed as an ordinary directory with no `tasks/` tree at the
+        // archive commit, so `a` is still the folder's place then and the
+        // archive commit dates the task, not the move into `a/b`.
+        let parent = scratch("harvest_plain_destination");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-01T12:00:00+00:00",
+        );
+        write_task(&parent, "a/tasks/scope_x.md", "2026-01-01", "open");
+        write_task(&parent, "a/b/notes.txt", "2026-01-01", "open");
+        commit_all(&parent, "live and notes", "2026-01-01T12:00:00+00:00");
+        fs::create_dir_all(parent.join("a/tasks/archive")).expect("archive");
+        git(
+            &parent,
+            &["mv", "a/tasks/scope_x.md", "a/tasks/archive/scope_x.md"],
+            "2026-02-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "a/tasks/archive/scope_x.md",
+            "2026-01-01",
+            "2026-02-01",
+            "finished",
+        );
+        commit_all(&parent, "archive", "2026-02-01T12:00:00+00:00");
+        fs::create_dir_all(parent.join("a/b/tasks")).expect("destination tasks");
+        git(
+            &parent,
+            &["mv", "a/tasks", "a/b/tasks"],
+            "2026-03-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "deeper", "2026-03-01T12:00:00+00:00");
+
+        let tasks = harvest_repository(&parent.join("a/b")).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(utc_day(2026, 2, 1)),
+            "the archive commit dates the task; the destination was no place then"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_dates_a_nested_tasks_tree_inside_the_folder_from_its_archive_commit() {
+        // The file first lived under a nested `tasks/` tree inside the folder,
+        // which charts no row of its own, so its archive commit still dates the
+        // task the folder's own tree charts after the move.
+        let parent = scratch("harvest_nested_tree_inside");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-05T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "a/b/c/tasks/archive/x_1.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        commit_all(&parent, "nested tree", "2026-01-05T12:00:00+00:00");
+        fs::create_dir_all(parent.join("a/b/tasks/archive")).expect("folder archive");
+        git(
+            &parent,
+            &[
+                "mv",
+                "a/b/c/tasks/archive/x_1.md",
+                "a/b/tasks/archive/x_1.md",
+            ],
+            "2026-02-01T12:00:00+00:00",
+        );
+        commit_all(
+            &parent,
+            "move into folder tree",
+            "2026-02-01T12:00:00+00:00",
+        );
+
+        let tasks = harvest_repository(&parent.join("a/b")).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(utc_day(2026, 1, 5)),
+            "the nested tree's archive commit dates the task"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_dates_a_folder_name_swap_from_the_earlier_archive_commit() {
+        // `proj2` is the current name, but at the earlier commit it was a
+        // different directory. The task was archived under `proj`, so that
+        // commit dates it, not the swap.
+        let parent = scratch("harvest_folder_swap");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-05T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "proj/tasks/archive/scope_one.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        write_task_dated(
+            &parent,
+            "proj2/tasks/archive/other_1.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        commit_all(&parent, "two folders", "2026-01-05T12:00:00+00:00");
+        git(&parent, &["mv", "proj", "tmp"], "2026-02-01T12:00:00+00:00");
+        git(
+            &parent,
+            &["mv", "proj2", "proj"],
+            "2026-02-01T12:00:00+00:00",
+        );
+        git(
+            &parent,
+            &["mv", "tmp", "proj2"],
+            "2026-02-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "swap names", "2026-02-01T12:00:00+00:00");
+
+        let tasks = harvest_repository(&parent.join("proj2")).expect("harvest");
+        let task = tasks
+            .iter()
+            .find(|task| task.path == "tasks/archive/scope_one.md")
+            .expect("the swapped task charts");
+        assert_eq!(
+            task.ship_date,
+            Some(utc_day(2026, 1, 5)),
+            "the old folder name's archive commit dates the task"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn harvest_dates_a_file_moved_in_from_a_sibling_tasks_tree() {
+        // The file was archived in `other`, which is neither the folder nor an
+        // ancestor of it, so that tree's archive commit dates the task.
+        let parent = scratch("harvest_sibling_tree");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-01-05T12:00:00+00:00",
+        );
+        write_task_dated(
+            &parent,
+            "other/tasks/archive/scope_one.md",
+            "2026-01-01",
+            "2026-01-01",
+            "finished",
+        );
+        commit_all(&parent, "sibling archive", "2026-01-05T12:00:00+00:00");
+        fs::create_dir_all(parent.join("folder/tasks/archive")).expect("folder archive");
+        git(
+            &parent,
+            &[
+                "mv",
+                "other/tasks/archive/scope_one.md",
+                "folder/tasks/archive/scope_one.md",
+            ],
+            "2026-02-01T12:00:00+00:00",
+        );
+        commit_all(&parent, "move into folder", "2026-02-01T12:00:00+00:00");
+
+        let tasks = harvest_repository(&parent.join("folder")).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(
+            task.ship_date,
+            Some(utc_day(2026, 1, 5)),
+            "the sibling tree's archive commit dates the task"
+        );
         let _ = fs::remove_dir_all(&parent);
     }
 
