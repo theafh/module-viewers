@@ -2,8 +2,8 @@
 description: "Date an archived non-finished task from the earliest commit across every accepted status spelling, not the first spelling that hits."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T16:05:05Z
-status: implemented
+updated: 2026-11-25T16:07:00Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -25,7 +25,7 @@ for (flag, pattern) in patterns {
         return Ok(Some(day));
 ```
 
-The patterns are the bare `status: <value>`, the double-quoted form, the single-quoted form, and an anchored `-G` form. A two-commit fixture where the first commit writes `status: "open"` and the second writes `status: open` returns the second commit's day, because the bare `-S` pattern hits only the later commit and is tried first, while the quoted patterns and the anchored `-G` both reach the earlier commit. `leave_dates` sends every archived status other than `finished` and `deferred` to this function, so the wrong day reaches the deferred weekly bar and the stored leave day. The pattern set itself was settled by [the padded-status task](archive/task-viewer_pickaxe-padded-status.md); this task changes how the hits are combined.
+The patterns are the bare `status: <value>`, the double-quoted form, the single-quoted form, and an anchored `-G` form. A two-commit fixture where the first commit writes `status: "open"` and the second writes `status: open` returns the second commit's day, because the bare `-S` pattern hits only the later commit and is tried first, while the quoted patterns and the anchored `-G` both reach the earlier commit. `leave_dates` sends every archived status other than `finished` and `deferred` to this function, so the wrong day reaches the deferred weekly bar and the stored leave day. The pattern set itself was settled by [the padded-status task](task-viewer_pickaxe-padded-status.md); this task changes how the hits are combined.
 
 ## Approach
 
