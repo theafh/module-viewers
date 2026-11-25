@@ -2,9 +2,11 @@
 description: "Refuse a canonical folder path that is not valid UTF-8 instead of storing a lossy path that fails every later scan, and check UTF-8 after canonicalization."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-24T22:41:46Z
-status: ready
+updated: 2026-11-25T02:56:00Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Canonical path must be UTF-8
@@ -32,10 +34,12 @@ macOS rejects a non-UTF-8 directory name outright, so the trigger is Linux plus 
 ## Approach
 
 1. Add one helper that turns a canonical `&Path` into the stored `String` and returns the UTF-8-refusal banner when the path does not convert. Use `Path::to_str`, not `to_string_lossy`.
-2. Call it after `canonicalize` in `choose_folder`, so Add, Relocate, and the confirm path all share the check. Log the refused canonical path with the same error line shape the picker-bytes branch uses.
+2. Call it after `canonicalize` in `choose_folder`, so Add and Relocate both refuse before the `tasks/` probe. Log the refused canonical path with the same error line shape the picker-bytes branch uses.
 3. Leave the picker-bytes check in place; it still catches a non-UTF-8 pick before the filesystem probe.
-4. Return the validated text from `choose_folder` beside the `PathBuf`, and store that text in `store_added`, `store_repository`, and `relocate_repository`, replacing the three `to_string_lossy` conversions. The `path-exists` lookup then reads the same string that will be stored.
-5. Update the guardrail sentences that state the refusal condition: `FEATURES.md` section 3's picker paragraph and `ARCHITECTURE.md`'s Add/Relocate component sentence both name the canonical path as the refused one.
+4. Replace the three `to_string_lossy` conversions by calling the helper at each site: `store_added` converts its `&Path` once for the `path-exists` lookup, `relocate_repository` converts the canonical `PathBuf` for the already-stored comparison, the `path-exists` lookup, and `update_repository_path`, and `store_repository` converts its `&Path` at the top of the function and returns the refusal banner through its existing `Result<(), Banner>`. `store_repository` derives the text instead of taking it as a parameter, because `confirm_repository` calls it with a `PathBuf` from `HeldClone` and never goes through `choose_folder`; `HeldClone`, `HeldCloneStore::insert`, `AddOutcome::DuplicateClone`, `add_repository`, and `confirm_repository` therefore keep their current `PathBuf` shapes and need no signature change. `choose_folder` has already refused a non-UTF-8 canonical path before a clone is held, so the derivation in `store_repository` is the same check reaching the confirm route rather than a second decision.
+5. Fold the new refusal into the sentences that already enumerate the picker's refusals, rewriting each one in place rather than appending a new sentence beside it.
+   - `FEATURES.md` section 3's Add paragraph already ends its refusal list with "a picked path that is not valid UTF-8 is refused with `path-not-utf8` instead of being stored lossily"; widen that clause so it records both refusals — the pick's and its canonical path's — rather than replacing the picked path with the canonical one: "a picked path that is not valid UTF-8, or a pick whose canonical path is not, is refused with `path-not-utf8` instead of being stored lossily".
+   - `ARCHITECTURE.md`'s "Relocate is `POST /repositories/{id}/path`" sentence enumerates refusals as "canonicalizes and probes the pick as Add does, refuses a path another repository already stores, writes the new path for that id, and re-harvests that repository alone". It states no UTF-8 refusal today, so there is no existing clause to reword: add the invalid-UTF-8 refusal of the canonical path into that same enumeration, between "probes the pick as Add does" and "refuses a path another repository already stores", so the sentence still reads as one account of what Relocate does with the pick.
 6. Add a unix test that builds a `PathBuf` from bytes holding an invalid sequence and asserts the helper returns the refusal banner, plus a test that a normal canonical path stores its exact text.
 
 **Out of scope:**
@@ -46,7 +50,7 @@ macOS rejects a non-UTF-8 directory name outright, so the trigger is Linux plus 
 ## Acceptance
 
 - [ ] A canonical path that is not valid UTF-8 is refused with the `path-not-utf8` banner by both Add and Relocate, and nothing is stored.
-- [ ] The stored path for a valid folder is its exact canonical text, so the existing exact-path Add test still passes unchanged.
+- [ ] No `to_string_lossy` conversion of a canonical path survives in `store_added`, `store_repository`, or `relocate_repository`: `rg -n 'to_string_lossy' task-viewer/src/web.rs` returns only the `static_version` component join and test code. Any non-test hit on a canonical path fails this item, and the existing exact-path Add test (`web_add_stores_a_non_ascii_path_with_a_trailing_newline`) still passes unchanged.
 - [ ] A unix test exercises the conversion helper with a `PathBuf` built from invalid bytes and with a normal path.
 - [ ] `FEATURES.md` and `ARCHITECTURE.md` name the canonical path as the one refused for invalid UTF-8.
 - [ ] `make lint` and `make test` pass.

@@ -1716,9 +1716,10 @@ struct ProjectView {
 }
 
 /// What one folder-picking step produced: a canonical folder that passed the
-/// `tasks/` probe, or a dialog the person dismissed.
+/// `tasks/` probe, or a dialog the person dismissed. The validated text travels
+/// beside the path so Relocate compares and stores it without converting again.
 enum ChosenFolder {
-    Chosen(PathBuf),
+    Chosen { path: PathBuf, text: String },
     Cancelled,
 }
 
@@ -1793,6 +1794,21 @@ async fn choose_folder(state: &AppState) -> Result<ChosenFolder, Banner> {
         }
     };
 
+    // The picker's bytes were valid UTF-8, but `canonicalize` can still resolve
+    // through a symlink to a directory name holding an invalid byte. A lossy
+    // conversion would name no directory and fail every later scan, so the
+    // resolved folder is refused before the `tasks/` probe.
+    let text = match canonical_path_text(&canonical) {
+        Ok(text) => text,
+        Err(banner) => {
+            tracing::error!(
+                path = %canonical.display(),
+                "the canonical folder path is not valid UTF-8"
+            );
+            return Err(banner);
+        }
+    };
+
     // The working-tree half of the `tasks/` disjunction, probed off the async
     // worker. A probe that fails for a reason other than a missing directory
     // is an unreadable folder, not a missing tasks tree.
@@ -1840,12 +1856,15 @@ async fn choose_folder(state: &AppState) -> Result<ChosenFolder, Banner> {
             }
         }
     }
-    Ok(ChosenFolder::Chosen(canonical))
+    Ok(ChosenFolder::Chosen {
+        path: canonical,
+        text,
+    })
 }
 
 async fn add_repository(State(state): State<AppState>) -> Response {
     let canonical = match choose_folder(&state).await {
-        Ok(ChosenFolder::Chosen(path)) => path,
+        Ok(ChosenFolder::Chosen { path, .. }) => path,
         Ok(ChosenFolder::Cancelled) => return Redirect::to("/repositories").into_response(),
         Err(banner) => return redirect_repositories(banner),
     };
@@ -1892,7 +1911,7 @@ enum AddOutcome {
 /// duplicates. The exact stored path is still refused first, so adding the same
 /// folder twice keeps its existing message instead of reading as a clone.
 async fn store_added(state: &AppState, path: &std::path::Path) -> Result<AddOutcome, Banner> {
-    let path_text = path.to_string_lossy();
+    let path_text = canonical_path_text(path)?;
     if db::path_exists(&state.pool, &path_text)
         .await
         .map_err(|_| Banner::RepositoryListUnreadable)?
@@ -1968,12 +1987,20 @@ fn decode_picked_path(raw: &[u8]) -> Result<&str, Banner> {
     })
 }
 
+/// The stored text of a canonical folder path. `Path::to_str` is used rather
+/// than a lossy conversion, so a canonical path holding an invalid byte is
+/// refused with `path-not-utf8` instead of being stored as a path that names no
+/// directory and fails every later scan.
+fn canonical_path_text(path: &std::path::Path) -> Result<String, Banner> {
+    path.to_str().map(str::to_owned).ok_or(Banner::PathNotUtf8)
+}
+
 /// Store one already-chosen folder as a repository and refresh its rows. A
 /// failed first harvest keeps the repository and its scan error and returns
 /// that error's banner, so Add can report the failure instead of a success.
 /// The detached Add store task holds the scan lock across this call.
 async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<(), Banner> {
-    let path_text = path.to_string_lossy().into_owned();
+    let path_text = canonical_path_text(path)?;
     if db::path_exists(&state.pool, &path_text)
         .await
         .map_err(|_| Banner::RepositoryListUnreadable)?
@@ -2046,8 +2073,8 @@ async fn scan_repository(State(state): State<AppState>, Path(id): Path<i64>) -> 
 /// repository is re-harvested, under the scan lock, so its rows read the new
 /// folder and its scan stamp is fresh.
 async fn relocate_repository(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    let canonical = match choose_folder(&state).await {
-        Ok(ChosenFolder::Chosen(path)) => path,
+    let (canonical, path_text) = match choose_folder(&state).await {
+        Ok(ChosenFolder::Chosen { path, text }) => (path, text),
         Ok(ChosenFolder::Cancelled) => return Redirect::to("/repositories").into_response(),
         Err(banner) => return redirect_repositories(banner),
     };
@@ -2065,10 +2092,9 @@ async fn relocate_repository(State(state): State<AppState>, Path(id): Path<i64>)
     else {
         return redirect_repositories(Banner::RepositoryNotFound);
     };
-    let path_text = canonical.to_string_lossy();
     // Relocating to the folder the repository already stores re-harvests it
     // rather than reporting a collision with itself.
-    if repository.path.as_str() != path_text.as_ref() {
+    if repository.path.as_str() != path_text.as_str() {
         match db::path_exists(&state.pool, &path_text).await {
             Ok(true) => return redirect_repositories(Banner::RepositoryPathTaken),
             Ok(false) => {}
@@ -2756,13 +2782,13 @@ mod tests {
     use super::{
         AppState, Banner, FLASH_CAPACITY, FlashQuery, FlashStore, GIT_ERROR, HarvestFn, HomeQuery,
         MISSING_TASKS_ERROR, PickerFn, PickerResult, PriorReadHookFn, ProjectForm, STOPPED_ERROR,
-        ScanFailure, ScanReport, StoreHookFn, add_repository, claim_banner, confirm_repository,
-        encode_query, flash_banner, human_stamp, init_templates, is_local_host, local_offset,
-        osascript_outcome, query_banner, record_scan_error, relocate_repository, remaining,
-        remove_repository, render_blocking_thread, render_home, render_repositories_at, router,
-        scan_all, scan_core, scan_flash, scan_instant, scan_label_at, scan_response,
+        ScanFailure, ScanReport, StoreHookFn, add_repository, canonical_path_text, claim_banner,
+        confirm_repository, encode_query, flash_banner, human_stamp, init_templates, is_local_host,
+        local_offset, osascript_outcome, query_banner, record_scan_error, relocate_repository,
+        remaining, remove_repository, render_blocking_thread, render_home, render_repositories_at,
+        router, scan_all, scan_core, scan_flash, scan_instant, scan_label_at, scan_response,
         scan_worker_cap, serve, serve_until_stopped, static_version, store_hook_from,
-        zenity_outcome,
+        store_repository, zenity_outcome,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -7597,6 +7623,59 @@ mod tests {
                 .expect("list")
                 .is_empty(),
             "a later Update does not fail on the refused path"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// A canonical path holding an invalid byte is refused with the UTF-8
+    /// banner rather than converted lossily, while a normal canonical path
+    /// keeps its exact text.
+    #[cfg(unix)]
+    #[test]
+    fn web_canonical_path_text_refuses_a_non_utf8_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = PathBuf::from(OsString::from_vec(b"/tmp/repo-\xFF".to_vec()));
+        assert_eq!(
+            canonical_path_text(&invalid),
+            Err(Banner::PathNotUtf8),
+            "a canonical path that is not valid UTF-8 is refused"
+        );
+
+        let normal = PathBuf::from("/tmp/repo Ä space");
+        assert_eq!(
+            canonical_path_text(&normal),
+            Ok("/tmp/repo Ä space".to_string()),
+            "a normal path keeps its exact text"
+        );
+    }
+
+    /// The confirm route stores a held path without going through
+    /// `choose_folder`, so a path holding an invalid byte is refused there too
+    /// and no repository row is written.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_store_repository_refuses_a_non_utf8_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let (state, path) = app_state("store_non_utf8").await;
+        let folder = unique_temp_dir("store_non_utf8_repo").join("Repo Ä space");
+        std::fs::create_dir_all(folder.join("tasks")).expect("tasks");
+        let mut bytes = folder.as_os_str().as_encoded_bytes().to_vec();
+        bytes.push(0xFF);
+        let invalid = PathBuf::from(OsString::from_vec(bytes));
+
+        let result = store_repository(&state, &invalid).await;
+        assert_eq!(result, Err(Banner::PathNotUtf8));
+        assert!(
+            db::list_repositories(&state.pool)
+                .await
+                .expect("list")
+                .is_empty(),
+            "no repository row exists for the refused canonical path"
         );
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
