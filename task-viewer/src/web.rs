@@ -7762,6 +7762,61 @@ mod tests {
         (state, path)
     }
 
+    /// Covers: every page the base template renders carries exactly one `main`
+    /// landmark with the `container` class, no page keeps the old
+    /// `<div class="container">`, the site nav stays outside that main element,
+    /// and the page header is a descendant of it, so the header no longer takes
+    /// the banner landmark.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_every_page_has_one_main_landmark() {
+        let (state, path) = app_state("main_landmark").await;
+        for route in ["/", "/repositories", "/tasks"] {
+            let body =
+                body_text(send(state.clone(), get_page(route, "127.0.0.1:7880")).await).await;
+            assert_eq!(
+                body.matches("<main").count(),
+                1,
+                "{route} renders exactly one main element"
+            );
+            let main_open = body.find("<main class=\"container\">").unwrap_or_else(|| {
+                panic!("{route} opens a main element carrying class=\"container\"")
+            });
+            let main_close = body
+                .find("</main>")
+                .unwrap_or_else(|| panic!("{route} closes its main element"));
+            assert!(
+                main_open < main_close,
+                "{route} closes its main element after it opens"
+            );
+            assert!(
+                !body.contains("<div class=\"container\">"),
+                "{route} keeps no div carrying the container class"
+            );
+            let nav_open = body
+                .find("<nav class=\"navbar\">")
+                .unwrap_or_else(|| panic!("{route} renders the site nav"));
+            let nav_close = body
+                .find("</nav>")
+                .unwrap_or_else(|| panic!("{route} closes the site nav"));
+            assert!(
+                nav_close < main_open,
+                "{route} keeps the site nav outside and before the main element"
+            );
+            assert!(
+                nav_open < nav_close,
+                "{route} closes the site nav after it opens"
+            );
+            let header = body
+                .find("class=\"page-header\"")
+                .unwrap_or_else(|| panic!("{route} renders the page header"));
+            assert!(
+                main_open < header && header < main_close,
+                "{route} keeps the page header inside the main element"
+            );
+        }
+        cleanup(&path);
+    }
+
     fn redirect_location(response: &axum::response::Response) -> String {
         response
             .headers()

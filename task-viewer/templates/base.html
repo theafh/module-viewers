@@ -24,9 +24,9 @@
             <button class="btn btn-secondary" id="theme-toggle" type="button" aria-pressed="true">Dark theme</button>
         </div>
     </nav>
-    <div class="container">
+    <main class="container">
         {% block content %}{% endblock %}
-    </div>
+    </main>
     <script src="/static/js/theme.js?v={{ version }}"></script>
     {% block scripts %}{% endblock %}
 </body>
