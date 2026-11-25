@@ -61,18 +61,27 @@ LAUNCHER_NAME=$(basename "${BASH_SOURCE[0]}")
 canonical_path() {
     local path="$1" dir
     [ -n "$path" ] || return 1
-    dir=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || return 1
-    printf '%s\n' "$dir/$(basename "$path")"
+    # `--` before the operand: a token that looks like an option (`-x`,
+    # `--noprofile`) is a filename here, and dirname would reject it as a flag.
+    dir=$(cd "$(dirname -- "$path")" 2>/dev/null && pwd -P) || return 1
+    printf '%s\n' "$dir/$(basename -- "$path")"
 }
 
 # Resolve a token to the file it names, following the final component through
 # `readlink` while it stays a symlink and joining a relative target to the
 # directory that holds it. `readlink` rather than `realpath`, which the installed
-# app's macOS 11 floor may lack. Prints nothing when the walk fails.
+# app's macOS 11 floor may lack. Prints nothing when the walk fails, and a walk
+# longer than `RESOLVE_HOPS` is a failure too, so a symlink cycle ends as one
+# instead of spinning the waiter forever.
+RESOLVE_HOPS=40
 resolve_path() {
-    local path target
+    local path target hops=0
     path=$(canonical_path "$1") || return 1
     while [ -L "$path" ]; do
+        if [ "$hops" -ge "$RESOLVE_HOPS" ]; then
+            return 1
+        fi
+        hops=$((hops + 1))
         target=$(readlink "$path" 2>/dev/null) || return 1
         [ -n "$target" ] || return 1
         case "$target" in
@@ -100,20 +109,25 @@ LAUNCHER_SELF=$(launcher_self_path)
 # True when a command line names this launcher. Every whitespace-separated token
 # is resolved and compared with this launcher's own resolved path, because a real
 # holder's line can carry the launcher behind an interpreter
-# (`bash --noprofile --norc <launcher> status`). A token whose walk fails falls
-# back to its basename, so a launcher invoked under its own name from any
-# directory still matches, while an alias whose basename differs is decided by
-# the walk instead.
+# (`bash --noprofile --norc <launcher> status`). A token the walk cannot resolve
+# to an existing file, and a bare name that carries no `/` at all, falls back to
+# the basename comparison, so a holder recorded as `bash ./task-viewer.sh` from
+# its own directory, or invoked by its bare name, is still waited for; a token
+# that does resolve to another existing file is decided by the walk, so an alias
+# pointing at a different launcher is not mistaken for this one.
 names_launcher() {
     local line="$1" token resolved
     [ -n "$line" ] || return 1
     # Word splitting is the point: each token is compared on its own.
     for token in $line; do
-        if resolved=$(resolve_path "$token"); then
+        if resolved=$(resolve_path "$token") && [ -e "$resolved" ]; then
             [ "$resolved" = "$LAUNCHER_SELF" ] && return 0
-        elif [ "$(basename "$token")" = "$LAUNCHER_NAME" ]; then
-            return 0
+            # A path that exists and is not this launcher is another program's.
+            case "$token" in
+                */*) continue ;;
+            esac
         fi
+        [ "$(basename -- "$token")" = "$LAUNCHER_NAME" ] && return 0
     done
     return 1
 }
