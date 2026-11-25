@@ -2,8 +2,8 @@
 description: "Stop the launcher from wedging on a stale lock whose PID was reused, and make a restart that cannot stop the old server fail instead of reporting success."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-25T00:15:31Z
-status: implemented
+updated: 2026-11-25T00:18:33Z
+status: finished
 implemented-by: Andreas Hoffmann
 design-extended: false
 reported-by: Andreas Hoffmann
