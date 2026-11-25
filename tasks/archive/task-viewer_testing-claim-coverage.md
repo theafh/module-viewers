@@ -17,7 +17,7 @@ The suite proves four behaviours `TESTING.md` already claims: a SIGINT that arri
 
 ## Context
 
-- `task-viewer/tests/graceful_shutdown.rs` loops over `["TERM", "INT"]`, but only the TERM arm holds a store open; the INT arm starts a server with no store, so an INT path that dropped a held store would pass.
+- `task-viewer/tests/graceful_shutdown.rs` loops over `["TERM", "INT"]` in `task_viewer_exits_on_sigterm_and_sigint`, but both arms start a server with no store open, and the in-flight-store test covers TERM only, so an INT path that dropped a held store would pass.
 - `human_stamp` in `task-viewer/src/web.rs` returns the raw stamp when it does not parse, but the only unparseable-stamp test drives `scan_label_at` and the page test uses parseable stamps, so deleting the raw-text return passes.
 - Every radar test that reads ring labels uses a peak that is already an exact multiple of four (4, 300, 8), so neither the `Math.ceil(count / 4) * 4` rounding nor the floor of four is exercised.
 - `git_scan_message` in `task-viewer/src/web.rs` takes the first line, trims it, and cuts it at 200 characters, but the only test asserts a prefix and a short substring, so removing the line cut, the trim, or the 200-character cap passes.

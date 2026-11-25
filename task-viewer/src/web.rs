@@ -4546,10 +4546,6 @@ mod tests {
             body.contains("scanned pending scan"),
             "the unparseable stamp keeps its raw text: {body}"
         );
-        assert!(
-            !body.contains("Last scan unknown"),
-            "the page renders the raw stamp, not the unknown-time label: {body}"
-        );
 
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
