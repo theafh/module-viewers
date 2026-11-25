@@ -46,22 +46,75 @@ chmod 600 "$PID_FILE" "$LOG_FILE" "$BUILD_LOG" "$STAMP_FILE" 2>/dev/null
 
 # One command at a time. The lock is a directory because `mkdir` is atomic on
 # macOS and Linux, and `flock` is absent on macOS. The PID recorded inside
-# names the holder, so a holder that died is reclaimed instead of wedging the
-# launcher forever.
+# names the holder, and the command line beside it names the launcher that took
+# it, so a holder that died is reclaimed instead of wedging the launcher forever.
 LOCK_HELD=0
 # The name this launcher runs under. A holder records its command line beside the
-# lock PID, and a waiter requires that line to carry this name before waiting, so
-# a live PID the system reused is reclaimed instead of waited for forever.
+# lock PID, and a waiter compares that line, and the live process's own line,
+# against this launcher's resolved path, so a live PID the system reused is
+# reclaimed instead of waited for forever.
 LAUNCHER_NAME=$(basename "${BASH_SOURCE[0]}")
 
-# True when a recorded holder command line names this launcher. A live PID alone
-# is not a holder: PIDs are reused, and a reused one must be reclaimed rather
-# than waited for forever.
-holder_is_launcher() {
-    [ -n "$1" ] || return 1
-    case "$1" in
-        *"$LAUNCHER_NAME"*) return 0 ;;
+# Canonicalise a path's directory and keep its final component, so a relative
+# symlink target carrying `..` collapses here instead of surviving into a
+# comparison.
+canonical_path() {
+    local path="$1" dir
+    [ -n "$path" ] || return 1
+    dir=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || return 1
+    printf '%s\n' "$dir/$(basename "$path")"
+}
+
+# Resolve a token to the file it names, following the final component through
+# `readlink` while it stays a symlink and joining a relative target to the
+# directory that holds it. `readlink` rather than `realpath`, which the installed
+# app's macOS 11 floor may lack. Prints nothing when the walk fails.
+resolve_path() {
+    local path target
+    path=$(canonical_path "$1") || return 1
+    while [ -L "$path" ]; do
+        target=$(readlink "$path" 2>/dev/null) || return 1
+        [ -n "$target" ] || return 1
+        case "$target" in
+            /*) path="$target" ;;
+            *)  path="$(dirname "$path")/$target" ;;
+        esac
+        path=$(canonical_path "$path") || return 1
+    done
+    printf '%s\n' "$path"
+}
+
+# This launcher's own resolved path. `BASH_SOURCE[0]` may be a bare name when the
+# launcher is reached through `PATH`, so resolve it through `command -v` first; an
+# invoked name carrying a `/` already names a file.
+launcher_self_path() {
+    local self="${BASH_SOURCE[0]}"
+    case "$self" in
+        */*) ;;
+        *) self=$(command -v "$self" 2>/dev/null) || self="${BASH_SOURCE[0]}" ;;
     esac
+    resolve_path "$self"
+}
+LAUNCHER_SELF=$(launcher_self_path)
+
+# True when a command line names this launcher. Every whitespace-separated token
+# is resolved and compared with this launcher's own resolved path, because a real
+# holder's line can carry the launcher behind an interpreter
+# (`bash --noprofile --norc <launcher> status`). A token whose walk fails falls
+# back to its basename, so a launcher invoked under its own name from any
+# directory still matches, while an alias whose basename differs is decided by
+# the walk instead.
+names_launcher() {
+    local line="$1" token resolved
+    [ -n "$line" ] || return 1
+    # Word splitting is the point: each token is compared on its own.
+    for token in $line; do
+        if resolved=$(resolve_path "$token"); then
+            [ "$resolved" = "$LAUNCHER_SELF" ] && return 0
+        elif [ "$(basename "$token")" = "$LAUNCHER_NAME" ]; then
+            return 0
+        fi
+    done
     return 1
 }
 
@@ -93,7 +146,7 @@ require_lock_ownership() {
 # reclaim, so a waiter slow enough to rename a fresh lock the winner already
 # created puts that lock back instead of deleting it.
 acquire_lock() {
-    local holder holder_cmd self_cmd stale missing_retries=0
+    local holder holder_cmd self_cmd stale missing_retries=0 live_cmd
     while :; do
         if mkdir "$LOCK_DIR" 2>/dev/null; then
             LOCK_HELD=1
@@ -108,13 +161,18 @@ acquire_lock() {
         fi
         holder=$(cat "$LOCK_DIR/pid" 2>/dev/null)
         holder_cmd=$(cat "$LOCK_DIR/cmd" 2>/dev/null)
-        # A live PID is a holder only when its recorded command line names this
-        # launcher; otherwise the PID was reused by an unrelated program, and
-        # waiting on it would wedge the launcher forever.
-        if [ -n "$holder" ] && holder_is_launcher "$holder_cmd" &&
+        # A live PID is a holder only when both its recorded command line and the
+        # live process's own command line name this launcher. The recorded line
+        # survives from a dead holder, so the live line decides; a live read that
+        # fails (empty) is not read as "not a holder", because reclaiming a real
+        # holder would run two commands at once.
+        if [ -n "$holder" ] && names_launcher "$holder_cmd" &&
             kill -0 "$holder" 2>/dev/null; then
-            sleep 0.1
-            continue
+            live_cmd=$(ps -ww -p "$holder" -o args= 2>/dev/null)
+            if [ -z "$live_cmd" ] || names_launcher "$live_cmd"; then
+                sleep 0.1
+                continue
+            fi
         fi
         # No recorded PID or command line is the short window between `mkdir` and
         # the writes, so give the holder a moment before treating it as stale.
@@ -292,7 +350,9 @@ build_binary() {
 start_binary() {
     if is_running && is_outdated; then
         echo "A newer task-viewer binary exists; restarting on it."
-        do_stop
+        # A stop that cannot take the old server down is not a restart: report it
+        # instead of falling through to the already-running success below.
+        do_stop || return 1
     fi
     if is_running; then
         echo "task-viewer is already running (PID: $(get_pid))"

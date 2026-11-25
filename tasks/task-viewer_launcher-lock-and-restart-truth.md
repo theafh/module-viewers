@@ -2,8 +2,10 @@
 description: "Stop the launcher from wedging on a stale lock whose PID was reused, and make a restart that cannot stop the old server fail instead of reporting success."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-24T22:41:46Z
-status: ready
+updated: 2026-11-25T00:15:31Z
+status: implemented
+implemented-by: Andreas Hoffmann
+design-extended: false
 reported-by: Andreas Hoffmann
 ---
 
@@ -51,10 +53,10 @@ Two constraints shape the lock fix. The script already treats a failed `ps` read
 
 1. In `acquire_lock`, read the live command line with `ps -ww -p "$holder" -o args=`. Wait when the recorded line names the launcher, the PID is alive, and either the live line also names the launcher or the live read failed (empty). Fall through to the reclaim path only when the live read succeeded and does not name the launcher.
 2. Leave the missing-record grace block unchanged, and keep its retry count.
-3. Resolve the launcher path inside a command line before comparing: resolve both the holder's token and the waiter's own script path through their symlinks (for example `realpath`), and fall back to the basename only when a token cannot be resolved. This recognises the same launcher reached through a symlinked alias instead of reclaiming a live holder.
+3. Settle what "names the launcher" means, and use one definition for both the recorded line and the live line: a command line names the launcher when any whitespace-separated token, resolved, equals the resolved own script path — compare every token rather than only the first, because a real holder's line can carry the launcher behind an interpreter (`bash --noprofile --norc <launcher> status`). Resolve a token with mechanisms the launcher's declared floor already carries: resolve its directory with `cd "$(dirname "$token")" && pwd -P` and follow the final component through `readlink` while it stays a symlink, joining a relative target to the directory that holds it; resolve the waiter's own `${BASH_SOURCE[0]}` the same way, through `command -v` first when the invoked name carries no `/`. Normalise both resolved paths through `cd "$(dirname "$path")" && pwd -P` immediately before comparing them, so a relative symlink target carrying `..` collapses to its canonical directory instead of surviving into the comparison, and fall back to a token's basename only when its walk fails, so the fallback recognises a launcher invoked under its own name from any directory and not an alias whose basename differs — the alias case is decided by the walk, which uses `readlink` rather than `realpath`, which the installed app's `LSMinimumSystemVersion` 11.0 floor (`scripts/install-desktop.sh`) may lack. This recognises the same launcher reached through a symlinked alias instead of reclaiming a live holder.
 4. In `start_binary`, make the restart branch propagate a failed stop: `do_stop || return 1`. The `toggle` and `restart` callers already return `start_binary`'s status.
 5. Update the header comments that describe the recorded-line-only rule, and extend `TESTING.md`'s launcher bullet with the recorded-and-live rule, the resolved-alias case, and the restart-failure behaviour the next item adds.
-6. Add cases in `task-viewer/tests/launcher_process_safety.rs` for the reused-PID wedge and the alias, and a sourced-driver case in `task-viewer/src/launcher_tests.rs` for a restart whose stop fails. Bound each wait with a timeout so a regression fails the test instead of hanging the suite.
+6. Add cases in `task-viewer/tests/launcher_process_safety.rs` for the reused-PID wedge and the alias, and sourced-driver cases in `task-viewer/src/launcher_tests.rs` for a restart whose stop fails and for a holder whose live `ps` read comes back empty (stubbing `ps` over the lock wait, as `IS_OURS_DRIVER` already stubs it for `is_ours`). Bound each wait with a timeout so a regression fails the test instead of hanging the suite.
 
 **Out of scope:**
 
@@ -65,6 +67,6 @@ Two constraints shape the lock fix. The script already treats a failed `ps` read
 
 - [ ] A process-level case writes a lock directory whose `pid` names a live unrelated process and whose `cmd` names the launcher, runs `status` under a bounded wait, and asserts it exits with the stopped status instead of timing out; the case hangs on the current script.
 - [ ] A launcher case stubs the stop helper to return 1 on the outdated-binary branch and asserts `start` exits non-zero and prints no "already running" line.
-- [ ] A live holder whose `ps` read fails is still waited for, and the missing-record grace case stays green.
-- [ ] A symlinked alias of the script running concurrently with the canonical path serialises on the lock instead of reclaiming it.
+- [ ] A sourced-driver case writes a lock whose `pid` names a live process and whose `cmd` names the launcher, stubs `ps` to print nothing for that PID, and runs `acquire_lock` in the background: after a fixed window the lock still records the holder's PID, and once the lock is released the call acquires it and proceeds; the case fails against an implementation that reads an empty live read as "not a holder", and `launcher_status_waits_for_the_lock_holder` stays green.
+- [ ] While a canonical-path invocation holds the lock, an invocation through a symlinked alias named `tv` — a basename the holder's recorded command line does not contain, created with a relative target that carries `..` (for example `ln -s ../scripts/task-viewer.sh bin/tv`) — is still running after a fixed window and finishes once the lock is released, so the alias waits on the live holder instead of reclaiming it; the current script lets that `tv` alias reclaim the lock and proceed without waiting.
 - [ ] `make lint` and `make test` pass, and every existing launcher case stays green.

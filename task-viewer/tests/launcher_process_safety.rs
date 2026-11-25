@@ -431,6 +431,143 @@ fn a_reused_pid_lock_is_reclaimed() {
     let _ = fs::remove_dir_all(&root.dir);
 }
 
+/// Covers: a lock whose recorded PID belongs to a live unrelated process while
+/// the recorded command line *does* name the launcher is still reclaimed. The
+/// recorded line survives from a killed holder, so a waiter that trusted it
+/// alone would wait on a reused PID forever; the live process's own line decides.
+/// This case hangs on the recorded-line-only implementation and fails on the
+/// window instead.
+#[test]
+fn a_reused_pid_whose_recorded_line_names_the_launcher_is_reclaimed() {
+    let port = free_loopback_port();
+    let root = Root::new("launcher_reused_launcher_pid", port);
+
+    let mut squatter = Command::new("sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn the unrelated live process");
+    fs::create_dir_all(root.lock_dir()).expect("stage the reused-PID lock");
+    fs::write(root.lock_dir().join("pid"), format!("{}\n", squatter.id()))
+        .expect("record the live PID");
+    // The dead holder's recorded line names the launcher, so a recorded-line-only
+    // rule cannot tell it from a real holder.
+    fs::write(
+        root.lock_dir().join("cmd"),
+        format!("bash {} status\n", root.launcher.display()),
+    )
+    .expect("record a launcher-shaped command line");
+
+    let status = wait_output(root.spawn("status"), RECLAIM_WINDOW);
+    let _ = squatter.kill();
+    let _ = squatter.wait();
+
+    assert_eq!(
+        status.status.code(),
+        Some(1),
+        "a stopped status must exit 1: {}\n{}",
+        stdout(&status),
+        stderr(&status),
+    );
+    assert!(
+        stdout(&status).contains("task-viewer is not running"),
+        "the reclaimed lock must let status read the launcher's own state: {}",
+        stdout(&status),
+    );
+    assert!(
+        !root.lock_dir().exists(),
+        "the reclaimed lock must be released once the command finishes",
+    );
+
+    let _ = fs::remove_dir_all(&root.dir);
+}
+
+/// Covers: an invocation through a symlinked alias named `tv`, whose basename the
+/// holder's recorded command line does not contain and whose relative target
+/// carries `..`, waits on the live holder reached by its canonical path instead
+/// of reclaiming it. The alias is still running after a fixed window and finishes
+/// once the holder releases the lock.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_alias_waits_on_a_live_holder() {
+    let port = free_loopback_port();
+    let root = Root::new("launcher_alias_wait", port);
+    let bin = root.dir.join("bin");
+    fs::create_dir_all(&bin).expect("alias dir");
+    let alias = bin.join("tv");
+    symlink("../scripts/task-viewer.sh", &alias).expect("stage the alias");
+
+    // A canonical-path invocation takes the lock and holds it for a fixed span.
+    let ready = root.dir.join("holder.ready");
+    let script = r#"
+source "$1"
+acquire_lock
+printf 'ready\n' >"$2"
+sleep 4
+release_lock
+"#;
+    let holder = root
+        .source_command(script)
+        .arg(&ready)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the canonical holder");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        ready.exists(),
+        "the holder must take the lock inside the window"
+    );
+
+    let mut waiter = root
+        .staged_env("bash")
+        .arg(&alias)
+        .arg("status")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the alias");
+
+    // The alias must wait on the live holder rather than reclaim its lock.
+    let window = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < window {
+        if let Some(status) = waiter.try_wait().expect("poll the alias") {
+            let _ = holder.wait_with_output();
+            panic!("the alias reclaimed a live holder's lock: {status:?}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let output = wait_output(waiter, SERVER_WINDOW);
+    let holder_output = wait_output(holder, SERVER_WINDOW);
+    assert!(
+        holder_output.status.success(),
+        "the holder failed: {}\n{}",
+        stdout(&holder_output),
+        stderr(&holder_output),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the alias must run status once the lock is released: {}\n{}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert!(
+        stdout(&output).contains("task-viewer is not running"),
+        "the alias must read the released state: {}",
+        stdout(&output),
+    );
+
+    let _ = fs::remove_dir_all(&root.dir);
+}
+
 /// Covers: a holder whose lock was renamed away before it entered the critical
 /// section re-acquires it instead of running beside the new holder. The script
 /// takes the lock, simulates a waiter renaming it aside and a fresh holder taking

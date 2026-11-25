@@ -582,6 +582,154 @@ exit 0
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Force the outdated-binary restart branch while the stop helper reports that
+/// it could not take the old server down.
+const RESTART_STOP_FAILS_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+is_running() { return 0; }
+is_outdated() { return 0; }
+do_stop() { return 1; }
+start_binary
+echo "status=$?"
+"#;
+
+/// Covers: a restart whose stop fails exits non-zero and prints no "already
+/// running" line, instead of reporting the surviving old server as a success.
+#[test]
+fn launcher_restart_reports_a_failed_stop() {
+    let dir = unique_temp_dir("launcher_restart_stop_fail");
+    let launcher = stage_root(&dir);
+
+    let output = run_driver(
+        &dir,
+        RESTART_STOP_FAILS_DRIVER,
+        &[(
+            "SCRIPT_PATH",
+            launcher.to_str().expect("the temp path is valid UTF-8"),
+        )],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=1"),
+        "a failed restart must exit non-zero: {stdout}",
+    );
+    assert!(
+        stdout.contains("restarting on it"),
+        "the restart branch must run: {stdout}",
+    );
+    assert!(
+        !stdout.contains("already running"),
+        "a failed stop must not read as an already-running success: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Hold a lock whose live `ps` read comes back empty, as a restricted system
+/// would answer, and run `acquire_lock` in the background.
+const EMPTY_LIVE_PS_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+# A live read that fails prints nothing, which must not read as "not a holder".
+ps() { return 0; }
+sleep 60 &
+holder=$!
+mkdir -p "$LOCK_DIR"
+printf '%s\n' "$holder" >"$LOCK_DIR/pid"
+printf '%s\n' "bash $SCRIPT_PATH status" >"$LOCK_DIR/cmd"
+(
+    acquire_lock
+    printf 'acquired\n' >"$ACQUIRED_LOG"
+    release_lock
+) &
+waiter=$!
+# Fixed window: the waiter must stay blocked on the live holder.
+for _ in {1..40}; do
+    [ -e "$ACQUIRED_LOG" ] && break
+    sleep 0.05
+done
+if [ -e "$ACQUIRED_LOG" ]; then
+    echo "reclaimed-empty-read"
+elif [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" != "$holder" ]; then
+    echo "lock-changed"
+else
+    echo "waited"
+fi
+# Release the lock; the waiter must now acquire it and proceed.
+rm -rf "$LOCK_DIR"
+for _ in {1..200}; do
+    [ -e "$ACQUIRED_LOG" ] && break
+    sleep 0.05
+done
+if [ -e "$ACQUIRED_LOG" ]; then
+    echo "acquired-after-release"
+else
+    echo "never-acquired"
+fi
+kill -9 "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+wait "$waiter" 2>/dev/null || true
+"#;
+
+/// Covers: a lock whose recorded PID is alive and whose recorded line names the
+/// launcher is still a holder when the live `ps` read comes back empty, so
+/// `acquire_lock` keeps waiting and only proceeds once the lock is released.
+#[test]
+fn launcher_lock_waits_when_the_live_read_is_empty() {
+    let dir = unique_temp_dir("launcher_empty_live_ps");
+    let launcher = stage_root(&dir);
+    let acquired = dir.join("acquired.log");
+
+    let output = run_driver(
+        &dir,
+        EMPTY_LIVE_PS_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            (
+                "ACQUIRED_LOG",
+                acquired.to_str().expect("the temp path is valid UTF-8"),
+            ),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "waited"),
+        "an empty live read must keep the waiter waiting: {stdout}",
+    );
+    assert!(
+        stdout.lines().any(|line| line == "acquired-after-release"),
+        "the waiter must acquire once the lock is released: {stdout}",
+    );
+    assert!(
+        !stdout.contains("reclaimed-empty-read") && !stdout.contains("never-acquired"),
+        "the waiter must neither reclaim early nor fail to acquire: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Wait for a child to finish, then collect its output, failing the test if it
 /// overruns the window instead of hanging the suite.
 fn wait_for_output(mut child: Child, window: Duration) -> std::process::Output {
