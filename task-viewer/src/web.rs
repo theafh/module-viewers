@@ -7769,8 +7769,9 @@ mod tests {
     /// the banner landmark.
     #[tokio::test(flavor = "current_thread")]
     async fn web_every_page_has_one_main_landmark() {
-        let (state, path) = app_state("main_landmark").await;
-        for route in ["/", "/repositories", "/tasks"] {
+        let (state, path, folder, id) = state_with_repository("main_landmark").await;
+        let remove_route = format!("/repositories/{id}/delete");
+        for route in ["/", "/repositories", "/tasks", remove_route.as_str()] {
             let body =
                 body_text(send(state.clone(), get_page(route, "127.0.0.1:7880")).await).await;
             assert_eq!(
@@ -7814,6 +7815,7 @@ mod tests {
                 "{route} keeps the page header inside the main element"
             );
         }
+        let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 
