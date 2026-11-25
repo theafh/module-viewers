@@ -2,8 +2,8 @@
 description: "Fail the launcher with a message when its state directory cannot be created, instead of spinning forever in the lock loop."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T10:37:08Z
-status: implemented
+updated: 2026-11-25T10:55:21Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
