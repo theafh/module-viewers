@@ -4504,8 +4504,9 @@ mod tests {
     #[test]
     fn harvest_rewalks_a_prior_row_whose_hash_predates_the_utc_reader() {
         // A row stored by the r2 reader carries `r2:` plus the file digest. The
-        // current r4 reader reads timestamps as instants, so that row mismatches
-        // once and the archive walk stores the UTC leave day.
+        // r3 reader introduced instant timestamps, so that row mismatches once
+        // against the current CONTENT_HASH_REVISION reader and the archive walk
+        // stores the UTC leave day.
         let repo = scratch("harvest_hash_utc_revision");
         git(
             &repo,
