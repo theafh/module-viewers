@@ -2,8 +2,8 @@
 description: "Let the launcher recognize its own server when the checkout path holds a space, so stop, status, and a failed start's cleanup still work."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T12:27:11Z
-status: implemented
+updated: 2026-11-25T12:32:20Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
