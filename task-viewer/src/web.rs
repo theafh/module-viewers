@@ -12400,6 +12400,112 @@ mod tests {
         );
     }
 
+    /// The shipped calendar's drawn cells in mark order, each carrying its
+    /// drill-down `from` day and its `y` attribute, so a test reads the row a
+    /// day landed in without trusting the drawing loop's own arithmetic.
+    fn calendar_cells(payload: &serde_json::Value) -> Vec<serde_json::Value> {
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload.to_string()),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var svg = globalThis.__env.cards["shipped-calendar"].querySelector("svg");
+  var cells = svg.children.filter(function (node) {
+    return node.name === "a" && node.attrs.href;
+  }).map(function (node) {
+    return {
+      from: /from=([^&]+)/.exec(node.attrs.href)[1],
+      y: Number(node.children[0].attrs.y)
+    };
+  });
+  return JSON.stringify({ cells: cells });
+})()"#,
+        );
+        result["cells"].as_array().cloned().expect("calendar cells")
+    }
+
+    /// Covers: a calendar whose window opens on a Sunday pads the top of its
+    /// opening column, so that Sunday sits in the bottom row and the following
+    /// Monday opens the next column's top row.
+    #[test]
+    fn browser_calendar_pads_a_sunday_window_to_monday_rows() {
+        let mut payload = fixture_payload();
+        let rows = serde_json::json!([
+            {"date": "2026-06-07", "count": 1},
+            {"date": "2026-06-08", "count": 2}
+        ]);
+        payload["shipped_calendar"] = rows.clone();
+        payload["created_calendar"] = rows;
+        payload["calendar_peak_shipped"] = serde_json::json!(2);
+        payload["calendar_peak_created"] = serde_json::json!(2);
+        let cells = calendar_cells(&payload);
+        assert_eq!(cells.len(), 2, "both days drew a cell: {cells:?}");
+        assert_eq!(
+            cells[0]["from"], "2026-06-07",
+            "the Sunday leads: {cells:?}"
+        );
+        assert_eq!(
+            cells[0]["y"].as_f64(),
+            Some(114.0),
+            "the Sunday cell sits in the bottom row: {cells:?}"
+        );
+        assert_eq!(
+            cells[1]["from"], "2026-06-08",
+            "the following Monday follows: {cells:?}"
+        );
+        assert_eq!(
+            cells[1]["y"].as_f64(),
+            Some(18.0),
+            "the following Monday opens the top row: {cells:?}"
+        );
+    }
+
+    /// Covers: a calendar whose window opens on a Monday puts that day in the
+    /// top row with no padding above it.
+    #[test]
+    fn browser_calendar_starts_a_monday_window_on_the_top_row() {
+        let mut payload = fixture_payload();
+        let rows = serde_json::json!([{"date": "2026-06-08", "count": 1}]);
+        payload["shipped_calendar"] = rows.clone();
+        payload["created_calendar"] = rows;
+        let cells = calendar_cells(&payload);
+        assert_eq!(cells.len(), 1, "the Monday drew a cell: {cells:?}");
+        assert_eq!(
+            cells[0]["from"], "2026-06-08",
+            "the Monday leads: {cells:?}"
+        );
+        assert_eq!(
+            cells[0]["y"].as_f64(),
+            Some(18.0),
+            "the Monday window starts on the top row: {cells:?}"
+        );
+    }
+
+    /// Covers: every cell of a 365-day calendar sits in the row its weekday
+    /// names, counting Monday as row 0, read from the cell's `from` day.
+    #[test]
+    fn browser_calendar_rows_follow_the_weekday_from_each_days_from_bound() {
+        let payload = year_of_calendar_rows();
+        let cells = calendar_cells(&payload);
+        assert_eq!(cells.len(), 365, "the fixture draws a cell per day");
+        for cell in cells {
+            let from = cell["from"].as_str().expect("cell from day");
+            let date = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d")
+                .expect("the from bound is a calendar day");
+            let expected = u64::from(chrono::Datelike::weekday(&date).num_days_from_monday());
+            let y = cell["y"].as_f64().expect("cell y");
+            let row = (y - 18.0) / 16.0;
+            assert_eq!(
+                row, expected as f64,
+                "{from} sits in row {row} instead of its Monday-first row {expected}"
+            );
+        }
+    }
+
     /// Covers: a one-day average prints the singular unit in both line-chart
     /// tooltips, so the `1 day` branch is asserted rather than only written.
     #[test]

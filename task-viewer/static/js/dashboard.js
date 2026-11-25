@@ -758,7 +758,9 @@
     var parsed = rows.map(function (row) {
       return { date: parseDay(row.date), count: row.count };
     });
-    var pad = parsed[0].date.getDay();
+    // Monday leads each row: `getDay()` counts from Sunday, so shift it back by
+    // one and wrap, leaving row 0 Monday through row 6 Sunday.
+    var pad = (parsed[0].date.getDay() + 6) % 7;
     var cells = [];
     for (var i = 0; i < pad; i += 1) cells.push(null);
     parsed.forEach(function (day) { cells.push(day); });

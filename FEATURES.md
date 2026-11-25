@@ -37,8 +37,8 @@ The dashboard shows ten charts from the stored rows, for all configured reposito
 
 - Weekly shipped, created, and deferred, Monday weeks, bars stacked from one baseline in the order the view names, each bar centred in its own week's slot and kept inside the plot. A View picker on the card redraws that card alone between all three stacked (the default), only shipped, only created, only deferred, and shipped plus deferred stacked without created; the summary names only the series the chosen view draws.
 - Cumulative tasks shipped, with a dashed trend; a one-day series draws a filled dot at its value and says `Not enough days yet` instead of an empty line.
-- Tasks shipped over the last 365 days, colour `log1p(count)`; the first month label carries its year.
-- Tasks created over the last 365 days, colour `log1p(count)`; the first month label carries its year.
+- Tasks shipped over the last 365 days, laid out in Monday-through-Sunday rows, colour `log1p(count)`; the first month label carries its year.
+- Tasks created over the last 365 days, laid out in Monday-through-Sunday rows, colour `log1p(count)`; the first month label carries its year.
 - Live backlog size by day, with a dashed trend; a one-day series draws a filled dot at its value and says `Not enough days yet`.
 - Mean age in days of the unfinished backlog, with a dashed trend; a one-day series draws a filled dot at its value and says `Not enough days yet`. Finished and deferred tasks leave that average on their archive leave day; they never count as shipped when deferred.
 - Cycle time, the mean days from a task's `created` day to its ship day over the tasks that finished on each charted day, with a dashed trend, a task count, and a one-day series that draws a filled dot and says `Not enough days yet`. A deferred task and a finished task with no ship day contribute nothing, and a ship day before `created` counts from the created day as a zero-day cycle.
