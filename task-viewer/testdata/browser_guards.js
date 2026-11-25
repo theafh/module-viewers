@@ -312,11 +312,10 @@
     ? JSON.stringify(defaultPayload)
     : String(config.payloadText);
 
-  // The template's own theme button: a constant "Dark theme" name whose
-  // pressed state carries the applied theme.
+  // The template's own theme button: its name is the theme it switches to, so
+  // it starts as "Light Mode" while the default dark theme is applied.
   var themeButton = new Node("button");
-  themeButton.textContent = "Dark theme";
-  themeButton.attrs["aria-pressed"] = "true";
+  themeButton.textContent = "Light Mode";
   // The dashboard's Update form and its submit button, so a test can dispatch
   // `submit` and read the busy state the shipped script applies. The form's own
   // `querySelector` finds the button the way the page does.

@@ -9972,7 +9972,7 @@ mod tests {
     }
 
     /// Covers: a throwing `localStorage` still flips `data-theme`, keeps
-    /// the button label in sync, recolors the charts through the theme event,
+    /// the button name in sync, recolors the charts through the theme event,
     /// and lets no exception escape the click handler.
     #[test]
     fn browser_theme_toggle_survives_throwing_storage() {
@@ -10016,8 +10016,8 @@ mod tests {
         assert_eq!(result["error"], serde_json::Value::Null);
         assert_eq!(result["theme"], "light");
         assert_eq!(
-            result["button"], "Dark theme",
-            "the theme button keeps its constant name"
+            result["button"], "Dark Mode",
+            "the button names the theme it switches to"
         );
         let before = result["before"].as_array().expect("before fills");
         assert!(
@@ -10440,35 +10440,27 @@ mod tests {
         assert_eq!(result["hidden"], serde_json::json!(false));
     }
 
-    /// Covers: the theme toggle's pressed state carries the applied theme while
-    /// its name stays constant.
+    /// Covers: the theme toggle names the theme it switches to, so its text
+    /// flips with the applied theme.
     #[test]
-    fn browser_theme_toggle_reports_its_pressed_state() {
+    fn browser_theme_toggle_names_the_target_theme() {
         let config = browser_config(false, false, None, serde_json::json!("#123456"));
         let result = run_browser(
             &config,
             r#"(function () {
   var env = globalThis.__env;
-  var states = [env.themeButton.getAttribute("aria-pressed")];
   var names = [env.themeButton.textContent];
   env.themeButton.click();
-  states.push(env.themeButton.getAttribute("aria-pressed"));
   names.push(env.themeButton.textContent);
   env.themeButton.click();
-  states.push(env.themeButton.getAttribute("aria-pressed"));
   names.push(env.themeButton.textContent);
-  return JSON.stringify({ states: states, names: names, theme: env.html.getAttribute("data-theme") });
+  return JSON.stringify({ names: names, theme: env.html.getAttribute("data-theme") });
 })()"#,
         );
         assert_eq!(
-            result["states"],
-            serde_json::json!(["true", "false", "true"]),
-            "the pressed state follows the applied theme"
-        );
-        assert_eq!(
             result["names"],
-            serde_json::json!(["Dark theme", "Dark theme", "Dark theme"]),
-            "the button's name stays constant"
+            serde_json::json!(["Light Mode", "Dark Mode", "Light Mode"]),
+            "the button names the opposite theme in each state"
         );
         assert_eq!(result["theme"], "dark");
     }
@@ -10483,14 +10475,17 @@ mod tests {
             &light,
             r#"JSON.stringify({
   theme: globalThis.__env.html.getAttribute("data-theme"),
-  pressed: globalThis.__env.themeButton.getAttribute("aria-pressed")
+  button: globalThis.__env.themeButton.textContent
 })"#,
         );
         assert_eq!(
             applied["theme"], "light",
             "a light OS preference opens the light theme"
         );
-        assert_eq!(applied["pressed"], "false");
+        assert_eq!(
+            applied["button"], "Dark Mode",
+            "a light page names the dark theme it switches to"
+        );
 
         let dark = browser_config(false, false, None, serde_json::json!("#123456"));
         let kept = run_browser(
@@ -14528,7 +14523,7 @@ mod tests {
     }
 
     /// Covers: the active nav tab carries `aria-current="page"` and the theme
-    /// toggle names itself "Dark theme" with its pressed state.
+    /// toggle names the theme it switches to.
     #[tokio::test(flavor = "current_thread")]
     async fn web_nav_marks_the_active_tab_and_theme_state() {
         let (state, path, folder, _id) = state_with_repository("a11y_nav_state").await;
@@ -14543,10 +14538,8 @@ mod tests {
             "only the active tab is current"
         );
         assert!(
-            dashboard.contains(
-                "id=\"theme-toggle\" type=\"button\" aria-pressed=\"true\">Dark theme</button>"
-            ),
-            "the theme toggle carries its constant name and pressed state"
+            dashboard.contains("id=\"theme-toggle\" type=\"button\">Light Mode</button>"),
+            "the theme toggle names the theme it switches to"
         );
         let repositories =
             body_text(send(state.clone(), get_page("/repositories", "127.0.0.1:7880")).await).await;
