@@ -2,8 +2,8 @@
 description: "Carry the real on-disk path beside the lossy stored path, so an evicted working-tree row with a non-UTF-8 file name is re-read instead of dropped."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-25T04:11:11Z
-status: implemented
+updated: 2026-11-25T04:14:55Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: false
