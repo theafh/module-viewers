@@ -2,8 +2,8 @@
 description: "Ask for a repository removal on its own server-rendered page, so a no-script browser cannot delete a repository and its rows in one click."
 scope: task-viewer
 created: 2026-11-25T09:49:49Z
-updated: 2026-11-25T11:26:59Z
-status: implemented
+updated: 2026-11-25T11:30:58Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
