@@ -2,8 +2,8 @@
 description: "Make the launcher process tests clean up after a failed assertion and actually exercise the dead-PID reclaim branch."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T19:57:52Z
-status: implemented
+updated: 2026-11-25T20:01:24Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
