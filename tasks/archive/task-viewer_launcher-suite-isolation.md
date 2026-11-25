@@ -2,8 +2,8 @@
 description: "Keep the launcher shell suite out of the live desktop: no osascript notifications and no writes to the real XDG state directory."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T13:03:16Z
-status: implemented
+updated: 2026-11-25T13:06:58Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
