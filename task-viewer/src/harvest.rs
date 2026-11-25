@@ -363,6 +363,10 @@ impl From<Vec<ParsedTask>> for Harvested {
 }
 
 /// Count one skipped task file under its reason.
+///
+/// Callers gate on `has_task_name_shape`, so a stray `README.md` under
+/// `tasks/` adds nothing to the tally even when the read-level skip path
+/// classifies it.
 fn record_skip(tally: &mut SkipTally, reason: SkipReason) {
     *tally.entry(reason).or_insert(0) += 1;
 }
@@ -602,11 +606,15 @@ fn harvest_chosen(
                     }
                     BlobContent::Missing => vanished = Some(path.clone()),
                     BlobContent::Oversized => {
-                        record_skip(&mut skipped, SkipReason::Oversized);
+                        if has_task_name_shape(&path) {
+                            record_skip(&mut skipped, SkipReason::Oversized);
+                        }
                         warn_skipped_task(&path, SkipReason::Oversized);
                     }
                     BlobContent::NotUtf8 => {
-                        record_skip(&mut skipped, SkipReason::NotUtf8);
+                        if has_task_name_shape(&path) {
+                            record_skip(&mut skipped, SkipReason::NotUtf8);
+                        }
                         warn_skipped_task(&path, SkipReason::NotUtf8);
                     }
                     // The listing named a blob, so `cat-file` cannot answer a
@@ -673,7 +681,9 @@ fn worktree_content(
             let bytes = fs::metadata(&on_disk)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
-            record_skip(skipped, reason);
+            if has_task_name_shape(path) {
+                record_skip(skipped, reason);
+            }
             warn_skipped_worktree_task(path, bytes, reason);
             None
         }
@@ -1065,7 +1075,9 @@ fn harvest_files(
                         let bytes = fs::metadata(&row.disk)
                             .map(|metadata| metadata.len())
                             .unwrap_or(0);
-                        record_skip(&mut skipped, reason);
+                        if has_task_name_shape(&row.path) {
+                            record_skip(&mut skipped, reason);
+                        }
                         warn_skipped_worktree_task(&row.path, bytes, reason);
                         None
                     }
@@ -1309,7 +1321,8 @@ fn parse_batch<R: BufRead>(
 /// that cannot be opened or read, one that is not valid UTF-8, and one larger
 /// than `MAX_TASK_FILE_BYTES` (read only through the cap plus one byte) each
 /// warn once with its path, its metadata length, and the reason. A file whose
-/// name lacks the task shape warns at debug level instead. The text of a charted
+/// name lacks the task shape warns at debug level instead and adds nothing to
+/// the skip tally. The text of a charted
 /// file is retained only while the running total stays within
 /// `MAX_WORKTREE_CACHE_BYTES`; a row past that budget keeps its path and is
 /// re-read one file at a time when it is charted.
@@ -1370,7 +1383,9 @@ fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow
                 let bytes = fs::metadata(path)
                     .map(|metadata| metadata.len())
                     .unwrap_or(0);
-                record_skip(skipped, reason);
+                if has_task_name_shape(&rel) {
+                    record_skip(skipped, reason);
+                }
                 warn_skipped_worktree_task(&rel, bytes, reason);
                 WorktreeRow {
                     path: rel,
@@ -7985,6 +8000,87 @@ mod tests {
             harvested.skipped
         );
         assert_eq!(harvested.tasks.len(), 1);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a stray `tasks/README.md` that is not UTF-8, or an oversized
+    /// stray markdown file, adds nothing to the read-level skip tally, so the
+    /// banner carries no skipped-file sentence for a file no task was lost
+    /// from. The valid task still charts.
+    #[test]
+    fn harvest_keeps_a_stray_read_level_file_out_of_the_skip_tally() {
+        let repo = scratch("harvest_skip_stray_read_level");
+        write_task(&repo, "tasks/scope_valid.md", "2026-05-01", "open");
+        write_non_utf8_task(&repo, "tasks/README.md", "2026-05-01", "2026-05-01", "open");
+
+        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        assert_eq!(harvested.tasks.len(), 1, "the valid task still charts");
+        assert_eq!(harvested.tasks[0].path, "tasks/scope_valid.md");
+        assert_eq!(
+            harvested.skipped_count(),
+            0,
+            "the non-UTF-8 README is not a task: {:?}",
+            harvested.skipped
+        );
+
+        // An oversized stray markdown file beside the valid task adds nothing
+        // either; its name lacks the task shape.
+        fs::write(
+            repo.join("tasks/NOTES.md"),
+            vec![b'a'; MAX_TASK_FILE_BYTES + 1],
+        )
+        .expect("oversized stray file");
+        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        assert_eq!(harvested.tasks.len(), 1);
+        assert_eq!(
+            harvested.skipped_count(),
+            0,
+            "the oversized NOTES.md is not a task: {:?}",
+            harvested.skipped
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a stray `tasks/README.md` whose committed content is not UTF-8
+    /// and that only a branch other than the checkout holds adds nothing to the
+    /// committed-blob skip tally, so the read-level gate holds there too.
+    #[test]
+    fn harvest_keeps_a_committed_stray_file_out_of_the_skip_tally() {
+        let repo = scratch("harvest_skip_committed_stray");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_valid.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "main task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_non_utf8_task(&repo, "tasks/README.md", "2026-05-01", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "stray readme on feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-06-02T12:00:00+00:00");
+
+        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        assert_eq!(harvested.tasks.len(), 1, "the valid task still charts");
+        assert_eq!(
+            harvested.skipped_count(),
+            0,
+            "the committed non-UTF-8 README is not a task: {:?}",
+            harvested.skipped
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 

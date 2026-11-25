@@ -2,9 +2,11 @@
 description: "Count only task-shaped files in the Update banner's skipped-file tally, so a stray non-UTF-8 or oversized markdown file under tasks/ stops inflating it."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-24T22:41:46Z
-status: ready
+updated: 2026-11-25T04:32:59Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Skip tally counts task files only
@@ -39,7 +41,7 @@ An archived task records that the shape gate applied to the warning site only. T
 
 1. Gate every read-level `record_skip` on `has_task_name_shape`, either at each call site or by moving the tally into the two warn helpers that already test the shape. Keep exactly one count per task-shaped file.
 2. Keep the debug-level log line for a non-task file, so the skip is still visible in the log without reaching the banner.
-3. Extend the skip-tally tests with a non-UTF-8 stray markdown file and an oversized stray markdown file beside one valid task, and assert the tally stays zero and the banner carries no skipped-file sentence.
+3. Extend the skip-tally tests with a non-UTF-8 stray markdown file and an oversized stray markdown file beside one valid task, and assert the tally stays zero.
 
 **Out of scope:**
 
@@ -48,7 +50,7 @@ An archived task records that the shape gate applied to the warning site only. T
 
 ## Acceptance
 
-- [ ] A harvest test with one valid task plus a non-UTF-8 `tasks/README.md` reports a zero skip tally, and the same holds for an oversized stray file.
+- [ ] A harvest test with one valid task plus a non-UTF-8 `tasks/README.md` reports a zero skip tally, and the same holds for an oversized stray file. That zero tally reaches the banner with no skipped-file sentence: `store_outcome` passes the harvest count on unchanged into `ScanReport.skipped` (`task-viewer/src/web.rs`), and `web_scan_banner_reports_a_clean_run` in that file asserts a `skipped: 0` report renders the banner as exactly `Charts updated.`
 - [ ] A task-shaped file that is not UTF-8, oversized, or unreadable still counts once under its reason.
 - [ ] Every read-level skip site is gated by the task-name shape; a search for `record_skip` shows no ungated call.
 - [ ] `make lint` and `make test` pass.
