@@ -206,6 +206,20 @@
     var frame = new Node("frame");
     var tip = new Node("tip");
     var summary = new Node("summary");
+    // A frame's client width is the config width until a test narrows or widens
+    // it, so a resize can be modelled between two draws without reloading the
+    // fixture. Writing the property is the per-instance override; the prototype
+    // getter serves every other node.
+    var frameWidth = width;
+    Object.defineProperty(frame, "clientWidth", {
+      get: function () {
+        return frameWidth;
+      },
+      set: function (value) {
+        var number = Number(value);
+        if (isFinite(number)) frameWidth = number;
+      }
+    });
     // A scrolling frame reports its chart's laid-out width as its content
     // width, so a chart wider than the frame scrolls, and `scrollLeft` clamps
     // to the range a browser allows.

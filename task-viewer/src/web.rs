@@ -9267,8 +9267,9 @@ mod tests {
         config
     }
 
-    /// A realistic year of shipped-calendar rows: 365 daily cells need more
-    /// than 52 columns, so the pre-fix cell width is negative at 120px.
+    /// A realistic year of calendar rows in both calendars: 365 daily cells
+    /// need more than 52 columns, so the pre-fix cell width is negative at
+    /// 120px, and both calendars are wide enough to gain a scroll range.
     fn year_of_calendar_rows() -> serde_json::Value {
         let start = chrono::NaiveDate::from_ymd_opt(2025, 11, 6).expect("start date");
         let shipped_calendar: Vec<serde_json::Value> = (0..365)
@@ -9280,12 +9281,21 @@ mod tests {
                 })
             })
             .collect();
+        let created_calendar: Vec<serde_json::Value> = (0..365)
+            .map(|offset| {
+                let date = start + chrono::Duration::days(offset);
+                serde_json::json!({
+                    "date": date.format("%Y-%m-%d").to_string(),
+                    "count": (offset + 1) % 3,
+                })
+            })
+            .collect();
         serde_json::json!({
             "counts": {"shipped_events": 10, "created_events": 12, "deferred": 0},
             "weekly": [{"week": "2026-01-05", "shipped": 1, "created": 2, "deferred": 0}],
             "cumulative": [{"date": "2026-01-05", "cumulative": 1, "shipped": 1, "trend": 1}],
             "shipped_calendar": shipped_calendar,
-            "created_calendar": [{"date": "2026-01-05", "count": 2}],
+            "created_calendar": created_calendar,
             "calendar_peak_shipped": 2,
             "calendar_peak_created": 2,
             "live_backlog": [{"date": "2026-01-05", "live": 1}],
@@ -11246,6 +11256,90 @@ mod tests {
             wide_result["clientWidth"].as_f64(),
             "a wide frame has no horizontal scroll range"
         );
+    }
+
+    /// Covers: a calendar first drawn in a frame that fits it still opens on
+    /// the newest days when a resize narrows the frame, for both the shipped
+    /// and the created calendar, and a redraw in a frame that already had a
+    /// scroll range leaves a reader-set `scrollLeft` alone. The frame's
+    /// per-instance `clientWidth` override changes the width between draws
+    /// without reloading the fixture.
+    #[test]
+    fn browser_calendar_pins_again_when_a_narrow_frame_gains_a_range() {
+        let payload = year_of_calendar_rows();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function redraw() {
+    env.window.dispatchEvent(new env.Event("resize"));
+    env.timeouts[env.timeouts.length - 1].handler();
+  }
+  function probe(name) {
+    var card = env.cards[name];
+    var frame = card.querySelector(".chart-frame");
+    var svg = card.querySelector("svg");
+    var before = {
+      clientWidth: frame.clientWidth,
+      scrollWidth: frame.scrollWidth,
+      scrollLeft: frame.scrollLeft,
+      natural: Number(svg.getAttribute("width"))
+    };
+    frame.clientWidth = 400;
+    redraw();
+    var afterResize = {
+      scrollLeft: frame.scrollLeft,
+      range: frame.scrollWidth - frame.clientWidth
+    };
+    frame.scrollLeft = 100;
+    redraw();
+    return {
+      before: before,
+      afterResize: afterResize,
+      afterReader: frame.scrollLeft
+    };
+  }
+  return JSON.stringify({
+    shipped: probe("shipped-calendar"),
+    created: probe("created-calendar")
+  });
+})()"#,
+        );
+        for card in ["shipped", "created"] {
+            let probe = &result[card];
+            assert_eq!(
+                probe["before"]["natural"].as_f64(),
+                Some(884.0),
+                "the {card} calendar is 884px wide, so it can gain a range"
+            );
+            assert_eq!(
+                probe["before"]["scrollWidth"].as_f64(),
+                probe["before"]["clientWidth"].as_f64(),
+                "a frame wider than the calendar has no scroll range: {probe:?}"
+            );
+            assert_eq!(
+                probe["afterResize"]["range"].as_f64(),
+                Some(484.0),
+                "the narrowed {card} frame has a scroll range: {probe:?}"
+            );
+            assert_eq!(
+                probe["afterResize"]["scrollLeft"].as_f64(),
+                Some(484.0),
+                "a narrowed {card} frame opens on the newest days: {probe:?}"
+            );
+            assert_eq!(
+                probe["afterReader"].as_f64(),
+                Some(100.0),
+                "a redraw leaves the reader's {card} scroll position alone: {probe:?}"
+            );
+        }
     }
 
     /// Covers: at a 120px frame the rendered month labels sit at least

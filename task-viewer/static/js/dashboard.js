@@ -11,9 +11,11 @@
   }
   var CARD_NAMES = ["weekly", "cumulative", "shipped-calendar", "created-calendar", "backlog", "age", "cycle", "staleness", "radar-shipped", "radar-live"];
   var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  // Calendars whose initial scroll position is already chosen, so a redraw on
-  // a resize keeps the reader's scroll position instead of snapping the frame
-  // back to the newest days.
+  // Calendars whose initial scroll position is already chosen, keyed by card
+  // and carrying whether the frame had a scroll range on that draw. A redraw on
+  // a resize keeps the reader's scroll position while a range exists, and a
+  // frame that fitted its calendar pins again once a range appears, so a resize
+  // still opens the calendar on the newest days.
   var calendarOpened = {};
 
   // Each draw records the marks it coloured with a theme colour, together with
@@ -859,15 +861,19 @@
     // element, so this attribute does not lay the fallback out; `message()`
     // sizes that from the frame instead.
     svg.setAttribute("width", String(naturalWidth));
-    // Open on the newest days once per card: the frame scrolls to its right
-    // edge so a narrow frame shows the recent cells rather than the oldest
-    // columns, and a frame that fits the natural width clamps back to zero.
-    // Later draws leave the reader's scroll position alone.
+    // Open on the newest days: the frame scrolls to its right edge so a narrow
+    // frame shows the recent cells rather than the oldest columns. A frame that
+    // fits the natural width pins nothing but records that it had no range, so
+    // a later draw in a narrower frame pins to the newest days instead of
+    // leaving the reader on the oldest months. Once a draw found a scroll
+    // range, later draws leave the reader's scroll position alone.
     var frame = root.querySelector(".chart-frame");
-    if (!calendarOpened[name]) {
-      calendarOpened[name] = true;
+    var scrolled = frame.scrollWidth > frame.clientWidth;
+    var previous = calendarOpened[name];
+    if (!previous || (scrolled && !previous.scrolled)) {
       frame.scrollLeft = frame.scrollWidth;
     }
+    calendarOpened[name] = { scrolled: scrolled };
   }
 
   function drawRadar(name, rows, colorName, noun, mode, kind) {
