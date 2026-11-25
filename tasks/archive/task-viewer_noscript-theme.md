@@ -2,8 +2,8 @@
 description: "Give the theme switch a no-script path through a server route and a cookie, so Light and Dark work without scripting."
 scope: task-viewer
 created: 2026-11-25T09:49:49Z
-updated: 2026-11-25T21:15:05Z
-status: implemented
+updated: 2026-11-25T21:18:33Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
