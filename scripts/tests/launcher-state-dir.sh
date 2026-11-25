@@ -6,6 +6,24 @@
 # spinning in the lock loop. Every case runs a copy of the launcher inside a
 # throwaway root and home, so no real state directory, log, PID, or lock file is
 # read or written.
+#
+# A launcher that spins never exits and prints nothing, so a case that ran it in
+# the foreground would hang the suite instead of failing it. Every invocation
+# runs in the background under a deadline that kills it, and each deadline
+# carries the latency measured on this machine, taken at load average 17 on 14
+# cores:
+#   - a launcher that fails the state-directory check only pays bash start-up
+#     before it exits (measured 0.05s worst of five runs), so FAST_DEADLINE's 5s
+#     is about a hundred times the observed cost;
+#   - the lock loop spends LOCK_FAILURE_LIMIT x LOCK_RETRY_SLEEP = 20 x 0.1s =
+#     2s in its retries, and start-up adds the rest (measured 2.74s worst of five
+#     runs, so about 0.74s of start-up; whole suite 3.0s), so LOCK_DEADLINE is
+#     that 2s retry budget plus a 4s start-up allowance, roughly five times the
+#     measured start-up cost.
+FAST_DEADLINE=5
+LOCK_RETRY_BUDGET=2
+LOCK_STARTUP_ALLOWANCE=4
+LOCK_DEADLINE=$((LOCK_RETRY_BUDGET + LOCK_STARTUP_ALLOWANCE))
 
 set -u
 
@@ -47,15 +65,43 @@ state_dir_for() {
     esac
 }
 
-# Run the staged launcher's status command, timing it. Sets `out`, `status`, and
-# `elapsed` (whole seconds) for the caller.
-run_status() {
-    local root="$1" started
+# Run one launcher invocation in the background, timing it, and kill it at the
+# deadline so a hang fails the case instead of blocking the suite. Sets `out`,
+# `status` (124 when the deadline fired), `elapsed` (whole seconds), and
+# `timed_out` (1 when the deadline killed the invocation).
+run_launcher() {
+    local deadline="$1" started pid rc=0 out_file
+    shift
+    timed_out=0
+    out_file="$TMP/launcher.$$.$RANDOM"
     started=$(date +%s)
-    out=$(HOME="$root/home" XDG_STATE_HOME="$root/state" \
-        bash "$root/scripts/task-viewer.sh" status 2>&1)
-    status=$?
+    "$@" >"$out_file" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$(($(date +%s) - started))" -ge "$deadline" ]; then
+            timed_out=1
+            kill -9 "$pid" 2>/dev/null
+            break
+        fi
+        sleep 0.1
+    done
+    wait "$pid" 2>/dev/null || rc=$?
     elapsed=$(($(date +%s) - started))
+    out=$(cat "$out_file" 2>/dev/null)
+    rm -f "$out_file"
+    if [ "$timed_out" = 1 ]; then
+        status=124
+    else
+        status=$rc
+    fi
+}
+
+# Run the staged launcher's status command under the fast deadline.
+run_status() {
+    local root="$1"
+    run_launcher "$FAST_DEADLINE" \
+        env HOME="$root/home" XDG_STATE_HOME="$root/state" \
+        bash "$root/scripts/task-viewer.sh" status
 }
 
 # A home the launcher cannot write to. The state directory lives inside it on
@@ -69,13 +115,17 @@ case_unwritable_home_fails_fast() {
         state="$root/home/.local/state/task-viewer"
     fi
     # No XDG_STATE_HOME override: the state directory has to sit under this home.
-    out=$(env -u XDG_STATE_HOME HOME="$root/home" \
-        bash "$root/scripts/task-viewer.sh" status 2>&1)
-    status=$?
-    if [ "$status" -ne 0 ] && printf '%s\n' "$out" | grep -qF "$state"; then
+    run_launcher "$FAST_DEADLINE" \
+        env -u XDG_STATE_HOME HOME="$root/home" \
+        bash "$root/scripts/task-viewer.sh" status
+    if [ "$timed_out" = 1 ]; then
+        fail "an unwritable home fails fast and names the state directory (still running after ${FAST_DEADLINE}s)"
+    elif [ "$status" -ne 0 ] &&
+        printf '%s\n' "$out" | grep -qF "$state" &&
+        [ "$elapsed" -le "$FAST_DEADLINE" ]; then
         pass "an unwritable home fails fast and names the state directory"
     else
-        fail "an unwritable home fails fast and names the state directory (status $status)"
+        fail "an unwritable home fails fast and names the state directory (status $status, ${elapsed}s)"
         printf '%s\n' "$out" | sed 's/^/    /'
     fi
 }
@@ -88,34 +138,38 @@ case_state_dir_is_a_file_fails_fast() {
     mkdir -p "$(dirname "$state")"
     : >"$state"
     run_status "$root"
-    if [ "$status" -ne 0 ] && printf '%s\n' "$out" | grep -qF "$state"; then
+    if [ "$timed_out" = 1 ]; then
+        fail "a state directory that is a file fails fast and names it (still running after ${FAST_DEADLINE}s)"
+    elif [ "$status" -ne 0 ] &&
+        printf '%s\n' "$out" | grep -qF "$state" &&
+        [ "$elapsed" -le "$FAST_DEADLINE" ]; then
         pass "a state directory that is a file fails fast and names it"
     else
-        fail "a state directory that is a file fails fast and names it (status $status)"
+        fail "a state directory that is a file fails fast and names it (status $status, ${elapsed}s)"
         printf '%s\n' "$out" | sed 's/^/    /'
     fi
 }
 
 # The state directory becomes unwritable after start-up, so the lock loop is
-# reached and has to stop instead of spinning. The driver is bounded by the
-# shell test's own window as well.
+# reached and has to stop instead of spinning. The deadline kills a launcher
+# that keeps looping, so the case fails instead of hanging.
 case_unwritable_lock_stops_the_loop() {
-    local root="$TMP/unwritable-lock" started elapsed state
+    local root="$TMP/unwritable-lock" state
     make_root "$root"
     state="$(state_dir_for "$root/home")"
-    started=$(date +%s)
-    out=$(HOME="$root/home" XDG_STATE_HOME="$root/state" bash -c '
+    run_launcher "$LOCK_DEADLINE" \
+        env HOME="$root/home" XDG_STATE_HOME="$root/state" bash -c '
         source "$1"
         chmod 500 "$STATE_DIR"
         acquire_lock
         printf "acquired\n"
-    ' _ "$root/scripts/task-viewer.sh" 2>&1)
-    status=$?
-    elapsed=$(($(date +%s) - started))
-    if [ "$status" -ne 0 ] &&
+    ' _ "$root/scripts/task-viewer.sh"
+    if [ "$timed_out" = 1 ]; then
+        fail "an unwritable lock stops the loop with a message naming the state directory (still looping after ${LOCK_DEADLINE}s)"
+    elif [ "$status" -ne 0 ] &&
         printf '%s\n' "$out" | grep -qF "$state" &&
         ! printf '%s\n' "$out" | grep -q '^acquired$' &&
-        [ "$elapsed" -le 10 ]; then
+        [ "$elapsed" -le "$LOCK_DEADLINE" ]; then
         pass "an unwritable lock stops the loop with a message naming the state directory"
     else
         fail "an unwritable lock stops the loop with a message naming the state directory (status $status, ${elapsed}s)"
@@ -130,7 +184,9 @@ case_writable_state_dir_works() {
     make_root "$root"
     state="$(state_dir_for "$root/home")"
     run_status "$root"
-    if [ "$status" -eq 1 ] && printf '%s\n' "$out" | grep -q 'task-viewer is not running'; then
+    if [ "$timed_out" = 1 ]; then
+        fail "a writable state directory still serves status (still running after ${FAST_DEADLINE}s)"
+    elif [ "$status" -eq 1 ] && printf '%s\n' "$out" | grep -q 'task-viewer is not running'; then
         if [ -d "$state" ] && [ ! -e "$state/task-viewer.lock" ]; then
             # macOS `ls` appends an extended-attribute flag, so read the mode
             # bits from stat, which both platforms answer.
