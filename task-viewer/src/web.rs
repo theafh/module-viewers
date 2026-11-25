@@ -1430,9 +1430,11 @@ mod csv_field_tests {
     use super::csv_field;
 
     /// Read one exported CSV record back into its cells: a field that opens
-    /// with a double quote runs to the next single quote, a doubled quote
-    /// inside it reads as one quote, and every other comma separates two cells.
-    /// A test compares a cell's text with what a spreadsheet shows in the cell.
+    /// with a double quote runs to the next unescaped double quote, a doubled
+    /// quote inside it reads as one quote, and every other comma separates two cells.
+    /// A test compares a cell's text with the exported cell text, which carries
+    /// the neutralization apostrophe a spreadsheet hides, not what a spreadsheet
+    /// displays in the cell.
     fn read_csv_record(line: &str) -> Vec<String> {
         let mut cells = Vec::new();
         let mut chars = line.chars().peekable();
