@@ -2,8 +2,8 @@
 description: "Put the calendar's single tab stop on a visible newest cell so tabbing in does not scroll the frame back to the oldest months."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T11:42:15Z
-status: implemented
+updated: 2026-11-25T11:44:13Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -23,7 +23,7 @@ Tabbing into or focusing a 365-day calendar leaves the frame on the newest days.
 frame.scrollLeft = frame.scrollWidth;
 ```
 
-A browser scrolls a focused element into view inside its `overflow-x: auto` frame, so tabbing into the calendar focuses the oldest cell and scrolls the frame back to the oldest months, undoing the "Open on the newest days" behaviour the pin installs. The archived [calendar re-pin task](archive/task-viewer_calendar-reopen-on-resize.md) listed "The roving tab stop's starting cell; unchanged." as out of scope, so this was noticed and left open rather than settled as correct.
+A browser scrolls a focused element into view inside its `overflow-x: auto` frame, so tabbing into the calendar focuses the oldest cell and scrolls the frame back to the oldest months, undoing the "Open on the newest days" behaviour the pin installs. The archived [calendar re-pin task](task-viewer_calendar-reopen-on-resize.md) listed "The roving tab stop's starting cell; unchanged." as out of scope, so this was noticed and left open rather than settled as correct.
 
 ## Approach
 
