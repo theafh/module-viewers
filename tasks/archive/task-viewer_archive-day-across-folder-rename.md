@@ -2,8 +2,8 @@
 description: "Keep a task's first archive day when the configured folder was renamed inside an enclosing repository, at any depth, instead of moving the ship or leave day to the rename commit."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-25T02:22:01Z
-status: implemented
+updated: 2026-11-25T02:29:17Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: true
