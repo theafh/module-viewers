@@ -57,11 +57,14 @@ make_root() {
     chmod +x "$root/target/release/task-viewer"
 }
 
-# The launcher's state directory for a given home, mirroring its own rule.
+# The launcher's state directory for a given home, mirroring its own rule. `$2`
+# is the XDG_STATE_HOME the case runs the launcher with: on Linux the launcher
+# reads it, so the expectation has to read the same value rather than this
+# script's own environment.
 state_dir_for() {
     case "$(uname -s)" in
         Darwin) printf '%s\n' "$1/Library/Logs/task-viewer" ;;
-        *)      printf '%s\n' "${XDG_STATE_HOME:-$1/.local/state}/task-viewer" ;;
+        *)      printf '%s\n' "${2:-$1/.local/state}/task-viewer" ;;
     esac
 }
 
@@ -134,7 +137,7 @@ case_unwritable_home_fails_fast() {
 case_state_dir_is_a_file_fails_fast() {
     local root="$TMP/state-is-a-file" state
     make_root "$root"
-    state="$(state_dir_for "$root/home")"
+    state="$(state_dir_for "$root/home" "$root/state")"
     mkdir -p "$(dirname "$state")"
     : >"$state"
     run_status "$root"
@@ -156,7 +159,7 @@ case_state_dir_is_a_file_fails_fast() {
 case_unwritable_lock_stops_the_loop() {
     local root="$TMP/unwritable-lock" state
     make_root "$root"
-    state="$(state_dir_for "$root/home")"
+    state="$(state_dir_for "$root/home" "$root/state")"
     run_launcher "$LOCK_DEADLINE" \
         env HOME="$root/home" XDG_STATE_HOME="$root/state" bash -c '
         source "$1"
@@ -182,7 +185,7 @@ case_unwritable_lock_stops_the_loop() {
 case_writable_state_dir_works() {
     local root="$TMP/writable" state mode
     make_root "$root"
-    state="$(state_dir_for "$root/home")"
+    state="$(state_dir_for "$root/home" "$root/state")"
     run_status "$root"
     if [ "$timed_out" = 1 ]; then
         fail "a writable state directory still serves status (still running after ${FAST_DEADLINE}s)"

@@ -213,11 +213,27 @@ acquire_lock() {
         # absent lock directory is not that window: the failed `mkdir` above could
         # not create it, so there is nothing to wait for.
         if [ -d "$LOCK_DIR" ] &&
-            { [ -z "$holder" ] || [ -z "$holder_cmd" ]; } &&
-            [ "$missing_retries" -lt 50 ]; then
-            missing_retries=$((missing_retries + 1))
-            sleep "$LOCK_RETRY_SLEEP"
-            continue
+            { [ -z "$holder" ] || [ -z "$holder_cmd" ]; }; then
+            if [ ! -w "$STATE_DIR" ]; then
+                # The wait is a grace only while the reclaim below can still run.
+                # An unwritable state directory cannot rename the lock aside, so
+                # every pass here takes nothing and reclaims nothing: count it
+                # toward the failure bound, which stops the launcher in about two
+                # seconds instead of after 50 ticks of grace on every cycle.
+                failed_passes=$((failed_passes + 1))
+                if [ "$failed_passes" -ge "$LOCK_FAILURE_LIMIT" ]; then
+                    echo "Cannot take or reclaim the task-viewer lock in: $STATE_DIR" >&2
+                    echo "Check that the state directory is writable, then try again." >&2
+                    exit 1
+                fi
+                sleep "$LOCK_RETRY_SLEEP"
+                continue
+            fi
+            if [ "$missing_retries" -lt 50 ]; then
+                missing_retries=$((missing_retries + 1))
+                sleep "$LOCK_RETRY_SLEEP"
+                continue
+            fi
         fi
         missing_retries=0
         stale="$LOCK_DIR.stale.$$.$RANDOM"
