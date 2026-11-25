@@ -6662,6 +6662,74 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_keeps_earlier_rows_when_a_tasks_symlink_points_outside() {
+        // A `tasks/` symlink that resolves outside the configured folder fails
+        // the repository's scan, so its earlier rows stay instead of being
+        // replaced by markdown charted from outside the folder.
+        let path = temp_database("scan_outside_tasks_symlink");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let root = unique_temp_dir("scan_outside_tasks_symlink_repo");
+        let repo = root.join("repo");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(
+            outside.join("scope_outside.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Outside\n",
+        )
+        .expect("outside task");
+        std::os::unix::fs::symlink(&outside, repo.join("tasks")).expect("tasks symlink");
+        let id = db::insert_repository(&pool, "outside-link", &repo.to_string_lossy())
+            .await
+            .expect("insert");
+        sqlx::query(
+            "INSERT INTO tasks
+                (repository_id, path, scope, kind, created, updated, ship_date, leave_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("tasks/scope_old.md")
+        .bind("scope")
+        .bind("live")
+        .bind("2026-05-01")
+        .bind("2026-05-01")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("earlier rows");
+
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        scan_core(
+            &pool,
+            &repositories,
+            1,
+            Arc::new(harvest::harvest_repository_with_prior),
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+
+        let after = db::list_repositories(&pool).await.expect("after");
+        let failed = after
+            .iter()
+            .find(|repository| repository.repository_id == id)
+            .expect("repository");
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("The scan could not read the repository."),
+            "the outside link records the fixed scan error"
+        );
+        let rows = db::load_tasks(&pool, Some(id)).await.expect("earlier rows");
+        assert_eq!(rows.len(), 1, "the earlier rows stay intact");
+        assert_eq!(rows[0].scope, "scope");
+        let _ = std::fs::remove_dir_all(&root);
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
     async fn web_scan_keeps_earlier_rows_when_a_ref_union_blob_vanishes() {
         // A listed blob that `cat-file --batch` answers `missing` must fail the
         // scan with a Git error that names its path, and the repository keeps

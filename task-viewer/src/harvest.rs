@@ -1317,6 +1317,11 @@ fn parse_batch<R: BufRead>(
 /// would replace the repository's rows with that smaller set. The error keeps
 /// the walk's own text, which names the path it could not read.
 ///
+/// A `tasks/` symlink is charted only when its resolved target stays inside the
+/// configured folder. Walkdir follows the walk root's own symlink, so a link
+/// that escapes the folder fails the scan with an error naming the `tasks/`
+/// path and the outside target, and the repository keeps its prior rows.
+///
 /// Every `.md` file is read and classified so each skip keeps its warning: one
 /// that cannot be opened or read, one that is not valid UTF-8, and one larger
 /// than `MAX_TASK_FILE_BYTES` (read only through the cap plus one byte) each
@@ -1333,6 +1338,22 @@ fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow
     let tasks_root = repo.join("tasks");
     if !tasks_root.is_dir() {
         return Ok(Vec::new());
+    }
+    // Walkdir follows a symlink at the walk root even with `follow_links` off,
+    // so a committed `tasks -> ../../..` would chart markdown from outside the
+    // configured folder under paths relative to it. Resolve the root once and
+    // fail the scan when it lands outside: the repository keeps its prior rows
+    // and the logged error names the path and the outside target. A target
+    // inside the folder keeps the walk on `tasks_root` itself, so every stored
+    // path stays `tasks/<subpath>`.
+    let target = fs::canonicalize(&tasks_root)?;
+    let root = fs::canonicalize(repo)?;
+    if !target.starts_with(&root) {
+        return Err(HarvestError::Io(std::io::Error::other(format!(
+            "the tasks/ folder at {} is a symlink that points outside the configured folder: it resolves to {}",
+            tasks_root.display(),
+            target.display()
+        ))));
     }
     let mut files = Vec::new();
     let mut retained = 0usize;
@@ -5143,6 +5164,59 @@ mod tests {
         let error = harvest_repository(&repo).expect_err("missing");
         assert!(matches!(error, HarvestError::MissingTasks));
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a `tasks/` symlink whose target stays inside the configured
+    /// folder charts its tasks under `tasks/...` paths, unchanged by the
+    /// containment check.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_charts_an_inside_tasks_symlink_under_tasks_paths() {
+        let repo = scratch("harvest_inside_tasks_symlink");
+        fs::create_dir_all(repo.join("real_tasks")).expect("real tasks");
+        write_task(&repo, "real_tasks/scope_inside.md", "2026-05-01", "open");
+        std::os::unix::fs::symlink("real_tasks", repo.join("tasks")).expect("tasks symlink");
+
+        let tasks = harvest_repository(&repo).expect("an inside link charts");
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(
+            tasks[0].path, "tasks/scope_inside.md",
+            "the stored path stays relative to the configured folder"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a `tasks/` symlink that points outside the configured folder
+    /// fails the scan, and the error names the `tasks/` path and the outside
+    /// target it resolves to.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_refuses_an_outside_tasks_symlink() {
+        let root = scratch("harvest_outside_tasks_symlink");
+        let repo = root.join("repo");
+        let outside = root.join("outside");
+        fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&outside).expect("outside");
+        write_task(&outside, "scope_outside.md", "2026-05-01", "open");
+        std::os::unix::fs::symlink(&outside, repo.join("tasks")).expect("tasks symlink");
+
+        let error = harvest_repository(&repo).expect_err("an outside link fails the scan");
+        assert!(matches!(error, HarvestError::Io(_)), "{error:?}");
+        let message = error.to_string();
+        assert!(
+            message.contains("tasks/"),
+            "the error names the stored tasks path: {message}"
+        );
+        let target = fs::canonicalize(&outside).expect("canonical outside");
+        assert!(
+            message.contains(&target.display().to_string()),
+            "the error names the outside target: {message}"
+        );
+        assert!(
+            message.contains("points outside the configured folder"),
+            "the error says the link points outside the folder: {message}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn write_task(repo: &Path, rel: &str, created: &str, status: &str) {
