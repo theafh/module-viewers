@@ -3031,11 +3031,15 @@ fn escape_posix_ere(value: &str) -> String {
     escaped
 }
 
-/// The committer day of the earliest commit that introduces `status` on `rel`.
+/// The committer day of the earliest commit that introduces `status` on `rel`,
+/// across every accepted spelling of the status.
 ///
-/// The three `-S` literals match the exact spellings first. The anchored `-G`
-/// pattern then widens the search to a status quoted with padding inside its
-/// quotes, which the frontmatter reader trims before it reaches this lookup.
+/// The three `-S` literals match the exact spellings, and the anchored `-G`
+/// pattern widens the search to a status quoted with padding inside its quotes,
+/// which the frontmatter reader trims before it reaches this lookup. Each
+/// pattern's hit is folded into the earliest day, so a task first written
+/// `status: "open"` and later rewritten `status: open` keeps the day of the
+/// earlier commit instead of the day of the first spelling that happens to hit.
 fn first_status_commit_date(
     repo: &Path,
     git: &GitContext,
@@ -3066,12 +3070,16 @@ fn first_status_commit_date(
             ),
         ),
     ];
+    let mut earliest: Option<NaiveDate> = None;
     for (flag, pattern) in patterns {
         if let Some(day) = git_pickaxe(repo, git, rel, flag, &pattern)? {
-            return Ok(Some(day));
+            earliest = Some(match earliest {
+                Some(current) => current.min(day),
+                None => day,
+            });
         }
     }
-    Ok(None)
+    Ok(earliest)
 }
 
 enum LogLookup {
@@ -6780,6 +6788,69 @@ mod tests {
         assert_eq!(
             day,
             Some(NaiveDate::from_ymd_opt(2026, 6, 15).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_dates_a_quoted_then_bare_status_from_its_earliest_commit() {
+        // The bare `-S` pattern hits only the second commit while the quoted
+        // patterns reach the first, so folding every hit into the earliest day
+        // is what keeps the earlier commit. Trying the patterns in order and
+        // returning the first hit would answer the second commit's day.
+        let repo = scratch("harvest_quoted_then_bare_status");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_quoted.md",
+            "2026-05-01",
+            "2026-05-01",
+            "\"open\"",
+        );
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archive quoted open"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_quoted.md",
+            "2026-05-01",
+            "2026-06-01",
+            "open",
+        );
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "rewrite status bare"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let git = GitContext::resolve(&repo).expect("git context");
+        let day = first_status_commit_date(&repo, &git, "tasks/archive/scope_quoted.md", "open")
+            .expect("lookup");
+        assert_eq!(
+            day,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day")),
+            "the earliest accepted spelling dates the task"
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day")),
+            "the stored leave day is the earlier commit, not the bare rewrite"
+        );
+        assert_ne!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day"))
         );
         let _ = fs::remove_dir_all(&repo);
     }
