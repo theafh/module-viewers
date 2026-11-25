@@ -441,6 +441,8 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(home))
         .route("/tasks", get(tasks_page))
         .route("/tasks.csv", get(tasks_csv))
+        .route("/charts.csv", get(charts_csv))
+        .route("/charts.json", get(charts_json))
         .route("/repositories", get(repositories_page).post(add_repository))
         .route(
             "/repositories/{id}/delete",
@@ -936,6 +938,15 @@ struct ProjectForm {
     project: String,
 }
 
+/// The chart exports take the same project filter the dashboard accepts and
+/// nothing else, so a link that leaves the page carries the one thing the
+/// charts depend on.
+#[derive(Debug, Deserialize, Default)]
+struct ChartQuery {
+    #[serde(default)]
+    project: String,
+}
+
 async fn home(State(state): State<AppState>, Query(query): Query<HomeQuery>) -> Response {
     match render_home(&state, &query).await {
         Ok(html) => Html(html).into_response(),
@@ -1002,6 +1013,59 @@ async fn tasks_csv(State(state): State<AppState>, Query(query): Query<TasksQuery
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "The task list could not be exported.",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /charts.json` serves the dashboard's own chart payload as an
+/// attachment, built for the project the query names, so a saved payload is the
+/// one the page drew from.
+async fn charts_json(State(state): State<AppState>, Query(query): Query<ChartQuery>) -> Response {
+    match render_charts_json(&state, &query.project).await {
+        Ok(json) => (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"charts.json\"",
+                ),
+            ],
+            json,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "chart JSON export failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The chart payload could not be exported.",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /charts.csv` serves the same series as a long-format CSV, one row per
+/// point, for the project the query names.
+async fn charts_csv(State(state): State<AppState>, Query(query): Query<ChartQuery>) -> Response {
+    match render_charts_csv(&state, &query.project).await {
+        Ok(csv) => (
+            [
+                (header::CONTENT_TYPE, "text/csv"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"charts.csv\"",
+                ),
+            ],
+            csv,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "chart CSV export failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The chart series could not be exported.",
             )
                 .into_response()
         }
@@ -1117,14 +1181,24 @@ fn chart_payload(board: &series::Dashboard) -> anyhow::Result<String> {
     Ok(String::from_utf8(buffer)?)
 }
 
-async fn render_dashboard(
-    state: &AppState,
-    query: &HomeQuery,
-    notice: String,
-    error: String,
-) -> anyhow::Result<String> {
+/// One project's chart inputs: the repositories the filter was resolved
+/// against, the stored rows it selected, and the radar mode and label that go
+/// with the selection.
+struct ChartSelection {
+    repositories: Vec<Repository>,
+    selected: Option<i64>,
+    tasks: Vec<series::TaskRecord>,
+    mode: RadarMode,
+    label: String,
+}
+
+/// Resolve one project filter into the rows and labels the charts are built
+/// from. The dashboard page and both chart exports call this, so a project
+/// named on the page and the same project named on an export read one set of
+/// rows.
+async fn chart_selection(state: &AppState, project: &str) -> anyhow::Result<ChartSelection> {
     let repositories = db::list_repositories(&state.pool).await?;
-    let selected = selected_id(&repositories, &query.project);
+    let selected = selected_id(&repositories, project);
     let (tasks, mode, label) = match selected {
         Some(id) => {
             let name = repositories
@@ -1144,6 +1218,73 @@ async fn render_dashboard(
             "All projects".to_string(),
         ),
     };
+    Ok(ChartSelection {
+        repositories,
+        selected,
+        tasks,
+        mode,
+        label,
+    })
+}
+
+/// The payload for one selection, carrying the filter's own spelling in
+/// `project` so a drill-down link built from an exported payload opens the same
+/// view. The dashboard page and the two chart exports all build through this
+/// function, so their payloads cannot drift.
+fn chart_board(
+    tasks: &[series::TaskRecord],
+    mode: RadarMode,
+    label: &str,
+    project: &str,
+) -> series::Dashboard {
+    let mut board = series::dashboard(tasks, crate::dates::today(), mode, label);
+    board.project = project.to_string();
+    board
+}
+
+/// The filter's own spelling: `all`, or the repository id the request named.
+fn chart_project(selected: Option<i64>) -> String {
+    match selected {
+        Some(id) => id.to_string(),
+        None => "all".to_string(),
+    }
+}
+
+async fn render_charts_json(state: &AppState, project: &str) -> anyhow::Result<String> {
+    let selection = chart_selection(state, project).await?;
+    let board = chart_board(
+        &selection.tasks,
+        selection.mode,
+        &selection.label,
+        &chart_project(selection.selected),
+    );
+    chart_payload(&board)
+}
+
+async fn render_charts_csv(state: &AppState, project: &str) -> anyhow::Result<String> {
+    let selection = chart_selection(state, project).await?;
+    let board = chart_board(
+        &selection.tasks,
+        selection.mode,
+        &selection.label,
+        &chart_project(selection.selected),
+    );
+    Ok(charts_csv_text(&board))
+}
+
+async fn render_dashboard(
+    state: &AppState,
+    query: &HomeQuery,
+    notice: String,
+    error: String,
+) -> anyhow::Result<String> {
+    let ChartSelection {
+        repositories,
+        selected,
+        tasks,
+        mode,
+        label,
+    } = chart_selection(state, &query.project).await?;
     let projects = repositories.iter().map(project_view).collect::<Vec<_>>();
     let scan_label = scan_label(&repositories, selected);
     let in_scope = repositories
@@ -1172,8 +1313,7 @@ async fn render_dashboard(
     let html = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         #[cfg(test)]
         record_render_blocking_thread();
-        let mut board = series::dashboard(&tasks, crate::dates::today(), mode, &label);
-        board.project = selected.clone();
+        let board = chart_board(&tasks, mode, &label, &selected);
         let summary = dashboard_summary(&board.counts, in_scope, &board.as_of);
         let data_json = chart_payload(&board)?;
         let page = DashboardPage {
@@ -1567,6 +1707,7 @@ async fn render_tasks(state: &AppState, query: &TasksQuery) -> anyhow::Result<St
         scopes: selection.scopes,
         headers: task_sort_headers(query, &project, sort),
         export_query: export_query(query, &project, sort),
+        charts_query: format!("project={}", encode_query(&project)),
         rows,
     };
     let context = Context::from_serialize(page)?;
@@ -1721,6 +1862,149 @@ fn csv_field(value: &str) -> String {
         out.push('"');
     } else {
         out.push_str(value);
+    }
+    out
+}
+
+/// One long-format chart CSV record: the series name, the point's key, and its
+/// value, each written through `csv_field` so a label holding a comma, a quote,
+/// or a line break survives the round trip and a label a spreadsheet would read
+/// as a formula opens as text.
+fn push_chart_row(out: &mut String, series: &str, key: &str, value: &str) {
+    let _ = writeln!(
+        out,
+        "{},{},{}",
+        csv_field(series),
+        csv_field(key),
+        csv_field(value)
+    );
+}
+
+/// A chart value as CSV text. An integer series writes its digits and a fitted
+/// trend writes its rounded float, both without a trailing `.0`.
+fn chart_value(value: f64) -> String {
+    format!("{value}")
+}
+
+/// The chart CSV body: the fixed header `series,key,value`, then one row per
+/// point of the ten series. A weekly point writes its week day for each of the
+/// three bars, a line chart writes its day for the level and a `<series>_trend`
+/// row for its fit, a calendar writes its day, staleness writes its day once per
+/// threshold, and each radar writes its spoke label. A project with no stored
+/// rows carries no event to export, so it returns the header alone instead of
+/// 365 zero-count calendar days per calendar.
+fn charts_csv_text(board: &series::Dashboard) -> String {
+    let mut out = String::from("series,key,value\n");
+    if board.counts.tasks == 0 {
+        return out;
+    }
+    for week in &board.weekly {
+        push_chart_row(&mut out, "created", &week.week, &week.created.to_string());
+        push_chart_row(&mut out, "shipped", &week.week, &week.shipped.to_string());
+        push_chart_row(&mut out, "deferred", &week.week, &week.deferred.to_string());
+    }
+    for point in &board.cumulative {
+        push_chart_row(
+            &mut out,
+            "cumulative",
+            &point.date,
+            &point.cumulative.to_string(),
+        );
+        push_chart_row(
+            &mut out,
+            "cumulative_trend",
+            &point.date,
+            &chart_value(point.trend),
+        );
+    }
+    for point in &board.shipped_calendar {
+        push_chart_row(
+            &mut out,
+            "shipped_calendar",
+            &point.date,
+            &point.count.to_string(),
+        );
+    }
+    for point in &board.created_calendar {
+        push_chart_row(
+            &mut out,
+            "created_calendar",
+            &point.date,
+            &point.count.to_string(),
+        );
+    }
+    for point in &board.live_backlog {
+        push_chart_row(&mut out, "backlog", &point.date, &point.live.to_string());
+        push_chart_row(
+            &mut out,
+            "backlog_trend",
+            &point.date,
+            &chart_value(point.trend),
+        );
+    }
+    for point in &board.mean_age {
+        push_chart_row(
+            &mut out,
+            "mean_age",
+            &point.date,
+            &chart_value(point.avg_age),
+        );
+        push_chart_row(
+            &mut out,
+            "mean_age_trend",
+            &point.date,
+            &chart_value(point.trend),
+        );
+    }
+    for point in &board.cycle {
+        push_chart_row(
+            &mut out,
+            "cycle",
+            &point.date,
+            &chart_value(point.avg_cycle),
+        );
+        push_chart_row(
+            &mut out,
+            "cycle_trend",
+            &point.date,
+            &chart_value(point.trend),
+        );
+    }
+    for point in &board.staleness {
+        push_chart_row(
+            &mut out,
+            "staleness_over_30",
+            &point.date,
+            &point.over_30.to_string(),
+        );
+        push_chart_row(
+            &mut out,
+            "staleness_over_90",
+            &point.date,
+            &point.over_90.to_string(),
+        );
+        push_chart_row(
+            &mut out,
+            "staleness_over_180",
+            &point.date,
+            &point.over_180.to_string(),
+        );
+    }
+    for spoke in &board.radar_shipped {
+        push_chart_row(
+            &mut out,
+            "radar_shipped",
+            &spoke.label,
+            &spoke.count.to_string(),
+        );
+    }
+    for spoke in &board.radar_live {
+        push_chart_row(
+            &mut out,
+            "radar_live",
+            &spoke.label,
+            &spoke.count.to_string(),
+        );
     }
     out
 }
@@ -2155,6 +2439,10 @@ struct TasksPage {
     headers: Vec<TaskSortHeader>,
     /// The percent-encoded query the Export CSV link carries.
     export_query: String,
+    /// The percent-encoded query the Charts CSV and Charts JSON links carry:
+    /// the selected project alone, since the chart series depend on nothing
+    /// else the list filters.
+    charts_query: String,
     rows: Vec<TaskRowView>,
 }
 
@@ -10686,6 +10974,278 @@ mod tests {
         assert!(
             all.contains("\"alpha_quote\"\"name.md\""),
             "a quote path is wrapped and its inner quote doubled: {all}"
+        );
+        cleanup(&path);
+    }
+
+    /// The chart JSON a dashboard render embeds in its payload script element.
+    fn embedded_payload(html: &str) -> serde_json::Value {
+        let marker = "<script id=\"payload\" type=\"application/json\">";
+        let start = html.find(marker).expect("the payload script") + marker.len();
+        let end = html[start..]
+            .find("</script>")
+            .map(|offset| start + offset)
+            .expect("the payload script closes");
+        serde_json::from_str(&html[start..end]).expect("the payload is JSON")
+    }
+
+    async fn dashboard_payload(state: &AppState, project: &str) -> serde_json::Value {
+        let uri = if project.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/?project={project}")
+        };
+        let response = send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri} renders");
+        embedded_payload(&body_text(response).await)
+    }
+
+    /// Covers: `GET /charts.json` serves the dashboard's own payload for the
+    /// same project as an attachment, so a saved payload is the one the page
+    /// drew from, for All projects (absent or `all`) and for one repository.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_charts_json_matches_the_dashboard_payload_for_the_project() {
+        let (state, path, alpha, beta) = seeded_task_list("charts_json").await;
+        for (filter, project) in [
+            (String::new(), "all".to_string()),
+            ("?project=all".to_string(), "all".to_string()),
+            (format!("?project={alpha}"), alpha.to_string()),
+            (format!("?project={beta}"), beta.to_string()),
+        ] {
+            let uri = format!("/charts.json{filter}");
+            let response = send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                header_text(&response, header::CONTENT_TYPE),
+                "application/json",
+                "{uri}"
+            );
+            assert_eq!(
+                header_text(&response, header::CONTENT_DISPOSITION),
+                "attachment; filename=\"charts.json\"",
+                "{uri}"
+            );
+            assert_eq!(
+                header_text(&response, header::CACHE_CONTROL),
+                "no-store",
+                "{uri}"
+            );
+            let exported: serde_json::Value =
+                serde_json::from_str(&body_text(response).await).expect("exported JSON");
+            let embedded = dashboard_payload(&state, filter.trim_start_matches("?project=")).await;
+            assert_eq!(exported, embedded, "{uri} equals the embedded payload");
+            assert_eq!(
+                exported["project"], project,
+                "{uri} keeps the filter's spelling"
+            );
+        }
+        cleanup(&path);
+    }
+
+    /// Covers: `GET /charts.csv` writes the fixed long-format header and one row
+    /// per point for every series: the weekly bars, each line chart's level and
+    /// `<series>_trend` fit, both calendars, the three staleness thresholds, and
+    /// both radars by spoke label.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_charts_csv_has_long_format_and_the_known_weekly_row() {
+        let (state, path, alpha, _beta) = seeded_task_list("charts_csv").await;
+        let uri = format!("/charts.csv?project={alpha}");
+        let response = send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            header_text(&response, header::CONTENT_TYPE),
+            "text/csv",
+            "{uri}"
+        );
+        assert_eq!(
+            header_text(&response, header::CONTENT_DISPOSITION),
+            "attachment; filename=\"charts.csv\"",
+            "{uri}"
+        );
+        assert_eq!(
+            header_text(&response, header::CACHE_CONTROL),
+            "no-store",
+            "{uri}"
+        );
+        let csv = body_text(response).await;
+        let rows = csv_rows(&csv);
+        assert_eq!(
+            rows[0],
+            vec!["series", "key", "value"],
+            "{uri} carries the fixed header"
+        );
+
+        // Alpha's live row was created on 2026-05-01 and its finished row on
+        // 2026-05-02, so both sit in the week starting Monday 2026-04-27; the
+        // finished row shipped on 2026-05-10, the week starting 2026-05-04.
+        let has_row = |series: &str, key: &str, value: &str| {
+            rows[1..]
+                .iter()
+                .any(|row| row[0] == series && row[1] == key && row[2] == value)
+        };
+        assert!(
+            has_row("created", "2026-04-27", "2"),
+            "the created weekly bar sums both rows: {csv}"
+        );
+        assert!(
+            has_row("shipped", "2026-05-04", "1"),
+            "the shipped weekly bar carries the ship week: {csv}"
+        );
+        assert!(
+            has_row("deferred", "2026-04-27", "0"),
+            "every charted week carries a deferred bar: {csv}"
+        );
+
+        for series in [
+            "created",
+            "shipped",
+            "deferred",
+            "cumulative",
+            "cumulative_trend",
+            "shipped_calendar",
+            "created_calendar",
+            "backlog",
+            "backlog_trend",
+            "mean_age",
+            "mean_age_trend",
+            "cycle",
+            "cycle_trend",
+            "staleness_over_30",
+            "staleness_over_90",
+            "staleness_over_180",
+            "radar_shipped",
+            "radar_live",
+        ] {
+            assert!(
+                rows[1..].iter().any(|row| row[0] == series),
+                "the CSV carries the {series} series: {csv}"
+            );
+        }
+        let series_rows = |name: &str| rows[1..].iter().filter(|row| row[0] == name).count();
+        assert_eq!(
+            series_rows("cumulative"),
+            series_rows("cumulative_trend"),
+            "cumulative carries one fit row per level row"
+        );
+        assert_eq!(
+            series_rows("backlog"),
+            series_rows("backlog_trend"),
+            "backlog carries one fit row per level row"
+        );
+        assert_eq!(
+            series_rows("mean_age"),
+            series_rows("mean_age_trend"),
+            "mean age carries one fit row per level row"
+        );
+        assert_eq!(
+            series_rows("cycle"),
+            series_rows("cycle_trend"),
+            "cycle time carries one fit row per level row"
+        );
+        assert!(
+            has_row("radar_live", "alpha", "1"),
+            "the live radar uses the scope as its spoke label: {csv}"
+        );
+        assert!(
+            has_row("radar_shipped", "alpha", "1"),
+            "the shipped radar uses the scope as its spoke label: {csv}"
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: a project with no stored rows exports the header alone and a
+    /// JSON payload whose event series are all empty, while both routes still
+    /// answer for the All-projects view.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_charts_exports_an_empty_project() {
+        let (state, path) = app_state("charts_empty").await;
+        let folder = unique_temp_dir("charts_empty_repo");
+        std::fs::create_dir_all(&folder).expect("repository folder");
+        let empty = db::insert_repository(&state.pool, "Empty", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+
+        let csv_response = send(
+            state.clone(),
+            get_page(&format!("/charts.csv?project={empty}"), "127.0.0.1:7880"),
+        )
+        .await;
+        assert_eq!(csv_response.status(), StatusCode::OK);
+        assert_eq!(body_text(csv_response).await, "series,key,value\n");
+
+        let json_response = send(
+            state.clone(),
+            get_page(&format!("/charts.json?project={empty}"), "127.0.0.1:7880"),
+        )
+        .await;
+        assert_eq!(json_response.status(), StatusCode::OK);
+        let payload: serde_json::Value =
+            serde_json::from_str(&body_text(json_response).await).expect("JSON payload");
+        assert_eq!(payload["counts"]["tasks"], 0);
+        for series in [
+            "weekly",
+            "cumulative",
+            "live_backlog",
+            "mean_age",
+            "cycle",
+            "staleness",
+            "radar_shipped",
+            "radar_live",
+        ] {
+            assert_eq!(
+                payload[series].as_array().map(Vec::len),
+                Some(0),
+                "the {series} series is empty"
+            );
+        }
+        for calendar in ["shipped_calendar", "created_calendar"] {
+            assert!(
+                payload[calendar]
+                    .as_array()
+                    .expect("calendar rows")
+                    .iter()
+                    .all(|day| day["count"] == 0),
+                "the {calendar} grid holds only zero counts"
+            );
+        }
+
+        // The same empty export answers the All-projects view, which has no
+        // stored rows either.
+        let all_csv =
+            body_text(send(state.clone(), get_page("/charts.csv", "127.0.0.1:7880")).await).await;
+        assert_eq!(all_csv, "series,key,value\n");
+        cleanup(&path);
+    }
+
+    /// Covers: the task list renders Charts CSV and Charts JSON beside Export
+    /// CSV, and both carry the selected project and nothing else.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_charts_links_carry_the_project_beside_export() {
+        let (state, path, alpha, _beta) = seeded_task_list("charts_links").await;
+        let body = task_list_body(&state, &format!("project={alpha}&kind=finished")).await;
+        let export = body.find(">Export CSV<").expect("Export CSV link");
+        let charts_csv = body.find(">Charts CSV<").expect("Charts CSV link");
+        let charts_json = body.find(">Charts JSON<").expect("Charts JSON link");
+        assert!(export < charts_csv && charts_csv < charts_json, "{body}");
+        assert!(
+            body.contains(&format!("href=\"/charts.csv?project={alpha}\">Charts CSV")),
+            "the Charts CSV link carries the project: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "href=\"/charts.json?project={alpha}\">Charts JSON"
+            )),
+            "the Charts JSON link carries the project: {body}"
+        );
+
+        let all = task_list_body(&state, "").await;
+        assert!(
+            all.contains("href=\"/charts.csv?project=all\">Charts CSV"),
+            "the All-projects view links project=all: {all}"
+        );
+        assert!(
+            all.contains("href=\"/charts.json?project=all\">Charts JSON"),
+            "{all}"
         );
         cleanup(&path);
     }
