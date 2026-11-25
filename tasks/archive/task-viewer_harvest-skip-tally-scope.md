@@ -2,8 +2,8 @@
 description: "Count only task-shaped files in the Update banner's skipped-file tally, so a stray non-UTF-8 or oversized markdown file under tasks/ stops inflating it."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-25T04:32:59Z
-status: implemented
+updated: 2026-11-25T04:36:00Z
+status: finished
 reported-by: Andreas Hoffmann
 implemented-by: Andreas Hoffmann
 design-extended: false
