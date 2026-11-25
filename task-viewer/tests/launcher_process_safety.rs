@@ -168,7 +168,7 @@ impl Root {
         }
         // The launcher's stop window can still leave a detached server behind;
         // the test's own cleanup sends the signal the launcher would have.
-        if process_alive(pid) {
+        if process_alive_for_cleanup(pid) {
             let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
         }
     }
@@ -312,7 +312,25 @@ fn answers(port: u16) -> bool {
     .is_ok()
 }
 
+/// Whether `pid` names a live process, read through `kill -0`. An assertion
+/// path calls this, so a `kill -0` that cannot run panics with a clear message
+/// instead of answering "not alive": a spawn failure must never make a
+/// "must be gone" assertion hold vacuously.
 fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run kill -0")
+        .success()
+}
+
+/// A non-panicking liveness read for `Root`'s cleanup, which runs while a
+/// failing assertion unwinds: a `kill -0` that cannot run reads as "unknown"
+/// and returns `false`, so `Drop` never panics a second time and aborts the
+/// test process. A `kill -0` that does run still decides.
+fn process_alive_for_cleanup(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
