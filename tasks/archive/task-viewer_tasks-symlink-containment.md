@@ -2,8 +2,8 @@
 description: "Follow a tasks folder symlink only when its target stays inside the selected repository, and fail the scan for an outside target."
 scope: task-viewer
 created: 2026-11-25T09:49:49Z
-updated: 2026-11-25T13:26:53Z
-status: implemented
+updated: 2026-11-25T13:29:32Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
