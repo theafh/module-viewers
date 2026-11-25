@@ -2,8 +2,8 @@
 description: "Let the repository row's action column shrink and its Rescan/Relocate/Remove labels wrap, so a long folder name stops widening the page at a narrow window."
 scope: task-viewer
 created: 2026-11-25T05:20:00Z
-updated: 2026-11-25T09:14:32Z
-status: implemented
+updated: 2026-11-25T07:58:57Z
+status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: false
 reported-by: Andreas Hoffmann
