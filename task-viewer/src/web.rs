@@ -101,7 +101,10 @@ pub struct AppState {
     /// check runs on the async worker. Production never reads it.
     offloaded_fs_calls: Arc<AtomicUsize>,
     harvest: Arc<HarvestFn>,
-    flash: Arc<Mutex<FlashStore>>,
+    /// The one-shot banners. The lock is synchronous because a dashboard read
+    /// that is dropped before its render finishes puts the claimed slot back
+    /// from `Drop`, and a destructor cannot await.
+    flash: Arc<std::sync::Mutex<FlashStore>>,
     /// A duplicate-clone Add held for confirmation: the already-validated
     /// canonical path and the repository it duplicates, named by a one-shot
     /// token the Repositories redirect carries.
@@ -126,10 +129,19 @@ impl AppState {
             prior_read_hook: Arc::new(|_| Box::pin(ready(()))),
             offloaded_fs_calls: Arc::new(AtomicUsize::new(0)),
             harvest: Arc::new(harvest::harvest_repository_with_prior),
-            flash: Arc::new(Mutex::new(FlashStore::default())),
+            flash: Arc::new(std::sync::Mutex::new(FlashStore::default())),
             held_clone: Arc::new(Mutex::new(HeldCloneStore::default())),
             static_version,
         })
+    }
+
+    /// Take the flash store's synchronous lock. A render that panicked while
+    /// holding it must not lose the banner, so a poisoned lock still yields
+    /// the store instead of panicking here.
+    fn flash(&self) -> std::sync::MutexGuard<'_, FlashStore> {
+        self.flash
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -200,6 +212,48 @@ struct ClaimedBanner {
     token: String,
     key: &'static str,
     message: String,
+}
+
+/// One dashboard read's claim on a flash slot. A read that is dropped before
+/// its render produces a response, as a cancelled navigation is, puts the slot
+/// back from `Drop`, so the next read shows the outcome instead of losing it.
+/// A completed render disarms the guard, which leaves the slot consumed, and
+/// the render's error arm restores the slot at its call site.
+struct BannerGuard<'a> {
+    state: &'a AppState,
+    claimed: Option<ClaimedBanner>,
+}
+
+impl<'a> BannerGuard<'a> {
+    /// Hold `claimed` for the read's lifetime. `None` holds nothing, so a read
+    /// that named no slot restores nothing.
+    fn new(state: &'a AppState, claimed: Option<ClaimedBanner>) -> Self {
+        Self { state, claimed }
+    }
+
+    /// The banner the read renders, if it claimed one.
+    fn claimed(&self) -> Option<&ClaimedBanner> {
+        self.claimed.as_ref()
+    }
+
+    /// Put the claimed slot back now, and leave nothing for `Drop` to restore.
+    fn restore(&mut self) {
+        if let Some(claimed) = self.claimed.take() {
+            self.state.flash().restore(claimed);
+        }
+    }
+
+    /// Drop the claim without restoring it, because the render consumed the
+    /// banner by producing its response.
+    fn disarm(&mut self) {
+        self.claimed = None;
+    }
+}
+
+impl Drop for BannerGuard<'_> {
+    fn drop(&mut self) {
+        self.restore();
+    }
 }
 
 /// The numeric slot a request's token names. A token that is not a plain
@@ -951,16 +1005,18 @@ async fn tasks_csv(State(state): State<AppState>, Query(query): Query<TasksQuery
 }
 
 async fn render_home(state: &AppState, query: &HomeQuery) -> anyhow::Result<String> {
-    let claimed = claim_banner(state, query).await;
-    let (notice, error) = banner_text(claimed.as_ref(), query);
+    let mut banner = BannerGuard::new(state, claim_banner(state, query));
+    let (notice, error) = banner_text(banner.claimed(), query);
     match render_dashboard(state, query, notice, error).await {
-        Ok(html) => Ok(html),
+        Ok(html) => {
+            // The render produced its response, so the slot stays consumed.
+            banner.disarm();
+            Ok(html)
+        }
         Err(error) => {
             // The read claimed the slot before the render, so a render that
             // fails for any reason puts the exact slot back for the next read.
-            if let Some(claimed) = claimed {
-                state.flash.lock().await.restore(claimed);
-            }
+            banner.restore();
             Err(error)
         }
     }
@@ -982,17 +1038,17 @@ fn banner_text(claimed: Option<&ClaimedBanner>, query: &HomeQuery) -> (String, S
 
 /// Claim the flash slot `?flash=` names for this request, or `None` when the
 /// query names no slot or names one that is already gone; the banner the query's
-/// code names then stands in. The claim removes the slot under one lock
-/// acquisition, so however many reads name one token, only the first renders
-/// it, and `render_home` puts the slot back when the render fails. The
-/// middleware rejects a cross-site read that names a slot before this runs, so
-/// a rejected read claims nothing and leaves the banner for the navigation the
-/// person actually made.
-async fn claim_banner(state: &AppState, query: &HomeQuery) -> Option<ClaimedBanner> {
+/// code names then stands in. The claim removes the slot under one synchronous
+/// lock acquisition, so however many reads name one token, only the first
+/// renders it, and the read's `BannerGuard` puts the slot back when the read is
+/// cancelled or the render fails. The middleware rejects a cross-site read that
+/// names a slot before this runs, so a rejected read claims nothing and leaves
+/// the banner for the navigation the person actually made.
+fn claim_banner(state: &AppState, query: &HomeQuery) -> Option<ClaimedBanner> {
     if query.flash.is_empty() {
         return None;
     }
-    state.flash.lock().await.claim(&query.flash)
+    state.flash().claim(&query.flash)
 }
 
 /// The thread the dashboard's blocking render closure last ran on, recorded for
@@ -2853,7 +2909,7 @@ fn skipped_note(skipped: usize) -> String {
 
 async fn scan_response(state: &AppState, project: &str, report: &ScanReport) -> Response {
     let (key, message) = scan_flash(report);
-    let token = state.flash.lock().await.insert(key, message);
+    let token = state.flash().insert(key, message);
     Redirect::to(&format!(
         "/?project={}&flash={token}",
         safe_project(project)
@@ -2865,9 +2921,7 @@ async fn scan_response(state: &AppState, project: &str, report: &ScanReport) -> 
 /// it, so a stopped or list-failed Update shows once and is gone on reload.
 async fn flash_banner(state: &AppState, project: &str, banner: Banner) -> Response {
     let token = state
-        .flash
-        .lock()
-        .await
+        .flash()
         .insert(banner.key(), banner.message().to_string());
     Redirect::to(&format!(
         "/?project={}&flash={token}",
@@ -3007,15 +3061,15 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Banner, FLASH_CAPACITY, FlashQuery, FlashStore, GIT_ERROR, HarvestFn, HomeQuery,
-        MISSING_TASKS_ERROR, PickerFn, PickerResult, PriorReadHookFn, ProjectForm, STOPPED_ERROR,
-        ScanFailure, ScanReport, StoreHookFn, add_repository, canonical_path_text, claim_banner,
-        confirm_repository, encode_query, flash_banner, human_stamp, init_templates, is_local_host,
-        local_offset, osascript_outcome, query_banner, record_scan_error, relocate_repository,
-        remaining, remove_repository, render_blocking_thread, render_home, render_repositories_at,
-        router, scan_all, scan_core, scan_flash, scan_instant, scan_label_at, scan_response,
-        scan_worker_cap, serve, serve_until_stopped, static_version, store_hook_from,
-        store_repository, zenity_outcome,
+        AppState, Banner, BannerGuard, FLASH_CAPACITY, FlashQuery, FlashStore, GIT_ERROR,
+        HarvestFn, HomeQuery, MISSING_TASKS_ERROR, PickerFn, PickerResult, PriorReadHookFn,
+        ProjectForm, STOPPED_ERROR, ScanFailure, ScanReport, StoreHookFn, add_repository,
+        canonical_path_text, claim_banner, confirm_repository, encode_query, flash_banner,
+        human_stamp, init_templates, is_local_host, local_offset, osascript_outcome, query_banner,
+        record_scan_error, relocate_repository, remaining, remove_repository,
+        render_blocking_thread, render_home, render_repositories_at, router, scan_all, scan_core,
+        scan_flash, scan_instant, scan_label_at, scan_response, scan_worker_cap, serve,
+        serve_until_stopped, static_version, store_hook_from, store_repository, zenity_outcome,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -3971,7 +4025,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let token = flash_token(&location, "all");
         assert!(
-            state.flash.lock().await.take(&token).is_some(),
+            state.flash().take(&token).is_some(),
             "the rejected read must not consume the banner"
         );
         cleanup(&path);
@@ -4045,7 +4099,7 @@ mod tests {
         );
 
         assert!(
-            state.flash.lock().await.take(&token).is_some(),
+            state.flash().take(&token).is_some(),
             "no rejected read consumes the banner"
         );
         cleanup(&path);
@@ -5601,7 +5655,7 @@ mod tests {
         let location = redirect_location(&response);
         let token = flash_token(&location, "all");
         assert_eq!(
-            state.flash.lock().await.take(&token),
+            state.flash().take(&token),
             Some((
                 "notice",
                 "Charts updated. 1 new task, 0 shipped since the last scan.".to_string()
@@ -5876,7 +5930,7 @@ mod tests {
         );
         for token in tokens {
             assert_eq!(
-                state.flash.lock().await.take(&token),
+                state.flash().take(&token),
                 Some(("notice", "Charts updated.".to_string())),
                 "every joined click reports the follow-up's outcome"
             );
@@ -6000,9 +6054,7 @@ mod tests {
             .expect("the first request joins");
         let first_token = flash_token(&redirect_location(&first_response), "all");
         let (key, message) = state
-            .flash
-            .lock()
-            .await
+            .flash()
             .take(&first_token)
             .expect("the running scan stored a banner");
         assert_eq!(key, "error");
@@ -6026,7 +6078,7 @@ mod tests {
         );
         for token in tokens {
             assert_eq!(
-                state.flash.lock().await.take(&token),
+                state.flash().take(&token),
                 Some((
                     "notice",
                     "Charts updated. 1 new task, 0 shipped since the last scan.".to_string()
@@ -6163,7 +6215,7 @@ mod tests {
                 .expect("the joined request joins");
             let token = flash_token(&redirect_location(&response), "all");
             assert_eq!(
-                state.flash.lock().await.take(&token),
+                state.flash().take(&token),
                 Some(("error", STOPPED_ERROR.to_string())),
                 "a run that ends without a result reports the stopped banner through the flash store"
             );
@@ -6176,7 +6228,7 @@ mod tests {
             .expect("the retry request joins");
         let token = flash_token(&redirect_location(&response), "all");
         assert_eq!(
-            state.flash.lock().await.take(&token),
+            state.flash().take(&token),
             Some(("notice", "Charts updated.".to_string())),
             "the click after a stopped run scans again"
         );
@@ -7426,7 +7478,7 @@ mod tests {
         let failure_location = redirect_location(&scan_response(&state, "all", &failed).await);
         let failure_token = flash_token(&failure_location, "all");
         assert_eq!(
-            state.flash.lock().await.take(&failure_token),
+            state.flash().take(&failure_token),
             Some((
                 "error",
                 "Charts updated for 1 of 2 repositories. Failed: sysadmin (Git could not read the history, so the rows were left as they were.).".to_string()
@@ -7444,7 +7496,7 @@ mod tests {
         let clean_token = flash_token(&clean_location, "all");
         assert_ne!(clean_token, failure_token, "each run names its own slot");
         assert_eq!(
-            state.flash.lock().await.take(&clean_token),
+            state.flash().take(&clean_token),
             Some(("notice", "Charts updated.".to_string()))
         );
         cleanup(&path);
@@ -7684,7 +7736,7 @@ mod tests {
             "the broken template set fails the render"
         );
         assert_eq!(
-            state.flash.lock().await.peek(&token),
+            state.flash().peek(&token),
             Some(("notice", "Charts updated.")),
             "a failed render must put the exact banner back under its own token"
         );
@@ -7696,7 +7748,7 @@ mod tests {
             "the next read still shows the Update outcome"
         );
         assert!(
-            state.flash.lock().await.peek(&token).is_none(),
+            state.flash().peek(&token).is_none(),
             "that read consumes the restored banner"
         );
         cleanup(&path);
@@ -7724,9 +7776,7 @@ mod tests {
             ..HomeQuery::default()
         };
 
-        let first = claim_banner(&state, &query)
-            .await
-            .expect("the first read claims the banner");
+        let first = claim_banner(&state, &query).expect("the first read claims the banner");
         assert_eq!(first.token, token, "the claim keeps the token it names");
         assert_eq!(
             (first.key, first.message.as_str()),
@@ -7734,24 +7784,144 @@ mod tests {
             "the claim carries the slot's key and message"
         );
         assert!(
-            claim_banner(&state, &query).await.is_none(),
+            claim_banner(&state, &query).is_none(),
             "a second read in flight renders nothing"
         );
 
-        state.flash.lock().await.restore(first);
-        let restored = claim_banner(&state, &query)
-            .await
-            .expect("the restored banner is readable again");
+        state.flash().restore(first);
+        let restored = claim_banner(&state, &query).expect("the restored banner is readable again");
         assert_eq!(
             (restored.token, restored.key, restored.message.as_str()),
             (token.clone(), "notice", "Charts updated."),
             "the restored slot keeps its token, key, and message"
         );
         assert!(
-            claim_banner(&state, &query).await.is_none(),
+            claim_banner(&state, &query).is_none(),
             "the restored banner is served once as well"
         );
         cleanup(&path);
+    }
+
+    /// Covers: a dashboard read that claims the one-shot banner and is then
+    /// dropped before it renders, as a cancelled navigation is, puts the slot
+    /// back, so the next read shows the outcome and a second claim finds
+    /// nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_cancelled_read_restores_the_claimed_banner() {
+        let (state, path) = app_state("flash_cancelled_read").await;
+        let token = state
+            .flash()
+            .insert("notice", "Charts updated.".to_string());
+        let query = HomeQuery {
+            flash: token.clone(),
+            ..HomeQuery::default()
+        };
+
+        {
+            // The read claims the banner, then the request future is dropped
+            // before `render_dashboard` returns, so the guard restores it.
+            let _guard = BannerGuard::new(&state, claim_banner(&state, &query));
+        }
+
+        let restored = claim_banner(&state, &query)
+            .expect("a cancelled read must put the claimed banner back");
+        assert_eq!(
+            (
+                restored.token.as_str(),
+                restored.key,
+                restored.message.as_str()
+            ),
+            (token.as_str(), "notice", "Charts updated."),
+            "the restored slot keeps its token, key, and message"
+        );
+        assert!(
+            claim_banner(&state, &query).is_none(),
+            "the restored banner is served once"
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: a completed render consumes the banner, so the guard is
+    /// disarmed and the next claim is empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_completed_render_consumes_the_claimed_banner() {
+        let (state, path) = app_state("flash_completed_render").await;
+        let token = state
+            .flash()
+            .insert("notice", "Charts updated.".to_string());
+        let query = HomeQuery {
+            flash: token.clone(),
+            ..HomeQuery::default()
+        };
+
+        render_home(&state, &query)
+            .await
+            .expect("the dashboard renders");
+        assert!(
+            claim_banner(&state, &query).is_none(),
+            "a completed render leaves the slot consumed"
+        );
+        cleanup(&path);
+    }
+
+    /// Covers: a render error restores the claimed banner exactly once. The
+    /// error arm's restore clears the guard's claim, so the guard's drop
+    /// restores nothing more, and the slot is still served exactly once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_failed_render_restores_the_claimed_banner_once() {
+        let (state, path) = app_state("flash_restore_once").await;
+        let token = state
+            .flash()
+            .insert("notice", "Charts updated.".to_string());
+        let query = HomeQuery {
+            flash: token.clone(),
+            ..HomeQuery::default()
+        };
+
+        let mut guard = BannerGuard::new(&state, claim_banner(&state, &query));
+        guard.restore();
+        assert!(
+            guard.claimed().is_none(),
+            "the error arm's restore clears the claim before the guard drops"
+        );
+        drop(guard);
+        assert_eq!(
+            state.flash().peek(&token),
+            Some(("notice", "Charts updated.")),
+            "the failed render put the exact slot back"
+        );
+        assert!(
+            claim_banner(&state, &query).is_some(),
+            "the restored banner is served to the next read"
+        );
+        assert!(
+            claim_banner(&state, &query).is_none(),
+            "the restore put back exactly one slot"
+        );
+        cleanup(&path);
+    }
+
+    /// The crate's own source, read at compile time so the flash-store source
+    /// assertions see exactly the text that is built.
+    const WEB_SOURCE: &str = include_str!("web.rs");
+
+    /// Covers: the flash store is claimed through the synchronous lock, so no
+    /// awaited flash lock remains, and the flash field carries
+    /// `std::sync::Mutex<FlashStore>` so a `Drop` implementation can restore a
+    /// cancelled read.
+    #[test]
+    fn web_flash_lock_is_synchronous() {
+        // Assembled from pieces so the assertion does not match its own text.
+        let awaited = concat!(".flash", ".lock()", ".await");
+        assert!(
+            !WEB_SOURCE.contains(awaited),
+            "the flash store is never locked with an await: {awaited}"
+        );
+        let field = concat!("flash: Arc<", "std::sync::Mutex<FlashStore>>");
+        assert!(
+            WEB_SOURCE.contains(field),
+            "the flash field carries the synchronous lock: {field}"
+        );
     }
 
     async fn app_state(name: &str) -> (AppState, PathBuf) {
