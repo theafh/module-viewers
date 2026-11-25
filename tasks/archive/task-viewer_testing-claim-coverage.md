@@ -2,8 +2,8 @@
 description: "Close four TESTING.md claims whose tests cannot fail if the claimed behaviour is removed."
 scope: task-viewer
 created: 2026-11-25T08:39:58Z
-updated: 2026-11-25T16:23:24Z
-status: implemented
+updated: 2026-11-25T16:26:59Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
