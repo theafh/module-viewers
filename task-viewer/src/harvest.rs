@@ -282,12 +282,16 @@ impl GitContext {
 /// version wins: the working tree first, then the version whose commit is most
 /// recent.
 /// One version of a task file: its rank, its blob id when it came from a
-/// commit, its path, and whether that path decoded lossily.
-type Candidate = ((u8, u8, i64), Option<String>, String, bool);
+/// commit, its path, whether that path decoded lossily, and — for a
+/// working-tree row — the real on-disk path the walk read it from. A committed
+/// row carries no disk path, because its content is read by object id.
+type Candidate = ((u8, u8, i64), Option<String>, String, bool, Option<PathBuf>);
 
 /// One chosen version of a task file: its path, its blob id when it came from
-/// a commit, and whether that path decoded lossily.
-type ChosenFile = (String, Option<String>, bool);
+/// a commit, whether that path decoded lossily, and the real on-disk path a
+/// working-tree row was read from, so an evicted row is re-read through it
+/// rather than through the lossy stored path.
+type ChosenFile = (String, Option<String>, bool, Option<PathBuf>);
 
 /// Why a task file contributed no row.
 ///
@@ -370,6 +374,10 @@ fn record_skip(tally: &mut SkipTally, reason: SkipReason) {
 struct WorktreeRow {
     path: String,
     lossy: bool,
+    /// The real on-disk path the walk read this file from. It is kept beside
+    /// the lossy `path`, so an evicted row is re-read from the file it came
+    /// from even when the name is not valid UTF-8 and `path` names no file.
+    disk: PathBuf,
     text: Option<String>,
     skip: Option<SkipReason>,
 }
@@ -427,6 +435,7 @@ fn union_files(
             Some(sha),
             path,
             path_is_lossy,
+            None,
         ));
     }
     // The working-tree walk reads every file so each skip keeps its warning, and
@@ -444,12 +453,13 @@ fn union_files(
             None,
             row.path.clone(),
             row.lossy,
+            Some(row.disk.clone()),
         ));
     }
     candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
     let mut seen = std::collections::HashSet::new();
     let mut chosen: Vec<ChosenFile> = Vec::new();
-    for (_, blob, path, path_is_lossy) in candidates {
+    for (_, blob, path, path_is_lossy, disk) in candidates {
         let name = path.rsplit('/').next().unwrap_or_default().to_string();
         if !seen.insert(name) {
             continue;
@@ -460,7 +470,7 @@ fn union_files(
         if blob.is_none() && skipped.contains(&path) {
             continue;
         }
-        chosen.push((path, blob, path_is_lossy));
+        chosen.push((path, blob, path_is_lossy, disk));
     }
     let worktree: WorktreeFiles = worktree
         .into_iter()
@@ -572,7 +582,7 @@ fn harvest_chosen(
 ) -> Result<Harvested, HarvestError> {
     let blobs: Vec<String> = chosen
         .iter()
-        .filter_map(|(_, blob, _)| blob.clone())
+        .filter_map(|(_, blob, _, _)| blob.clone())
         .collect();
     let mut state = HarvestState::default();
     let mut rows = chosen.into_iter();
@@ -584,7 +594,7 @@ fn harvest_chosen(
     read_blobs(root, Some(dir), &blobs, |content| {
         // Advance to the next row that names a blob, harvesting the
         // working-tree rows that sit ahead of it.
-        for (path, blob, path_is_lossy) in rows.by_ref() {
+        for (path, blob, path_is_lossy, disk) in rows.by_ref() {
             if blob.is_some() {
                 match content {
                     BlobContent::Text(text) => {
@@ -605,7 +615,9 @@ fn harvest_chosen(
                 }
                 break;
             }
-            if let Some(text) = worktree_content(repo, &mut worktree, &path, &mut skipped) {
+            if let Some(text) =
+                worktree_content(repo, &mut worktree, &path, disk.as_deref(), &mut skipped)
+            {
                 state.harvest_file(&path, &text, path_is_lossy, &mut skipped);
             }
         }
@@ -617,8 +629,10 @@ fn harvest_chosen(
     }
     // Every committed row has taken its content, so the rows left are
     // working-tree ones.
-    for (path, _, path_is_lossy) in rows {
-        if let Some(text) = worktree_content(repo, &mut worktree, &path, &mut skipped) {
+    for (path, _, path_is_lossy, disk) in rows {
+        if let Some(text) =
+            worktree_content(repo, &mut worktree, &path, disk.as_deref(), &mut skipped)
+        {
             state.harvest_file(&path, &text, path_is_lossy, &mut skipped);
         }
     }
@@ -630,13 +644,18 @@ fn harvest_chosen(
 
 /// One chosen working-tree row's content: the text the cache retained, or a
 /// fresh read bounded by `MAX_TASK_FILE_BYTES + 1` when the cache evicted the
-/// row or the file changed since the walk. A file that can no longer be read,
-/// is not UTF-8, or is over the cap contributes no row and warns once with its
-/// path, byte count, and reason, as the walk does.
+/// row or the file changed since the walk. The re-read and the metadata size
+/// both come from the row's carried on-disk path, so a name that is not valid
+/// UTF-8 is read from the file it came from instead of from the lossy stored
+/// path, which names no file on a filesystem that permits such a name. A row
+/// that carries no disk path falls back to the stored path. A file that can no
+/// longer be read, is not UTF-8, or is over the cap contributes no row and
+/// warns once with its path, byte count, and reason, as the walk does.
 fn worktree_content(
     repo: &Path,
     worktree: &mut WorktreeFiles,
     path: &str,
+    disk: Option<&Path>,
     skipped: &mut SkipTally,
 ) -> Option<String> {
     if let Some((text, _)) = worktree.remove(path) {
@@ -644,13 +663,14 @@ fn worktree_content(
     }
     #[cfg(test)]
     worktree_read_count::record(repo);
-    let read = read_worktree_file(&repo.join(path));
+    let on_disk = disk.map_or_else(|| repo.join(path), Path::to_path_buf);
+    let read = read_worktree_file(&on_disk);
     match read.outcome {
         Ok(text) => Some(text),
         Err(reason) => {
             // The byte count comes from the file's metadata, so a file that
             // cannot be opened or is not UTF-8 still reports its real size.
-            let bytes = fs::metadata(repo.join(path))
+            let bytes = fs::metadata(&on_disk)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
             record_skip(skipped, reason);
@@ -1026,22 +1046,23 @@ fn harvest_files(
             continue;
         }
         // An evicted row was charted during the walk, so re-read it one file at
-        // a time through the same size cap. A file that changed since the walk
-        // is classified again instead of charted from stale text, and a re-read
-        // that fails warns once with its path, byte count, and reason.
+        // a time through the same size cap, from the on-disk path it was walked
+        // from. A file that changed since the walk is classified again instead
+        // of charted from stale text, and a re-read that fails warns once with
+        // its path, byte count, and reason.
         let text = match row.text {
             Some(text) => Some(text),
             None => {
                 #[cfg(test)]
                 worktree_read_count::record(repo);
-                let read = read_worktree_file(&repo.join(&row.path));
+                let read = read_worktree_file(&row.disk);
                 match read.outcome {
                     Ok(text) => Some(text),
                     Err(reason) => {
                         // The byte count comes from the file's metadata, so a
                         // file that cannot be opened or is not UTF-8 still
                         // reports its real size.
-                        let bytes = fs::metadata(repo.join(&row.path))
+                        let bytes = fs::metadata(&row.disk)
                             .map(|metadata| metadata.len())
                             .unwrap_or(0);
                         record_skip(&mut skipped, reason);
@@ -1309,6 +1330,11 @@ fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow
             continue;
         }
         let (rel, path_is_lossy) = relative_path(path, repo);
+        // The real on-disk path the walk reached, kept beside the lossy stored
+        // path so an evicted row is re-read from the file it came from. It is
+        // taken from the walk entry, never re-derived from `rel`, because a
+        // name that is not valid UTF-8 makes `rel` name no file.
+        let disk = path.to_path_buf();
         #[cfg(test)]
         worktree_read_count::record(repo);
         let read = read_worktree_file(path);
@@ -1324,6 +1350,7 @@ fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow
                     WorktreeRow {
                         path: rel,
                         lossy: path_is_lossy,
+                        disk,
                         text: Some(text),
                         skip: None,
                     }
@@ -1331,6 +1358,7 @@ fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow
                     WorktreeRow {
                         path: rel,
                         lossy: path_is_lossy,
+                        disk,
                         text: None,
                         skip: None,
                     }
@@ -1347,6 +1375,7 @@ fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow
                 WorktreeRow {
                     path: rel,
                     lossy: path_is_lossy,
+                    disk,
                     text: None,
                     skip: Some(reason),
                 }
@@ -3212,17 +3241,19 @@ mod tests {
     #[cfg(unix)]
     use super::git_override;
     use super::{
-        BlobContent, CONTENT_HASH_REVISION, GIT_COMMAND_TIMEOUT, GitContext, GitFailure,
-        HarvestError, HarvestState, LogLookup, MAX_TASK_FILE_BYTES, MAX_WORKTREE_CACHE_BYTES,
-        ParsedTask, PriorTask, RepositoryIdentity, SkipReason, SkipTally, TaskKind,
-        archive_log_args, archived_leave_lookup, blob_days, blob_days_log_args, content_hash,
-        drain_reader, enclosing_prefix, escape_posix_ere, first_status_commit_date, fnv1a_digest,
-        frontmatter, git_bin, git_deadline, git_dir_command, git_log_args, git_path, git_program,
-        git_read, git_timeout, harvest_repository, harvest_repository_with_prior,
+        BlobContent, CONTENT_HASH_REVISION, ChosenFile, GIT_COMMAND_TIMEOUT, GitContext,
+        GitFailure, HarvestError, HarvestState, LogLookup, MAX_TASK_FILE_BYTES,
+        MAX_WORKTREE_CACHE_BYTES, ParsedTask, PriorTask, RepositoryIdentity, SkipReason, SkipTally,
+        TaskKind, WorktreeFiles, WorktreeRow, archive_log_args, archived_leave_lookup, blob_days,
+        blob_days_log_args, content_hash, drain_reader, enclosing_prefix, escape_posix_ere,
+        files_on_disk, first_status_commit_date, fnv1a_digest, frontmatter, git_bin, git_deadline,
+        git_dir_command, git_log_args, git_path, git_program, git_read, git_timeout,
+        harvest_chosen, harvest_files, harvest_repository, harvest_repository_with_prior,
         normalize_origin_url, parse_archive_log, parse_batch, pickaxe_log_args, read_blobs,
         repository_identity, run_git_command, run_git_log, run_git_streaming, scan_log_dates,
         scrub_git_env, stream_blob_days, take_leave_walk_count, take_recursive_ls_tree_count,
-        take_worktree_cache_peak, take_worktree_read_bytes, take_worktree_read_count,
+        take_worktree_cache_peak, take_worktree_read_bytes, take_worktree_read_count, union_files,
+        worktree_content,
     };
     use crate::test_support::unique_temp_dir;
     use chrono::NaiveDate;
@@ -8697,6 +8728,210 @@ mod tests {
             warnings[0].contains(lossy) && warnings[0].contains("collapsed=2"),
             "the warning must name the path and the count: {warnings:?}"
         );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// The lossy stored path names no file on a filesystem that permits a
+    /// non-UTF-8 name, so an evicted row is re-read from the on-disk path the
+    /// walk carried beside it, and its metadata size comes from that path too.
+    #[test]
+    fn harvest_rereads_an_evicted_row_through_its_disk_path() {
+        let repo = scratch("harvest_lossy_reread_content");
+        write_task(&repo, "tasks/scope_real.md", "2026-05-01", "open");
+        let disk = repo.join("tasks/scope_real.md");
+        let stored = "tasks/scope_bad\u{FFFD}.md";
+        let mut worktree = WorktreeFiles::default();
+        let mut skipped = SkipTally::default();
+
+        let text = worktree_content(&repo, &mut worktree, stored, Some(&disk), &mut skipped)
+            .expect("the evicted row is re-read from its on-disk path");
+        assert!(
+            text.contains("created: 2026-05-01T10:00:00"),
+            "the carried path yields the real file's text: {text:?}"
+        );
+        assert!(
+            skipped.is_empty(),
+            "a readable file records no skip: {skipped:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// The folder-outside-git read takes the same carried path: an evicted row
+    /// charts under its lossy stored path while the file is read from disk.
+    #[test]
+    fn harvest_files_rereads_an_evicted_row_through_its_disk_path() {
+        let repo = scratch("harvest_lossy_reread_files");
+        write_task(&repo, "tasks/scope_real.md", "2026-05-01", "open");
+        let stored = "tasks/scope_bad\u{FFFD}.md";
+        let git = GitContext {
+            dir: None,
+            prefix: String::new(),
+            inside_repository: false,
+            root: None,
+            repository_dir: None,
+        };
+        let row = WorktreeRow {
+            path: stored.to_string(),
+            lossy: true,
+            disk: repo.join("tasks/scope_real.md"),
+            text: None,
+            skip: None,
+        };
+
+        let harvested = harvest_files(&repo, &git, vec![row], &[], SkipTally::default())
+            .expect("the carried path charts the row");
+        assert_eq!(harvested.tasks.len(), 1, "{:?}", harvested.tasks);
+        assert_eq!(
+            harvested.tasks[0].path, stored,
+            "the stored path stays the lossy String"
+        );
+        assert_eq!(
+            harvested.tasks[0].created,
+            NaiveDate::from_ymd_opt(2026, 5, 1).expect("day")
+        );
+        assert_eq!(harvested.skipped_count(), 0, "{:?}", harvested.skipped);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// A file that genuinely disappears between the walk and the re-read still
+    /// counts once as unreadable, and its warning reports the carried path's
+    /// metadata size.
+    #[test]
+    fn harvest_counts_a_vanished_evicted_row_once_as_unreadable() {
+        let repo = scratch("harvest_lossy_reread_vanished");
+        let stored = "tasks/scope_gone\u{FFFD}.md";
+        let git = GitContext {
+            dir: None,
+            prefix: String::new(),
+            inside_repository: false,
+            root: None,
+            repository_dir: None,
+        };
+        let row = WorktreeRow {
+            path: stored.to_string(),
+            lossy: true,
+            disk: repo.join("tasks/scope_gone.md"),
+            text: None,
+            skip: None,
+        };
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let harvested = tracing::subscriber::with_default(subscriber, || {
+            harvest_files(&repo, &git, vec![row], &[], SkipTally::default())
+        })
+        .expect("a vanished file does not fail the harvest");
+        assert!(harvested.tasks.is_empty(), "{:?}", harvested.tasks);
+        assert_eq!(
+            harvested.skipped.get(&SkipReason::Unreadable).copied(),
+            Some(1),
+            "the vanished row counts once as unreadable: {:?}",
+            harvested.skipped
+        );
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains(stored),
+            "the warning names the stored path: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("bytes=0"),
+            "a vanished file reports its metadata size of zero: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("could not be read"),
+            "the warning names the reason: {warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// The walk's carried path reaches `chosen`: with no eviction, both the
+    /// `files_on_disk` row and the `union_files` working-tree triple name the
+    /// real file.
+    #[test]
+    fn harvest_carries_the_walk_path_into_chosen() {
+        let repo = scratch("harvest_lossy_carry_to_chosen");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_carry.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "carry task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let real = repo.join("tasks/scope_carry.md");
+
+        let mut tally = SkipTally::default();
+        let rows = files_on_disk(&repo, &mut tally).expect("walk");
+        let row = rows
+            .iter()
+            .find(|row| row.path == "tasks/scope_carry.md")
+            .expect("the walk reaches the task");
+        assert_eq!(row.disk, real, "the walk row carries the real on-disk path");
+        assert!(row.text.is_some(), "the row fits the cache, so no eviction");
+
+        let git = GitContext::resolve(&repo).expect("git context");
+        let (root, dir) = git.repository().expect("repository");
+        let (chosen, _, _) = union_files(&repo, root, dir, &git.prefix, &mut tally).expect("union");
+        let entry = chosen
+            .iter()
+            .find(|(path, _, _, _)| path == "tasks/scope_carry.md")
+            .expect("the task is chosen");
+        assert_eq!(
+            entry.1, None,
+            "the working-tree row outranks the committed copy"
+        );
+        assert_eq!(
+            entry.3.as_deref(),
+            Some(real.as_path()),
+            "the chosen triple carries the real on-disk path"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// `harvest_chosen` hands the carried path into the read, so a chosen row
+    /// whose stored path is a mismatched lossy `String` still charts.
+    #[test]
+    fn harvest_chosen_rereads_through_the_carried_path() {
+        let repo = scratch("harvest_lossy_chosen_reread");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_real.md", "2026-05-01", "open");
+        let stored = "tasks/scope_bad\u{FFFD}.md".to_string();
+        let git = GitContext::resolve(&repo).expect("git context");
+        let (root, dir) = git.repository().expect("repository");
+        let chosen: Vec<ChosenFile> = vec![(
+            stored.clone(),
+            None,
+            true,
+            Some(repo.join("tasks/scope_real.md")),
+        )];
+
+        let harvested = harvest_chosen(
+            &repo,
+            &git,
+            root,
+            dir,
+            chosen,
+            WorktreeFiles::default(),
+            &[],
+            SkipTally::default(),
+        )
+        .expect("the carried path charts the chosen row");
+        assert_eq!(harvested.tasks.len(), 1, "{:?}", harvested.tasks);
+        assert_eq!(
+            harvested.tasks[0].path, stored,
+            "the stored path stays the lossy String"
+        );
+        assert_eq!(harvested.skipped_count(), 0, "{:?}", harvested.skipped);
         let _ = fs::remove_dir_all(&repo);
     }
 

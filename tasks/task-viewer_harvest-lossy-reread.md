@@ -2,9 +2,11 @@
 description: "Carry the real on-disk path beside the lossy stored path, so an evicted working-tree row with a non-UTF-8 file name is re-read instead of dropped."
 scope: task-viewer
 created: 2026-11-24T22:27:16Z
-updated: 2026-11-24T22:41:46Z
-status: ready
+updated: 2026-11-25T04:11:11Z
+status: implemented
 reported-by: Andreas Hoffmann
+implemented-by: Andreas Hoffmann
+design-extended: false
 ---
 
 # Lossy re-read after cache eviction
@@ -38,9 +40,9 @@ The real `WalkDir` path is available while the walk runs and is currently thrown
 
 ## Approach
 
-1. Carry the real on-disk `PathBuf` beside the stored lossy path from the walk into the candidate tuple that feeds `chosen`, and through `harvest_chosen`'s destructuring into `worktree_content`. The `WorktreeFiles` map holds retained text only and needs no change; the eviction branch keeps the `PathBuf` on the row. The stored `path` stays the lossy `String`.
+1. Carry the real on-disk `PathBuf` beside the stored lossy path from the walk into the candidate tuple that feeds `chosen`, and through `harvest_chosen`'s destructuring into `worktree_content`. The `WorktreeFiles` map holds retained text only and needs no change; the eviction branch keeps the `PathBuf` on the row. The stored `path` stays the lossy `String`. The carried path is the `WalkDir` entry path, set where `files_on_disk` builds each row; it is never re-derived from `rel`.
 2. Re-read an evicted row through that `PathBuf` in `worktree_content` and in the folder-outside-git read, and take the file's metadata size from the same `PathBuf`. The size changes for a file that is present but unreadable or not UTF-8; a genuinely vanished file reports zero either way.
-3. Add a unit test that builds the carried row directly with `text: None`, a real `PathBuf`, and a deliberately lossy stored path, and asserts the content is read from the `PathBuf`; the test needs no non-UTF-8 file on disk. Add a second case where the `PathBuf` is gone and the row still counts once as unreadable.
+3. Add unit tests that each build their input directly, so the suite needs no non-UTF-8 file on disk. One drives `worktree_content` (or `harvest_chosen` with a chosen row) with a mismatched lossy stored path and a real `PathBuf`, and asserts it returns the file's text. Another builds a `WorktreeRow` with `text: None`, a real `PathBuf`, and a mismatched lossy stored path, and asserts `harvest_files` returns the file's text. A further case removes the `PathBuf` before the read and asserts the row still counts once as unreadable. A fourth test builds a scratch repository holding a plain `tasks/scope_carry.md` file, with no eviction, and asserts that `files_on_disk`'s row for that file and `union_files`' chosen working-tree triple both carry a `PathBuf` naming the real file.
 
 **Out of scope:**
 
@@ -50,6 +52,9 @@ The real `WalkDir` path is available while the walk runs and is currently thrown
 ## Acceptance
 
 - [ ] An evicted row is re-read through its on-disk `PathBuf`; a test with a mismatched stored path and a real path returns the file's text instead of `Unreadable`.
+- [ ] The git-repository re-read is proven too: `worktree_content` returns the file's text for an evicted chosen row whose stored path is a mismatched lossy `String` and whose carried `PathBuf` names the real file, instead of reporting it `Unreadable`.
+- [ ] The walk's `PathBuf` carry reaches `chosen`: a test builds a scratch repository holding a plain `tasks/scope_carry.md` file, with no eviction, and asserts that `files_on_disk`'s row for that file and `union_files`' chosen working-tree triple both carry a `PathBuf` naming the real file.
+- [ ] `harvest_chosen` hands the carried `PathBuf` into the read: a test builds a `chosen` vector holding one working-tree entry whose stored path is a mismatched lossy `String` and whose carried `PathBuf` names the real file, drives `harvest_chosen` against a scratch repository and a resolved `GitContext`, and asserts the row charts as a task instead of counting once as `Unreadable`.
 - [ ] The stored path in the database is still the lossy `String`, so the existing committed-listing test and the lossy-path dedupe keep passing unchanged.
 - [ ] A file that genuinely disappears between the walk and the re-read still counts once as unreadable, and its warning reports the `PathBuf`'s metadata size.
 - [ ] `make lint` and `make test` pass.
