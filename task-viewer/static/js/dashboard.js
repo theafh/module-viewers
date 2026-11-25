@@ -1268,6 +1268,116 @@
     });
   }
 
+  // A downloaded chart is a copy of the drawn SVG with its theme colours
+  // inlined and laid on the card's own background, so the PNG keeps the theme
+  // it was drawn in instead of landing on an unknown backdrop.
+  var DOWNLOAD_SCALE = 2;
+
+  function chartSize(svg) {
+    var viewBox = svg.getAttribute("viewBox");
+    var parts = viewBox ? viewBox.trim().split(/\s+/).map(Number) : [];
+    if (parts.length === 4 && isFinite(parts[2]) && isFinite(parts[3]) &&
+        parts[2] > 0 && parts[3] > 0) {
+      return { width: parts[2], height: parts[3] };
+    }
+    return { width: svg.clientWidth || 640, height: svg.clientHeight || 280 };
+  }
+
+  // The clone is detached, so the computed colours are read from the drawn
+  // nodes and written to the matching clone nodes in the same order.
+  function inlineThemeColors(source, clone) {
+    var originals = [source].concat(Array.prototype.slice.call(source.querySelectorAll("*")));
+    var copies = [clone].concat(Array.prototype.slice.call(clone.querySelectorAll("*")));
+    originals.forEach(function (node, index) {
+      var copy = copies[index];
+      if (!copy) {
+        return;
+      }
+      var style = getComputedStyle(node);
+      ["fill", "stroke", "color"].forEach(function (property) {
+        var value = style.getPropertyValue(property);
+        if (value && value !== "none") {
+          copy.setAttribute(property, value);
+        }
+      });
+    });
+  }
+
+  function downloadFileName(name) {
+    var asOf = payload && payload.as_of ? payload.as_of : "unknown-day";
+    return "task-viewer-" + name + "-" + asOf + ".png";
+  }
+
+  function saveChartPng(button) {
+    var root = button.closest ? button.closest("[data-chart]") : null;
+    var name = root ? root.getAttribute("data-chart") : null;
+    var svg = root ? root.querySelector("svg") : null;
+    if (!name || !svg) {
+      return;
+    }
+    var size = chartSize(svg);
+    var clone = svg.cloneNode(true);
+    inlineThemeColors(svg, clone);
+    var background = document.createElementNS(NS, "rect");
+    background.setAttribute("x", "0");
+    background.setAttribute("y", "0");
+    background.setAttribute("width", String(size.width));
+    background.setAttribute("height", String(size.height));
+    background.setAttribute("fill", cssVar("--chart-card"));
+    clone.insertBefore(background, clone.firstChild);
+    var xml = new XMLSerializer().serializeToString(clone);
+    var url = URL.createObjectURL(new Blob([xml], { type: "image/svg+xml;charset=utf-8" }));
+    var image = new Image();
+    image.onload = function () {
+      var canvas = document.createElement("canvas");
+      canvas.width = size.width * DOWNLOAD_SCALE;
+      canvas.height = size.height * DOWNLOAD_SCALE;
+      canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+      var anchor = document.createElement("a");
+      anchor.href = canvas.toDataURL("image/png");
+      anchor.download = downloadFileName(name);
+      anchor.click();
+      URL.revokeObjectURL(url);
+      canvas = null;
+    };
+    image.onerror = function () {
+      URL.revokeObjectURL(url);
+    };
+    image.src = url;
+  }
+
+  // The control ships hidden so a page without scripting shows no button that
+  // cannot work; it appears only once the browser can rasterize the chart.
+  function canSaveChartPng() {
+    return typeof Blob === "function" &&
+      typeof Image === "function" &&
+      typeof XMLSerializer === "function" &&
+      typeof URL !== "undefined" && URL &&
+      typeof URL.createObjectURL === "function" &&
+      typeof URL.revokeObjectURL === "function" &&
+      typeof document.createElement === "function";
+  }
+
+  var downloadButtons = typeof document.querySelectorAll === "function"
+    ? document.querySelectorAll("[data-download]")
+    : [];
+  if (canSaveChartPng()) {
+    Array.prototype.slice.call(downloadButtons).forEach(function (button) {
+      button.addEventListener("click", function (event) {
+        if (event && typeof event.preventDefault === "function") {
+          event.preventDefault();
+        }
+        try {
+          saveChartPng(button);
+        } catch (error) {
+          logError(error);
+        }
+      });
+      button.hidden = false;
+      button.style.display = "inline-block";
+    });
+  }
+
   window.addEventListener("task-viewer-theme", recolor);
   document.addEventListener("pointerdown", hideAllTips);
 

@@ -286,6 +286,25 @@ input[type="search"] {
     padding: 0.2rem 0.4rem;
 }
 
+/* The weekly card keeps its view picker and the PNG control together at the
+   header's end, and every other card puts the control there beside its
+   heading. */
+.chart-controls {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem 0.75rem;
+}
+
+.chart-download {
+    /* The control stays hidden until the script can rasterize the chart, so a
+       page without scripting shows no button that cannot work. It is declared
+       after `.btn`, whose own `display` would otherwise keep it visible. */
+    display: none;
+    font-size: 0.8rem;
+    padding: 0.2rem 0.5rem;
+}
+
 .banner {
     background: var(--card-bg);
     border: 1px solid var(--border);

@@ -9,6 +9,15 @@
   var width = typeof config.width === "number" ? config.width : narrow ? 120 : 1000;
   var storageThrows = !!config.storageThrows;
   var cssValue = config.cssValue === undefined ? "#123456" : config.cssValue;
+  // The chart-download path's records, filled by the stubs below: the anchors
+  // that carried a `download` name, the blobs and object URLs it made, the URLs
+  // it revoked, the canvases it drew to, and every serialized SVG.
+  var downloads = [];
+  var blobs = [];
+  var objectUrls = [];
+  var revokedUrls = [];
+  var canvases = [];
+  var serialized = [];
 
   // The shipped stylesheet's chart heights: `.chart-frame svg` is 280px,
   // `.chart-frame.calendar svg` is 190px, and `.chart-frame.radar svg` is
@@ -129,6 +138,68 @@
     if (child.parent === this) child.parent = null;
     return child;
   };
+  // Insert a child at a position, which the download path uses to put its
+  // background rectangle first in the cloned SVG.
+  Node.prototype.insertBefore = function (child, reference) {
+    var index = reference ? this.children.indexOf(reference) : -1;
+    if (index < 0) return this.appendChild(child);
+    this.children.splice(index, 0, child);
+    child.parent = this;
+    return child;
+  };
+  // A deep clone of a drawn chart, as the download path copies the SVG before
+  // inlining its colours. The clone carries its chart kind so it keeps the
+  // laid-out size the original reports.
+  Node.prototype.cloneNode = function (deep) {
+    var copy = new Node(this.name, this.chart);
+    var source = this;
+    Object.keys(source.attrs).forEach(function (key) {
+      copy.attrs[key] = source.attrs[key];
+    });
+    Object.keys(source.style).forEach(function (key) {
+      copy.style[key] = source.style[key];
+    });
+    copy.textContent = source.textContent;
+    if (deep) {
+      source.children.forEach(function (child) {
+        copy.appendChild(child.cloneNode(true));
+      });
+    }
+    return copy;
+  };
+  // The selector shapes the shipped scripts use: `*`, a class, and an
+  // attribute-presence selector such as `[data-chart]` or `[data-download]`.
+  function matches(node, selector) {
+    if (selector === "*") return true;
+    if (selector.charAt(0) === ".") {
+      var classes = String(node.attrs.class || "").split(/\s+/);
+      return classes.indexOf(selector.slice(1)) >= 0;
+    }
+    if (selector.charAt(0) === "[" && selector.charAt(selector.length - 1) === "]") {
+      return node.getAttribute(selector.slice(1, -1)) !== null;
+    }
+    return false;
+  }
+  function descendants(node, found) {
+    node.children.forEach(function (child) {
+      found.push(child);
+      descendants(child, found);
+    });
+    return found;
+  }
+  Node.prototype.querySelectorAll = function (selector) {
+    return descendants(this, []).filter(function (node) {
+      return matches(node, selector);
+    });
+  };
+  Node.prototype.closest = function (selector) {
+    var node = this;
+    while (node) {
+      if (matches(node, selector)) return node;
+      node = node.parent || null;
+    }
+    return null;
+  };
   // Whether `other` is this node or one of its descendants, walking the real
   // parent chain a removed node no longer belongs to.
   Node.prototype.contains = function (other) {
@@ -184,6 +255,11 @@
     return null;
   };
   Node.prototype.click = function () {
+    // A programmatic click on an anchor carrying `download` is the page's
+    // download trigger, so record it instead of navigating.
+    if (this.download) {
+      downloads.push({ name: this.download, href: this.href });
+    }
     var handlers = this.listeners.click || [];
     for (var index = 0; index < handlers.length; index += 1) {
       handlers[index]({ type: "click", currentTarget: this, clientX: 0, clientY: 0 });
@@ -220,12 +296,26 @@
   ];
   var registry = {};
   var cards = {};
+  var downloadButtons = {};
   CARD_NAMES.forEach(function (name) {
     var root = new Node("card:" + name);
+    root.attrs["data-chart"] = name;
+    root.attrs.class = "chart-card";
     var svg = new Node("svg", CHART_KIND[name]);
     var frame = new Node("frame");
     var tip = new Node("tip");
     var summary = new Node("summary");
+    // The card header's PNG control, hidden until `dashboard.js` wires it the
+    // way the page hides it without scripting.
+    var header = new Node("header");
+    var download = new Node("button");
+    download.attrs.class = "btn btn-secondary chart-download";
+    download.attrs["data-download"] = "";
+    download.attrs.hidden = "";
+    download.hidden = true;
+    download.textContent = "Download PNG";
+    header.appendChild(download);
+    downloadButtons[name] = download;
     // A frame's client width is the config width until a test narrows or widens
     // it, so a resize can be modelled between two draws without reloading the
     // fixture. Writing the property is the per-instance override; the prototype
@@ -276,6 +366,7 @@
     };
     // The page nests the chart inside the card, so `contains` reaches a mark
     // through the card root, the SVG, and the mark's own parent chain.
+    root.appendChild(header);
     root.appendChild(svg);
     cards[name] = root;
   });
@@ -284,6 +375,7 @@
   });
 
   var defaultPayload = {
+    as_of: "2026-01-12",
     project: "3",
     counts: { shipped_events: 3, created_events: 5, deferred: 1 },
     weekly: [
@@ -397,14 +489,46 @@
     createElementNS: function (namespace, name) {
       return new Node(name);
     },
-    // The data tables build plain HTML rows and cells.
+    // The data tables build plain HTML rows and cells, and the download path
+    // builds an anchor and a canvas. A canvas reports the 2D context it was
+    // handed, recording the image it drew, and a PNG data URL.
     createElement: function (name) {
-      return new Node(name);
+      var node = new Node(name);
+      if (name === "canvas") {
+        node.width = 0;
+        node.height = 0;
+        node.drawn = null;
+        node.getContext = function () {
+          return {
+            drawImage: function (image, x, y, width, height) {
+              node.drawn = { image: image, x: x, y: y, width: width, height: height };
+            }
+          };
+        };
+        node.toDataURL = function () {
+          return "data:image/png;base64,stub";
+        };
+        canvases.push(node);
+      }
+      return node;
     },
     querySelector: function (selector) {
       if (selector === ".charts") return chartsSection;
       if (selector === ".nav-form") return projectForm;
       return Object.prototype.hasOwnProperty.call(registry, selector) ? registry[selector] : null;
+    },
+    // The download path finds every card's PNG control by its `data-download`
+    // attribute, so the document search walks the registered cards.
+    querySelectorAll: function (selector) {
+      var found = [];
+      Object.keys(cards).forEach(function (name) {
+        var root = cards[name];
+        if (matches(root, selector)) found.push(root);
+        descendants(root, []).forEach(function (node) {
+          if (matches(node, selector)) found.push(node);
+        });
+      });
+      return found;
     },
     // A page-level listener such as the dashboard's pointerdown hide and the
     // repositories page's delegated submit.
@@ -493,9 +617,19 @@
   function Event(type) {
     this.type = type;
   }
-  function getComputedStyle() {
+  // `getComputedStyle` answers a custom property with the configured theme
+  // value, and a presentation property with the value the node already carries,
+  // so the download path inlines real colours instead of one blanket value.
+  function getComputedStyle(node) {
     return {
-      getPropertyValue: function () {
+      getPropertyValue: function (property) {
+        if (property === "fill" || property === "stroke" || property === "color") {
+          if (node && typeof node.getAttribute === "function") {
+            var value = node.getAttribute(property);
+            if (value !== null) return value;
+          }
+          return property === "color" ? "#000000" : "none";
+        }
         return cssForTheme();
       }
     };
@@ -505,6 +639,62 @@
       return String(value);
     };
   }
+  // The rasterization stubs the download path needs: a blob, an object-URL
+  // pair, an image that resolves its `src` at once, and an XML serializer that
+  // records every serialized SVG.
+  function Blob(parts, options) {
+    this.parts = parts;
+    this.type = options && options.type;
+    blobs.push(this);
+  }
+  var URL = {
+    createObjectURL: function (blob) {
+      var url = "blob:stub/" + objectUrls.length;
+      objectUrls.push({ url: url, blob: blob });
+      return url;
+    },
+    revokeObjectURL: function (url) {
+      revokedUrls.push(url);
+    }
+  };
+  function Image() {
+    var image = this;
+    this.onload = null;
+    this.onerror = null;
+    this.srcValue = "";
+    Object.defineProperty(this, "src", {
+      get: function () {
+        return image.srcValue;
+      },
+      set: function (value) {
+        image.srcValue = String(value);
+        if (typeof image.onload === "function") image.onload();
+      }
+    });
+  }
+  function escapeAttribute(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;");
+  }
+  function serializeNode(node) {
+    var attrs = Object.keys(node.attrs).map(function (key) {
+      return " " + key + "=\"" + escapeAttribute(node.attrs[key]) + "\"";
+    }).join("");
+    var text = node.textContent ? String(node.textContent) : "";
+    if (!node.children.length && !text) {
+      return "<" + node.name + attrs + "/>";
+    }
+    return "<" + node.name + attrs + ">" + text +
+      node.children.map(serializeNode).join("") + "</" + node.name + ">";
+  }
+  function XMLSerializer() {}
+  XMLSerializer.prototype.serializeToString = function (node) {
+    var xml = serializeNode(node);
+    serialized.push(xml);
+    return xml;
+  };
 
   globalThis.document = document;
   globalThis.window = window;
@@ -512,6 +702,10 @@
   globalThis.getComputedStyle = getComputedStyle;
   globalThis.localStorage = localStorage;
   globalThis.Intl = { NumberFormat: NumberFormat };
+  globalThis.Blob = Blob;
+  globalThis.URL = URL;
+  globalThis.Image = Image;
+  globalThis.XMLSerializer = XMLSerializer;
   globalThis.setTimeout = window.setTimeout;
   globalThis.clearTimeout = window.clearTimeout;
   globalThis.__env = {
@@ -531,6 +725,13 @@
     chartsSection: chartsSection,
     scanStatus: scanStatusNode,
     timeouts: timeouts,
-    confirms: confirms
+    confirms: confirms,
+    downloadButtons: downloadButtons,
+    downloads: downloads,
+    blobs: blobs,
+    objectUrls: objectUrls,
+    revokedUrls: revokedUrls,
+    canvases: canvases,
+    serialized: serialized
   };
 })();

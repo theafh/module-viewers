@@ -12986,6 +12986,173 @@ mod tests {
         );
     }
 
+    /// Covers: each card's PNG control becomes usable once the script can
+    /// rasterize the chart, and a click serializes that card's SVG with its
+    /// theme colours and the card background inlined, draws it to a canvas at
+    /// twice the SVG's size, and starts a download named for the chart and the
+    /// as-of day while the drawn chart stays untouched.
+    #[test]
+    fn browser_chart_download_serializes_the_card_and_names_the_png() {
+        let payload_text = fixture_payload().to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var button = env.downloadButtons["weekly"];
+  var svg = env.cards["weekly"].querySelector("svg");
+  var drawnBefore = svg.children.length;
+  var summaryBefore = env.cards["weekly"].querySelector(".summary").textContent;
+  button.click();
+  var download = env.downloads[0] || {};
+  var canvas = env.canvases[0] || {};
+  var blob = env.blobs[0] || {};
+  var visible = env.cardNames.filter(function (name) {
+    var control = env.downloadButtons[name];
+    return control && !control.hidden && control.style.display === "inline-block";
+  }).length;
+  return JSON.stringify({
+    hidden: button.hidden,
+    display: button.style.display,
+    visible: visible,
+    downloads: env.downloads.length,
+    name: download.name || null,
+    href: download.href || null,
+    url: env.objectUrls[0] ? env.objectUrls[0].url : null,
+    revoked: env.revokedUrls,
+    blobType: blob.type || null,
+    canvasWidth: canvas.width,
+    canvasHeight: canvas.height,
+    drawnWidth: canvas.drawn ? canvas.drawn.width : null,
+    drawnHeight: canvas.drawn ? canvas.drawn.height : null,
+    serialized: env.serialized[0] || "",
+    drawnBefore: drawnBefore,
+    drawnAfter: svg.children.length,
+    summaryBefore: summaryBefore,
+    summaryAfter: env.cards["weekly"].querySelector(".summary").textContent
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["visible"].as_u64(),
+            Some(10),
+            "every chart card's PNG control is usable with scripting"
+        );
+        assert_eq!(
+            result["hidden"],
+            serde_json::json!(false),
+            "the control drops its hidden attribute once wired"
+        );
+        assert_eq!(
+            result["display"],
+            serde_json::json!("inline-block"),
+            "the control overrides the stylesheet's no-script hiding"
+        );
+        assert_eq!(
+            result["downloads"].as_u64(),
+            Some(1),
+            "one click starts one download"
+        );
+        assert_eq!(
+            result["name"],
+            serde_json::json!("task-viewer-weekly-2026-01-12.png"),
+            "the download is named for the chart and the as-of day"
+        );
+        assert_eq!(
+            result["href"],
+            serde_json::json!("data:image/png;base64,stub"),
+            "the anchor carries the canvas's PNG"
+        );
+        assert_eq!(
+            result["blobType"],
+            serde_json::json!("image/svg+xml;charset=utf-8"),
+            "the serialized SVG is the blob's content"
+        );
+        let serialized = result["serialized"]
+            .as_str()
+            .expect("the SVG was serialized");
+        assert!(
+            serialized.contains("<svg"),
+            "the serialized SVG is non-empty: {serialized}"
+        );
+        assert!(
+            serialized
+                .contains("<rect x=\"0\" y=\"0\" width=\"1000\" height=\"280\" fill=\"#123456\""),
+            "the card background covers the chart: {serialized}"
+        );
+        assert!(
+            serialized.contains("fill=\"#123456\""),
+            "the drawn marks carry the inlined theme colour: {serialized}"
+        );
+        assert_eq!(
+            result["canvasWidth"].as_f64(),
+            Some(2000.0),
+            "the canvas is twice the SVG's width"
+        );
+        assert_eq!(
+            result["canvasHeight"].as_f64(),
+            Some(560.0),
+            "the canvas is twice the SVG's height"
+        );
+        assert_eq!(
+            result["drawnWidth"].as_f64(),
+            Some(2000.0),
+            "the image is drawn at the canvas's full width"
+        );
+        assert_eq!(
+            result["drawnHeight"].as_f64(),
+            Some(560.0),
+            "the image is drawn at the canvas's full height"
+        );
+        assert_eq!(
+            result["revoked"][0], result["url"],
+            "the object URL is revoked after the download starts"
+        );
+        assert_eq!(
+            result["drawnBefore"], result["drawnAfter"],
+            "the drawn chart keeps every mark after the download"
+        );
+        assert_eq!(
+            result["summaryBefore"], result["summaryAfter"],
+            "the drawn chart's summary is untouched"
+        );
+    }
+
+    /// Covers: every chart card carries one PNG control, and each ships hidden
+    /// so a page without scripting offers no download that cannot work.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_dashboard_every_chart_card_carries_a_hidden_png_control() {
+        let (state, path, folder, _id) = state_with_repository("chart_download_control").await;
+        let body = body_text(send(state.clone(), get_page("/", "127.0.0.1:7880")).await).await;
+        assert_eq!(
+            body.matches("data-chart=\"").count(),
+            10,
+            "the dashboard renders ten chart cards"
+        );
+        assert_eq!(
+            body.matches("data-download").count(),
+            10,
+            "every chart card carries one PNG control"
+        );
+        assert_eq!(
+            body.matches("data-download hidden").count(),
+            10,
+            "each PNG control ships hidden"
+        );
+        let rule = css_rule(".chart-download");
+        assert!(
+            rule.contains("display: none"),
+            "the stylesheet hides the control without scripting: {rule}"
+        );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
     /// The harness's `CHART_HEIGHT` values are the shipped stylesheet's chart
     /// heights, so raising a rule in `style.css` fails here instead of leaving
     /// the harness reporting the page the stylesheet no longer describes.
@@ -14941,6 +15108,7 @@ mod tests {
     /// same rows to two runs that differ by one week.
     fn fixture_payload() -> serde_json::Value {
         serde_json::json!({
+            "as_of": "2026-01-12",
             "project": "3",
             "counts": {"shipped_events": 3, "created_events": 5, "deferred": 1},
             "weekly": [
