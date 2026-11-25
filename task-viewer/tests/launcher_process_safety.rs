@@ -22,6 +22,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -73,8 +74,13 @@ fn write_executable(path: &Path, body: &str) {
 }
 
 /// One checkout-shaped root, its private home, and the port its launcher copy
-/// probes and binds.
+/// probes and binds. Dropping it stops any server the case started and removes
+/// the whole temp root, so a panicking assertion unwinds through the same
+/// cleanup a passing case takes.
 struct Root {
+    /// The unique temp root, which is `dir` itself unless the case nests the
+    /// checkout under a path holding a space.
+    root: PathBuf,
     dir: PathBuf,
     home: PathBuf,
     xdg: PathBuf,
@@ -84,15 +90,18 @@ struct Root {
 
 impl Root {
     fn new(name: &str, port: u16) -> Root {
-        Root::from_dir(unique_temp_dir(name), port)
+        let root = unique_temp_dir(name);
+        Root::from_dir(root.clone(), root, port)
     }
 
     /// A root whose own path holds a space, as `install-desktop.sh` supports.
     fn new_under_a_space(name: &str, port: u16) -> Root {
-        Root::from_dir(unique_temp_dir(name).join("My Projects"), port)
+        let root = unique_temp_dir(name);
+        let dir = root.join("My Projects");
+        Root::from_dir(root, dir, port)
     }
 
-    fn from_dir(dir: PathBuf, port: u16) -> Root {
+    fn from_dir(root: PathBuf, dir: PathBuf, port: u16) -> Root {
         let home = dir.join("home");
         let xdg = dir.join("state");
         fs::create_dir_all(home.join(".cargo/bin")).expect("fake tool dir");
@@ -119,11 +128,48 @@ impl Root {
         }
 
         Root {
+            root,
             dir,
             home,
             xdg,
             launcher,
             port,
+        }
+    }
+
+    /// Stop any server this root started, without panicking: `Drop` runs while
+    /// a failing assertion unwinds, so a second panic here would abort the test
+    /// process instead of reporting the original failure.
+    fn stop_any_server(&self) {
+        let Some(pid) = self.read_pid() else {
+            return;
+        };
+        if let Ok(mut child) = self
+            .command()
+            .arg("stop")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let deadline = Instant::now() + COMMAND_WINDOW;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                }
+            }
+        }
+        // The launcher's stop window can still leave a detached server behind;
+        // the test's own cleanup sends the signal the launcher would have.
+        if process_alive(pid) {
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
         }
     }
 
@@ -197,6 +243,16 @@ impl Root {
     }
 }
 
+/// Every path out of a case, a panicking assertion included, stops the server
+/// and removes the temp root, so a failed run leaves no detached server on the
+/// port and no directory on disk.
+impl Drop for Root {
+    fn drop(&mut self) {
+        self.stop_any_server();
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
 /// Wait for a child to finish, then collect its output, failing the test if it
 /// overruns the window instead of hanging the suite.
 fn wait_output(mut child: Child, window: Duration) -> Output {
@@ -262,8 +318,8 @@ fn process_alive(pid: u32) -> bool {
         .arg(pid.to_string())
         .stderr(Stdio::null())
         .status()
-        .expect("run kill -0")
-        .success()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// The PID named in a `task-viewer started (PID: N)` line.
@@ -362,17 +418,16 @@ fn concurrent_starts_serialize_on_one_lock() {
     wait_for_server(port, SERVER_WINDOW);
     let pid = assert_one_start_won(&first, &second, &root);
     stop_and_assert(&root, pid);
-
-    let _ = fs::remove_dir_all(&root.dir);
 }
 
-/// Covers: a lock directory whose recorded PID is not alive is reclaimed by the
-/// next invocation, which starts the server, and two invocations racing on one
-/// stale lock leave exactly one running server.
+/// Covers: a lock directory whose recorded PID is not alive and carries no
+/// recorded command line is reclaimed, and two invocations racing on one stale
+/// lock leave exactly one running server. This is the missing-command retry:
+/// the launcher waits out its grace and reclaims without a `cmd` file.
 #[test]
-fn a_stale_lock_is_reclaimed_once() {
+fn a_stale_lock_without_a_command_line_is_reclaimed_once() {
     let port = free_loopback_port();
-    let root = Root::new("launcher_stale_lock", port);
+    let root = Root::new("launcher_stale_lock_no_cmd", port);
     fs::create_dir_all(root.lock_dir()).expect("stage the stale lock");
     fs::write(root.lock_dir().join("pid"), format!("{}\n", dead_pid()))
         .expect("record a dead holder");
@@ -389,8 +444,38 @@ fn a_stale_lock_is_reclaimed_once() {
         "the reclaimed lock directory must be gone once the holder releases",
     );
     stop_and_assert(&root, pid);
+}
 
-    let _ = fs::remove_dir_all(&root.dir);
+/// Covers: a lock directory whose recorded PID is not alive and whose recorded
+/// command line names this launcher is reclaimed by the next invocation, which
+/// starts the server, and two invocations racing on one stale lock leave exactly
+/// one running server. The recorded launcher line is what makes this case reach
+/// the `kill -0` branch: a dead PID under a launcher-shaped line is reclaimed by
+/// the failed liveness check. Delete that check and the empty live command line
+/// reads as a real holder, so the case stalls to the reclaim window and fails.
+#[test]
+fn a_stale_lock_with_a_launcher_command_line_is_reclaimed_once() {
+    let port = free_loopback_port();
+    let root = Root::new("launcher_stale_lock", port);
+    fs::create_dir_all(root.lock_dir()).expect("stage the stale lock");
+    fs::write(root.lock_dir().join("pid"), format!("{}\n", dead_pid()))
+        .expect("record a dead holder");
+    // The dead holder's line names this launcher, so only the liveness check
+    // separates it from a real holder that must be waited for.
+    fs::write(
+        root.lock_dir().join("cmd"),
+        format!("bash {} start\n", root.launcher.display()),
+    )
+    .expect("record a launcher-shaped command line");
+
+    let first = root.spawn("start");
+    let second = root.spawn("start");
+    let first = wait_output(first, COMMAND_WINDOW);
+    let second = wait_output(second, COMMAND_WINDOW);
+    wait_for_server(port, SERVER_WINDOW);
+
+    let pid = assert_one_start_won(&first, &second, &root);
+    stop_and_assert(&root, pid);
 }
 
 /// Covers: a lock whose recorded PID belongs to a live process that is not this
@@ -435,8 +520,6 @@ fn a_reused_pid_lock_is_reclaimed() {
         !root.lock_dir().exists(),
         "the reclaimed lock must be released once the command finishes",
     );
-
-    let _ = fs::remove_dir_all(&root.dir);
 }
 
 /// Covers: a lock whose recorded PID belongs to a live unrelated process while
@@ -485,8 +568,6 @@ fn a_reused_pid_whose_recorded_line_names_the_launcher_is_reclaimed() {
         !root.lock_dir().exists(),
         "the reclaimed lock must be released once the command finishes",
     );
-
-    let _ = fs::remove_dir_all(&root.dir);
 }
 
 /// Covers: an invocation through a symlinked alias named `tv`, whose basename the
@@ -572,8 +653,6 @@ release_lock
         "the alias must read the released state: {}",
         stdout(&output),
     );
-
-    let _ = fs::remove_dir_all(&root.dir);
 }
 
 /// Covers: a holder whose lock was renamed away before it entered the critical
@@ -703,8 +782,6 @@ release_lock
         !root.lock_dir().exists(),
         "the re-acquired lock must be released at the end of the script",
     );
-
-    let _ = fs::remove_dir_all(&root.dir);
 }
 
 /// Covers: an exported `TASK_VIEWER_PORT` does not change the port the
@@ -739,8 +816,6 @@ fn inherited_task_viewer_port_does_not_move_the_bind() {
 
     let pid = root.read_pid().expect("the started server's PID file");
     stop_and_assert(&root, pid);
-
-    let _ = fs::remove_dir_all(&root.dir);
 }
 
 /// Covers: a checkout whose path holds a space still lets the launcher recognize
@@ -777,6 +852,47 @@ fn a_checkout_path_with_a_space_recognizes_its_server() {
     );
 
     stop_and_assert(&root, pid);
+}
 
-    let _ = fs::remove_dir_all(&root.dir);
+/// Covers: a panicking assertion after a start unwinds through `Root`'s `Drop`,
+/// which stops the detached server and removes the temp root, so the port stops
+/// answering and no directory is left behind.
+#[test]
+fn a_panic_after_start_leaves_no_listener_and_no_temp_dir() {
+    let port = free_loopback_port();
+    let root_dir = unique_temp_dir("launcher_panic");
+    let watched = root_dir.clone();
+    let pid = Arc::new(AtomicU64::new(0));
+    let recorded = Arc::clone(&pid);
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let root = Root::from_dir(watched.clone(), watched, port);
+        let start = wait_output(root.spawn("start"), COMMAND_WINDOW);
+        assert!(
+            start.status.success(),
+            "start failed: {}\n{}",
+            stdout(&start),
+            stderr(&start),
+        );
+        wait_for_server(port, SERVER_WINDOW);
+        let server = root.read_pid().expect("the started server's PID file");
+        recorded.store(u64::from(server), Ordering::SeqCst);
+        panic!("a deliberate panic must still clean up");
+    }));
+
+    assert!(outcome.is_err(), "the deliberate panic unwinds");
+    assert!(
+        !root_dir.exists(),
+        "the temp root is removed when the panicking case unwinds",
+    );
+    let server = pid.load(Ordering::SeqCst);
+    assert_ne!(server, 0, "the server started before the panic");
+    assert!(
+        !process_alive(u32::try_from(server).expect("the recorded PID fits u32")),
+        "the started server is gone after the panic",
+    );
+    assert!(
+        root_status(port).is_none(),
+        "no listener answers on the copy's port after the panic",
+    );
 }
