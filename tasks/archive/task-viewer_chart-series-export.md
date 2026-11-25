@@ -2,8 +2,8 @@
 description: "Serve the chart series as downloadable CSV and JSON beside the task CSV, filtered by the dashboard's project."
 scope: task-viewer
 created: 2026-11-25T09:49:49Z
-updated: 2026-11-25T20:25:56Z
-status: implemented
+updated: 2026-11-25T20:28:30Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
