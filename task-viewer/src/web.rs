@@ -1151,7 +1151,7 @@ async fn render_dashboard(
     let failures = repositories
         .iter()
         .filter(|repo| selected.is_none_or(|id| repo.repository_id == id))
-        .filter(|repo| repo.last_error.is_some())
+        .filter(|repo| repo.failing())
         .map(project_view)
         .collect::<Vec<_>>();
     let selected = match selected {
@@ -1706,6 +1706,12 @@ fn project_view_at(repo: &Repository, now: DateTime<Utc>, zone: &FixedOffset) ->
             .as_deref()
             .map(|stamp| human_stamp(stamp, now, zone)),
         last_error: repo.last_error.clone().unwrap_or_default(),
+        last_error_at: repo
+            .last_error_at
+            .as_deref()
+            .map(|stamp| human_stamp(stamp, now, zone)),
+        last_outcome: repo.last_outcome.clone(),
+        failing: repo.failing(),
     }
 }
 
@@ -1720,6 +1726,12 @@ struct RepositoryRowView {
     created_at: String,
     scanned_at: Option<String>,
     last_error: String,
+    /// The error's own stamp, rendered as a human local time, so a recovered
+    /// repository shows when its stored error happened.
+    last_error_at: Option<String>,
+    /// Whether the most recent scan failed, which decides the error's styling:
+    /// a current failure reads as an error, a recovered one as history.
+    failing: bool,
     /// `N tasks · M live` with the task noun in the singular at one row, or
     /// empty for a repository that was never scanned, so the row reads
     /// `not scanned yet` instead of a pair of zeros.
@@ -1749,6 +1761,8 @@ impl RepositoryRowView {
             created_at: project.created_at,
             scanned_at: project.scanned_at,
             last_error: project.last_error,
+            last_error_at: project.last_error_at,
+            failing: project.failing,
             counts,
         }
     }
@@ -1783,7 +1797,7 @@ fn scan_label_at(
     let stale = in_scope
         .iter()
         .filter(|repo| {
-            repo.last_error.is_some()
+            repo.failing()
                 || repo
                     .scanned_at
                     .as_deref()
@@ -1949,6 +1963,9 @@ struct ProjectView {
     created_at: String,
     scanned_at: Option<String>,
     last_error: String,
+    last_error_at: Option<String>,
+    last_outcome: Option<String>,
+    failing: bool,
 }
 
 /// What one folder-picking step produced: a canonical folder that passed the
@@ -2435,7 +2452,7 @@ async fn scan_status(State(state): State<AppState>) -> Response {
         .map(|(_, stamp)| stamp.to_string());
     let failed_repositories = repositories
         .iter()
-        .filter(|repository| repository.last_error.is_some())
+        .filter(|repository| repository.failing())
         .count();
     Json(StatusPage {
         scanning,
@@ -4367,12 +4384,13 @@ mod tests {
             "the unscanned repository names its state once"
         );
         assert!(
-            !body.contains("scanned not scanned yet") && !body.contains("scanned Not scanned yet"),
-            "the unscanned repository never doubles the scanned phrase"
+            !body.contains("last success not scanned yet")
+                && !body.contains("last success Not scanned yet"),
+            "the unscanned repository never doubles the success phrase"
         );
         let expected = human_stamp(&stamp, Utc::now(), &local_offset());
         assert!(
-            body.contains(&format!("scanned {expected}")),
+            body.contains(&format!("last success {expected}")),
             "the scanned repository renders its stamp as a human local time"
         );
         assert!(
@@ -4505,7 +4523,7 @@ mod tests {
             "the Added stamp renders in the fixed zone with its age: {body}"
         );
         assert!(
-            body.contains("2026-11-09 00:45 (3 days ago)"),
+            body.contains("last success 2026-11-09 00:45 (3 days ago)"),
             "the scan stamp renders in the fixed zone with its age: {body}"
         );
         assert!(
@@ -4543,11 +4561,199 @@ mod tests {
             .expect("render");
 
         assert!(
-            body.contains("scanned pending scan"),
+            body.contains("last success pending scan"),
             "the unparseable stamp keeps its raw text: {body}"
         );
 
         let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Covers: the Repositories page renders `last success` and `last error`
+    /// with their human times, keeps the error after a later success as muted
+    /// history, and marks it as an error once a scan fails again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_repositories_page_renders_last_success_and_last_error_history() {
+        let (state, path) = app_state("repo_history").await;
+        let folder = live_repository("repo_history_folder");
+        let id = db::insert_repository(&state.pool, "recovered", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        sqlx::query(
+            "UPDATE repositories SET scanned_at = ?, last_error = ?, last_error_at = ?,
+                    last_outcome = 'success'
+             WHERE repository_id = ?",
+        )
+        .bind("2026-11-08T23:45:00Z")
+        .bind("Git could not read the history.")
+        .bind("2026-11-09T23:45:00Z")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .expect("stamp the repository");
+
+        let now = DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
+            .expect("reference instant")
+            .with_timezone(&Utc);
+        let zone = FixedOffset::east_opt(3600).expect("one hour east");
+        let body = render_repositories_at(&state, &FlashQuery::default(), now, &zone)
+            .await
+            .expect("render");
+
+        assert!(
+            body.contains("last success 2026-11-09 00:45 (3 days ago)"),
+            "the success stamp renders with its human time: {body}"
+        );
+        assert!(
+            body.contains(
+                "last error 2026-11-10 00:45 (2 days ago): Git could not read the history."
+            ),
+            "the error text and its own time render beside the success: {body}"
+        );
+        assert!(
+            !body.contains("class=\"error-text\""),
+            "a recovered repository renders its stored error as history: {body}"
+        );
+
+        sqlx::query("UPDATE repositories SET last_outcome = 'error' WHERE repository_id = ?")
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .expect("record a new failure");
+        let body = render_repositories_at(&state, &FlashQuery::default(), now, &zone)
+            .await
+            .expect("render");
+        assert!(
+            body.contains("class=\"error-text\">last error"),
+            "a failing repository renders its error as a current failure: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Covers: the dashboard's failure list follows `failing`, so a recovered
+    /// repository's stored error stays off it while a current failure and a
+    /// legacy row with no outcome still render.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_dashboard_failure_list_follows_the_failing_flag() {
+        let (state, path) = app_state("dashboard_failing").await;
+        let recovered_folder = live_repository("dashboard_failing_recovered");
+        let recovered = db::insert_repository(
+            &state.pool,
+            "recovered",
+            &recovered_folder.to_string_lossy(),
+        )
+        .await
+        .expect("insert recovered");
+        sqlx::query(
+            "UPDATE repositories SET scanned_at = ?, last_error = ?, last_error_at = ?,
+                    last_outcome = 'success'
+             WHERE repository_id = ?",
+        )
+        .bind("2026-11-09T08:00:00Z")
+        .bind("Recovered history error.")
+        .bind("2026-11-08T08:00:00Z")
+        .bind(recovered)
+        .execute(&state.pool)
+        .await
+        .expect("stamp recovered");
+        let failing_folder = live_repository("dashboard_failing_current");
+        let failing =
+            db::insert_repository(&state.pool, "failing", &failing_folder.to_string_lossy())
+                .await
+                .expect("insert failing");
+        db::set_scan_error(&state.pool, failing, "Current failure.")
+            .await
+            .expect("scan error");
+
+        let html = render_home(&state, &HomeQuery::default())
+            .await
+            .expect("render");
+        assert!(
+            html.contains("Current failure."),
+            "a current failure renders on the dashboard: {html}"
+        );
+        assert!(
+            !html.contains("Recovered history error."),
+            "a recovered repository's stored error stays off the failure list: {html}"
+        );
+
+        let legacy_folder = live_repository("dashboard_failing_legacy");
+        let legacy = db::insert_repository(&state.pool, "legacy", &legacy_folder.to_string_lossy())
+            .await
+            .expect("insert legacy");
+        sqlx::query("UPDATE repositories SET last_error = ? WHERE repository_id = ?")
+            .bind("Legacy stored error.")
+            .bind(legacy)
+            .execute(&state.pool)
+            .await
+            .expect("write a legacy error");
+        let html = render_home(&state, &HomeQuery::default())
+            .await
+            .expect("render");
+        assert!(
+            html.contains("Legacy stored error."),
+            "a legacy row with a null outcome falls back to its stored error: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(recovered_folder);
+        let _ = std::fs::remove_dir_all(failing_folder);
+        let _ = std::fs::remove_dir_all(legacy_folder);
+        cleanup(&path);
+    }
+
+    /// Covers: `GET /status`'s `failed_repositories` follows `failing`, so a
+    /// success after an error clears the count while the error text stays, and
+    /// a legacy row with a null outcome still counts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_status_failed_repositories_follows_the_failing_flag() {
+        let (state, path) = app_state("status_failing").await;
+        let folder = live_repository("status_failing_repo");
+        let id = db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
+            .await
+            .expect("insert");
+        db::set_scan_error(&state.pool, id, "The tasks directory is missing.")
+            .await
+            .expect("scan error");
+        let failed = status_json(&state).await;
+        assert_eq!(failed["failed_repositories"], serde_json::json!(1));
+
+        db::replace_tasks(&state.pool, id, &[], immediate_store_hook().as_ref())
+            .await
+            .expect("successful store");
+        let recovered = status_json(&state).await;
+        assert_eq!(
+            recovered["failed_repositories"],
+            serde_json::json!(0),
+            "a success after an error stops the repository counting as failed"
+        );
+        let repositories = db::list_repositories(&state.pool).await.expect("list");
+        assert_eq!(
+            repositories[0].last_error.as_deref(),
+            Some("The tasks directory is missing."),
+            "the error text stays as history"
+        );
+
+        let legacy_folder = live_repository("status_failing_legacy");
+        let legacy = db::insert_repository(&state.pool, "legacy", &legacy_folder.to_string_lossy())
+            .await
+            .expect("insert legacy");
+        sqlx::query("UPDATE repositories SET last_error = ? WHERE repository_id = ?")
+            .bind("Legacy stored error.")
+            .bind(legacy)
+            .execute(&state.pool)
+            .await
+            .expect("write a legacy error");
+        let legacy_status = status_json(&state).await;
+        assert_eq!(
+            legacy_status["failed_repositories"],
+            serde_json::json!(1),
+            "a legacy row with a null outcome falls back to its stored error"
+        );
+
+        let _ = std::fs::remove_dir_all(folder);
+        let _ = std::fs::remove_dir_all(legacy_folder);
         cleanup(&path);
     }
 
@@ -5214,15 +5420,19 @@ mod tests {
 
     #[test]
     fn web_scan_label_compares_stamps_as_instants() {
-        let repository =
-            |id: i64, scanned_at: Option<&str>, last_error: Option<&str>| db::Repository {
-                repository_id: id,
-                name: format!("repo {id}"),
-                path: format!("/tmp/repo-{id}"),
-                created_at: "2026-11-01T00:00:00Z".to_string(),
-                scanned_at: scanned_at.map(str::to_string),
-                last_error: last_error.map(str::to_string),
-            };
+        let repository = |id: i64,
+                          scanned_at: Option<&str>,
+                          last_error: Option<&str>,
+                          last_outcome: Option<&str>| db::Repository {
+            repository_id: id,
+            name: format!("repo {id}"),
+            path: format!("/tmp/repo-{id}"),
+            created_at: "2026-11-01T00:00:00Z".to_string(),
+            scanned_at: scanned_at.map(str::to_string),
+            last_error: last_error.map(str::to_string),
+            last_error_at: last_error.map(|_| "2026-11-09T07:00Z".to_string()),
+            last_outcome: last_outcome.map(str::to_string),
+        };
         // A fixed reference instant and zone keep the human rendering independent
         // of the clock and the machine's own zone.
         let now = DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
@@ -5234,8 +5444,8 @@ mod tests {
         // 23:45 UTC scan, even though its text sorts later. The oldest stamp is
         // the day the numbers are current to.
         let repositories = vec![
-            repository(1, Some("2026-11-09 00:30"), None),
-            repository(2, Some("2026-11-08T23:45Z"), None),
+            repository(1, Some("2026-11-09 00:30"), None, None),
+            repository(2, Some("2026-11-08T23:45Z"), None, None),
         ];
         assert_eq!(
             scan_label_at(&repositories, None, now, &zone),
@@ -5243,13 +5453,15 @@ mod tests {
         );
 
         // One fresh and one failed repository: the failed repository's last
-        // successful stamp is the oldest, and it counts as stale.
+        // successful stamp is the oldest, and it counts as stale. The null
+        // outcome is a legacy row, where the stored error alone decides.
         let repositories = vec![
-            repository(1, Some("2026-11-10T08:00Z"), None),
+            repository(1, Some("2026-11-10T08:00Z"), None, Some("success")),
             repository(
                 2,
                 Some("2026-11-09T08:00Z"),
                 Some("Git could not read the history."),
+                None,
             ),
         ];
         assert_eq!(
@@ -5257,11 +5469,27 @@ mod tests {
             "Oldest scan 2026-11-09 09:00 (2 days ago) · 1 repository stale"
         );
 
+        // A success after an error keeps the stored error as history but stops
+        // the repository counting as stale.
+        let repositories = vec![
+            repository(1, Some("2026-11-10T08:00Z"), None, Some("success")),
+            repository(
+                2,
+                Some("2026-11-09T08:00Z"),
+                Some("Git could not read the history."),
+                Some("success"),
+            ),
+        ];
+        assert_eq!(
+            scan_label_at(&repositories, None, now, &zone),
+            "Oldest scan 2026-11-09 09:00 (2 days ago)"
+        );
+
         // A stored stamp that does not parse reads as an unknown time, not as
         // a folder that was never scanned, and still counts as stale.
         let repositories = vec![
-            repository(1, Some("pending"), None),
-            repository(2, Some("unknown"), None),
+            repository(1, Some("pending"), None, None),
+            repository(2, Some("unknown"), None, None),
         ];
         assert_eq!(
             scan_label_at(&repositories, None, now, &zone),
@@ -5270,7 +5498,7 @@ mod tests {
 
         // A repository with no stamp at all was never scanned, so it is not
         // stale: nothing has read it yet.
-        let repositories = vec![repository(1, None, None)];
+        let repositories = vec![repository(1, None, None, None)];
         assert_eq!(
             scan_label_at(&repositories, None, now, &zone),
             "Not scanned yet"
@@ -5279,11 +5507,12 @@ mod tests {
         // A selected repository scopes both the oldest stamp and the stale
         // count.
         let repositories = vec![
-            repository(1, Some("2026-11-10T08:00Z"), None),
+            repository(1, Some("2026-11-10T08:00Z"), None, Some("success")),
             repository(
                 2,
                 Some("2026-11-09T08:00Z"),
                 Some("Git could not read the history."),
+                Some("error"),
             ),
         ];
         assert_eq!(
@@ -15190,6 +15419,15 @@ mod tests {
         (rows.len(), error)
     }
 
+    /// Whether one repository counts as failing after the last scan.
+    async fn stored_failing(pool: &sqlx::SqlitePool, repository_id: i64) -> bool {
+        let repositories = db::list_repositories(pool).await.expect("list");
+        repositories
+            .iter()
+            .find(|repository| repository.repository_id == repository_id)
+            .is_some_and(|repository| repository.failing())
+    }
+
     /// Add accepts a folder whose working tree lacks `tasks/` but whose branch
     /// holds it, and charts that branch's task.
     #[tokio::test(flavor = "current_thread")]
@@ -15313,7 +15551,15 @@ mod tests {
         scan_listed(&pool).await;
         let (rows, error) = stored_state(&pool, id).await;
         assert_eq!(rows, 0, "an empty tasks tree charts no rows");
-        assert_eq!(error, None, "a successful scan clears the recorded error");
+        assert_eq!(
+            error.as_deref(),
+            Some(MISSING_TASKS_ERROR),
+            "the prior error stays as history after the success"
+        );
+        assert!(
+            !stored_failing(&pool, id).await,
+            "a successful scan stops the repository counting as failing"
+        );
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
@@ -15351,7 +15597,15 @@ mod tests {
         scan_listed(&pool).await;
         let (rows, error) = stored_state(&pool, id).await;
         assert_eq!(rows, 0, "a fully skipped tasks tree charts no rows");
-        assert_eq!(error, None, "a successful scan clears the recorded error");
+        assert_eq!(
+            error.as_deref(),
+            Some(MISSING_TASKS_ERROR),
+            "the prior error stays as history after the success"
+        );
+        assert!(
+            !stored_failing(&pool, id).await,
+            "a successful scan stops the repository counting as failing"
+        );
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
@@ -15393,7 +15647,15 @@ mod tests {
         scan_listed(&pool).await;
         let (rows, error) = stored_state(&pool, id).await;
         assert_eq!(rows, 0, "the only ref task is skipped");
-        assert_eq!(error, None, "a successful scan clears the recorded error");
+        assert_eq!(
+            error.as_deref(),
+            Some(MISSING_TASKS_ERROR),
+            "the prior error stays as history after the success"
+        );
+        assert!(
+            !stored_failing(&pool, id).await,
+            "a successful scan stops the repository counting as failing"
+        );
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }

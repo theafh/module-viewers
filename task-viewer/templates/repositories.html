@@ -40,9 +40,9 @@
             <div>
                 <a class="repo-name" href="/?project={{ project.id_str }}">{{ project.name }}</a>
                 <span class="muted repo-path">{{ project.path }}</span>
-                <span class="muted">Added {{ project.created_at }} · {% if project.scanned_at %}scanned {{ project.scanned_at }}{% if project.counts %} · {{ project.counts }}{% endif %}{% else %}not scanned yet{% endif %}</span>
+                <span class="muted">Added {{ project.created_at }}{% if project.scanned_at %} · last success {{ project.scanned_at }}{% if project.counts %} · {{ project.counts }}{% endif %}{% endif %}{% if not project.scanned_at and not project.last_error %} · not scanned yet{% endif %}</span>
                 {% if project.last_error %}
-                <span class="error-text">{{ project.last_error }}</span>
+                <span class="{% if project.failing %}error-text{% else %}muted{% endif %}">last error{% if project.last_error_at %} {{ project.last_error_at }}{% endif %}: {{ project.last_error }}</span>
                 {% endif %}
             </div>
             <div class="repo-actions">

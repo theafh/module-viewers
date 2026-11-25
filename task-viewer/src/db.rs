@@ -28,16 +28,20 @@ pub type StoreHookFn = dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Se
 pub const SCHEMA: &str = include_str!("schema.sql");
 
 /// The schema version a database reaches after `init` runs its migrations.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
-/// The statement that moves a database from version `version - 1` to
+/// The statements that move a database from version `version - 1` to
 /// `version`, or `None` when no such migration exists. The caller guards
 /// version 3 on the table's own columns, so a database stamped below 3 that
 /// already carries `content_hash` migrates without repeating the `ALTER`.
-fn migration(version: i64) -> Option<&'static str> {
+fn migration(version: i64) -> Option<&'static [&'static str]> {
     match version {
-        2 => Some("DROP INDEX IF EXISTS tasks_repository_id"),
-        3 => Some("ALTER TABLE tasks ADD COLUMN content_hash TEXT"),
+        2 => Some(&["DROP INDEX IF EXISTS tasks_repository_id"]),
+        3 => Some(&["ALTER TABLE tasks ADD COLUMN content_hash TEXT"]),
+        4 => Some(&[
+            "ALTER TABLE repositories ADD COLUMN last_error_at TEXT",
+            "ALTER TABLE repositories ADD COLUMN last_outcome TEXT",
+        ]),
         _ => None,
     }
 }
@@ -50,6 +54,26 @@ pub struct Repository {
     pub created_at: String,
     pub scanned_at: Option<String>,
     pub last_error: Option<String>,
+    /// When the stored `last_error` was written, kept after a later success so
+    /// the error survives as history beside the newer scan stamp.
+    pub last_error_at: Option<String>,
+    /// `success` or `error`: which of the two stamps came last. `None` on a row
+    /// an older build stored, where `last_error` alone decides.
+    pub last_outcome: Option<String>,
+}
+
+impl Repository {
+    /// Whether the repository's most recent scan failed. The outcome column
+    /// decides, so a success after an error stops the repository counting as
+    /// failing while its stored error stays as history; a legacy row with no
+    /// outcome falls back to the stored error.
+    pub fn failing(&self) -> bool {
+        match self.last_outcome.as_deref() {
+            Some("error") => true,
+            Some("success") => false,
+            _ => self.last_error.is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -263,26 +287,38 @@ async fn migrate_step(conn: &mut SqliteConnection, version: i64) -> Result<()> {
     if test_migration::take(version) {
         anyhow::bail!("the injected schema migration failure fired");
     }
-    let Some(statement) = migration(version) else {
+    let Some(statements) = migration(version) else {
         anyhow::bail!("No migration from database schema version {}", version - 1);
     };
-    if version == 3 && column_exists(conn, "content_hash").await? {
+    if version == 3 && column_exists(conn, "tasks", "content_hash").await? {
         // A file stamped below 3 that already carries the column only needs
         // its stamp, so the `ALTER` stays idempotent.
         return stamp_version(conn, version).await;
     }
-    sqlx::query(statement).execute(&mut *conn).await?;
+    // The version-4 step adds both columns in one transaction, so a file that
+    // already carries them (stamped back by a test or a repaired copy) only
+    // needs its stamp instead of a duplicate `ALTER`.
+    if version == 4
+        && column_exists(conn, "repositories", "last_error_at").await?
+        && column_exists(conn, "repositories", "last_outcome").await?
+    {
+        return stamp_version(conn, version).await;
+    }
+    for statement in statements {
+        sqlx::query(statement).execute(&mut *conn).await?;
+    }
     stamp_version(conn, version).await
 }
 
-/// Whether `tasks` already carries `column`, read through SQLite's own table
+/// Whether `table` already carries `column`, read through SQLite's own table
 /// info so the check needs no schema text of its own.
-async fn column_exists(conn: &mut SqliteConnection, column: &str) -> Result<bool> {
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?")
-            .bind(column)
-            .fetch_one(&mut *conn)
-            .await?;
+async fn column_exists(conn: &mut SqliteConnection, table: &str, column: &str) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?"
+    ))
+    .bind(column)
+    .fetch_one(&mut *conn)
+    .await?;
     Ok(count > 0)
 }
 
@@ -399,7 +435,8 @@ pub fn now_stamp() -> String {
 
 pub async fn list_repositories(pool: &Pool<Sqlite>) -> Result<Vec<Repository>> {
     let rows = sqlx::query_as::<_, Repository>(
-        "SELECT repository_id, name, path, created_at, scanned_at, last_error
+        "SELECT repository_id, name, path, created_at, scanned_at, last_error,
+                last_error_at, last_outcome
          FROM repositories
          ORDER BY name COLLATE NOCASE, repository_id",
     )
@@ -515,8 +552,11 @@ pub async fn replace_tasks(
         });
         insert.build().execute(&mut *tx).await?;
     }
+    // A success stamps the scan and records the outcome, and leaves the stored
+    // error and its time in place, so a recovered repository still shows what
+    // failed last while the outcome stops it counting as failing.
     sqlx::query(
-        "UPDATE repositories SET scanned_at = ?, last_error = NULL WHERE repository_id = ?",
+        "UPDATE repositories SET scanned_at = ?, last_outcome = 'success' WHERE repository_id = ?",
     )
     .bind(now_stamp())
     .bind(repository_id)
@@ -566,11 +606,15 @@ pub async fn load_prior_tasks(pool: &Pool<Sqlite>, repository_id: i64) -> Result
 }
 
 pub async fn set_scan_error(pool: &Pool<Sqlite>, repository_id: i64, message: &str) -> Result<()> {
-    sqlx::query("UPDATE repositories SET last_error = ? WHERE repository_id = ?")
-        .bind(message)
-        .bind(repository_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE repositories SET last_error = ?, last_error_at = ?, last_outcome = 'error'
+         WHERE repository_id = ?",
+    )
+    .bind(message)
+    .bind(now_stamp())
+    .bind(repository_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -852,10 +896,10 @@ pub(crate) mod test_worker_name {
 mod tests {
     use super::{
         PathSource, SCHEMA, SCHEMA_VERSION, StoreHookFn, create_parent_dir, database_path,
-        delete_repository, init, init_at, init_with, is_locked, list_repositories,
-        load_prior_tasks, load_tasks, migrate, now_stamp, replace_tasks, repository_counts,
-        set_scan_error, test_db, test_migration, test_version_read, test_worker_name,
-        update_repository_path,
+        delete_repository, init, init_at, init_with, insert_repository, is_locked,
+        list_repositories, load_prior_tasks, load_tasks, migrate, now_stamp, replace_tasks,
+        repository_counts, set_scan_error, test_db, test_migration, test_version_read,
+        test_worker_name, update_repository_path,
     };
     use crate::harvest::{ParsedTask, TaskKind};
     use crate::test_support::unique_temp_dir;
@@ -1355,7 +1399,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(version, SCHEMA_VERSION);
         let columns = sqlx::query("PRAGMA table_info('tasks')")
             .fetch_all(&pool)
@@ -1421,6 +1465,191 @@ mod tests {
             .filter(|name| name == "content_hash")
             .count();
         assert_eq!(content_hash_columns, 1);
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a version-3 database upgrades to version 4 with the two history
+    /// columns and keeps every repository and task row, and a legacy row whose
+    /// history is null falls back to its stored error for `failing`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_migrates_a_version_three_database_and_keeps_scan_history() {
+        let dir = unique_temp_dir("db_migrates_v3");
+        std::fs::create_dir_all(&dir).expect("db scratch");
+        let path = dir.join("test.db");
+        let version_three = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("version three");
+        sqlx::query(SCHEMA)
+            .execute(&version_three)
+            .await
+            .expect("baseline schema");
+        sqlx::query("DROP INDEX IF EXISTS tasks_repository_id")
+            .execute(&version_three)
+            .await
+            .expect("version two migration");
+        sqlx::query("ALTER TABLE tasks ADD COLUMN content_hash TEXT")
+            .execute(&version_three)
+            .await
+            .expect("version three migration");
+        sqlx::query("PRAGMA user_version = 3")
+            .execute(&version_three)
+            .await
+            .expect("version stamp");
+        sqlx::query(
+            "INSERT INTO repositories (name, path, created_at, scanned_at, last_error)
+             VALUES ('ai-modules', '/tmp/ai-modules', '2026-01-01 00:00',
+                     '2026-01-02 00:00', 'Git could not read the history.')",
+        )
+        .execute(&version_three)
+        .await
+        .expect("repository");
+        sqlx::query(
+            "INSERT INTO tasks (repository_id, path, scope, kind, created, updated)
+             VALUES (1, 'tasks/scope_one.md', 'scope', 'live', '2026-01-01', '2026-01-01')",
+        )
+        .execute(&version_three)
+        .await
+        .expect("task");
+        version_three.close().await;
+
+        let pool = init_at(&path).await.expect("init migrates");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let columns = sqlx::query("PRAGMA table_info('repositories')")
+            .fetch_all(&pool)
+            .await
+            .expect("table info");
+        let names: Vec<String> = columns
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("name").ok())
+            .collect();
+        for column in ["last_error_at", "last_outcome"] {
+            assert!(
+                names.iter().any(|name| name == column),
+                "the upgraded table carries {column}: {names:?}"
+            );
+        }
+
+        let repositories = list_repositories(&pool).await.expect("list");
+        assert_eq!(repositories.len(), 1, "the repository row survives");
+        assert_eq!(
+            repositories[0].last_error.as_deref(),
+            Some("Git could not read the history.")
+        );
+        assert!(repositories[0].last_error_at.is_none());
+        assert!(repositories[0].last_outcome.is_none());
+        assert!(
+            repositories[0].failing(),
+            "a legacy row with a stored error still counts as failing"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks")
+            .fetch_one(&pool)
+            .await
+            .expect("task count");
+        assert_eq!(rows, 1, "the task row survives");
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a success after an error keeps the error text and its time as
+    /// history, stamps the success, and stops the repository counting as
+    /// failing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_success_after_error_keeps_the_error_and_clears_failing() {
+        let path = temp_database();
+        let pool = init_at(&path).await.expect("init");
+        let id = insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        set_scan_error(&pool, id, "The tasks directory is missing.")
+            .await
+            .expect("scan error");
+        let failed = list_repositories(&pool).await.expect("list");
+        let error_at = failed[0].last_error_at.clone().expect("the error time");
+        assert_eq!(failed[0].last_outcome.as_deref(), Some("error"));
+        assert!(failed[0].failing());
+
+        replace_tasks(&pool, id, &[task()], immediate_hook().as_ref())
+            .await
+            .expect("successful store");
+        let recovered = list_repositories(&pool).await.expect("list");
+        assert_eq!(
+            recovered[0].last_error.as_deref(),
+            Some("The tasks directory is missing."),
+            "the error text survives the later success"
+        );
+        assert_eq!(
+            recovered[0].last_error_at.as_deref(),
+            Some(error_at.as_str()),
+            "the error time survives the later success"
+        );
+        assert_eq!(recovered[0].last_outcome.as_deref(), Some("success"));
+        assert!(
+            recovered[0].scanned_at.is_some(),
+            "the success carries its own scan stamp"
+        );
+        assert!(
+            !recovered[0].failing(),
+            "a recovered repository no longer counts as failing"
+        );
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: an error after a success stamps the error time and counts the
+    /// repository as failing, and a repository that never succeeded with an
+    /// error counts as failing too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_error_after_success_sets_failing() {
+        let path = temp_database();
+        let pool = init_at(&path).await.expect("init");
+        let id = insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        replace_tasks(&pool, id, &[task()], immediate_hook().as_ref())
+            .await
+            .expect("successful store");
+        let succeeded = list_repositories(&pool).await.expect("list");
+        assert_eq!(succeeded[0].last_outcome.as_deref(), Some("success"));
+        assert!(!succeeded[0].failing());
+
+        set_scan_error(&pool, id, "Git could not read the history.")
+            .await
+            .expect("scan error");
+        let failed = list_repositories(&pool).await.expect("list");
+        assert_eq!(failed[0].last_outcome.as_deref(), Some("error"));
+        assert!(failed[0].last_error_at.is_some());
+        assert!(
+            failed[0].scanned_at.is_some(),
+            "the last success stamp stays beside the error"
+        );
+        assert!(failed[0].failing());
+
+        let never = insert_repository(&pool, "never", "/tmp/never")
+            .await
+            .expect("insert");
+        set_scan_error(&pool, never, "The tasks directory is missing.")
+            .await
+            .expect("scan error");
+        let listed = list_repositories(&pool).await.expect("list");
+        let never = listed
+            .iter()
+            .find(|repository| repository.repository_id == never)
+            .expect("the never-scanned repository");
+        assert!(never.scanned_at.is_none());
+        assert!(never.failing(), "an error alone counts as failing");
         pool.close().await;
         remove_scratch(&path);
     }
@@ -1557,8 +1786,8 @@ mod tests {
         );
         let last_migration = statements
             .iter()
-            .rposition(|statement| trimmed(statement) == "PRAGMA user_version = 3")
-            .expect("the last migration stamps version 3");
+            .rposition(|statement| trimmed(statement) == "PRAGMA user_version = 4")
+            .expect("the last migration stamps version 4");
         assert!(
             commits[0] > last_migration,
             "the commit follows the last migration: {statements:?}"
