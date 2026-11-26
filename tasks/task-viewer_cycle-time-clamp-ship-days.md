@@ -2,9 +2,11 @@
 description: "Clamp a future ship day to today before computing cycle time, so one mistyped date cannot blow up the card's mean."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T15:03:51Z
-status: ready
+updated: 2026-11-26T19:16:52Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Clamp a future ship day's cycle value to today

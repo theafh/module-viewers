@@ -649,7 +649,8 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
 /// charted day. Only a finished task with a ship day contributes; a deferred row
 /// and a finished row with no ship day contribute nothing, and a day no task
 /// finished on carries no point, so the trend is fitted to exactly the days the
-/// payload carries.
+/// payload carries. A ship day after today is clamped to today, so it contributes
+/// `today - created` instead of a mistyped future year's raw span.
 fn cycle_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<CyclePoint> {
     let mut sums: BTreeMap<NaiveDate, (i64, usize)> = BTreeMap::new();
     for task in tasks {
@@ -666,6 +667,12 @@ fn cycle_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<CyclePoint> {
         // A day outside the charted range folds into the nearest bound, the way
         // the other series fold theirs.
         let day = day.max(series_floor()).min(today);
+        // A ship day after today is a mistyped year rather than a long cycle, so
+        // it counts as shipping today: the value is `today - created` instead of
+        // the raw `ship - created`, which a far-future year turns into tens of
+        // thousands of days and would scale every real value onto the baseline.
+        // The zero floor below still keeps a task created after today at zero.
+        let ship = ship.min(today);
         let days = (ship - task.created).num_days().max(0);
         let entry = sums.entry(day).or_insert((0, 0));
         entry.0 += days;
@@ -2376,5 +2383,132 @@ mod tests {
         assert_eq!(only.n, 1);
         assert_eq!(only.avg_cycle.to_bits(), 0.0_f64.to_bits());
         assert_eq!(only.trend.to_bits(), 0.0_f64.to_bits());
+    }
+
+    /// Covers: a future ship day is clamped to today, so it contributes
+    /// `today - created` days (never negative) on today's point, while a normal
+    /// past ship keeps its real difference.
+    #[test]
+    fn series_cycle_time_clamps_a_future_ship_day_to_today() {
+        let today = day(2026, 6, 10);
+
+        // Created today and shipped in 2099: zero days on today's point.
+        let same_day = dashboard(
+            &[task(
+                "alpha",
+                "today",
+                TaskKind::Finished,
+                today,
+                Some(day(2099, 1, 1)),
+                Some(day(2099, 1, 1)),
+            )],
+            today,
+            RadarMode::Scope,
+            "alpha",
+        );
+        let point = same_day.cycle.first().expect("the future-ship point");
+        assert_eq!(point.date, "2026-06-10", "the point folds onto today");
+        assert_eq!(point.n, 1);
+        assert_eq!(point.avg_cycle.to_bits(), 0.0_f64.to_bits());
+
+        // Created ten days ago and shipped in 2099: exactly ten days, not the
+        // tens of thousands the raw `ship - created` would read.
+        let ten_days = dashboard(
+            &[task(
+                "alpha",
+                "ten",
+                TaskKind::Finished,
+                day(2026, 5, 31),
+                Some(day(2099, 1, 1)),
+                Some(day(2099, 1, 1)),
+            )],
+            today,
+            RadarMode::Scope,
+            "alpha",
+        );
+        let point = ten_days.cycle.first().expect("the ten-day point");
+        assert_eq!(point.date, "2026-06-10");
+        assert_eq!(point.n, 1);
+        assert_eq!(point.avg_cycle.to_bits(), 10.0_f64.to_bits());
+
+        // Created after today and shipped after its created day: the negative
+        // `today - created` is floored to zero, and the point still sits on today.
+        let after_today = dashboard(
+            &[task(
+                "alpha",
+                "future-created",
+                TaskKind::Finished,
+                day(2026, 6, 20),
+                Some(day(2026, 7, 1)),
+                Some(day(2026, 7, 1)),
+            )],
+            today,
+            RadarMode::Scope,
+            "alpha",
+        );
+        let point = after_today.cycle.first().expect("the future-created point");
+        assert_eq!(point.date, "2026-06-10");
+        assert_eq!(point.n, 1);
+        assert_eq!(point.avg_cycle.to_bits(), 0.0_f64.to_bits());
+
+        // A normal past ship keeps its real difference on its own ship day.
+        let past = dashboard(
+            &[task(
+                "alpha",
+                "past",
+                TaskKind::Finished,
+                day(2026, 6, 1),
+                Some(day(2026, 6, 5)),
+                Some(day(2026, 6, 5)),
+            )],
+            today,
+            RadarMode::Scope,
+            "alpha",
+        );
+        let point = past.cycle.first().expect("the past-ship point");
+        assert_eq!(point.date, "2026-06-05");
+        assert_eq!(point.n, 1);
+        assert_eq!(point.avg_cycle.to_bits(), 4.0_f64.to_bits());
+
+        // Every future-dated row still counts in today's cycle task count.
+        let board = dashboard(
+            &[
+                task(
+                    "alpha",
+                    "today",
+                    TaskKind::Finished,
+                    today,
+                    Some(day(2099, 1, 1)),
+                    Some(day(2099, 1, 1)),
+                ),
+                task(
+                    "alpha",
+                    "ten",
+                    TaskKind::Finished,
+                    day(2026, 5, 31),
+                    Some(day(2099, 1, 1)),
+                    Some(day(2099, 1, 1)),
+                ),
+                task(
+                    "alpha",
+                    "future-created",
+                    TaskKind::Finished,
+                    day(2026, 6, 20),
+                    Some(day(2026, 7, 1)),
+                    Some(day(2026, 7, 1)),
+                ),
+            ],
+            today,
+            RadarMode::Scope,
+            "alpha",
+        );
+        let point = board
+            .cycle
+            .iter()
+            .find(|point| point.date == "2026-06-10")
+            .expect("the shared today point");
+        assert_eq!(point.n, 3, "all three future-dated rows count on today");
+        // The mean of 0, 10, and 0 days, rounded to two places.
+        assert_eq!(point.avg_cycle.to_bits(), 3.33_f64.to_bits());
     }
 }
