@@ -136,7 +136,10 @@ build_macos_icns() {
 # Move the finished bundle into place atomically. The old bundle is moved into
 # a backup directory beside it, the new one is moved in, and only then is the
 # backup removed. A failed move restores the old bundle, and a trap restores it
-# when an interrupt lands between the two moves.
+# when an interrupt lands between the two moves. Returns 0 on success, 1 when
+# the old bundle was put back, and 2 when the restore itself failed, with the
+# old bundle left at $swap_restore_failed_path.
+swap_restore_failed_path=""
 swap_in_bundle() {
     local new_bundle="$1"
     local app_bundle="$2"
@@ -146,31 +149,45 @@ swap_in_bundle() {
     backup="$(mktemp -d "$apps_dir/.Task Viewer.app.backup.XXXXXX")"
     old_bundle="$backup/Task Viewer.app"
     local moved_old=0
+    local restore_status
+    swap_restore_failed_path=""
 
+    # Only a failed restore move is a restore failure. A failed backup cleanup
+    # is not: the old bundle is already back in place, so it leaves the caller
+    # its plain status-1 failure instead of a reported restore failure.
     swap_restore() {
         if [ "$moved_old" -eq 1 ] && [ ! -e "$app_bundle" ] && [ -e "$old_bundle" ]; then
-            mv "$old_bundle" "$app_bundle"
+            if ! mv "$old_bundle" "$app_bundle"; then
+                swap_restore_failed_path="$old_bundle"
+                echo "⚠ Could not restore the previous bundle; it remains at: $old_bundle"
+                return 1
+            fi
         fi
-        rm -rf "$backup"
+        rm -rf "$backup" || true
+        return 0
     }
     trap 'swap_restore' EXIT INT TERM HUP
 
     if [ -e "$app_bundle" ]; then
         if ! mv "$app_bundle" "$old_bundle"; then
-            swap_restore
+            restore_status=0
+            swap_restore || restore_status=$?
             trap - EXIT INT TERM HUP
+            [ "$restore_status" -eq 0 ] || return 2
             return 1
         fi
         moved_old=1
     fi
 
     if ! mv "$new_bundle" "$app_bundle"; then
-        swap_restore
+        restore_status=0
+        swap_restore || restore_status=$?
         trap - EXIT INT TERM HUP
+        [ "$restore_status" -eq 0 ] || return 2
         return 1
     fi
 
-    rm -rf "$backup"
+    rm -rf "$backup" || echo "⚠ Could not remove the backup directory $backup; the previous bundle remains there"
     trap - EXIT INT TERM HUP
     return 0
 }
@@ -178,7 +195,7 @@ swap_in_bundle() {
 install_macos() {
     local apps_dir="$HOME/Applications"
     local app_bundle="$apps_dir/Task Viewer.app"
-    local staging new_bundle contents macos_dir resources_dir launcher_bin icon_status
+    local staging new_bundle contents macos_dir resources_dir launcher_bin icon_status swap_status
 
     echo "Installing Task Viewer.app for the Mac Dock..."
     echo "Project directory: $PROJECT_DIR"
@@ -254,7 +271,13 @@ EOF
         return 1
     fi
 
-    if ! swap_in_bundle "$new_bundle" "$app_bundle"; then
+    swap_status=0
+    swap_in_bundle "$new_bundle" "$app_bundle" || swap_status=$?
+    if [ "$swap_status" -eq 2 ]; then
+        echo "✗ Could not replace $app_bundle, and the previous bundle could not be restored; it remains at: $swap_restore_failed_path"
+        return 1
+    fi
+    if [ "$swap_status" -ne 0 ]; then
         echo "✗ Could not replace $app_bundle; the previous bundle was restored."
         return 1
     fi

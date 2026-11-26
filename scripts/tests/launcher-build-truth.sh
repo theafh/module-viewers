@@ -393,6 +393,7 @@ EOS
     status=$?
     if [ "$status" -ne 0 ] &&
         printf '%s\n' "$out" | grep -q 'add it by hand' &&
+        ! printf '%s\n' "$out" | grep -q 'python3 is not available' &&
         ! printf '%s\n' "$out" | grep -q 'Traceback'; then
         pass "a failing defaults import prints the manual pin guidance"
     else
@@ -433,6 +434,99 @@ EOS
         fail "a clean install replaces the bundle and pins it (status $status)"
         printf '%s\n' "$out" | sed 's/^/    /'
         printf '%s\n' "$leftovers" | sed 's/^/    leftover: /'
+    fi
+}
+
+# A restore that put the old bundle back has succeeded, even when removing the
+# backup then fails. That cleanup failure must not be reported as a failed
+# restore, and the failure message must not print an empty backup path.
+case_restore_success_with_failed_cleanup() {
+    local root="$TMP/installer-restore-cleanup" out status marker real_mv real_rm
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    real_mv="$(command -v mv)"
+    real_rm="$(command -v rm)"
+    cat >"$root/bin/mv" <<EOS
+#!/bin/bash
+src="\$1"
+dst="\$2"
+case "\$dst" in
+    *"/Task Viewer.app")
+        case "\$src" in
+            *".staging."*) exit 1 ;;
+        esac
+        ;;
+esac
+exec "$real_mv" "\$@"
+EOS
+    cat >"$root/bin/rm" <<EOS
+#!/bin/bash
+for arg in "\$@"; do
+    case "\$arg" in
+        *".Task Viewer.app.backup."*) exit 1 ;;
+    esac
+done
+exec "$real_rm" "\$@"
+EOS
+    chmod +x "$root/bin/uname" "$root/bin/mv" "$root/bin/rm"
+    marker="$root/home/Applications/Task Viewer.app/Contents/old-bundle-marker"
+    mkdir -p "$(dirname "$marker")"
+    printf 'previous\n' >"$marker"
+    out=$(HOME="$root/home" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ] &&
+        [ -f "$marker" ] &&
+        printf '%s\n' "$out" | grep -q 'previous bundle was restored' &&
+        ! printf '%s\n' "$out" | grep -q 'could not be restored' &&
+        ! printf '%s\n' "$out" | grep -q 'remains at: *$'; then
+        pass "a failed backup cleanup does not report a failed restore"
+    else
+        fail "a failed backup cleanup does not report a failed restore (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# A swap that put the new bundle in place has succeeded, even when removing the
+# backup then fails. That leftover must be reported with the backup directory it
+# names, and the install must still finish clean.
+case_success_with_failed_cleanup_reports_leftover() {
+    local root="$TMP/installer-success-cleanup" out status marker real_rm backup_dir
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    real_rm="$(command -v rm)"
+    cat >"$root/bin/rm" <<EOS
+#!/bin/bash
+for arg in "\$@"; do
+    case "\$arg" in
+        *".Task Viewer.app.backup."*) exit 1 ;;
+    esac
+done
+exec "$real_rm" "\$@"
+EOS
+    cat >"$root/bin/dockutil" <<'EOS'
+#!/bin/bash
+exit 0
+EOS
+    chmod +x "$root/bin/uname" "$root/bin/rm" "$root/bin/dockutil"
+    marker="$root/home/Applications/Task Viewer.app/Contents/old-bundle-marker"
+    mkdir -p "$(dirname "$marker")"
+    printf 'previous\n' >"$marker"
+    out=$(HOME="$root/home" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    backup_dir="$(find "$root/home/Applications" -maxdepth 1 -name '.*backup*' -print | head -n 1)"
+    if [ "$status" -eq 0 ] &&
+        [ ! -e "$marker" ] &&
+        [ -n "$backup_dir" ] &&
+        printf '%s\n' "$out" | grep -qF "$backup_dir" &&
+        printf '%s\n' "$out" | grep -q 'previous bundle remains there'; then
+        pass "a successful swap reports a backup it could not remove"
+    else
+        fail "a successful swap reports a backup it could not remove (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
     fi
 }
 
@@ -579,6 +673,8 @@ case_icon_resize_failure_falls_back_to_png
 case_failing_dockutil_prints_guidance
 case_failing_defaults_prints_guidance
 case_clean_install_replaces_bundle
+case_restore_success_with_failed_cleanup
+case_success_with_failed_cleanup_reports_leftover
 case_detach_refuses_without_python3_or_setsid
 case_detach_uses_setsid
 case_launcher_state_stays_under_root
