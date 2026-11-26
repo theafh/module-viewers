@@ -2,8 +2,8 @@
 description: "Run the duplicate-clone confirm store in a detached task that takes the scan lock, so a disconnect cannot leave a repository with no rows."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T23:31:41Z
-status: implemented
+updated: 2026-11-26T23:35:37Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
@@ -19,7 +19,7 @@ Posting the duplicate-clone confirm and then disconnecting still inserts the rep
 
 `confirm_repository` in `task-viewer/src/web.rs` takes the scan lock and the held token in the handler, then awaits `store_repository` inline. Add and Relocate both spawn a task that takes the scan lock itself, so a dropped request leaves their store running; the confirm path does not. If the client goes away between the insert and the first harvest, the insert commits while the harvest's result is never stored: `refresh_one` runs the harvest on `spawn_blocking`, which keeps running after the handler future drops, so its rows are harvested and discarded. The repository is left with a null `scanned_at` and a null `last_error`, which the Repositories page shows as "not scanned yet" with no banner explaining it.
 
-The archived Relocate task [`tasks/archive/task-viewer_relocate-survives-disconnect.md`](archive/task-viewer_relocate-survives-disconnect.md) deferred this work with the rationale "a dropped confirm stores nothing"; that rationale is wrong, because `insert_repository` commits the repository row before the store, so a dropped confirm stores a repository with no rows.
+The archived Relocate task [`tasks/archive/task-viewer_relocate-survives-disconnect.md`](task-viewer_relocate-survives-disconnect.md) deferred this work with the rationale "a dropped confirm stores nothing"; that rationale is wrong, because `insert_repository` commits the repository row before the store, so a dropped confirm stores a repository with no rows.
 
 ## Approach
 
