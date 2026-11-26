@@ -2,9 +2,11 @@
 description: "Fail start-up with the file, version, table, and missing column when a database stamped at the current schema version lacks a column the code selects."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T15:40:52Z
-status: ready
+updated: 2026-11-26T23:06:13Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Verify a current-stamped database still has its columns

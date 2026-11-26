@@ -51,6 +51,44 @@ fn migration(version: i64) -> Option<&'static [&'static str]> {
 /// migration step can guard each `ALTER` on its own column.
 const VERSION_FOUR_COLUMNS: [&str; 2] = ["last_error_at", "last_outcome"];
 
+/// The tables and the columns each carries once a database reaches
+/// `SCHEMA_VERSION`. `verify_columns` reads them against the live tables after
+/// the migration loop, so a file already stamped at the current version that
+/// lacks a column the code selects fails start-up instead of starting and
+/// answering every page with a 500. A migration step that adds a column extends
+/// this list in the same step, so the check follows a `SCHEMA_VERSION` bump
+/// instead of drifting from it.
+const EXPECTED_COLUMNS: [(&str, &[&str]); 2] = [
+    (
+        "repositories",
+        &[
+            "repository_id",
+            "name",
+            "path",
+            "created_at",
+            "scanned_at",
+            "last_error",
+            "last_error_at",
+            "last_outcome",
+        ],
+    ),
+    (
+        "tasks",
+        &[
+            "task_id",
+            "repository_id",
+            "path",
+            "scope",
+            "kind",
+            "created",
+            "updated",
+            "ship_date",
+            "leave_date",
+            "content_hash",
+        ],
+    ),
+];
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Repository {
     pub repository_id: i64,
@@ -279,6 +317,42 @@ async fn migrate_locked(conn: &mut SqliteConnection, path: &Path) -> Result<()> 
             )
         })?;
         version = next;
+    }
+    verify_columns(conn, path, version).await?;
+    Ok(())
+}
+
+/// Confirm the tables and columns `SCHEMA_VERSION` promises are present after
+/// the migration loop, so a file already stamped at the current version that
+/// lost a column the code selects fails start-up naming the file, the version,
+/// the table, and the column, rather than starting and answering every page
+/// with a 500.
+async fn verify_columns(conn: &mut SqliteConnection, path: &Path, version: i64) -> Result<()> {
+    for (table, columns) in EXPECTED_COLUMNS {
+        // `pragma_table_info` returns no rows for a missing table as well, so
+        // the table's own presence is checked first and named on its own.
+        let present: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&mut *conn)
+        .await?;
+        if present == 0 {
+            anyhow::bail!(
+                "the database at {} is stamped schema version {version} but its {table} table \
+                 is missing",
+                path.display()
+            );
+        }
+        for column in columns {
+            if !column_exists(conn, table, column).await? {
+                anyhow::bail!(
+                    "the database at {} is stamped schema version {version} but its {table} \
+                     table lacks the {column} column the code selects",
+                    path.display()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1985,6 +2059,112 @@ mod tests {
             .expect("version");
         assert_eq!(version, newer, "the refusal leaves the stamp untouched");
         fresh.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a database stamped at `SCHEMA_VERSION` that lacks a column the
+    /// code selects fails start-up naming its path, version, table, and column,
+    /// while a complete current-version database still opens.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_refuses_a_current_version_database_missing_a_selected_column() {
+        for (table, column, drop_statement) in [
+            (
+                "repositories",
+                "last_error_at",
+                "ALTER TABLE repositories DROP COLUMN last_error_at",
+            ),
+            (
+                "repositories",
+                "last_outcome",
+                "ALTER TABLE repositories DROP COLUMN last_outcome",
+            ),
+            (
+                "tasks",
+                "content_hash",
+                "ALTER TABLE tasks DROP COLUMN content_hash",
+            ),
+        ] {
+            let path = temp_database();
+            let pool = init_at(&path).await.expect("init");
+            pool.close().await;
+            let raw = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(SqliteConnectOptions::new().filename(&path))
+                .await
+                .expect("raw connection");
+            sqlx::query(drop_statement)
+                .execute(&raw)
+                .await
+                .expect("drop the selected column");
+            sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+                .execute(&raw)
+                .await
+                .expect("the file keeps the current version stamp");
+            raw.close().await;
+
+            let error = init_at(&path)
+                .await
+                .expect_err("a current-version file missing a selected column fails start-up");
+            let message = format!("{error:#}");
+            for needle in [
+                path.display().to_string(),
+                SCHEMA_VERSION.to_string(),
+                table.to_string(),
+                column.to_string(),
+            ] {
+                assert!(
+                    message.contains(&needle),
+                    "the refusal names {needle}: {message}"
+                );
+            }
+            remove_scratch(&path);
+        }
+
+        let complete = temp_database();
+        let pool = init_at(&complete)
+            .await
+            .expect("a complete current-version database still opens");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        pool.close().await;
+        remove_scratch(&complete);
+    }
+
+    /// Covers: a database stamped at `SCHEMA_VERSION` whose `tasks` table is
+    /// absent fails start-up naming that table, the path, and the version.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_refuses_a_current_version_database_missing_a_table() {
+        let path = temp_database();
+        let pool = init_at(&path).await.expect("init");
+        pool.close().await;
+        let raw = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .expect("raw connection");
+        sqlx::query("DROP TABLE tasks")
+            .execute(&raw)
+            .await
+            .expect("drop the tasks table");
+        sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .execute(&raw)
+            .await
+            .expect("the file keeps the current version stamp");
+        raw.close().await;
+
+        let error = init_at(&path)
+            .await
+            .expect_err("a current-version file missing its tasks table fails start-up");
+        let message = format!("{error:#}");
+        assert!(message.contains("tasks"), "{message}");
+        assert!(
+            message.contains(&path.display().to_string()),
+            "the refusal names its database: {message}"
+        );
+        assert!(message.contains(&SCHEMA_VERSION.to_string()), "{message}");
         remove_scratch(&path);
     }
 
