@@ -1182,6 +1182,9 @@
   }
 
   function renderCard(name, draw) {
+    // A redraw replaces the chart a failed download named, so its message goes
+    // with it instead of outliving the card it described.
+    clearExportMessage(name);
     try {
       draw();
     } catch (error) {
@@ -1208,6 +1211,8 @@
     // A redraw replaces every tooltip node, so the pointerdown registry starts
     // empty for the draw that follows.
     tips = [];
+    // Every card is redrawn, so every failed-download message is stale.
+    Object.keys(exportMessages).forEach(clearExportMessage);
     if (!payload) {
       CARD_NAMES.forEach(renderUnavailable);
       return;
@@ -1316,6 +1321,38 @@
     return "task-viewer-" + name + "-" + asOf + ".png";
   }
 
+  // One live region per card, created beside the card's PNG control the first
+  // time a download fails. A region of its own keeps the message out of the
+  // scan poll's `#scan-status` line, and `role="status"` announces the text
+  // without stealing focus.
+  var exportMessages = {};
+
+  function clearExportMessage(name) {
+    var region = exportMessages[name];
+    if (region) {
+      region.textContent = "";
+    }
+  }
+
+  function showExportFailure(name, button) {
+    var region = exportMessages[name];
+    if (!region) {
+      // `parentNode` is the DOM spelling; `parent` is the stub DOM's, so both
+      // resolve the node the control sits in.
+      var parent = button ? (button.parentNode || button.parent) : null;
+      if (!parent || typeof document.createElement !== "function") {
+        return;
+      }
+      region = document.createElement("span");
+      region.setAttribute("class", "chart-download-error");
+      region.setAttribute("role", "status");
+      region.setAttribute("aria-live", "polite");
+      parent.appendChild(region);
+      exportMessages[name] = region;
+    }
+    region.textContent = "Download failed";
+  }
+
   function saveChartPng(button) {
     var root = button.closest ? button.closest("[data-chart]") : null;
     var name = root ? root.getAttribute("data-chart") : null;
@@ -1342,15 +1379,32 @@
       // whole pixel below twice the SVG's size rather than a fractional size.
       canvas.width = Math.floor(size.width * DOWNLOAD_SCALE);
       canvas.height = Math.floor(size.height * DOWNLOAD_SCALE);
-      canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
-      var anchor = document.createElement("a");
-      anchor.href = canvas.toDataURL("image/png");
-      anchor.download = downloadFileName(name);
-      anchor.click();
+      try {
+        var context = canvas.getContext("2d");
+        if (!context) {
+          throw new Error("No 2D context for the chart PNG");
+        }
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        var anchor = document.createElement("a");
+        anchor.href = canvas.toDataURL("image/png");
+        anchor.download = downloadFileName(name);
+        anchor.click();
+      } catch (error) {
+        // A null context, a failed draw, or a failed encode all land here
+        // instead of escaping an asynchronous callback where the click
+        // handler's try/catch cannot reach them.
+        logError(error);
+        showExportFailure(name, button);
+        URL.revokeObjectURL(url);
+        canvas = null;
+        return;
+      }
+      clearExportMessage(name);
       URL.revokeObjectURL(url);
       canvas = null;
     };
     image.onerror = function () {
+      showExportFailure(name, button);
       URL.revokeObjectURL(url);
     };
     image.src = url;

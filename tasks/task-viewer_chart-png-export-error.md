@@ -2,9 +2,11 @@
 description: "Show an inline message when a chart PNG download fails, instead of only writing to the console."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T15:04:01Z
-status: ready
+updated: 2026-11-26T21:50:19Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Report a failed chart PNG download

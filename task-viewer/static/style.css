@@ -305,6 +305,12 @@ input[type="search"] {
     padding: 0.2rem 0.5rem;
 }
 
+/* A failed chart PNG download reports beside its control, in the header row. */
+.chart-download-error {
+    font-size: 0.8rem;
+    color: var(--danger);
+}
+
 .banner {
     background: var(--card-bg);
     border: 1px solid var(--border);

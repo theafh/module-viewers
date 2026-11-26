@@ -13323,6 +13323,187 @@ mod tests {
         );
     }
 
+    /// Covers: a chart PNG download that cannot load its image, get a 2D
+    /// context, draw, or encode shows `Download failed` beside the control and
+    /// announces it in that card's own polite status region, revokes the object
+    /// URL, and starts no download; a successful export shows no message, and a
+    /// redraw through `renderAll` or the weekly View picker clears a message.
+    #[test]
+    fn browser_chart_download_failure_shows_a_message() {
+        let failure_assertion = r#"(function () {
+  var env = globalThis.__env;
+  var button = env.downloadButtons["weekly"];
+  button.click();
+  var region = env.cards["weekly"].querySelectorAll(".chart-download-error")[0] || null;
+  return JSON.stringify({
+    message: region ? region.textContent : null,
+    role: region ? region.getAttribute("role") : null,
+    live: region ? region.getAttribute("aria-live") : null,
+    beside: region ? region.parent === button.parent : false,
+    downloads: env.downloads.length,
+    url: env.objectUrls[0] ? env.objectUrls[0].url : null,
+    revoked: env.revokedUrls[0] || null
+  });
+})()"#;
+        for (switch, label) in [
+            ("imageError", "an image-load failure"),
+            ("nullContext", "a null 2D context"),
+            ("toDataURLThrows", "a throwing toDataURL"),
+        ] {
+            let mut config = browser_config(false, false, None, serde_json::json!("#123456"));
+            config[switch] = serde_json::json!(true);
+            let result = run_browser(&config, failure_assertion);
+            assert_eq!(
+                result["message"],
+                serde_json::json!("Download failed"),
+                "{label} shows the message"
+            );
+            assert_eq!(
+                result["role"],
+                serde_json::json!("status"),
+                "{label} announces through a status region"
+            );
+            assert_eq!(
+                result["live"],
+                serde_json::json!("polite"),
+                "{label} keeps the announcement polite"
+            );
+            assert_eq!(
+                result["beside"],
+                serde_json::json!(true),
+                "{label} puts the message beside the control"
+            );
+            assert_eq!(
+                result["downloads"].as_u64(),
+                Some(0),
+                "{label} starts no download"
+            );
+            assert_eq!(
+                result["revoked"], result["url"],
+                "{label} revokes the object URL"
+            );
+        }
+
+        let success = run_browser(
+            &browser_config(false, false, None, serde_json::json!("#123456")),
+            r#"(function () {
+  var env = globalThis.__env;
+  env.downloadButtons["weekly"].click();
+  return JSON.stringify({
+    regions: env.cards["weekly"].querySelectorAll(".chart-download-error").length,
+    downloads: env.downloads.length,
+    url: env.objectUrls[0] ? env.objectUrls[0].url : null,
+    revoked: env.revokedUrls[0] || null
+  });
+})()"#,
+        );
+        assert_eq!(
+            success["regions"].as_u64(),
+            Some(0),
+            "a successful export shows no message"
+        );
+        assert_eq!(
+            success["downloads"].as_u64(),
+            Some(1),
+            "a successful export still starts one download"
+        );
+        assert_eq!(
+            success["revoked"], success["url"],
+            "a successful export revokes the object URL"
+        );
+
+        // A failure followed by a success in one realm proves the success path
+        // clears the message an earlier failure left behind.
+        let mut recovered = browser_config(false, false, None, serde_json::json!("#123456"));
+        recovered["imageErrorOnce"] = serde_json::json!(true);
+        let recovered = run_browser(
+            &recovered,
+            r#"(function () {
+  var env = globalThis.__env;
+  var button = env.downloadButtons["weekly"];
+  function message() {
+    var region = env.cards["weekly"].querySelectorAll(".chart-download-error")[0];
+    return region ? region.textContent : null;
+  }
+  button.click();
+  var afterFail = message();
+  button.click();
+  return JSON.stringify({
+    afterFail: afterFail,
+    afterSuccess: message(),
+    downloads: env.downloads.length
+  });
+})()"#,
+        );
+        assert_eq!(
+            recovered["afterFail"],
+            serde_json::json!("Download failed"),
+            "the first download reports its failure"
+        );
+        assert_eq!(
+            recovered["afterSuccess"],
+            serde_json::json!(""),
+            "a successful export clears the earlier message"
+        );
+        assert_eq!(
+            recovered["downloads"].as_u64(),
+            Some(1),
+            "the successful export downloads as before"
+        );
+
+        let mut config = browser_config(false, false, None, serde_json::json!("#123456"));
+        config["imageError"] = serde_json::json!(true);
+        let cleared = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var button = env.downloadButtons["weekly"];
+  function message() {
+    var region = env.cards["weekly"].querySelectorAll(".chart-download-error")[0];
+    return region ? region.textContent : null;
+  }
+  button.click();
+  var afterFail = message();
+  env.window.dispatchEvent({ type: "resize" });
+  var timers = env.timeouts.filter(function (timer) { return timer.delay === 100; });
+  if (timers.length) timers[timers.length - 1].handler();
+  var afterRenderAll = message();
+  button.click();
+  var beforeView = message();
+  var select = env.document.getElementById("weekly-mode");
+  select.value = "shipped";
+  select.dispatchEvent({ type: "change" });
+  var afterView = message();
+  return JSON.stringify({
+    afterFail: afterFail,
+    afterRenderAll: afterRenderAll,
+    beforeView: beforeView,
+    afterView: afterView
+  });
+})()"#,
+        );
+        assert_eq!(
+            cleared["afterFail"],
+            serde_json::json!("Download failed"),
+            "the failure message is shown before a redraw"
+        );
+        assert_eq!(
+            cleared["afterRenderAll"],
+            serde_json::json!(""),
+            "renderAll clears the message"
+        );
+        assert_eq!(
+            cleared["beforeView"],
+            serde_json::json!("Download failed"),
+            "the message is shown again after a second failure"
+        );
+        assert_eq!(
+            cleared["afterView"],
+            serde_json::json!(""),
+            "the weekly View picker redraw clears the message"
+        );
+    }
+
     /// Covers: every chart card carries one PNG control, and each ships hidden
     /// so a page without scripting offers no download that cannot work.
     #[tokio::test(flavor = "current_thread")]

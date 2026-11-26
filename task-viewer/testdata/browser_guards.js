@@ -24,6 +24,9 @@
   var revokedUrls = [];
   var canvases = [];
   var serialized = [];
+  // A one-shot image-load failure, so a test can fail one download and then
+  // succeed on the next in the same realm.
+  var failNextImage = !!config.imageErrorOnce;
 
   // The shipped stylesheet's chart heights: `.chart-frame svg` is 280px,
   // `.chart-frame.calendar svg` is 190px, and `.chart-frame.radar svg` is
@@ -505,6 +508,8 @@
         node.height = 0;
         node.drawn = null;
         node.getContext = function () {
+          // A browser can refuse a 2D context, so a config switch models it.
+          if (config.nullContext) return null;
           return {
             drawImage: function (image, x, y, width, height) {
               node.drawn = { image: image, x: x, y: y, width: width, height: height };
@@ -512,6 +517,7 @@
           };
         };
         node.toDataURL = function () {
+          if (config.toDataURLThrows) throw new Error("toDataURL failed");
           return "data:image/png;base64,stub";
         };
         canvases.push(node);
@@ -676,7 +682,19 @@
       },
       set: function (value) {
         image.srcValue = String(value);
-        if (typeof image.onload === "function") image.onload();
+        // An unloadable image fires `error` instead of `load`, so a config
+        // switch models the failure the shipped script must report. The
+        // one-shot switch fails a single download and then loads normally.
+        var fail = !!config.imageError;
+        if (!fail && failNextImage) {
+          fail = true;
+          failNextImage = false;
+        }
+        if (fail) {
+          if (typeof image.onerror === "function") image.onerror();
+        } else if (typeof image.onload === "function") {
+          image.onload();
+        }
       }
     });
   }
