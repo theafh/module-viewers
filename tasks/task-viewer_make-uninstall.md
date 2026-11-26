@@ -2,7 +2,7 @@
 description: "Add make uninstall that removes the macOS app bundle, Dock tile, Linux desktop entry, and icon, idempotently."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-26T19:06:35Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -24,7 +24,7 @@ Two live tasks share this surface. [task-viewer_install-desktop-atomic-bundle.md
 ## Approach
 
 1. Add an executable `scripts/uninstall-desktop.sh` and a `make uninstall` target that invokes it as a path, the way `install install-desktop` invokes its script, and add `uninstall` to the `.PHONY` line.
-2. On macOS, remove the app bundle, then drop the Task Viewer tile from `com.apple.dock` `persistent-apps` with the installer's `python3`/`plistlib` path and its bundle-identifier and label filter, and restart the Dock only when a tile was actually removed. Treat a missing bundle or tile as success. When `python3` is absent or the plist edit fails, print the explanation the installer's missing-`python3` branch prints, naming `python3` and the Dock domain, keep the bundle removal reported, and exit non-zero.
+2. On macOS, remove the app bundle, then drop the Task Viewer tile from `com.apple.dock` `persistent-apps` with the installer's own branch — `dockutil --remove` when `dockutil` exists, otherwise the `python3`/`plistlib` edit — using its bundle-identifier and label filter, and restart the Dock only when a tile was actually removed. Treat a missing bundle or tile as success. When neither tool is available, or the plist edit fails, print the guidance the installer's missing-`python3` branch prints, naming the missing tool and the Dock domain, keep the bundle removal reported, and exit non-zero.
 3. On macOS, remove the staging and backup directories that a failed atomic install leaves beside `~/Applications/Task Viewer.app`.
 4. On Linux, remove the `.desktop` file and the icon, and refresh the desktop database and the icon cache with the same guarded `update-desktop-database` and `gtk-update-icon-cache` calls the installer makes; treat missing files as success.
 5. Print each path removed and a final line saying the database and logs were kept.
@@ -41,7 +41,7 @@ Two live tasks share this surface. [task-viewer_install-desktop-atomic-bundle.md
 - The first run prints each path it removed, then a line saying the database and logs were kept.
 - A second run succeeds, reports nothing left to remove, and restarts no Dock when no tile was removed.
 - The database and the launcher's state directory are untouched.
-- On a macOS run with no `python3`, the Dock step names `python3` and the `com.apple.dock` domain (the installer's branch names `python3`; the domain is the uninstaller's own addition), the bundle removal is still reported, and the command exits non-zero.
+- On a macOS run with neither `dockutil` nor `python3`, the Dock step names the missing tool and the `com.apple.dock` domain, the bundle removal is still reported, and the command exits non-zero.
 - A host that is neither macOS nor Linux exits non-zero naming the platform.
 - `scripts/tests/uninstall-desktop.sh` is listed in the `make test` target and passes there.
 - `README.md`, `FEATURES.md`, `SECURITY.md`, and `TESTING.md` each describe `make uninstall`, with the `TESTING.md` suite sentence naming the new script instead of its three-script list.

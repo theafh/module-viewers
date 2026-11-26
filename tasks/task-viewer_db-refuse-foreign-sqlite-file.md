@@ -2,7 +2,7 @@
 description: "Refuse to initialize a non-empty SQLite file that is not task-viewer's, instead of adding tables and stamping its user_version."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-26T19:06:35Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -11,7 +11,7 @@ reported-by: "Andreas Hoffmann"
 
 ## Goal
 
-`TASK_VIEWER_DB` pointed at a SQLite file that already holds another application's tables fails start-up with a message naming the path, and the file's tables, rows, and `user_version` stay unchanged. An empty or newly created file still initializes.
+`TASK_VIEWER_DB` pointed at a SQLite file whose schema is not task-viewer's fails start-up with a message naming the path and the offending table or column, and the file's tables, rows, and `user_version` stay unchanged. An empty or newly created file still initializes.
 
 ## Context
 
@@ -26,7 +26,7 @@ if version == 0 {
 
 `task-viewer/src/schema.sql` uses `CREATE TABLE IF NOT EXISTS`, so a foreign `tasks` or `repositories` table is left in place, and the later steps add `content_hash`, `last_error_at`, and `last_outcome` to it before stamping `user_version`.
 
-Reproduced with the current build: a file holding a `notes` table was opened through `TASK_VIEWER_DB`; it gained `repositories` and `tasks` and its `user_version` became 4, while `notes` kept its row. With a compatible `tasks` table, task-viewer would then read and replace another application's rows. A foreign file stamped above 0 fares no better: one stamped 2 that already carries compatible `tasks` and `repositories` tables is migrated and stamped 4 (one without them fails at the version-3 `ALTER TABLE tasks` step), and one stamped 4 passes `init` and then fails its first `list_repositories` select with `no such table: repositories`.
+Reproduced with the current build: a file holding a `notes` table was opened through `TASK_VIEWER_DB`; it gained `repositories` and `tasks` and its `user_version` became 4, while `notes` kept its row. With a compatible `tasks` table, task-viewer would then read and replace another application's rows. A foreign file stamped above 0 fares no better: one stamped 2 that already carries compatible `tasks` and `repositories` tables is migrated and stamped 4 (one without them fails at the version-3 `ALTER TABLE tasks` step), and one stamped 4 passes `init` and then fails its first `list_repositories` select with `no such table: repositories`. A foreign file that exactly matches task-viewer's schema at its stamped version is indistinguishable from a genuine one and still migrates; the guard catches the clearly incompatible file, not that lookalike.
 
 `open_pool` sets `.journal_mode(SqliteJournalMode::Wal)` when it connects, and `migrate_locked` runs after that, so a refused file has already been switched to WAL. Its tables, rows, and `user_version` survive unchanged, while its journal mode and `-wal`/`-shm` sidecars may not.
 
@@ -34,26 +34,23 @@ Reproduced with the current build: a file holding a `notes` table was opened thr
 
 ## Approach
 
-1. Before the baseline and every migration step, inside the same `BEGIN IMMEDIATE` transaction, count the file's tables with `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`.
-2. When `user_version` reads 0 and that count is above zero, bail with a message naming the database path and saying it already holds another database's tables, and that an empty file or a new path is needed.
-3. When the count is zero, create the baseline as today and set `PRAGMA application_id` to a task-viewer value, so an external reader inspecting a copy can recognise it; whether the program also reads that value as the discriminator is part of the `**Open decision:**` block below.
+1. Before the baseline and every migration step, inside the same `BEGIN IMMEDIATE` transaction, read the file's schema: the non-`sqlite_%` tables from `sqlite_master` and each table's columns from `pragma_table_info`. Build the shape the claimed version must have — an empty pre-baseline file at `user_version` 0, and for versions 1 through `SCHEMA_VERSION` the tables and columns the migrations produce.
+2. Refuse a file that is clearly foreign: it carries a non-`sqlite_%` table the tool does not own, or it is missing a table or column its claimed version must have while carrying one that version cannot have. The message names the database path and the offending table or column, and says an empty file or a new path is needed. A file that matches an older task-viewer version is not foreign and migrates.
+3. When the file is empty (version 0 with no non-`sqlite_%` table), create the baseline as today and set `PRAGMA application_id` to a task-viewer value, so an external reader inspecting a copy can recognise it.
 4. Keep the migration of a file the guard accepts at version 1 through `SCHEMA_VERSION` unchanged, including one created before `application_id` was written.
 5. Keep the existing `version > SCHEMA_VERSION` bail unchanged.
-6. Add a database test: a file with a foreign table and `user_version` 0 fails `init` with that message and keeps its table, rows, and version; an empty file still initializes and carries the application id; the non-zero-`user_version` cases the open decision settles (a foreign file stamped 2 and one stamped `SCHEMA_VERSION`) join the same test once that decision is made.
+6. Add a database test: a version-0 file holding a `notes` table is refused and keeps its table, rows, and version; a version-2 file with the version-2 tables and columns still migrates to 4; a version-2 file missing `tasks` while carrying `notes` is refused; a version-4 file missing `last_error_at` while carrying an unknown column or table is refused; an empty file initializes and carries the application id.
 7. Record the rule in `ARCHITECTURE.md`'s database paragraph, `SECURITY.md`'s data section, and `TESTING.md`'s Database bullet.
 
-**Open decision:** Whether the refusal also covers a foreign file whose `user_version` is 1 through `SCHEMA_VERSION`. The Goal promises refusal for any foreign file, but such a file must first be told apart from a genuine task-viewer database, which holds the `repositories` and `tasks` tables at every version; the choice is user-owned product scope that the code and the guardrail docs do not settle.
-
-- **Widen with a discriminator (suggested default):** before the baseline and every migration step, refuse a file that is not recognisably task-viewer's — version 1 through `SCHEMA_VERSION` is foreign unless its schema carries the columns the current version expects and, once written, a matching `application_id`, with a stated rule for a legacy task-viewer file that carries tables and no `application_id`. Cost: a schema-shape check, and a corrupt or hand-repaired task-viewer copy is refused instead of migrated.
-- **Widen on the table count alone:** refuse on a non-zero non-`sqlite_%` table count at every version. Cost: it refuses every existing task-viewer database, so it contradicts the migration of an existing task-viewer file and the acceptance item that an existing database still migrates and opens.
-- **Narrow the Goal:** keep the `user_version` 0 guard and rewrite the Goal and acceptance to say only a `user_version` 0 file is refused, leaving a non-zero-stamped foreign file to the column check in the `db-verify-columns-at-current-version` task.
+**Decision:** The refusal covers every version, using a schema-shape check rather than the table count alone. A file is refused when it is clearly incompatible: an unknown non-`sqlite_%` table or column, or a missing table or column its claimed version must have while carrying one that version cannot. A legacy task-viewer database at version 1, 2, or 3 keeps its shape and migrates. This check runs before migration; the db-verify-columns task still checks a current-version file that is merely missing a column after migration.
 
 **Out of scope:** recovering or importing another application's task rows.
 
 ## Acceptance
 
-- A non-empty SQLite file with `user_version` 0 and a foreign table is refused with a message naming its path.
-- The same refusal covers the non-zero-`user_version` cases the open decision settles (a foreign file stamped 2 and one stamped `SCHEMA_VERSION`), once that decision is made.
+- A non-empty SQLite file with `user_version` 0 and a foreign table is refused with a message naming its path and the offending table.
+- A file stamped at any version from 1 through `SCHEMA_VERSION` is refused when its schema is clearly foreign — it carries an unknown table or column, or is missing one that version must have while carrying one it cannot — and the message names the offending table or column.
+- A legacy task-viewer database at version 1, 2, or 3 still migrates and opens.
 - That file's tables, rows, and `user_version` are unchanged after the failed start.
 - An empty or missing file initializes and is stamped with the task-viewer `application_id`.
 - An existing task-viewer database still migrates and opens (a regression guard: the version-one, version-two, and version-three migration tests pass at HEAD).

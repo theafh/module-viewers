@@ -2,7 +2,7 @@
 description: "Percent-encode the theme form's local next path so a non-ASCII value yields an RFC-valid Location."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-26T19:06:35Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -32,7 +32,7 @@ fn safe_theme_next(next: &str) -> &str {
 
 This is the only redirect target taken from request input; every other redirect interpolates a sanitized id, a fixed code, or a numeric token.
 
-**Open decision:** The 500 premise is refuted at HEAD: `POST /theme` with `next=/café` already answers `303 See Other` with raw UTF-8 bytes in `Location`, so there is no crash to fix. This fork is open because the evidence cannot settle what the work should deliver: it is a product call on whether a working but non-RFC-conformant `Location` is worth a change. Options: (a) re-premise as a URI-compliance fix, keeping the percent-encoding and accepting a change for a non-crashing defect (suggested default, since the current `Location` is not a valid URI reference); (b) narrow to a test-only change that pins today's `303` and raw bytes so a later encoder change is visible, reading `Location` through `as_bytes()` because the `redirect_location` test helper's `to_str()` panics on the raw bytes; (c) defer and archive the task, leaving the raw-byte `Location` in place. Until this is settled, the Approach and Acceptance below describe option (a).
+**Decision:** The task delivers the percent-encoding. The 500 premise is refuted, but `Location: /café` is not a valid URI reference, so the defect is real even though it does not crash. Pinning the raw bytes (a test-only change) would preserve the invalid `Location`, and deferring would leave it; the encoding is small and this is the only redirect target taken from request input.
 
 ## Approach
 
