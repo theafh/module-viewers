@@ -305,6 +305,18 @@ input[type="search"] {
     padding: 0.2rem 0.5rem;
 }
 
+/* The control and its status region travel in one wrapper, so the header row's
+   `space-between` still puts the control at the card's right edge. The wrapper
+   lays the region out before the control with the row's own gap. It centers
+   itself in the baseline-aligned row so its baseline is the control's text, not
+   the empty region's bottom edge, and the row keeps its pre-change height. */
+.chart-download-group {
+    display: inline-flex;
+    align-items: center;
+    align-self: center;
+    gap: 0.4rem 0.75rem;
+}
+
 /* A failed chart PNG download reports beside its control, in the header row. */
 .chart-download-error {
     font-size: 0.8rem;

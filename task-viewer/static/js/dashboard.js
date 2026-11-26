@@ -1321,11 +1321,17 @@
     return "task-viewer-" + name + "-" + asOf + ".png";
   }
 
-  // One live region per card, created beside the card's PNG control the first
-  // time a download fails. A region of its own keeps the message out of the
+  // One live region per card, created empty beside the card's PNG control when
+  // that control is wired. A region of its own keeps the message out of the
   // scan poll's `#scan-status` line, and `role="status"` announces the text
-  // without stealing focus.
+  // without stealing focus. The region has to be in the accessibility tree
+  // before its text changes, because a region inserted and filled in the same
+  // tick is routinely not announced.
   var exportMessages = {};
+  // Each click starts an attempt for its card, and only the newest attempt may
+  // write that card's message, so a slow older export cannot overwrite or clear
+  // the result of a click the person made after it.
+  var exportAttempts = {};
 
   function clearExportMessage(name) {
     var region = exportMessages[name];
@@ -1337,19 +1343,22 @@
   function showExportFailure(name, button) {
     var region = exportMessages[name];
     if (!region) {
-      // `parentNode` is the DOM spelling; `parent` is the stub DOM's, so both
-      // resolve the node the control sits in.
+      // The wiring creates the region; this fallback only covers a control the
+      // wiring never reached. `parentNode` is the DOM spelling; `parent` is the
+      // stub DOM's, so both resolve the node the control sits in.
       var parent = button ? (button.parentNode || button.parent) : null;
       if (!parent || typeof document.createElement !== "function") {
         return;
       }
       region = document.createElement("span");
-      region.setAttribute("class", "chart-download-error");
       region.setAttribute("role", "status");
       region.setAttribute("aria-live", "polite");
       parent.appendChild(region);
       exportMessages[name] = region;
     }
+    // The class arrives with the text, so a card that never failed carries no
+    // `chart-download-error` node while the empty region waits in the page.
+    region.setAttribute("class", "chart-download-error");
     region.textContent = "Download failed";
   }
 
@@ -1394,19 +1403,30 @@
         // instead of escaping an asynchronous callback where the click
         // handler's try/catch cannot reach them.
         logError(error);
-        showExportFailure(name, button);
+        if (attempt === exportAttempts[name]) {
+          showExportFailure(name, button);
+        }
         URL.revokeObjectURL(url);
         canvas = null;
         return;
       }
-      clearExportMessage(name);
+      if (attempt === exportAttempts[name]) {
+        clearExportMessage(name);
+      }
       URL.revokeObjectURL(url);
       canvas = null;
     };
     image.onerror = function () {
-      showExportFailure(name, button);
+      if (attempt === exportAttempts[name]) {
+        showExportFailure(name, button);
+      }
       URL.revokeObjectURL(url);
     };
+    // Stamp the attempt only once the fallible setup above has succeeded, so an
+    // attempt that dies before it can reach a load never disarms an earlier one
+    // that is still in flight.
+    exportAttempts[name] = (exportAttempts[name] || 0) + 1;
+    var attempt = exportAttempts[name];
     image.src = url;
   }
 
@@ -1427,6 +1447,43 @@
     : [];
   if (canSaveChartPng()) {
     Array.prototype.slice.call(downloadButtons).forEach(function (button) {
+      // The card's status region goes into the page now, empty and without the
+      // `chart-download-error` class, so it is already registered when a later
+      // failure writes its text and a card that never failed carries no
+      // failure node.
+      //
+      // The region and the control travel in one wrapper, because the header
+      // row spaces its items with `space-between`: an empty element is still a
+      // flex item, so a region appended straight to the row would take a share
+      // of that free space and pull the control off the card's right edge. The
+      // row positions the wrapper as a single item instead, and the region
+      // comes first inside it, empty until a message arrives, so it is in the
+      // accessibility tree before its text changes.
+      var root = button.closest ? button.closest("[data-chart]") : null;
+      var name = root ? root.getAttribute("data-chart") : null;
+      var parent = button.parentNode || button.parent || null;
+      if (name && parent && typeof document.createElement === "function") {
+        var wrapper = document.createElement("span");
+        // Not the control's own `chart-download` class, which the stylesheet
+        // hides until the script can rasterize the chart.
+        wrapper.setAttribute("class", "chart-download-group");
+        var region = document.createElement("span");
+        region.setAttribute("role", "status");
+        region.setAttribute("aria-live", "polite");
+        wrapper.appendChild(region);
+        // Put the wrapper where the control was, then move the control into it
+        // behind the region, so the row keeps the control's place.
+        if (typeof parent.insertBefore === "function") {
+          parent.insertBefore(wrapper, button);
+        } else {
+          parent.appendChild(wrapper);
+        }
+        if (typeof parent.removeChild === "function") {
+          parent.removeChild(button);
+        }
+        wrapper.appendChild(button);
+        exportMessages[name] = region;
+      }
       button.addEventListener("click", function (event) {
         if (event && typeof event.preventDefault === "function") {
           event.preventDefault();
