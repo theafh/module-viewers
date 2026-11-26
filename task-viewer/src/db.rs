@@ -2108,7 +2108,7 @@ mod tests {
             let message = format!("{error:#}");
             for needle in [
                 path.display().to_string(),
-                SCHEMA_VERSION.to_string(),
+                format!("schema version {SCHEMA_VERSION}"),
                 table.to_string(),
                 column.to_string(),
             ] {
@@ -2164,7 +2164,10 @@ mod tests {
             message.contains(&path.display().to_string()),
             "the refusal names its database: {message}"
         );
-        assert!(message.contains(&SCHEMA_VERSION.to_string()), "{message}");
+        assert!(
+            message.contains(&format!("schema version {SCHEMA_VERSION}")),
+            "{message}"
+        );
         remove_scratch(&path);
     }
 
