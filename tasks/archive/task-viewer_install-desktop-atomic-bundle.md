@@ -2,8 +2,8 @@
 description: "Build the macOS app bundle in a temp path and swap it in only after it is complete, so a failed reinstall cannot destroy a working icon."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T20:01:46Z
-status: implemented
+updated: 2026-11-26T20:05:36Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
