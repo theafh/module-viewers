@@ -1143,7 +1143,7 @@ async fn tasks_csv(State(state): State<AppState>, Query(query): Query<TasksQuery
     match render_tasks_csv(&state, &query).await {
         Ok(csv) => (
             [
-                (header::CONTENT_TYPE, "text/csv"),
+                (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
                 (
                     header::CONTENT_DISPOSITION,
                     "attachment; filename=\"tasks.csv\"",
@@ -1196,7 +1196,7 @@ async fn charts_csv(State(state): State<AppState>, Query(query): Query<ChartQuer
     match render_charts_csv(&state, &query.project).await {
         Ok(csv) => (
             [
-                (header::CONTENT_TYPE, "text/csv"),
+                (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
                 (
                     header::CONTENT_DISPOSITION,
                     "attachment; filename=\"charts.csv\"",
@@ -11349,7 +11349,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{uri}");
             assert_eq!(
                 header_text(&response, header::CONTENT_TYPE),
-                "text/csv",
+                "text/csv; charset=utf-8",
                 "{uri}"
             );
             assert!(
@@ -11492,7 +11492,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
         assert_eq!(
             header_text(&response, header::CONTENT_TYPE),
-            "text/csv",
+            "text/csv; charset=utf-8",
             "{uri}"
         );
         assert_eq!(
@@ -11588,6 +11588,80 @@ mod tests {
             has_row("radar_shipped", "alpha", "1"),
             "the shipped radar uses the scope as its spoke label: {csv}"
         );
+        cleanup(&path);
+    }
+
+    /// Covers: both CSV exports declare `text/csv; charset=utf-8`, so a
+    /// spreadsheet reads the bodies as UTF-8, while each keeps its attachment
+    /// name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_csv_exports_declare_utf8() {
+        let (state, path, _alpha, _beta) = seeded_task_list("csv_charset_header").await;
+        for (uri, filename) in [
+            ("/tasks.csv".to_string(), "tasks.csv"),
+            ("/charts.csv".to_string(), "charts.csv"),
+        ] {
+            let response = send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                header_text(&response, header::CONTENT_TYPE),
+                "text/csv; charset=utf-8",
+                "{uri}"
+            );
+            assert_eq!(
+                header_text(&response, header::CONTENT_DISPOSITION),
+                format!("attachment; filename=\"{filename}\""),
+                "{uri}"
+            );
+        }
+        cleanup(&path);
+    }
+
+    /// Covers: both CSV exports carry a non-ASCII scope as UTF-8 bytes and
+    /// start their body without a byte-order mark, so a spreadsheet that
+    /// honours the declared charset reads the scope rather than mojibake.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_csv_exports_carry_a_non_ascii_scope_as_utf8_without_a_bom() {
+        let (state, path) = app_state("csv_charset_body").await;
+        let folder = unique_temp_dir("csv_charset_body_repo");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let repo = db::insert_repository(&state.pool, "Alpha", &folder.to_string_lossy())
+            .await
+            .expect("repository");
+        db::replace_tasks(
+            &state.pool,
+            repo,
+            &[stored_row(
+                "größe_live.md",
+                "größe",
+                TaskKind::Live,
+                (2026, 5, 1),
+                None,
+                None,
+            )],
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("rows");
+        for uri in [
+            "/tasks.csv".to_string(),
+            format!("/charts.csv?project={repo}"),
+        ] {
+            let response = send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            assert!(
+                !bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+                "{uri} starts its body without a byte-order mark"
+            );
+            let text = String::from_utf8(bytes.to_vec()).expect("the body is UTF-8");
+            assert!(
+                text.contains("größe"),
+                "{uri} carries the non-ASCII scope as UTF-8: {text}"
+            );
+        }
         cleanup(&path);
     }
 

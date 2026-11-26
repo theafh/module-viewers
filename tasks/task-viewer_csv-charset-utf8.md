@@ -2,9 +2,11 @@
 description: "Serve both CSV exports as text/csv; charset=utf-8 so non-ASCII paths open correctly in spreadsheet applications."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T15:42:07Z
-status: ready
+updated: 2026-11-26T19:39:44Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Declare the CSV exports as UTF-8
