@@ -535,9 +535,9 @@ pub fn remaining(deadline: Instant) -> Duration {
 ///
 /// The deadline is taken when the shutdown future resolves. `axum`'s graceful
 /// shutdown stops accepting and drains the open connections; a store that holds
-/// `state.scan` from listing through the last store — an Update scan, Add's or
-/// Relocate's detached store — is waited for under the same deadline. The
-/// database close
+/// `state.scan` from listing through the last store — an Update scan, Add's,
+/// Relocate's, or Confirm's detached store — is waited for under the same
+/// deadline. The database close
 /// then runs under
 /// the time the deadline has left and is dropped once it is spent, leaving an
 /// unfinished store to the WAL rollback on the next open. A listener that ends
@@ -2940,16 +2940,29 @@ async fn duplicate_clone(existing: &[Repository], path: &std::path::Path) -> Opt
 }
 
 /// Store the held path of a duplicate-clone Add once the person confirmed it.
-/// The slot is taken under the scan lock, so one held path is stored at most
-/// once and a token the store no longer holds reports the not-found code.
+/// The token take and the store run in their own task that takes the scan lock
+/// itself, so a request that disconnects drops only the handler: the store keeps
+/// the lock and finishes, and a take cannot consume the token without storing
+/// the held path. One held path is stored at most once, and a token the store no
+/// longer holds reports the not-found code.
 async fn confirm_repository(State(state): State<AppState>, Path(token): Path<String>) -> Response {
-    let _guard = state.scan.lock().await;
-    let Some(held) = state.held_clone.lock().await.take(&token) else {
-        return redirect_repositories(Banner::RepositoryNotFound);
-    };
-    match store_repository(&state, &held.path).await {
-        Ok(()) => redirect_repositories(Banner::RepositoryAdded),
-        Err(banner) => redirect_repositories(banner),
+    let store_state = state.clone();
+    let store = tokio::spawn(async move {
+        let _guard = store_state.scan.lock().await;
+        let Some(held) = store_state.held_clone.lock().await.take(&token) else {
+            return Banner::RepositoryNotFound;
+        };
+        match store_repository(&store_state, &held.path).await {
+            Ok(()) => Banner::RepositoryAdded,
+            Err(banner) => banner,
+        }
+    });
+    match store.await {
+        Ok(banner) => redirect_repositories(banner),
+        Err(error) => {
+            tracing::error!(%error, "the Confirm store task stopped");
+            redirect_repositories(Banner::RepositorySaveFailed)
+        }
     }
 }
 
@@ -2975,7 +2988,7 @@ fn canonical_path_text(path: &std::path::Path) -> Result<String, Banner> {
 /// Store one already-chosen folder as a repository and refresh its rows. A
 /// failed first harvest keeps the repository and its scan error and returns
 /// that error's banner, so Add can report the failure instead of a success.
-/// The detached Add store task holds the scan lock across this call.
+/// The detached Add or Confirm store task holds the scan lock across this call.
 async fn store_repository(state: &AppState, path: &std::path::Path) -> Result<(), Banner> {
     let path_text = canonical_path_text(path)?;
     if db::path_exists(&state.pool, &path_text)
@@ -3246,8 +3259,9 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
 
 /// List the repositories, harvest them, and store each result while holding the
 /// scan lock. The lock is held across the whole list-then-harvest-then-store
-/// sequence, the detached Add store task and `fn remove_repository` take the
-/// same lock, and `scan_core` never takes it. Taking the lock is the wait for a
+/// sequence, the detached Add, Relocate, and Confirm store tasks and
+/// `fn remove_repository` take the same lock, and `scan_core` never takes it.
+/// Taking the lock is the wait for a
 /// scan that already runs, and the pending-scan slot is emptied right after it,
 /// so a later click starts a new follow-up instead of joining a run that may
 /// already be reading files.
@@ -9446,6 +9460,88 @@ mod tests {
             state.scan.try_lock().is_ok(),
             "the scan lock is free after the detached store"
         );
+        let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Confirm's token take and store run in a detached task that takes the scan
+    /// lock itself, so dropping the request future leaves the store running: the
+    /// repository and its first harvest's rows are stored with a scan stamp, and
+    /// the lock is free afterwards.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_confirm_store_survives_a_dropped_request() {
+        let (mut state, path) = app_state("confirm_detached_store").await;
+        let folder = live_repository("confirm_detached_store_repo");
+        let token = state
+            .held_clone
+            .lock()
+            .await
+            .insert(folder.clone(), "existing".to_string());
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let store_hook: Arc<StoreHookFn> = Arc::new(move || {
+            let entered_tx = entered_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let _ = entered_tx.send(()).await;
+                let release = release_rx.lock().await.take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+            })
+        });
+        state.store_hook = store_hook;
+
+        let confirm = tokio::spawn(confirm_repository(State(state.clone()), UrlPath(token)));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the detached store is entered")
+            .expect("the store signalled");
+
+        // The insert committed before the first harvest's write, so the parked
+        // repository exists with no rows and no scan stamp yet.
+        let parked = db::list_repositories(&state.pool).await.expect("list");
+        assert_eq!(parked.len(), 1, "the insert commits before the store");
+        assert_eq!(
+            parked[0].scanned_at, None,
+            "the first harvest has not stored yet"
+        );
+
+        // The client goes away while the store is parked inside its write.
+        drop_request(confirm).await;
+
+        // The store that outlives the request still holds the hook open; one
+        // that was cancelled with the handler took the receiver with it, so the
+        // send's failure is the old code's outcome and the assertions below are
+        // what this test proves.
+        let _ = release_tx.send(());
+
+        // The detached task holds the scan lock until its last row is stored, so
+        // taking the lock observes the store finished.
+        let guard = tokio::time::timeout(Duration::from_secs(10), state.scan.lock())
+            .await
+            .expect("the detached confirm releases the scan lock");
+        let stored = db::list_repositories(&state.pool).await.expect("list")[0].clone();
+        let rows = db::load_tasks(&state.pool, Some(stored.repository_id))
+            .await
+            .expect("rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the detached store keeps the first harvest's rows after the request is dropped"
+        );
+        assert!(
+            stored.scanned_at.is_some(),
+            "the detached store leaves a scan stamp instead of an unscanned repository"
+        );
+        assert_eq!(
+            stored.last_error, None,
+            "a clean first harvest stores no scan error"
+        );
+        drop(guard);
+
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }

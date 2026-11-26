@@ -2,9 +2,11 @@
 description: "Run the duplicate-clone confirm store in a detached task that takes the scan lock, so a disconnect cannot leave a repository with no rows."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T15:03:57Z
-status: ready
+updated: 2026-11-26T23:31:41Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Keep the confirm store alive when the request disconnects
