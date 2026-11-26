@@ -650,7 +650,9 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
 /// and a finished row with no ship day contribute nothing, and a day no task
 /// finished on carries no point, so the trend is fitted to exactly the days the
 /// payload carries. A ship day after today is clamped to today, so it contributes
-/// `today - created` instead of a mistyped future year's raw span.
+/// `today - created` instead of a mistyped future year's raw span, floored at zero
+/// when `created` is itself after today, so a task created after today contributes
+/// 0 rather than a negative `today - created`.
 fn cycle_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<CyclePoint> {
     let mut sums: BTreeMap<NaiveDate, (i64, usize)> = BTreeMap::new();
     for task in tasks {
