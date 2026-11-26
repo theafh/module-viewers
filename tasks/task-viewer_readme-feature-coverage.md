@@ -2,7 +2,7 @@
 description: "Document the task list, the three exports, Rescan/Relocate/Remove, and TASK_VIEWER_DB in the README."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-26T22:56:46Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -20,7 +20,7 @@ The README's `## Run` bullet list, inside its `task-viewer` section, lists only 
 ## Approach
 
 1. Add a bullet for the task list: reachable by activating a shipped or created weekly bar, a calendar day, or a radar spoke; search, scope, sort, and per-filter export.
-2. Add a bullet for the exports: `Export CSV` on the task list, and `Charts CSV` / `Charts JSON` for the dashboard's series; word the chart-export sentence so it stays true whether those links sit on the task list or on the dashboard, since [dashboard export links](task-viewer_dashboard-export-links.md) adds the dashboard links and keeps the task-list links.
+2. Add a bullet for the exports: `Export CSV` on the task list, and `Charts CSV` / `Charts JSON` for the dashboard's series; word the chart-export sentence so it stays true whether those links sit on the task list or on the dashboard, since [dashboard export links](archive/task-viewer_dashboard-export-links.md) adds the dashboard links and keeps the task-list links.
 3. Add a bullet for repository management: Rescan re-harvests one repository, Relocate re-points the dashboard at another folder (it keeps the repository's id and stored rows and re-harvests them from the picked folder, leaving both folders on disk unchanged), and Remove drops it and its rows from `~/.task-viewer`.
 4. Document `TASK_VIEWER_DB`: it names a different database file, defaults to `~/.task-viewer`, is created on first launch, and a padded value opens the same file.
 5. Extend the bullet list inside `## Run` with the task-list, export, and repository-management bullets, and add the `TASK_VIEWER_DB` sentence to the environment paragraph that documents `TASK_VIEWER_SCAN_WORKERS` and `TASK_VIEWER_GIT_TIMEOUT_SECS`. Keep the existing launcher, Build, and Layout sections.

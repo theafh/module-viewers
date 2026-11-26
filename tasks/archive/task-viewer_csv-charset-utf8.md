@@ -2,7 +2,7 @@
 description: "Serve both CSV exports as text/csv; charset=utf-8 so non-ASCII paths open correctly in spreadsheet applications."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T19:41:34Z
+updated: 2026-11-26T22:56:46Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
@@ -31,7 +31,7 @@ and `charts_csv` uses the same shape. The bodies are UTF-8 strings, but the type
 2. Keep the existing `Content-Disposition` attachment names and the body bytes unchanged (no BOM).
 3. Keep the JSON export and the page routes unchanged.
 4. Add a web test asserting the header on both routes, and one that reads a non-ASCII scope as UTF-8 bytes from the body and asserts the body carries no leading U+FEFF. Update the two existing assertions that pin the bare type in `web_tasks_csv_matches_the_filtered_table` and `web_charts_csv_has_long_format_and_the_known_weekly_row` in `task-viewer/src/web.rs` to expect `text/csv; charset=utf-8`.
-5. In `FEATURES.md`, rewrite the task-list paragraph's clause "as `text/csv` with an attachment disposition" to "as `text/csv; charset=utf-8` with an attachment disposition", name the charset in the chart-export paragraph that begins "`GET /charts.json` serves the dashboard's own chart payload", and name the charset in `TESTING.md`'s task-list bullet. The task-list paragraph and the task-list bullet are also edited by [task-viewer_dashboard-export-links](../task-viewer_dashboard-export-links.md), so merge this task's charset wording with that task's sentence and assertion rather than replacing either passage; the chart-export paragraph is this task's own edit.
+5. In `FEATURES.md`, rewrite the task-list paragraph's clause "as `text/csv` with an attachment disposition" to "as `text/csv; charset=utf-8` with an attachment disposition", name the charset in the chart-export paragraph that begins "`GET /charts.json` serves the dashboard's own chart payload", and name the charset in `TESTING.md`'s task-list bullet. The task-list paragraph and the task-list bullet are also edited by [task-viewer_dashboard-export-links](task-viewer_dashboard-export-links.md), so merge this task's charset wording with that task's sentence and assertion rather than replacing either passage; the chart-export paragraph is this task's own edit.
 
 **Out of scope:** adding a BOM, and changing the CSV columns or quoting.
 

@@ -2,8 +2,8 @@
 description: "Put Charts CSV and Charts JSON links in the dashboard's navigation bar, carrying the selected project, so the chart data is exportable from the page that draws it."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T22:53:41Z
-status: implemented
+updated: 2026-11-26T22:56:46Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -26,7 +26,7 @@ The dashboard's navigation bar carries an Export group with Charts CSV and Chart
 3. Keep the existing links on the task list; they carry the task list's project too.
 4. Keep the controls visible without scripting, since they are plain links.
 5. Add a template test: a dashboard for one project renders both links with that project; All projects renders them with `project=all`; the links resolve to the two routes.
-6. Record the control in `FEATURES.md`'s navigation paragraph and its task-list paragraph, whose `Charts CSV and Charts JSON links sit beside Export CSV` sentence gains the dashboard placement, and record the dashboard-link assertion in `TESTING.md`'s task-list bullet: both links render with the selected project, and All projects renders them with `project=all`. The task-list paragraph and the task-list bullet are also edited by [task-viewer_csv-charset-utf8.md](archive/task-viewer_csv-charset-utf8.md), so merge this task's sentence and assertion with that task's wording rather than replacing either passage; the navigation paragraph is this task's alone.
+6. Record the control in `FEATURES.md`'s navigation paragraph and its task-list paragraph, whose `Charts CSV and Charts JSON links sit beside Export CSV` sentence gains the dashboard placement, and record the dashboard-link assertion in `TESTING.md`'s task-list bullet: both links render with the selected project, and All projects renders them with `project=all`. The task-list paragraph and the task-list bullet are also edited by [task-viewer_csv-charset-utf8.md](task-viewer_csv-charset-utf8.md), so merge this task's sentence and assertion with that task's wording rather than replacing either passage; the navigation paragraph is this task's alone.
 
 **Out of scope:** adding a task-list link to the navigation bar, and changing either export's body.
 
