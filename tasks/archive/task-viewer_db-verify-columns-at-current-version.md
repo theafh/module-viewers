@@ -2,8 +2,8 @@
 description: "Fail start-up with the file, version, table, and missing column when a database stamped at the current schema version lacks a column the code selects."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T23:06:13Z
-status: implemented
+updated: 2026-11-26T23:11:49Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
@@ -28,7 +28,7 @@ Reproduced with the current build: a version-4 file without `last_error_at` star
 3. On a missing column, bail with a message naming the database path, the reached version, the table, and the column, so start-up fails before the listener binds.
 4. Keep the below-version migration and its guards unchanged.
 5. Add a database test: a file stamped `SCHEMA_VERSION` with `last_error_at` dropped from `repositories`, and one with `content_hash` dropped from `tasks`, each fails `init` with that message; a file stamped `SCHEMA_VERSION` with every column still opens.
-6. Record the check in `ARCHITECTURE.md`'s `db.rs` paragraph, `TESTING.md`'s database bullet, and `FEATURES.md` §1's database bullet, the last carrying one sentence naming the new start-up refusal. The sibling [`db-refuse-foreign-sqlite-file`](task-viewer_db-refuse-foreign-sqlite-file.md) task adds another start-up refusal inside the same `migrate_locked` and edits the same `ARCHITECTURE.md` `db.rs` paragraph, which [`db-file-permissions`](task-viewer_db-file-permissions.md) also edits, so keep this task's sentence to the column check and leave the rest of that paragraph intact. [`startup-database-log`](task-viewer_startup-database-log.md) instead edits the `ARCHITECTURE.md` System Overview database sentence and co-edits the `FEATURES.md` §1 database bullet this task extends, so extend that bullet in place rather than replacing it.
+6. Record the check in `ARCHITECTURE.md`'s `db.rs` paragraph, `TESTING.md`'s database bullet, and `FEATURES.md` §1's database bullet, the last carrying one sentence naming the new start-up refusal. The sibling [`db-refuse-foreign-sqlite-file`](../task-viewer_db-refuse-foreign-sqlite-file.md) task adds another start-up refusal inside the same `migrate_locked` and edits the same `ARCHITECTURE.md` `db.rs` paragraph, which [`db-file-permissions`](../task-viewer_db-file-permissions.md) also edits, so keep this task's sentence to the column check and leave the rest of that paragraph intact. [`startup-database-log`](../task-viewer_startup-database-log.md) instead edits the `ARCHITECTURE.md` System Overview database sentence and co-edits the `FEATURES.md` §1 database bullet this task extends, so extend that bullet in place rather than replacing it.
 
 **Out of scope:** repairing the missing column automatically. A repaired copy is the user's decision; start-up names the file and the column instead of mutating it.
 

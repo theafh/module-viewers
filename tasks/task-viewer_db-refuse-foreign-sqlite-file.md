@@ -2,7 +2,7 @@
 description: "Refuse to initialize a non-empty SQLite file that is not task-viewer's, instead of adding tables and stamping its user_version."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T19:06:35Z
+updated: 2026-11-26T23:12:07Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -30,7 +30,7 @@ Reproduced with the current build: a file holding a `notes` table was opened thr
 
 `open_pool` sets `.journal_mode(SqliteJournalMode::Wal)` when it connects, and `migrate_locked` runs after that, so a refused file has already been switched to WAL. Its tables, rows, and `user_version` survive unchanged, while its journal mode and `-wal`/`-shm` sidecars may not.
 
-`migrate_locked` and `init_at_with_source` in `task-viewer/src/db.rs`, and the `ARCHITECTURE.md` `db.rs` paragraph the Approach rewrites, are also edited by live siblings: [db-verify-columns-at-current-version](task-viewer_db-verify-columns-at-current-version.md) extends `migrate_locked`, while [db-file-permissions](task-viewer_db-file-permissions.md) and [startup-database-log](task-viewer_startup-database-log.md) edit `init_at_with_source`. This task's refusal lands first, before `db-file-permissions` tightens the file's mode, so a refused foreign file is never chmod'ed, and each later edit re-reads the paragraph this task rewrites.
+`migrate_locked` and `init_at_with_source` in `task-viewer/src/db.rs`, and the `ARCHITECTURE.md` `db.rs` paragraph the Approach rewrites, are also edited by live siblings: [db-verify-columns-at-current-version](archive/task-viewer_db-verify-columns-at-current-version.md) extends `migrate_locked`, while [db-file-permissions](task-viewer_db-file-permissions.md) and [startup-database-log](task-viewer_startup-database-log.md) edit `init_at_with_source`. This task's refusal lands first, before `db-file-permissions` tightens the file's mode, so a refused foreign file is never chmod'ed, and each later edit re-reads the paragraph this task rewrites.
 
 ## Approach
 
