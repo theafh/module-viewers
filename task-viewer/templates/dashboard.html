@@ -15,6 +15,12 @@
     <input type="hidden" name="project" value="{{ selected }}">
     <button class="btn btn-secondary" type="submit">Update</button>
 </form>
+{# The export group is a plain container, not a `.nav-form`, so the shipped script keeps binding the project picker's form and hiding only its Show button. #}
+<div class="nav-export">
+    <span class="nav-export-label">Export</span>
+    <a class="btn btn-secondary" href="/charts.csv?{{ charts_query }}">Charts CSV</a>
+    <a class="btn btn-secondary" href="/charts.json?{{ charts_query }}">Charts JSON</a>
+</div>
 {% endblock %}
 {% block content %}
 {% if notice %}

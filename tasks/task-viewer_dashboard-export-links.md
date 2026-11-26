@@ -2,9 +2,11 @@
 description: "Put Charts CSV and Charts JSON links in the dashboard's navigation bar, carrying the selected project, so the chart data is exportable from the page that draws it."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T19:41:34Z
-status: ready
+updated: 2026-11-26T22:53:41Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Export the chart data from the dashboard

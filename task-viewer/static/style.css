@@ -122,14 +122,16 @@ a {
 }
 
 .nav-actions,
-.nav-form {
+.nav-form,
+.nav-export {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     flex-wrap: wrap;
 }
 
-.nav-form label {
+.nav-form label,
+.nav-export-label {
     color: var(--text-secondary);
     font-size: 0.9rem;
 }

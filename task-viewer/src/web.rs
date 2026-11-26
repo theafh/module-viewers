@@ -1487,6 +1487,10 @@ async fn render_dashboard(
         None => "all".to_string(),
     };
     let has_projects = !repositories.is_empty();
+    // The export links carry the same resolved project the charts draw and the
+    // task list's own Charts CSV and Charts JSON links spell, so exporting from
+    // the dashboard yields the series on screen.
+    let charts_query = format!("project={}", encode_query(&selected));
     let templates = Arc::clone(&state.templates);
     let version = state.static_version.clone();
     let theme = chrome.theme;
@@ -1515,6 +1519,7 @@ async fn render_dashboard(
             failures,
             data_json,
             has_projects,
+            charts_query,
         };
         let context = Context::from_serialize(page)?;
         templates
@@ -2580,6 +2585,9 @@ struct DashboardPage {
     failures: Vec<ProjectView>,
     data_json: String,
     has_projects: bool,
+    /// The query string the navigation bar's Charts CSV and Charts JSON links
+    /// carry: `project=all` or `project=<id>`, matching the charts on screen.
+    charts_query: String,
 }
 
 #[derive(Serialize)]
@@ -11825,6 +11833,72 @@ mod tests {
             all.contains("href=\"/charts.json?project=all\">Charts JSON"),
             "{all}"
         );
+        cleanup(&path);
+    }
+
+    /// Covers: the dashboard's navigation bar carries Charts CSV and Charts
+    /// JSON beside the project filter and Update as plain server-rendered
+    /// anchors with no `hidden` attribute, each naming the project the charts
+    /// draw, with `project=all` for All projects, and both hrefs resolving to
+    /// their export routes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_dashboard_nav_links_the_chart_exports_with_the_selected_project() {
+        let (state, path, folder, id) = state_with_repository("dashboard_export_links").await;
+        let all = body_text(send(state.clone(), get_page("/", "127.0.0.1:7880")).await).await;
+        let project_filter = all.find("id=\"project\"").expect("project filter");
+        let update = all.find("id=\"update-form\"").expect("Update form");
+        let group = all
+            .find("class=\"nav-export\"")
+            .expect("the Export group renders");
+        let theme = all.find("id=\"theme-toggle\"").expect("theme control");
+        assert!(
+            project_filter < update && update < group && group < theme,
+            "the Export group sits beside the project filter and Update: {all}"
+        );
+        // The exact anchor markup proves a plain server-rendered link with no
+        // `hidden` attribute and no script-created markup.
+        assert!(
+            all.contains(
+                "<a class=\"btn btn-secondary\" href=\"/charts.csv?project=all\">Charts CSV</a>"
+            ),
+            "the All-projects view links Charts CSV with project=all: {all}"
+        );
+        assert!(
+            all.contains(
+                "<a class=\"btn btn-secondary\" href=\"/charts.json?project=all\">Charts JSON</a>"
+            ),
+            "the All-projects view links Charts JSON with project=all: {all}"
+        );
+
+        let one = body_text(
+            send(
+                state.clone(),
+                get_page(&format!("/?project={id}"), "127.0.0.1:7880"),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            one.contains(&format!(
+                "<a class=\"btn btn-secondary\" href=\"/charts.csv?project={id}\">Charts CSV</a>"
+            )),
+            "the single-project view links Charts CSV with its project: {one}"
+        );
+        assert!(
+            one.contains(&format!(
+                "<a class=\"btn btn-secondary\" href=\"/charts.json?project={id}\">Charts JSON</a>"
+            )),
+            "the single-project view links Charts JSON with its project: {one}"
+        );
+
+        for uri in [
+            format!("/charts.csv?project={id}"),
+            format!("/charts.json?project={id}"),
+        ] {
+            let response = send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri} resolves");
+        }
+        let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 
