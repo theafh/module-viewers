@@ -2,8 +2,8 @@
 description: "Clamp a future ship day to today before computing cycle time, so one mistyped date cannot blow up the card's mean."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T19:16:52Z
-status: implemented
+updated: 2026-11-26T19:18:44Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -31,7 +31,7 @@ A commit with a future committer date, or a finished task whose fallback leave d
 1. Clamp the ship day used for the value to `today` before subtracting: `let ship = ship.min(today); let days = (ship - task.created).num_days().max(0);`.
 2. Keep the existing fold of the point's day and the zero-day rule for a ship before `created`.
 3. Add a series test: a task created today and shipped in 2099 contributes 0 days to today's point; a task created 10 days ago and shipped in 2099 contributes 10; a task created after today and shipped after its created day contributes 0, the negative `today - created` floored by `.max(0)`; a normal past ship keeps its real difference.
-4. Record the clamp in `ARCHITECTURE.md`'s cycle-time rule, `TESTING.md`'s series bullet, and `FEATURES.md`'s cycle-time entry, so each states the future-ship clamp in place of the raw `ship_date - created` rule. `TESTING.md`'s series bullet is also edited by [task-viewer_deferred-future-leave-fold.md](task-viewer_deferred-future-leave-fold.md) and [task-viewer_series-warn-once-per-row.md](task-viewer_series-warn-once-per-row.md); each rewrites that one bullet in place, so whichever lands later keeps the earlier clamp wording rather than appending a second statement.
+4. Record the clamp in `ARCHITECTURE.md`'s cycle-time rule, `TESTING.md`'s series bullet, and `FEATURES.md`'s cycle-time entry, so each states the future-ship clamp in place of the raw `ship_date - created` rule. `TESTING.md`'s series bullet is also edited by [task-viewer_deferred-future-leave-fold.md](../task-viewer_deferred-future-leave-fold.md) and [task-viewer_series-warn-once-per-row.md](../task-viewer_series-warn-once-per-row.md); each rewrites that one bullet in place, so whichever lands later keeps the earlier clamp wording rather than appending a second statement.
 
 **Out of scope:** excluding a future-dated row from the cycle count, and changing the after-today warning for created and shipped events.
 
