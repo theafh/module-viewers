@@ -38,6 +38,8 @@ make install
 - **macOS:** `~/Applications/Task Viewer.app`, pinned to the Dock automatically.
   Click toggles start/stop and opens the browser when starting.
 
+A reinstall builds the new bundle in a hidden `.Task Viewer.app.staging.*` directory beside `~/Applications/Task Viewer.app` and swaps it in only after its executable and `Info.plist` exist, so a failed install leaves the previous app in place. A failed install can leave that staging directory, or a `.Task Viewer.app.backup.*` directory, beside the bundle. When the icon build fails, the install reports that the icon build was skipped and copies the PNG instead, so the bundle still carries an icon; when the Dock pin fails, it prints how to add the app by hand.
+
 Manual control:
 
 ```bash

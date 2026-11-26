@@ -106,17 +106,24 @@ build_macos_icns() {
     local iconset="$work/AppIcon.iconset"
     mkdir -p "$iconset"
 
-    # iconutil expects this exact set of names and sizes.
-    sips -z 16 16 "$png" --out "$iconset/icon_16x16.png" >/dev/null
-    sips -z 32 32 "$png" --out "$iconset/icon_16x16@2x.png" >/dev/null
-    sips -z 32 32 "$png" --out "$iconset/icon_32x32.png" >/dev/null
-    sips -z 64 64 "$png" --out "$iconset/icon_32x32@2x.png" >/dev/null
-    sips -z 128 128 "$png" --out "$iconset/icon_128x128.png" >/dev/null
-    sips -z 256 256 "$png" --out "$iconset/icon_128x128@2x.png" >/dev/null
-    sips -z 256 256 "$png" --out "$iconset/icon_256x256.png" >/dev/null
-    sips -z 512 512 "$png" --out "$iconset/icon_256x256@2x.png" >/dev/null
-    sips -z 512 512 "$png" --out "$iconset/icon_512x512.png" >/dev/null
-    sips -z 1024 1024 "$png" --out "$iconset/icon_512x512@2x.png" >/dev/null
+    # iconutil expects this exact set of names and sizes. A failed resize sets
+    # a flag so the caller skips iconutil and falls back to the PNG.
+    local resize_failed=0
+    sips -z 16 16 "$png" --out "$iconset/icon_16x16.png" >/dev/null || resize_failed=1
+    sips -z 32 32 "$png" --out "$iconset/icon_16x16@2x.png" >/dev/null || resize_failed=1
+    sips -z 32 32 "$png" --out "$iconset/icon_32x32.png" >/dev/null || resize_failed=1
+    sips -z 64 64 "$png" --out "$iconset/icon_32x32@2x.png" >/dev/null || resize_failed=1
+    sips -z 128 128 "$png" --out "$iconset/icon_128x128.png" >/dev/null || resize_failed=1
+    sips -z 256 256 "$png" --out "$iconset/icon_128x128@2x.png" >/dev/null || resize_failed=1
+    sips -z 256 256 "$png" --out "$iconset/icon_256x256.png" >/dev/null || resize_failed=1
+    sips -z 512 512 "$png" --out "$iconset/icon_256x256@2x.png" >/dev/null || resize_failed=1
+    sips -z 512 512 "$png" --out "$iconset/icon_512x512.png" >/dev/null || resize_failed=1
+    sips -z 1024 1024 "$png" --out "$iconset/icon_512x512@2x.png" >/dev/null || resize_failed=1
+
+    if [ "$resize_failed" -ne 0 ]; then
+        rm -rf "$work"
+        return 2
+    fi
 
     if iconutil -c icns "$iconset" -o "$icns_out" 2>/dev/null; then
         rm -rf "$work"
@@ -126,19 +133,67 @@ build_macos_icns() {
     return 1
 }
 
+# Move the finished bundle into place atomically. The old bundle is moved into
+# a backup directory beside it, the new one is moved in, and only then is the
+# backup removed. A failed move restores the old bundle, and a trap restores it
+# when an interrupt lands between the two moves.
+swap_in_bundle() {
+    local new_bundle="$1"
+    local app_bundle="$2"
+    local apps_dir
+    apps_dir="$(dirname "$app_bundle")"
+    local backup old_bundle
+    backup="$(mktemp -d "$apps_dir/.Task Viewer.app.backup.XXXXXX")"
+    old_bundle="$backup/Task Viewer.app"
+    local moved_old=0
+
+    swap_restore() {
+        if [ "$moved_old" -eq 1 ] && [ ! -e "$app_bundle" ] && [ -e "$old_bundle" ]; then
+            mv "$old_bundle" "$app_bundle"
+        fi
+        rm -rf "$backup"
+    }
+    trap 'swap_restore' EXIT INT TERM HUP
+
+    if [ -e "$app_bundle" ]; then
+        if ! mv "$app_bundle" "$old_bundle"; then
+            swap_restore
+            trap - EXIT INT TERM HUP
+            return 1
+        fi
+        moved_old=1
+    fi
+
+    if ! mv "$new_bundle" "$app_bundle"; then
+        swap_restore
+        trap - EXIT INT TERM HUP
+        return 1
+    fi
+
+    rm -rf "$backup"
+    trap - EXIT INT TERM HUP
+    return 0
+}
+
 install_macos() {
     local apps_dir="$HOME/Applications"
     local app_bundle="$apps_dir/Task Viewer.app"
-    local contents="$app_bundle/Contents"
-    local macos_dir="$contents/MacOS"
-    local resources_dir="$contents/Resources"
-    local launcher_bin="$macos_dir/task-viewer-launcher"
+    local staging new_bundle contents macos_dir resources_dir launcher_bin icon_status
 
     echo "Installing Task Viewer.app for the Mac Dock..."
     echo "Project directory: $PROJECT_DIR"
 
     mkdir -p "$apps_dir"
-    rm -rf "$app_bundle"
+
+    # Build the new bundle in a staging directory beside the target. The
+    # installed bundle is untouched until the staging copy validates, so a
+    # failure here leaves the previously working app in place.
+    staging="$(mktemp -d "$apps_dir/.Task Viewer.app.staging.XXXXXX")"
+    new_bundle="$staging/Task Viewer.app"
+    contents="$new_bundle/Contents"
+    macos_dir="$contents/MacOS"
+    resources_dir="$contents/Resources"
+    launcher_bin="$macos_dir/task-viewer-launcher"
     mkdir -p "$macos_dir" "$resources_dir"
 
     # %q keeps a path with quotes or $ intact inside the generated script.
@@ -182,14 +237,31 @@ EOF
         if build_macos_icns "$ICON_SOURCE" "$resources_dir/AppIcon.icns"; then
             echo "✓ Icon installed as AppIcon.icns"
         else
+            icon_status=$?
             cp "$ICON_SOURCE" "$resources_dir/AppIcon.png"
-            echo "⚠ iconutil failed; copied PNG into Resources (Dock may show a generic icon)"
+            if [ "$icon_status" -eq 2 ]; then
+                echo "⚠ Icon build was skipped because an image resize failed; copied PNG into Resources (Dock may show a generic icon)"
+            else
+                echo "⚠ Icon build was skipped because iconutil failed; copied PNG into Resources (Dock may show a generic icon)"
+            fi
         fi
     else
         echo "⚠ Warning: Icon not found at $ICON_SOURCE"
     fi
 
-    # Clear quarantine so a first click is less likely to be blocked.
+    if [ ! -x "$launcher_bin" ] || [ ! -f "$contents/Info.plist" ]; then
+        echo "✗ New app bundle is incomplete at $new_bundle; the installed bundle is unchanged."
+        return 1
+    fi
+
+    if ! swap_in_bundle "$new_bundle" "$app_bundle"; then
+        echo "✗ Could not replace $app_bundle; the previous bundle was restored."
+        return 1
+    fi
+    rm -rf "$staging"
+
+    # Clear quarantine on the installed copy, so a first click is less likely
+    # to be blocked.
     if command -v xattr >/dev/null 2>&1; then
         xattr -dr com.apple.quarantine "$app_bundle" 2>/dev/null || true
     fi
@@ -207,27 +279,38 @@ EOF
     echo "If macOS blocks the first launch: right-click Task Viewer.app → Open."
 }
 
+# One guidance message for every way the automatic Dock pin can fail. It names
+# no missing tool, because the caller already explained any missing one.
+dock_pin_guidance() {
+    local app_bundle="$1"
+    echo "Cannot pin Task Viewer to the Dock automatically."
+    echo "The app bundle was created at: $app_bundle"
+    echo "To add it by hand, open that bundle once, then choose Options → Keep in Dock."
+}
+
 # Pin an .app to the Dock. Prefer dockutil; otherwise edit Dock prefs and restart Dock.
 pin_to_dock() {
     local app_bundle="$1"
 
     if command -v dockutil >/dev/null 2>&1; then
         dockutil --remove "$APP_NAME" --no-restart 2>/dev/null || true
-        dockutil --add "$app_bundle" --replacing "$APP_NAME"
-        echo "✓ Added Task Viewer to the Dock"
-        return 0
+        if dockutil --add "$app_bundle" --replacing "$APP_NAME"; then
+            echo "✓ Added Task Viewer to the Dock"
+            return 0
+        fi
+        dock_pin_guidance "$app_bundle"
+        return 1
     fi
 
     if ! command -v python3 >/dev/null 2>&1; then
         echo "Cannot pin Task Viewer to the Dock: python3 is not available."
-        echo "The app bundle was created at: $app_bundle"
-        echo "To add it by hand, open that bundle once, then choose Options → Keep in Dock."
+        dock_pin_guidance "$app_bundle"
         return 1
     fi
 
     # Drop every existing Task Viewer tile first so reinstall never doubles icons.
     # defaults stores file:// URLs, so a raw path grep misses the live tile.
-    python3 - "$app_bundle" <<'PY'
+    if ! python3 - "$app_bundle" 2>/dev/null <<'PY'
 import pathlib, plistlib, subprocess, sys
 app = pathlib.Path(sys.argv[1]).resolve().as_uri()
 raw = subprocess.check_output(["defaults", "export", "com.apple.dock", "-"])
@@ -256,6 +339,10 @@ subprocess.run(
     check=True,
 )
 PY
+    then
+        dock_pin_guidance "$app_bundle"
+        return 1
+    fi
     killall Dock 2>/dev/null || true
     echo "✓ Added Task Viewer to the Dock"
 }

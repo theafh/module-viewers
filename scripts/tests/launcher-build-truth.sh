@@ -268,7 +268,7 @@ case_missing_python3_fails_install_with_explanation() {
     chmod +x "$root/bin/uname"
     # Only the commands the Darwin branch reaches, so neither python3 nor
     # dockutil can be found. bash itself is called by its absolute path.
-    for cmd in dirname chmod mkdir rm cat; do
+    for cmd in dirname chmod mkdir rm cat mktemp mv; do
         ln -s "$(command -v "$cmd")" "$root/bin/$cmd"
     done
     bash_bin=$(command -v bash)
@@ -284,6 +284,155 @@ case_missing_python3_fails_install_with_explanation() {
     else
         fail "a missing python3 fails the install and names python3 and the bundle (status $status)"
         printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# A failure while the new bundle is still being built leaves the installed
+# bundle alone. A failing `cat` write is the simplest abort before the swap.
+case_failed_build_keeps_previous_bundle() {
+    local root="$TMP/installer-atomic-fail" out status marker
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    printf '#!/bin/bash\nexit 1\n' >"$root/bin/cat"
+    chmod +x "$root/bin/uname" "$root/bin/cat"
+    marker="$root/home/Applications/Task Viewer.app/Contents/old-bundle-marker"
+    mkdir -p "$(dirname "$marker")"
+    printf 'previous\n' >"$marker"
+    out=$(HOME="$root/home" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ] && [ -f "$marker" ]; then
+        pass "a failure before the swap leaves the previous bundle intact"
+    else
+        fail "a failure before the swap leaves the previous bundle intact (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# A failed sips resize must skip iconutil, say the icon build was skipped, and
+# still install a bundle that carries the PNG.
+case_icon_resize_failure_falls_back_to_png() {
+    local root="$TMP/installer-sips" out status iconutil_log
+    make_root "$root"
+    mkdir -p "$root/bin" "$root/task-viewer/static"
+    printf 'png-bytes\n' >"$root/task-viewer/static/task-viewer-icon.png"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    printf '#!/bin/bash\nexit 1\n' >"$root/bin/sips"
+    cat >"$root/bin/iconutil" <<'EOS'
+#!/bin/bash
+printf 'called\n' >>"$ICONUTIL_LOG"
+exit 0
+EOS
+    printf '#!/bin/bash\nexit 0\n' >"$root/bin/dockutil"
+    chmod +x "$root/bin/uname" "$root/bin/sips" "$root/bin/iconutil" "$root/bin/dockutil"
+    iconutil_log="$root/iconutil.log"
+    out=$(HOME="$root/home" ICONUTIL_LOG="$iconutil_log" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    if [ "$status" -eq 0 ] &&
+        printf '%s\n' "$out" | grep -q 'Icon build was skipped' &&
+        [ -x "$root/home/Applications/Task Viewer.app/Contents/MacOS/task-viewer-launcher" ] &&
+        [ -f "$root/home/Applications/Task Viewer.app/Contents/Resources/AppIcon.png" ] &&
+        [ ! -e "$root/home/Applications/Task Viewer.app/Contents/Resources/AppIcon.icns" ] &&
+        [ ! -e "$iconutil_log" ]; then
+        pass "a failed sips resize skips the icon build and installs the PNG"
+    else
+        fail "a failed sips resize skips the icon build and installs the PNG (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# A failing dockutil must not read as a crash: the shared guidance follows.
+case_failing_dockutil_prints_guidance() {
+    local root="$TMP/installer-dockutil" out status
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    printf '#!/bin/bash\nexit 1\n' >"$root/bin/dockutil"
+    chmod +x "$root/bin/uname" "$root/bin/dockutil"
+    out=$(HOME="$root/home" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ] &&
+        printf '%s\n' "$out" | grep -q 'App bundle created' &&
+        printf '%s\n' "$out" | grep -q 'add it by hand' &&
+        ! printf '%s\n' "$out" | grep -q 'Traceback'; then
+        pass "a failing dockutil prints the manual pin guidance"
+    else
+        fail "a failing dockutil prints the manual pin guidance (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# The python3 Dock edit fails on `defaults import`; that must reach the shared
+# guidance instead of printing a bare traceback. The export succeeds with a
+# minimal plist so the import is the failing step.
+case_failing_defaults_prints_guidance() {
+    local root="$TMP/installer-defaults" out status py python_dir
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    cat >"$root/bin/defaults" <<'EOS'
+#!/bin/bash
+if [ "$1" = "export" ]; then
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<plist version="1.0"><dict><key>persistent-apps</key><array/></dict></plist>'
+    exit 0
+fi
+exit 1
+EOS
+    chmod +x "$root/bin/uname" "$root/bin/defaults"
+    py="$(command -v python3 || true)"
+    python_dir=""
+    if [ -n "$py" ]; then
+        python_dir="$(dirname "$py"):"
+    fi
+    out=$(HOME="$root/home" PATH="$root/bin:${python_dir}/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ] &&
+        printf '%s\n' "$out" | grep -q 'add it by hand' &&
+        ! printf '%s\n' "$out" | grep -q 'Traceback'; then
+        pass "a failing defaults import prints the manual pin guidance"
+    else
+        fail "a failing defaults import prints the manual pin guidance (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# A clean run replaces the installed bundle, pins it, and leaves no staging or
+# backup directory behind.
+case_clean_install_replaces_bundle() {
+    local root="$TMP/installer-clean" out status marker leftovers
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    cat >"$root/bin/dockutil" <<'EOS'
+#!/bin/bash
+printf '%s\n' "$*" >>"$DOCKUTIL_LOG"
+exit 0
+EOS
+    chmod +x "$root/bin/uname" "$root/bin/dockutil"
+    marker="$root/home/Applications/Task Viewer.app/Contents/old-bundle-marker"
+    mkdir -p "$(dirname "$marker")"
+    printf 'previous\n' >"$marker"
+    out=$(HOME="$root/home" DOCKUTIL_LOG="$root/dockutil.log" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    leftovers="$(find "$root/home/Applications" -maxdepth 1 \
+        \( -name '.*staging*' -o -name '.*backup*' \) -print)"
+    if [ "$status" -eq 0 ] &&
+        [ ! -e "$marker" ] &&
+        [ -x "$root/home/Applications/Task Viewer.app/Contents/MacOS/task-viewer-launcher" ] &&
+        [ -f "$root/home/Applications/Task Viewer.app/Contents/Info.plist" ] &&
+        grep -q -- '--add' "$root/dockutil.log" 2>/dev/null &&
+        [ -z "$leftovers" ]; then
+        pass "a clean install replaces the bundle and pins it"
+    else
+        fail "a clean install replaces the bundle and pins it (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        printf '%s\n' "$leftovers" | sed 's/^/    leftover: /'
     fi
 }
 
@@ -425,6 +574,11 @@ case_toggle_builds_once
 case_icon_cache_failure_prints_no_checkmark
 case_desktop_database_failure_prints_no_checkmark
 case_missing_python3_fails_install_with_explanation
+case_failed_build_keeps_previous_bundle
+case_icon_resize_failure_falls_back_to_png
+case_failing_dockutil_prints_guidance
+case_failing_defaults_prints_guidance
+case_clean_install_replaces_bundle
 case_detach_refuses_without_python3_or_setsid
 case_detach_uses_setsid
 case_launcher_state_stays_under_root
