@@ -2,8 +2,8 @@
 description: "Stub `ps` in the launcher status exit-code test so PID 4242's real process line cannot add a Started-from line and break the byte-exact assertion."
 scope: task-viewer
 created: 2026-11-27T21:05:42Z
-updated: 2026-11-27T22:41:54Z
-status: implemented
+updated: 2026-11-27T22:44:27Z
+status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: false
 reported-by: "Andreas Hoffmann"
