@@ -12826,24 +12826,74 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Covers: the dashboard's navigation bar carries Charts CSV and Charts
-    /// JSON beside the project filter and Update as plain server-rendered
-    /// anchors with no `hidden` attribute, each naming the project the charts
-    /// draw, with `project=all` for All projects, and both hrefs resolving to
-    /// their export routes.
+    /// Covers: the dashboard's navigation bar carries one closed Export
+    /// `<details>` control whose menu holds the Charts CSV and Charts JSON
+    /// anchors, each naming the project the charts draw, with `project=all` for
+    /// All projects, and both hrefs resolving to their export routes. No
+    /// standalone label span or export button remains.
     #[tokio::test(flavor = "current_thread")]
     async fn web_dashboard_nav_links_the_chart_exports_with_the_selected_project() {
         let (state, path, folder, id) = state_with_repository("dashboard_export_links").await;
         let all = body_text(send(state.clone(), get_page("/", "127.0.0.1:7880")).await).await;
         let project_filter = all.find("id=\"project\"").expect("project filter");
         let update = all.find("id=\"update-form\"").expect("Update form");
-        let group = all
-            .find("class=\"nav-export\"")
-            .expect("the Export group renders");
+        let details = all
+            .find("<details class=\"nav-export\">")
+            .expect("the Export control is a details element");
         let theme = all.find("id=\"theme-toggle\"").expect("theme control");
         assert!(
-            project_filter < update && update < group && group < theme,
-            "the Export group sits beside the project filter and Update: {all}"
+            project_filter < update && update < details && details < theme,
+            "the Export control sits beside the project filter and Update: {all}"
+        );
+        // One Export control: a closed `<details>` whose summary carries the
+        // label and a menu holds both links. No `open` attribute ships, so the
+        // menu starts closed and still opens without scripting.
+        assert!(
+            !all.contains("<details class=\"nav-export\" open"),
+            "the Export menu starts closed: {all}"
+        );
+        assert!(
+            all.contains(
+                "<summary class=\"btn btn-secondary\">Export<span class=\"nav-export-caret\" aria-hidden=\"true\">▾</span></summary>"
+            ),
+            "the summary is the one visible Export control: {all}"
+        );
+        // Neither a standalone label span nor an `Export` text node outside the
+        // summary remains.
+        assert!(
+            !all.contains("nav-export-label"),
+            "the old Export label span is gone: {all}"
+        );
+        let summary_at = all
+            .find("<summary class=\"btn btn-secondary\">")
+            .expect("the Export summary renders");
+        let summary_end = summary_at
+            + all[summary_at..]
+                .find("</summary>")
+                .expect("the summary closes")
+            + "</summary>".len();
+        assert!(
+            !all[..summary_at].contains(">Export<") && !all[summary_end..].contains(">Export<"),
+            "no Export text node sits outside the summary: {all}"
+        );
+        let menu = all
+            .find("class=\"nav-export-menu\"")
+            .expect("the Export menu renders");
+        let csv_at = all.find(">Charts CSV<").expect("Charts CSV link");
+        let json_at = all.find(">Charts JSON<").expect("Charts JSON link");
+        assert!(
+            menu < csv_at && menu < json_at,
+            "both export links sit inside the Export menu: {all}"
+        );
+        assert_eq!(
+            all.matches(">Charts CSV<").count(),
+            1,
+            "the navigation bar carries one Charts CSV link: {all}"
+        );
+        assert_eq!(
+            all.matches(">Charts JSON<").count(),
+            1,
+            "the navigation bar carries one Charts JSON link: {all}"
         );
         // The exact anchor markup proves a plain server-rendered link with no
         // `hidden` attribute and no script-created markup.
@@ -14156,7 +14206,7 @@ mod tests {
   var blob = env.blobs[0] || {};
   var visible = env.cardNames.filter(function (name) {
     var control = env.downloadButtons[name];
-    return control && !control.hidden && control.style.display === "inline-block";
+    return control && !control.hidden && control.style.display === "inline-flex";
   }).length;
   return JSON.stringify({
     hidden: button.hidden,
@@ -14193,7 +14243,7 @@ mod tests {
         );
         assert_eq!(
             result["display"],
-            serde_json::json!("inline-block"),
+            serde_json::json!("inline-flex"),
             "the control overrides the stylesheet's no-script hiding"
         );
         assert_eq!(
@@ -14569,8 +14619,10 @@ mod tests {
         );
     }
 
-    /// Covers: every chart card carries one PNG control, and each ships hidden
-    /// so a page without scripting offers no download that cannot work.
+    /// Covers: every chart card carries one icon-only PNG control pinned to its
+    /// upper-right corner, each named for assistive technology by its own
+    /// `aria-label` and given hover text by `title`, and each ships hidden so a
+    /// page without scripting offers no download that cannot work.
     #[tokio::test(flavor = "current_thread")]
     async fn web_dashboard_every_chart_card_carries_a_hidden_png_control() {
         let (state, path, folder, _id) = state_with_repository("chart_download_control").await;
@@ -14590,6 +14642,15 @@ mod tests {
             10,
             "each PNG control ships hidden"
         );
+        assert_eq!(
+            body.matches("title=\"Download PNG\"").count(),
+            10,
+            "each icon-only control carries its hover text"
+        );
+        assert!(
+            !body.contains(">Download PNG<"),
+            "no card carries a text-bearing Download PNG button: {body}"
+        );
         let labels: Vec<&str> = body
             .match_indices("aria-label=\"Download PNG: ")
             .map(|(at, _)| {
@@ -14608,6 +14669,24 @@ mod tests {
         assert!(
             rule.contains("display: none"),
             "the stylesheet hides the control without scripting: {rule}"
+        );
+        assert!(
+            rule.contains("position: absolute"),
+            "the control is pinned to the card corner: {rule}"
+        );
+        assert!(
+            rule.contains("width: 1.75rem") && rule.contains("height: 1.75rem"),
+            "the control is a square hit target that clears the 24px minimum: {rule}"
+        );
+        let card = css_rule(".chart-card");
+        assert!(
+            card.contains("position: relative"),
+            "the card anchors its corner control: {card}"
+        );
+        let head = css_rule(".chart-head");
+        assert!(
+            head.contains("padding-right"),
+            "the header reserves the corner the control sits in: {head}"
         );
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
@@ -18341,7 +18420,9 @@ mod tests {
             let summary = tag_of(block, "<p class=\"muted summary\"");
             let summary_id = attribute(summary, "id").expect("the summary carries an id");
 
-            let svg = tag_of(block, "<svg");
+            // The card now carries an icon-only download control whose own SVG
+            // comes before the chart, so select the chart's group-role SVG.
+            let svg = tag_of(block, "<svg role=\"group\"");
             assert_eq!(attribute(svg, "role").as_deref(), Some("group"));
             assert_eq!(
                 attribute(svg, "aria-labelledby").as_deref(),
@@ -18390,7 +18471,9 @@ mod tests {
             "the no-script block names the Repositories link: {noscript}"
         );
         let mut charts = 0;
-        for block in html.split("<svg ").skip(1) {
+        // Each card's icon-only download control carries its own SVG, so the
+        // chart SVGs are the group-role ones.
+        for block in html.split("<svg role=\"group\"").skip(1) {
             let svg = block.split("</svg>").next().expect("the svg closes");
             assert!(
                 svg.contains("Loading chart…"),

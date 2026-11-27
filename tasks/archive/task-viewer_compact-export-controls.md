@@ -2,9 +2,11 @@
 description: "Collapse the dashboard's Export group into one Export control that opens a flyout with Charts CSV and Charts JSON, and turn each card's Download PNG button into a corner save icon."
 scope: task-viewer
 created: 2026-11-27T10:53:08Z
-updated: 2026-11-27T10:53:08Z
-status: open
+updated: 2026-11-27T11:59:10Z
+status: finished
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Compact the dashboard's export controls
@@ -21,7 +23,7 @@ Every one of the ten chart cards carries a `<div class="chart-controls">` inside
 
 `task-viewer/static/js/dashboard.js` wires every `[data-download]` control: it wraps the control and a fresh `role="status"` `aria-live="polite"` region in a `span.chart-download-group`, inserts that wrapper where the control was, moves the control inside it behind the region, sets `button.hidden = false` and `button.style.display = "inline-block"`, and on click calls `saveChartPng`. `showExportFailure` writes `Download failed` into that region, and `renderAll` plus the weekly View redraw clear it. The stylesheet's `.chart-download` rule hides the control with `display: none` until then, and `.chart-download-group` exists only to keep the empty region from taking a share of the header row's free space.
 
-Two finished tasks shape this markup: [dashboard-export-links](archive/task-viewer_dashboard-export-links.md) added the Export group and the constraint that its container must not carry `class="nav-form"`, because the shipped script binds the first `.nav-form` in document order and hides its first button, and [chart-png-export-error](archive/task-viewer_chart-png-export-error.md) added the per-card live region and the rule that the region is in the accessibility tree before its text changes.
+Two finished tasks shape this markup: [dashboard-export-links](task-viewer_dashboard-export-links.md) added the Export group and the constraint that its container must not carry `class="nav-form"`, because the shipped script binds the first `.nav-form` in document order and hides its first button, and [chart-png-export-error](task-viewer_chart-png-export-error.md) added the per-card live region and the rule that the region is in the accessibility tree before its text changes.
 
 The guarded surfaces are `task-viewer/src/web.rs`'s `web_dashboard_nav_links_the_chart_exports_with_the_selected_project`, which asserts the exact anchor markup, the group's position between the Update form and the theme control, and that the links resolve; and `web_dashboard_every_chart_card_carries_a_hidden_png_control`, which asserts ten `data-download` controls, ten `data-download hidden`, ten unique `aria-label="Download PNG: …"` values, and that `.chart-download` contains `display: none`. The rquickjs harness `task-viewer/testdata/browser_guards.js` builds its own cards, gives each one a text-bearing `Download PNG` button in the card header, and registers them in `downloadButtons`. `FEATURES.md` carries the behaviour in the navigation paragraph beginning `On Dashboard, the bar also carries the project filter and Update` and the chart-card paragraph beginning `Every chart card carries a Download PNG control`, and `TESTING.md` carries it in the `Task list:` bullet's `the dashboard's navigation bar renders the same two links beside the project filter and Update` clause and the `Browser guards:` bullet's `Each chart card's PNG control ships hidden` sentence.
 

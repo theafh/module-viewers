@@ -323,7 +323,6 @@
     download.attrs["data-download"] = "";
     download.attrs.hidden = "";
     download.hidden = true;
-    download.textContent = "Download PNG";
     header.appendChild(download);
     downloadButtons[name] = download;
     // A frame's client width is the config width until a test narrows or widens
@@ -362,6 +361,7 @@
     });
     root.querySelector = function (selector) {
       if (selector === "svg") return svg;
+      if (selector === 'svg[role="group"]') return svg;
       if (selector === ".summary") return summary;
       if (selector === ".chart-frame") return frame;
       if (selector === ".tooltip") return tip;

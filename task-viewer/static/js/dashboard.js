@@ -364,7 +364,7 @@
 
   function drawWeekly() {
     var root = card("weekly");
-    var svg = root.querySelector("svg");
+    var svg = root.querySelector('svg[role="group"]');
     var rows = payload.weekly || [];
     var keys = WEEKLY_VIEWS[weeklyView] || WEEKLY_VIEWS["stacked-all"];
     var counts = payload.counts || {};
@@ -490,7 +490,7 @@
 
   function drawLine(name, rows, colorName, yOf, tipText, subtitle) {
     var root = card(name);
-    var svg = root.querySelector("svg");
+    var svg = root.querySelector('svg[role="group"]');
     // A lone row has no line to draw, so the card says why instead of leaving
     // an empty plot under the generic subtitle.
     summary(name, rows.length === 1 ? "Not enough days yet" : subtitle);
@@ -602,7 +602,7 @@
   // are the comparison, not a fit.
   function drawStaleness() {
     var root = card("staleness");
-    var svg = root.querySelector("svg");
+    var svg = root.querySelector('svg[role="group"]');
     var rows = payload.staleness || [];
     var all = [
       { key: "over_30", color: "--chart-create", label: "over 30 days" },
@@ -758,7 +758,7 @@
 
   function drawCalendar(name, rows, colorName, noun, peak, kind, axis) {
     var root = card(name);
-    var svg = root.querySelector("svg");
+    var svg = root.querySelector('svg[role="group"]');
     // A fallback draw forces the width to the frame; clear it so a later
     // successful draw returns the calendar to its natural, scrollable width.
     svg.style.width = "";
@@ -921,7 +921,7 @@
 
   function drawRadar(name, rows, colorName, noun, mode, kind) {
     var root = card(name);
-    var svg = root.querySelector("svg");
+    var svg = root.querySelector('svg[role="group"]');
     // Radar: fit the frame by expanding the viewBox rather than shrinking the
     // 64px label margin, and render the expanded chart at 1:1 so the 11px
     // labels keep their size. The inline size is cleared first because
@@ -1197,7 +1197,7 @@
   function renderUnavailable(name) {
     var root = card(name);
     if (!root) return;
-    var svg = root.querySelector("svg");
+    var svg = root.querySelector('svg[role="group"]');
     if (svg) {
       message(name, svg, "Charts unavailable");
     }
@@ -1380,7 +1380,11 @@
       region = document.createElement("span");
       region.setAttribute("role", "status");
       region.setAttribute("aria-live", "polite");
-      parent.appendChild(region);
+      if (typeof parent.insertBefore === "function") {
+        parent.insertBefore(region, button);
+      } else {
+        parent.appendChild(region);
+      }
       exportMessages[name] = region;
     }
     // The class arrives with the text, so a card that never failed carries no
@@ -1392,7 +1396,7 @@
   function saveChartPng(button) {
     var root = button.closest ? button.closest("[data-chart]") : null;
     var name = root ? root.getAttribute("data-chart") : null;
-    var svg = root ? root.querySelector("svg") : null;
+    var svg = root ? root.querySelector('svg[role="group"]') : null;
     if (!name || !svg) {
       return;
     }
@@ -1477,38 +1481,21 @@
       // The card's status region goes into the page now, empty and without the
       // `chart-download-error` class, so it is already registered when a later
       // failure writes its text and a card that never failed carries no
-      // failure node.
-      //
-      // The region and the control travel in one wrapper, because the header
-      // row spaces its items with `space-between`: an empty element is still a
-      // flex item, so a region appended straight to the row would take a share
-      // of that free space and pull the control off the card's right edge. The
-      // row positions the wrapper as a single item instead, and the region
-      // comes first inside it, empty until a message arrives, so it is in the
-      // accessibility tree before its text changes.
+      // failure node. It sits directly before the control in the control's own
+      // parent, so it is in the accessibility tree before its text changes and
+      // stays beside the icon-only control that reports into it.
       var root = button.closest ? button.closest("[data-chart]") : null;
       var name = root ? root.getAttribute("data-chart") : null;
       var parent = button.parentNode || button.parent || null;
       if (name && parent && typeof document.createElement === "function") {
-        var wrapper = document.createElement("span");
-        // Not the control's own `chart-download` class, which the stylesheet
-        // hides until the script can rasterize the chart.
-        wrapper.setAttribute("class", "chart-download-group");
         var region = document.createElement("span");
         region.setAttribute("role", "status");
         region.setAttribute("aria-live", "polite");
-        wrapper.appendChild(region);
-        // Put the wrapper where the control was, then move the control into it
-        // behind the region, so the row keeps the control's place.
         if (typeof parent.insertBefore === "function") {
-          parent.insertBefore(wrapper, button);
+          parent.insertBefore(region, button);
         } else {
-          parent.appendChild(wrapper);
+          parent.appendChild(region);
         }
-        if (typeof parent.removeChild === "function") {
-          parent.removeChild(button);
-        }
-        wrapper.appendChild(button);
         exportMessages[name] = region;
       }
       button.addEventListener("click", function (event) {
@@ -1522,7 +1509,7 @@
         }
       });
       button.hidden = false;
-      button.style.display = "inline-block";
+      button.style.display = "inline-flex";
     });
   }
 

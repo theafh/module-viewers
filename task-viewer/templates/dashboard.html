@@ -15,12 +15,14 @@
     <input type="hidden" name="project" value="{{ selected }}">
     <button class="btn btn-secondary" type="submit">Update</button>
 </form>
-{# The export group is a plain container, not a `.nav-form`, so the shipped script keeps binding the project picker's form and hiding only its Show button. #}
-<div class="nav-export">
-    <span class="nav-export-label">Export</span>
-    <a class="btn btn-secondary" href="/charts.csv?{{ charts_query }}">Charts CSV</a>
-    <a class="btn btn-secondary" href="/charts.json?{{ charts_query }}">Charts JSON</a>
-</div>
+{# The export group is a native `<details>`, not a `.nav-form`, so the shipped script keeps binding the project picker's form and hiding only its Show button. Its links stay server-rendered and the menu opens without scripting. #}
+<details class="nav-export">
+    <summary class="btn btn-secondary">Export<span class="nav-export-caret" aria-hidden="true">▾</span></summary>
+    <div class="nav-export-menu">
+        <a class="btn btn-secondary" href="/charts.csv?{{ charts_query }}">Charts CSV</a>
+        <a class="btn btn-secondary" href="/charts.json?{{ charts_query }}">Charts JSON</a>
+    </div>
+</details>
 {% endblock %}
 {% block content %}
 {% if notice %}
@@ -67,7 +69,7 @@
                             <option value="stacked-ship-defer">Shipped + deferred</option>
                         </select>
                     </label>
-                    <button class="btn btn-secondary chart-download" type="button" data-download hidden aria-label="Download PNG: Tasks shipped vs created by week">Download PNG</button>
+                    <button class="btn btn-secondary chart-download" type="button" data-download hidden title="Download PNG" aria-label="Download PNG: Tasks shipped vs created by week"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h7l3 3v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm2 0v4h6V3.5L8.5 2H4zm0 7v5h8V9H4z"/></svg></button>
                 </div>
             </div>
             <p class="muted summary" id="weekly-summary"></p>
@@ -78,7 +80,7 @@
         <header>
             <div class="chart-head">
                 <h2 id="cumulative-title">Cumulative tasks shipped</h2>
-                <button class="btn btn-secondary chart-download" type="button" data-download hidden aria-label="Download PNG: Cumulative tasks shipped">Download PNG</button>
+                <button class="btn btn-secondary chart-download" type="button" data-download hidden title="Download PNG" aria-label="Download PNG: Cumulative tasks shipped"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h7l3 3v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm2 0v4h6V3.5L8.5 2H4zm0 7v5h8V9H4z"/></svg></button>
             </div>
             <p class="muted summary" id="cumulative-summary"></p>
         </header>
@@ -88,7 +90,7 @@
         <header>
             <div class="chart-head">
                 <h2 id="shipped-calendar-title">Tasks shipped, last 365 days</h2>
-                <button class="btn btn-secondary chart-download" type="button" data-download hidden aria-label="Download PNG: Tasks shipped, last 365 days">Download PNG</button>
+                <button class="btn btn-secondary chart-download" type="button" data-download hidden title="Download PNG" aria-label="Download PNG: Tasks shipped, last 365 days"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h7l3 3v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm2 0v4h6V3.5L8.5 2H4zm0 7v5h8V9H4z"/></svg></button>
             </div>
             <p class="muted summary" id="shipped-calendar-summary"></p>
         </header>
@@ -98,7 +100,7 @@
         <header>
             <div class="chart-head">
                 <h2 id="created-calendar-title">Tasks created, last 365 days</h2>
-                <button class="btn btn-secondary chart-download" type="button" data-download hidden aria-label="Download PNG: Tasks created, last 365 days">Download PNG</button>
+                <button class="btn btn-secondary chart-download" type="button" data-download hidden title="Download PNG" aria-label="Download PNG: Tasks created, last 365 days"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h7l3 3v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm2 0v4h6V3.5L8.5 2H4zm0 7v5h8V9H4z"/></svg></button>
             </div>
             <p class="muted summary" id="created-calendar-summary"></p>
         </header>
@@ -108,7 +110,7 @@
         <header>
             <div class="chart-head">
                 <h2 id="backlog-title">Live backlog</h2>
-                <button class="btn btn-secondary chart-download" type="button" data-download hidden aria-label="Download PNG: Live backlog">Download PNG</button>
+                <button class="btn btn-secondary chart-download" type="button" data-download hidden title="Download PNG" aria-label="Download PNG: Live backlog"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h7l3 3v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm2 0v4h6V3.5L8.5 2H4zm0 7v5h8V9H4z"/></svg></button>
             </div>
             <p class="muted summary" id="backlog-summary"></p>
         </header>
@@ -118,7 +120,7 @@
         <header>
             <div class="chart-head">
                 <h2 id="age-title">Mean backlog age</h2>
-                <button class="btn btn-secondary chart-download" type="button" data-download hidden aria-label="Download PNG: Mean backlog age">Download PNG</button>
+                <button class="btn btn-secondary chart-download" type="button" data-download hidden title="Download PNG" aria-label="Download PNG: Mean backlog age"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h7l3 3v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm2 0v4h6V3.5L8.5 2H4zm0 7v5h8V9H4z"/></svg></button>
             </div>
             <p class="muted summary" id="age-summary"></p>
         </header>
@@ -128,7 +130,7 @@
         <header>
             <div class="chart-head">
                 <h2 id="cycle-title">Cycle time</h2>
-                <button class="btn btn-secondary chart-download" type="button" data-download hidden aria-label="Download PNG: Cycle time">Download PNG</button>
+                <button class="btn btn-secondary chart-download" type="button" data-download hidden title="Download PNG" aria-label="Download PNG: Cycle time"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h7l3 3v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm2 0v4h6V3.5L8.5 2H4zm0 7v5h8V9H4z"/></svg></button>
             </div>
             <p class="muted summary" id="cycle-summary"></p>
         </header>
@@ -138,7 +140,7 @@
         <header>
             <div class="chart-head">
                 <h2 id="staleness-title">Live tasks by days since last edit</h2>
-                <button class="btn btn-secondary chart-download" type="button" data-download hidden aria-label="Download PNG: Live tasks by days since last edit">Download PNG</button>
+                <button class="btn btn-secondary chart-download" type="button" data-download hidden title="Download PNG" aria-label="Download PNG: Live tasks by days since last edit"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h7l3 3v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm2 0v4h6V3.5L8.5 2H4zm0 7v5h8V9H4z"/></svg></button>
             </div>
             <p class="muted summary" id="staleness-summary"></p>
         </header>
@@ -148,7 +150,7 @@
         <header>
             <div class="chart-head">
                 <h2 id="radar-shipped-title">Shipped</h2>
-                <button class="btn btn-secondary chart-download" type="button" data-download hidden aria-label="Download PNG: Shipped">Download PNG</button>
+                <button class="btn btn-secondary chart-download" type="button" data-download hidden title="Download PNG" aria-label="Download PNG: Shipped"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h7l3 3v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm2 0v4h6V3.5L8.5 2H4zm0 7v5h8V9H4z"/></svg></button>
             </div>
             <p class="muted summary" id="radar-shipped-summary"></p>
         </header>
@@ -158,7 +160,7 @@
         <header>
             <div class="chart-head">
                 <h2 id="radar-live-title">Live backlog by slice</h2>
-                <button class="btn btn-secondary chart-download" type="button" data-download hidden aria-label="Download PNG: Live backlog by slice">Download PNG</button>
+                <button class="btn btn-secondary chart-download" type="button" data-download hidden title="Download PNG" aria-label="Download PNG: Live backlog by slice"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h7l3 3v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm2 0v4h6V3.5L8.5 2H4zm0 7v5h8V9H4z"/></svg></button>
             </div>
             <p class="muted summary" id="radar-live-summary"></p>
         </header>

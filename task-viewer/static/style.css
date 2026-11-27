@@ -122,18 +122,71 @@ a {
 }
 
 .nav-actions,
-.nav-form,
-.nav-export {
+.nav-form {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     flex-wrap: wrap;
 }
 
-.nav-form label,
-.nav-export-label {
+.nav-form label {
     color: var(--text-secondary);
     font-size: 0.9rem;
+}
+
+/* The export control is a native `<details>`: its summary is the one visible
+   button and the menu hangs below the bar, which stays unclipped so the menu
+   can extend past it. */
+.nav-export {
+    position: relative;
+}
+
+.nav-export > summary {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    list-style: none;
+}
+
+.nav-export > summary::-webkit-details-marker {
+    display: none;
+}
+
+.nav-export-caret {
+    font-size: 0.7rem;
+    line-height: 1;
+}
+
+.nav-export-menu {
+    position: absolute;
+    top: calc(100% + 0.35rem);
+    right: 0;
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    min-width: 9rem;
+    padding: 0.35rem;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+}
+
+.nav-export-menu a {
+    display: block;
+    padding: 0.4rem 0.6rem;
+    border-radius: 6px;
+}
+
+.nav-export-menu a:hover,
+.nav-export-menu a:focus {
+    color: var(--accent);
+    background: var(--input-bg);
+}
+
+.nav-export[open] > summary {
+    color: var(--accent);
+    border-color: var(--accent);
 }
 
 select,
@@ -297,6 +350,8 @@ input[type="search"] {
 .chart-card {
     background: var(--chart-card);
     min-width: 0;
+    /* The icon-only PNG control is pinned to the card's upper-right corner. */
+    position: relative;
 }
 
 .card h2,
@@ -306,14 +361,17 @@ input[type="search"] {
     margin: 0;
 }
 
-/* The weekly card's view picker shares the heading row, so the chart keeps its
-   full width while the switch sits at the end of the header. */
 .chart-head {
+    /* The weekly card's view picker shares the heading row, so the chart keeps
+       its full width while the switch sits at the end of the header. */
     display: flex;
     flex-wrap: wrap;
     align-items: baseline;
     justify-content: space-between;
     gap: 0.4rem 0.75rem;
+    /* Reserve the corner for the absolutely positioned PNG control so the
+       heading and the weekly View picker never run under it. */
+    padding-right: 2.5rem;
 }
 
 .chart-view {
@@ -346,20 +404,22 @@ input[type="search"] {
        page without scripting shows no button that cannot work. It is declared
        after `.btn`, whose own `display` would otherwise keep it visible. */
     display: none;
-    font-size: 0.8rem;
-    padding: 0.2rem 0.5rem;
+    position: absolute;
+    top: 0.6rem;
+    right: 0.6rem;
+    /* A square target that clears the 24px minimum hit size, centered on its
+       icon. */
+    width: 1.75rem;
+    height: 1.75rem;
+    padding: 0;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
 }
 
-/* The control and its status region travel in one wrapper, so the header row's
-   `space-between` still puts the control at the card's right edge. The wrapper
-   lays the region out before the control with the row's own gap. It centers
-   itself in the baseline-aligned row so its baseline is the control's text, not
-   the empty region's bottom edge, and the row keeps its pre-change height. */
-.chart-download-group {
-    display: inline-flex;
-    align-items: center;
-    align-self: center;
-    gap: 0.4rem 0.75rem;
+.chart-download:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
 /* A failed chart PNG download reports beside its control, in the header row. */
