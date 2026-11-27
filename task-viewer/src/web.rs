@@ -3434,7 +3434,7 @@ async fn run_scan(state: AppState) -> Result<ScanReport, Banner> {
     .await)
 }
 
-type HarvestFn = dyn Fn(&std::path::Path, &[PriorTask]) -> Result<harvest::Harvested, HarvestError>
+type HarvestFn = dyn Fn(&std::path::Path, &[PriorTask]) -> Result<harvest::Harvested, harvest::HarvestFailure>
     + Send
     + Sync;
 
@@ -3461,7 +3461,8 @@ struct ScanReport {
 
 /// One harvest result as it leaves its join, before the store turns it into a
 /// scan error or a set of stored rows.
-type HarvestOutcome = Result<Result<harvest::Harvested, HarvestError>, tokio::task::JoinError>;
+type HarvestOutcome =
+    Result<Result<harvest::Harvested, harvest::HarvestFailure>, tokio::task::JoinError>;
 
 /// What storing one harvest outcome produced: the banner a failure earns, how
 /// many task files the harvest skipped, and the change against the rows the
@@ -3687,34 +3688,41 @@ async fn store_outcome(
                 }
             }
         }
-        Ok(Err(HarvestError::MissingTasks)) => {
-            record_scan_error(pool, repository_id, MISSING_TASKS_ERROR).await;
-            StoredOutcome {
-                banner: Some(Banner::NoTasksDirectory),
-                skipped: 0,
-                new_tasks: 0,
-                shipped: 0,
-            }
-        }
-        Ok(Err(HarvestError::Git(reason))) => {
-            tracing::error!(%reason, repository_id, "git could not read the history");
-            let message = git_scan_message(&reason);
-            record_scan_error(pool, repository_id, &message).await;
-            StoredOutcome {
-                banner: Some(Banner::GitUnreadable),
-                skipped: 0,
-                new_tasks: 0,
-                shipped: 0,
-            }
-        }
-        Ok(Err(HarvestError::Io(error))) => {
-            tracing::error!(%error, repository_id, "scan failed");
-            record_scan_error(pool, repository_id, IO_ERROR).await;
-            StoredOutcome {
-                banner: Some(Banner::ScanUnreadable),
-                skipped: 0,
-                new_tasks: 0,
-                shipped: 0,
+        Ok(Err(failure)) => {
+            // The failure carries the task files the harvest skipped before it
+            // failed, so the banner counts them beside the failure reason.
+            let skipped = failure.skipped_count();
+            match failure.error {
+                HarvestError::MissingTasks => {
+                    record_scan_error(pool, repository_id, MISSING_TASKS_ERROR).await;
+                    StoredOutcome {
+                        banner: Some(Banner::NoTasksDirectory),
+                        skipped,
+                        new_tasks: 0,
+                        shipped: 0,
+                    }
+                }
+                HarvestError::Git(reason) => {
+                    tracing::error!(%reason, repository_id, "git could not read the history");
+                    let message = git_scan_message(&reason);
+                    record_scan_error(pool, repository_id, &message).await;
+                    StoredOutcome {
+                        banner: Some(Banner::GitUnreadable),
+                        skipped,
+                        new_tasks: 0,
+                        shipped: 0,
+                    }
+                }
+                HarvestError::Io(error) => {
+                    tracing::error!(%error, repository_id, "scan failed");
+                    record_scan_error(pool, repository_id, IO_ERROR).await;
+                    StoredOutcome {
+                        banner: Some(Banner::ScanUnreadable),
+                        skipped,
+                        new_tasks: 0,
+                        shipped: 0,
+                    }
+                }
             }
         }
         Err(error) => {
@@ -7198,7 +7206,7 @@ mod tests {
                     if let Ok(release) = release_rx.lock() {
                         let _ = release.recv();
                     }
-                    return Err(HarvestError::MissingTasks);
+                    return Err(HarvestError::MissingTasks.into());
                 }
                 Ok(harvest::Harvested::from(vec![parsed_task()]))
             })
@@ -8031,11 +8039,16 @@ mod tests {
         let harvest: Arc<HarvestFn> = Arc::new(|path: &Path, prior: &[PriorTask]| {
             let outcome = harvest::harvest_repository_with_prior(path, prior);
             match &outcome {
-                Err(HarvestError::Git(message)) => assert!(
-                    message.contains("tasks/scope_vanished.md"),
-                    "the ref-union missing object must name its path: {message}"
-                ),
-                other => panic!("expected a Git error naming the vanished path, got {other:?}"),
+                Err(failure) => match &failure.error {
+                    HarvestError::Git(message) => assert!(
+                        message.contains("tasks/scope_vanished.md"),
+                        "the ref-union missing object must name its path: {message}"
+                    ),
+                    other => {
+                        panic!("expected a Git error naming the vanished path, got {other:?}")
+                    }
+                },
+                Ok(_) => panic!("expected a Git error naming the vanished path, got {outcome:?}"),
             }
             outcome
         });
@@ -8069,6 +8082,106 @@ mod tests {
         let rows = db::load_tasks(&pool, Some(id)).await.expect("earlier rows");
         assert_eq!(rows.len(), 1, "the earlier rows stay intact");
         assert_eq!(rows[0].scope, "scope");
+
+        harvest::clear_test_git(&repo);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bin);
+        cleanup(&path);
+    }
+
+    /// Covers: a failed Update that skipped a task-shaped file still counts that
+    /// skip in its banner beside the failure reason, and a later failure that
+    /// skipped nothing renders no skipped-file sentence.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_scan_banner_counts_the_skips_a_failed_harvest_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_database("scan_failed_skip_tally");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+        let repo = unique_temp_dir("scan_failed_skip_tally_repo");
+        std::fs::create_dir_all(repo.join("tasks/archive")).expect("tasks");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        // An archived task routes the harvest through the archive history walk
+        // that the stand-in fails below.
+        std::fs::write(
+            repo.join("tasks/archive/scope_done.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-06-01T10:00:00\nstatus: finished\n---\n\n# Done\n",
+        )
+        .expect("archived task");
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "archived task"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        // A task-shaped file over the 4 MiB cap is skipped by the working-tree
+        // walk, before the archive walk fails.
+        let oversized = repo.join("tasks/scope_huge.md");
+        std::fs::write(&oversized, vec![b'a'; 4 * 1024 * 1024 + 1]).expect("oversized task");
+
+        let bin = unique_temp_dir("scan_failed_skip_tally_bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let script = bin.join("git");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$*\" in\n  *--follow*) echo 'fatal: simulated archive log failure' >&2; exit 128 ;;\n  *) exec git \"$@\" ;;\nesac\n",
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+        harvest::register_test_git(&repo, &script, Duration::from_secs(5));
+
+        db::insert_repository(&pool, "skips", &repo.to_string_lossy())
+            .await
+            .expect("insert");
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        let report = scan_core(
+            &pool,
+            &repositories,
+            1,
+            Arc::new(harvest::harvest_repository_with_prior),
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+
+        assert_eq!(report.skipped, 1, "the failed harvest carries its skip");
+        let (key, message) = scan_flash(&report);
+        assert_eq!(key, "error");
+        assert!(
+            message.contains(GIT_ERROR),
+            "the banner names the failure reason: {message}"
+        );
+        assert!(
+            message.ends_with(" 1 task file skipped."),
+            "the banner counts the skip beside the failure reason: {message}"
+        );
+
+        // The same failing scan with no skippable file renders no sentence.
+        std::fs::remove_file(&oversized).expect("remove oversized task");
+        let report = scan_core(
+            &pool,
+            &repositories,
+            1,
+            Arc::new(harvest::harvest_repository_with_prior),
+            &immediate_store_hook(),
+            &immediate_prior_read_hook(),
+        )
+        .await;
+        assert_eq!(report.skipped, 0, "nothing was skipped this run");
+        let (key, message) = scan_flash(&report);
+        assert_eq!(key, "error");
+        assert!(
+            !message.contains("task file skipped"),
+            "a failure that skipped nothing renders no skipped-file sentence: {message}"
+        );
 
         harvest::clear_test_git(&repo);
         let _ = std::fs::remove_dir_all(&repo);
@@ -8141,11 +8254,14 @@ mod tests {
         let harvest: Arc<HarvestFn> = Arc::new(|path: &Path, prior: &[PriorTask]| {
             let outcome = harvest::harvest_repository_with_prior(path, prior);
             match &outcome {
-                Err(HarvestError::Git(message)) => assert!(
-                    message.contains("simulated probe failure"),
-                    "the probe failure must carry git's stderr: {message}"
-                ),
-                other => panic!("expected a Git error carrying git's stderr, got {other:?}"),
+                Err(failure) => match &failure.error {
+                    HarvestError::Git(message) => assert!(
+                        message.contains("simulated probe failure"),
+                        "the probe failure must carry git's stderr: {message}"
+                    ),
+                    other => panic!("expected a Git error carrying git's stderr, got {other:?}"),
+                },
+                Ok(_) => panic!("expected a Git error carrying git's stderr, got {outcome:?}"),
             }
             outcome
         });
@@ -8203,7 +8319,7 @@ mod tests {
         let broken_path = broken.clone();
         let harvest: Arc<HarvestFn> = Arc::new(move |path: &Path, _: &[PriorTask]| {
             if path == broken_path {
-                Err(HarvestError::Git("no history".to_string()))
+                Err(HarvestError::Git("no history".to_string()).into())
             } else {
                 Ok(harvest::Harvested::from(Vec::new()))
             }
@@ -8698,8 +8814,9 @@ mod tests {
             folders.push(folder);
         }
         let repositories = db::list_repositories(&state.pool).await.expect("list");
-        let harvest: Arc<HarvestFn> =
-            Arc::new(|_: &Path, _: &[PriorTask]| Err(HarvestError::Git("no history".to_string())));
+        let harvest: Arc<HarvestFn> = Arc::new(|_: &Path, _: &[PriorTask]| {
+            Err(HarvestError::Git("no history".to_string()).into())
+        });
         let report = scan_core(
             &state.pool,
             &repositories,

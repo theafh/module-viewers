@@ -105,6 +105,38 @@ impl From<GitFailure> for HarvestError {
     }
 }
 
+/// A harvest that failed, carrying the task files it had already skipped before
+/// the failure, so the Update banner counts them beside the failure reason
+/// instead of reporting zero.
+#[derive(Debug)]
+pub struct HarvestFailure {
+    pub error: HarvestError,
+    pub skipped: SkipTally,
+}
+
+impl HarvestFailure {
+    /// The number of task files the harvest skipped before it failed.
+    pub fn skipped_count(&self) -> usize {
+        self.skipped.values().sum()
+    }
+}
+
+impl std::fmt::Display for HarvestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl From<HarvestError> for HarvestFailure {
+    /// A failure that struck before the harvest recorded any skip.
+    fn from(error: HarvestError) -> Self {
+        Self {
+            error,
+            skipped: SkipTally::default(),
+        }
+    }
+}
+
 /// Why a git command did not produce a usable result.
 ///
 /// `Timeout` is final: a hung command must reach `store_outcome` as a scan
@@ -126,7 +158,7 @@ impl std::fmt::Display for GitFailure {
 }
 
 #[cfg(test)]
-pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> {
+pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestFailure> {
     harvest_repository_with_prior(repo, &[]).map(|harvested| harvested.tasks)
 }
 
@@ -134,12 +166,14 @@ pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestError> 
 /// content hash still matches the row the database holds. Prior rows arrive as
 /// an argument, so harvest stays read-only of the database. The returned rows
 /// carry the task files the harvest charted, and the tally says how many task
-/// files it skipped and why.
+/// files it skipped and why. A failure carries the tally it had recorded, so a
+/// scan that fails after a skip still counts that skip.
 pub fn harvest_repository_with_prior(
     repo: &Path,
     prior: &[PriorTask],
-) -> Result<Harvested, HarvestError> {
-    let repo = fs::canonicalize(repo)?;
+) -> Result<Harvested, HarvestFailure> {
+    let repo =
+        fs::canonicalize(repo).map_err(|error| HarvestFailure::from(HarvestError::from(error)))?;
     let mut skipped = SkipTally::default();
     // The working-tree half of the `tasks/` disjunction. The ref half arrives
     // with the union listing below, so a folder whose checked-out branch has no
@@ -151,8 +185,8 @@ pub fn harvest_repository_with_prior(
     // remote-tracking ref holds, so a task stays visible whichever branch is
     // checked out. The repository that holds it is the folder's own `.git` or
     // an enclosing one. A folder outside git is charted from its files.
-    let git =
-        GitContext::resolve(&repo).map_err(|failure| HarvestError::Git(failure.to_string()))?;
+    let git = GitContext::resolve(&repo)
+        .map_err(|failure| HarvestFailure::from(HarvestError::Git(failure.to_string())))?;
     match git.repository() {
         Some((root, dir)) => {
             // A `.git` that git cannot open fails the scan; charting frontmatter
@@ -160,26 +194,50 @@ pub fn harvest_repository_with_prior(
             // day. A failed enclosing probe already fails `GitContext::resolve`,
             // so only the folder's own `.git` needs the probe here.
             if git.dir.is_some() {
-                git_read(&repo, dir, &["rev-parse", "--git-dir"]).map_err(HarvestError::Git)?;
+                git_read(&repo, dir, &["rev-parse", "--git-dir"])
+                    .map_err(|reason| HarvestFailure::from(HarvestError::Git(reason)))?;
             }
             let (chosen, worktree, ref_holds_tasks) =
-                union_files(&repo, root, dir, &git.prefix, &mut skipped)?;
+                union_files(&repo, root, dir, &git.prefix, &mut skipped).map_err(|error| {
+                    HarvestFailure {
+                        error,
+                        skipped: std::mem::take(&mut skipped),
+                    }
+                })?;
             // Neither the working tree nor any ref holds `tasks/`, so the folder
             // has no tasks directory. The error keeps the repository's stored
             // rows instead of replacing them with an empty set.
             if !tasks_present(worktree_tasks, ref_holds_tasks) {
-                return Err(HarvestError::MissingTasks);
+                return Err(HarvestFailure {
+                    error: HarvestError::MissingTasks,
+                    skipped,
+                });
             }
-            harvest_chosen(&repo, &git, root, dir, chosen, worktree, prior, skipped)
+            harvest_chosen(
+                &repo,
+                &git,
+                root,
+                dir,
+                chosen,
+                worktree,
+                prior,
+                &mut skipped,
+            )
         }
         None => {
             // A folder outside git holds `tasks/` only when its working tree
             // does, and its stored rows survive the same missing-directory error.
             if !tasks_present(worktree_tasks, false) {
-                return Err(HarvestError::MissingTasks);
+                return Err(HarvestFailure {
+                    error: HarvestError::MissingTasks,
+                    skipped,
+                });
             }
-            let files = files_on_disk(&repo, &mut skipped)?;
-            harvest_files(&repo, &git, files, prior, skipped)
+            let files = files_on_disk(&repo, &mut skipped).map_err(|error| HarvestFailure {
+                error,
+                skipped: std::mem::take(&mut skipped),
+            })?;
+            harvest_files(&repo, &git, files, prior, &mut skipped)
         }
     }
 }
@@ -592,8 +650,8 @@ fn harvest_chosen(
     chosen: Vec<ChosenFile>,
     mut worktree: WorktreeFiles,
     prior: &[PriorTask],
-    mut skipped: SkipTally,
-) -> Result<Harvested, HarvestError> {
+    skipped: &mut SkipTally,
+) -> Result<Harvested, HarvestFailure> {
     let blobs: Vec<String> = chosen
         .iter()
         .filter_map(|(_, blob, _, _)| blob.clone())
@@ -605,25 +663,25 @@ fn harvest_chosen(
     // with a message that says which object went away instead of charting the
     // rest as if that task never existed.
     let mut vanished: Option<String> = None;
-    read_blobs(root, Some(dir), &blobs, |content| {
+    let read = read_blobs(root, Some(dir), &blobs, |content| {
         // Advance to the next row that names a blob, harvesting the
         // working-tree rows that sit ahead of it.
         for (path, blob, path_is_lossy, disk) in rows.by_ref() {
             if blob.is_some() {
                 match content {
                     BlobContent::Text(text) => {
-                        state.harvest_file(&path, &text, path_is_lossy, &mut skipped);
+                        state.harvest_file(&path, &text, path_is_lossy, skipped);
                     }
                     BlobContent::Missing => vanished = Some(path.clone()),
                     BlobContent::Oversized => {
                         if has_task_name_shape(&path) {
-                            record_skip(&mut skipped, SkipReason::Oversized);
+                            record_skip(skipped, SkipReason::Oversized);
                         }
                         warn_skipped_task(&path, SkipReason::Oversized);
                     }
                     BlobContent::NotUtf8 => {
                         if has_task_name_shape(&path) {
-                            record_skip(&mut skipped, SkipReason::NotUtf8);
+                            record_skip(skipped, SkipReason::NotUtf8);
                         }
                         warn_skipped_task(&path, SkipReason::NotUtf8);
                     }
@@ -634,29 +692,45 @@ fn harvest_chosen(
                 break;
             }
             if let Some(text) =
-                worktree_content(repo, &mut worktree, &path, disk.as_deref(), &mut skipped)
+                worktree_content(repo, &mut worktree, &path, disk.as_deref(), skipped)
             {
-                state.harvest_file(&path, &text, path_is_lossy, &mut skipped);
+                state.harvest_file(&path, &text, path_is_lossy, skipped);
             }
         }
-    })?;
+    });
+    if let Err(error) = read {
+        return Err(HarvestFailure {
+            error: error.into(),
+            skipped: std::mem::take(skipped),
+        });
+    }
     if let Some(path) = vanished {
-        return Err(HarvestError::from(GitFailure::Other(format!(
-            "the object for {path} vanished during the scan"
-        ))));
+        return Err(HarvestFailure {
+            error: HarvestError::from(GitFailure::Other(format!(
+                "the object for {path} vanished during the scan"
+            ))),
+            skipped: std::mem::take(skipped),
+        });
     }
     // Every committed row has taken its content, so the rows left are
     // working-tree ones.
     for (path, _, path_is_lossy, disk) in rows {
-        if let Some(text) =
-            worktree_content(repo, &mut worktree, &path, disk.as_deref(), &mut skipped)
-        {
-            state.harvest_file(&path, &text, path_is_lossy, &mut skipped);
+        if let Some(text) = worktree_content(repo, &mut worktree, &path, disk.as_deref(), skipped) {
+            state.harvest_file(&path, &text, path_is_lossy, skipped);
         }
     }
+    let tasks = match state.finish(repo, git, prior) {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            return Err(HarvestFailure {
+                error,
+                skipped: std::mem::take(skipped),
+            });
+        }
+    };
     Ok(Harvested {
-        tasks: state.finish(repo, git, prior)?,
-        skipped,
+        tasks,
+        skipped: std::mem::take(skipped),
     })
 }
 
@@ -1057,8 +1131,8 @@ fn harvest_files(
     git: &GitContext,
     files: Vec<WorktreeRow>,
     prior: &[PriorTask],
-    mut skipped: SkipTally,
-) -> Result<Harvested, HarvestError> {
+    skipped: &mut SkipTally,
+) -> Result<Harvested, HarvestFailure> {
     let mut state = HarvestState::default();
     for row in files {
         // A skipped row warned once during the walk and contributes no row.
@@ -1086,7 +1160,7 @@ fn harvest_files(
                             .map(|metadata| metadata.len())
                             .unwrap_or(0);
                         if has_task_name_shape(&row.path) {
-                            record_skip(&mut skipped, reason);
+                            record_skip(skipped, reason);
                         }
                         warn_skipped_worktree_task(&row.path, bytes, reason);
                         None
@@ -1095,12 +1169,21 @@ fn harvest_files(
             }
         };
         if let Some(text) = text {
-            state.harvest_file(&row.path, &text, row.lossy, &mut skipped);
+            state.harvest_file(&row.path, &text, row.lossy, skipped);
         }
     }
+    let tasks = match state.finish(repo, git, prior) {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            return Err(HarvestFailure {
+                error,
+                skipped: std::mem::take(skipped),
+            });
+        }
+    };
     Ok(Harvested {
-        tasks: state.finish(repo, git, prior)?,
-        skipped,
+        tasks,
+        skipped: std::mem::take(skipped),
     })
 }
 
@@ -5196,7 +5279,7 @@ mod tests {
         )
         .expect("gitfile");
         let error = harvest_repository(&repo).expect_err("git failure");
-        assert!(matches!(error, HarvestError::Git(_)));
+        assert!(matches!(&error.error, HarvestError::Git(_)));
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -5241,7 +5324,7 @@ mod tests {
     fn harvest_rejects_a_folder_without_tasks() {
         let repo = scratch("harvest_missing");
         let error = harvest_repository(&repo).expect_err("missing");
-        assert!(matches!(error, HarvestError::MissingTasks));
+        assert!(matches!(&error.error, HarvestError::MissingTasks));
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -5280,7 +5363,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, repo.join("tasks")).expect("tasks symlink");
 
         let error = harvest_repository(&repo).expect_err("an outside link fails the scan");
-        assert!(matches!(error, HarvestError::Io(_)), "{error:?}");
+        assert!(matches!(&error.error, HarvestError::Io(_)), "{error:?}");
         let message = error.to_string();
         let tasks_path = repo.join("tasks").display().to_string();
         assert!(
@@ -9503,7 +9586,7 @@ mod tests {
             skip: None,
         };
 
-        let harvested = harvest_files(&repo, &git, vec![row], &[], SkipTally::default())
+        let harvested = harvest_files(&repo, &git, vec![row], &[], &mut SkipTally::default())
             .expect("the carried path charts the row");
         assert_eq!(harvested.tasks.len(), 1, "{:?}", harvested.tasks);
         assert_eq!(
@@ -9543,7 +9626,7 @@ mod tests {
         let captured = CapturedWarnings::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         let harvested = tracing::subscriber::with_default(subscriber, || {
-            harvest_files(&repo, &git, vec![row], &[], SkipTally::default())
+            harvest_files(&repo, &git, vec![row], &[], &mut SkipTally::default())
         })
         .expect("a vanished file does not fail the harvest");
         assert!(harvested.tasks.is_empty(), "{:?}", harvested.tasks);
@@ -9648,7 +9731,7 @@ mod tests {
             chosen,
             WorktreeFiles::default(),
             &[],
-            SkipTally::default(),
+            &mut SkipTally::default(),
         )
         .expect("the carried path charts the chosen row");
         assert_eq!(harvested.tasks.len(), 1, "{:?}", harvested.tasks);
@@ -9918,7 +10001,7 @@ mod tests {
         let result = harvest_repository(&repo);
         fs::set_permissions(&archive, original).expect("restore archive");
         let error = result.expect_err("an unreadable tasks subdirectory must fail the scan");
-        match error {
+        match error.error {
             HarvestError::Io(error) => {
                 let message = error.to_string();
                 assert!(
@@ -10234,7 +10317,7 @@ mod tests {
         register_fake_git(&repo, &script);
 
         let error = harvest_repository(&repo).expect_err("a hanging git must fail the scan");
-        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        assert!(matches!(&error.error, HarvestError::Git(_)), "{error:?}");
         clear_fake_git(&repo);
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&bin);
@@ -10327,7 +10410,7 @@ mod tests {
         register_fake_git_with_deadline(&repo, &script, Duration::from_secs(5));
 
         let error = harvest_repository(&repo).expect_err("a failed cat-file must fail the scan");
-        match error {
+        match error.error {
             HarvestError::Git(message) => assert!(
                 message.contains("simulated cat-file failure"),
                 "the scan error must carry git's stderr: {message}"
@@ -10364,7 +10447,7 @@ mod tests {
         register_fake_git_with_deadline(&repo, &script, Duration::from_secs(5));
 
         let error = harvest_repository(&repo).expect_err("the probe must fail the scan");
-        match error {
+        match error.error {
             HarvestError::Git(message) => assert!(
                 message.contains("simulated probe failure"),
                 "the scan error must carry the probe's stderr: {message}"
@@ -10426,7 +10509,7 @@ mod tests {
 
         let error =
             harvest_repository(&repo).expect_err("a probe that cannot start fails the scan");
-        match error {
+        match error.error {
             HarvestError::Git(message) => assert!(
                 message.contains("git did not start"),
                 "the scan error must carry the start error: {message}"
@@ -10450,7 +10533,7 @@ mod tests {
         register_fake_git_with_deadline(&repo, &script, Duration::from_secs(5));
 
         let error = harvest_repository(&repo).expect_err("a short probe answer fails the scan");
-        match error {
+        match error.error {
             HarvestError::Git(message) => assert!(
                 message.contains("fewer than three lines"),
                 "the scan error must name the short answer: {message}"
@@ -10500,7 +10583,7 @@ mod tests {
 
         let error = harvest_repository(&parent.join("nested"))
             .expect_err("the leave-day log must time out");
-        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        assert!(matches!(&error.error, HarvestError::Git(_)), "{error:?}");
         clear_fake_git(&parent);
         let _ = fs::remove_dir_all(&parent);
         let _ = fs::remove_dir_all(&bin);
@@ -10536,7 +10619,7 @@ mod tests {
 
         let error =
             harvest_repository(&parent.join("nested")).expect_err("the pickaxe log must time out");
-        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        assert!(matches!(&error.error, HarvestError::Git(_)), "{error:?}");
         clear_fake_git(&parent);
         let _ = fs::remove_dir_all(&parent);
         let _ = fs::remove_dir_all(&bin);
@@ -10554,7 +10637,7 @@ mod tests {
 
         let error = harvest_repository(&parent.join("nested"))
             .expect_err("the leave-day batch read must time out");
-        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        assert!(matches!(&error.error, HarvestError::Git(_)), "{error:?}");
         clear_fake_git(&parent);
         let _ = fs::remove_dir_all(&parent);
         let _ = fs::remove_dir_all(&bin);
@@ -10570,7 +10653,7 @@ mod tests {
 
         let error = harvest_repository(&parent.join("nested"))
             .expect_err("a hung rev-parse must not look like a folder outside git");
-        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        assert!(matches!(&error.error, HarvestError::Git(_)), "{error:?}");
         clear_fake_git(&parent);
         let _ = fs::remove_dir_all(&parent);
         let _ = fs::remove_dir_all(&bin);
@@ -10622,7 +10705,7 @@ mod tests {
         // cannot pass on its own, because an ordinary git failure also ends
         // the scan after one invocation.
         let error = harvest_repository(&repo).expect_err("the pickaxe log must time out");
-        match error {
+        match error.error {
             HarvestError::Git(message) => assert!(
                 message.contains("git did not finish within 10000 ms"),
                 "the scan error must carry the deadline's message: {message}"
@@ -10670,7 +10753,7 @@ mod tests {
         register_fake_git(&repo, &script);
 
         let error = harvest_repository(&repo).expect_err("the batch read must time out");
-        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        assert!(matches!(&error.error, HarvestError::Git(_)), "{error:?}");
         clear_fake_git(&repo);
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&bin);
@@ -11135,7 +11218,7 @@ mod tests {
 
         let error =
             harvest_repository(&repo).expect_err("a vanished listed blob must fail the scan");
-        match error {
+        match error.error {
             HarvestError::Git(message) => assert!(
                 message.contains("tasks/scope_vanished.md"),
                 "the scan error must name the vanished object's path: {message}"
@@ -11219,7 +11302,7 @@ mod tests {
             fs::write(&dot, contents).expect("git file");
 
             let error = harvest_repository(&repo).expect_err("an unparseable .git must fail");
-            match error {
+            match error.error {
                 HarvestError::Git(message) => assert!(
                     message.contains(&dot.display().to_string()),
                     "the error must name {dot:?}: {message}"
@@ -11249,7 +11332,7 @@ mod tests {
 
         let error = harvest_repository(&repo).expect_err("an unreadable .git must fail");
         fs::set_permissions(&dot, original).expect("restore");
-        match error {
+        match error.error {
             HarvestError::Git(message) => assert!(
                 message.contains(&dot.display().to_string()),
                 "the error must name {dot:?}: {message}"
@@ -11357,7 +11440,10 @@ mod tests {
         );
 
         let error = harvest_repository(&repo).expect_err("no tasks anywhere");
-        assert!(matches!(error, HarvestError::MissingTasks), "{error:?}");
+        assert!(
+            matches!(&error.error, HarvestError::MissingTasks),
+            "{error:?}"
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -11458,7 +11544,7 @@ mod tests {
 
         let error = harvest_repository(&parent.join("nested"))
             .expect_err("a failed enclosing leave-day lookup must stop the scan");
-        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        assert!(matches!(&error.error, HarvestError::Git(_)), "{error:?}");
         clear_fake_git(&parent);
         let _ = fs::remove_dir_all(&parent);
         let _ = fs::remove_dir_all(&bin);
@@ -11502,7 +11588,7 @@ mod tests {
 
         let error = harvest_repository(&parent.join("nested"))
             .expect_err("a failed enclosing pickaxe must stop the scan");
-        assert!(matches!(error, HarvestError::Git(_)), "{error:?}");
+        assert!(matches!(&error.error, HarvestError::Git(_)), "{error:?}");
         clear_fake_git(&parent);
         let _ = fs::remove_dir_all(&parent);
         let _ = fs::remove_dir_all(&bin);

@@ -2,9 +2,11 @@
 description: "Carry a harvest's skipped-file tally through a failed scan so the Update banner counts the skips it promises on the failure message too."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-26T15:10:22Z
-status: ready
+updated: 2026-11-27T06:41:37Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Count skipped files when a scan fails
