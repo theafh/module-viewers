@@ -49,7 +49,7 @@ No test in `scripts/tests/`, `task-viewer/src/launcher_tests.rs`, or `task-viewe
 
 Two harnesses reach `start`. `task-viewer/src/launcher_tests.rs` copies the launcher verbatim through `stage_launcher`, so a test staged there runs on the real `PORT=7880` and a live dashboard can be the holder. `task-viewer/tests/launcher_process_safety.rs` rewrites the `PORT=7880` line to a free port and stages a fake `cargo`, `open`, and `osascript` on `PATH`.
 
-Live sibling tasks share these surfaces. [The free-port race task](task-viewer_test-free-port-race.md) adds a candidate-list port helper for the same file and appends the retry rule to the same `TESTING.md` launcher bullet. [The moved-checkout ownership task](task-viewer_launcher-moved-checkout-ownership.md) rewrites the same port-holder branch so a `task-viewer` binary from another path stops counting as "another process". The foreign-PID stop test verifies an existing sentence in that same `TESTING.md` bullet and adds none.
+Live sibling tasks share these surfaces. [The free-port race task](task-viewer_test-free-port-race.md) adds a candidate-list port helper for the same file and appends the retry rule to the same `TESTING.md` launcher bullet. [The moved-checkout ownership task](archive/task-viewer_launcher-moved-checkout-ownership.md) rewrites the same port-holder branch so a `task-viewer` binary from another path stops counting as "another process". The foreign-PID stop test verifies an existing sentence in that same `TESTING.md` bullet and adds none.
 
 ## Approach
 

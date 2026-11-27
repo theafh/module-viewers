@@ -23,7 +23,7 @@ Each launcher copy carries one `PORT=7880` line, which `Root::from_dir` rewrites
 
 The launcher tests that never start a server keep `free_loopback_port`: the reused-PID, symlinked-alias, and lock-renamed-away cases probe a port they never bind. The port-conflict task deliberately holds a port so `start` refuses.
 
-Live siblings share `TESTING.md`'s `- Launcher process safety:` bullet: [the port-conflict task](task-viewer_launcher-port-conflict-test.md) and [the guardrail claims task](archive/task-viewer_guardrail-status-and-radar-claims.md) rewrite it, [the moved-checkout task](task-viewer_launcher-moved-checkout-ownership.md) rewrites the port-holder branch this retry keys on, and the foreign-PID stop task verifies one of its sentences and adds none. This task's bullet edit merges into one pass with theirs.
+Live siblings share `TESTING.md`'s `- Launcher process safety:` bullet: [the port-conflict task](task-viewer_launcher-port-conflict-test.md) and [the guardrail claims task](archive/task-viewer_guardrail-status-and-radar-claims.md) rewrite it, [the moved-checkout task](archive/task-viewer_launcher-moved-checkout-ownership.md) rewrites the port-holder branch this retry keys on, and the foreign-PID stop task verifies one of its sentences and adds none. This task's bullet edit merges into one pass with theirs.
 
 ## Approach
 

@@ -2,8 +2,8 @@
 description: "Stop reporting a moved checkout's running server as stopped and as another process, and never claim a stop while the server still serves the port."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-27T20:29:50Z
-status: implemented
+updated: 2026-11-27T20:35:15Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -34,7 +34,7 @@ The port keeps answering and there is no supported way to stop the server short 
 
 The checkout-only rule is written down in the guardrail docs and must move with the code. `SECURITY.md` states "The launcher signals only a PID whose command line is this checkout's release binary." `FEATURES.md`'s launcher bullet states that the launcher recognizes its own server across the printed forms and "signals only such a process", and its `status` sentence says "the running branch prints the PID line and the `Access at:` URL while the stopped branch prints one line, and the exit code carries the answer." `TESTING.md`'s launcher process-safety case requires that `is_ours` "rejects a path outside the checkout".
 
-Other live tasks edit the same launcher test file and launcher regions, including [task-viewer_launcher-port-conflict-test.md](task-viewer_launcher-port-conflict-test.md), which keeps and tests `start_binary`'s port-holder refusal, and [task-viewer_launcher-foreign-pid-stop-test.md](task-viewer_launcher-foreign-pid-stop-test.md), which makes `do_stop`'s `is_ours` guards load-bearing. The foreign-PID stop test follows this task, because it targets the widened `is_ours` and the changed `do_stop`; the port-conflict task is the soft companion with no direction and may land either side. Every live `task-viewer_launcher-*` task that adds cases to `task-viewer/src/launcher_tests.rs` rebases its cases onto the shared driver.
+Other live tasks edit the same launcher test file and launcher regions, including [task-viewer_launcher-port-conflict-test.md](../task-viewer_launcher-port-conflict-test.md), which keeps and tests `start_binary`'s port-holder refusal, and [task-viewer_launcher-foreign-pid-stop-test.md](../task-viewer_launcher-foreign-pid-stop-test.md), which makes `do_stop`'s `is_ours` guards load-bearing. The foreign-PID stop test follows this task, because it targets the widened `is_ours` and the changed `do_stop`; the port-conflict task is the soft companion with no direction and may land either side. Every live `task-viewer_launcher-*` task that adds cases to `task-viewer/src/launcher_tests.rs` rebases its cases onto the shared driver.
 
 ## Approach
 
@@ -48,7 +48,7 @@ Other live tasks edit the same launcher test file and launcher regions, includin
 
 The port is shared by every checkout, so a task-viewer binary on it is this app's server and the launcher's stop owns it. An unrelated listener stays untouched.
 
-**Out of scope:** removing an installed Dock tile or `.desktop` entry, which [make uninstall](task-viewer_make-uninstall.md) owns, changing the checkout path the launcher embeds at install time, and identifying a listener on a machine with neither `lsof` nor `ss` and no PID file, where the launcher cannot know the process.
+**Out of scope:** removing an installed Dock tile or `.desktop` entry, which [make uninstall](../task-viewer_make-uninstall.md) owns, changing the checkout path the launcher embeds at install time, and identifying a listener on a machine with neither `lsof` nor `ss` and no PID file, where the launcher cannot know the process.
 
 ## Acceptance
 
