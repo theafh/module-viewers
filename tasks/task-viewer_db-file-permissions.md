@@ -27,7 +27,7 @@ SQLite copies the database file's mode only when it creates a `-wal` or `-shm` f
 4. Add a `#[cfg(unix)]` test: a newly created database is 0600; a database seeded 0644 is 0600 after `init`; and a database left beside 0644 `-wal` and `-shm` files, asserted 0644 before `init`, has both sidecars at 0600 after `init`.
 5. Record the rule as a new sentence in `SECURITY.md`'s `## Data` section, in the `## Components` paragraph of `ARCHITECTURE.md` that opens `**`task-viewer/src/db.rs`**` (append to that paragraph, which other live database tasks also extend, rather than replacing its text), and in `TESTING.md`'s `- Database:` bullet under `## What Must Be Covered`.
 
-When [task-viewer_db-refuse-foreign-sqlite-file](task-viewer_db-refuse-foreign-sqlite-file.md) lands first, its refusal check runs inside `migrate_locked` before `SCHEMA`, so the tighten moves after that check and before `SCHEMA`, and a file the check refuses keeps the mode it was found with. Until then the tighten runs on the path task-viewer opens.
+When [task-viewer_db-refuse-foreign-sqlite-file](archive/task-viewer_db-refuse-foreign-sqlite-file.md) lands first, its refusal check runs inside `migrate_locked` before `SCHEMA`, so the tighten moves after that check and before `SCHEMA`, and a file the check refuses keeps the mode it was found with. Until then the tighten runs on the path task-viewer opens.
 
 **Out of scope:** changing the default database location, and chmod'ing the user's home directory.
 
