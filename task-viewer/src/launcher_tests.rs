@@ -932,14 +932,17 @@ kill() {
 }
 do_stop
 echo "status=$?"
-# Drop the logging stub first, so the probe below asks the real `kill` about a
-# process the stub never signalled.
+# Drop the logging stub first, so the trailing `kill -9 "$foreign"` cleanup
+# below reaches the real builtin instead of appending to $KILL_LOG. The probe
+# asks `command ps` to reach the real `ps` past this driver's stub above, and
+# rejects a zombie state that `kill -0` would accept, so an exited child reads
+# as dead.
 unset -f kill
-if kill -0 "$foreign" 2>/dev/null; then
-    echo "foreign-alive"
-else
-    echo "foreign-dead"
-fi
+state=$(command ps -p "$foreign" -o stat= 2>/dev/null) || state=""
+case "$state" in
+    "" | Z*) echo "foreign-dead" ;;
+    *) echo "foreign-alive" ;;
+esac
 kill -9 "$foreign" 2>/dev/null || true
 wait "$foreign" 2>/dev/null || true
 "#;

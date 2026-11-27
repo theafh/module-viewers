@@ -2,9 +2,11 @@
 description: "Make the foreign-PID stop test's liveness probe read the child's process state, so an exited or zombie child cannot print foreign-alive and pass the test for the wrong reason."
 scope: task-viewer
 created: 2026-11-27T21:24:30Z
-updated: 2026-11-27T22:44:27Z
-status: open
+updated: 2026-11-27T23:07:33Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Make the foreign-PID stop test's liveness probe reject a zombie child
@@ -38,10 +40,10 @@ The test and its driver were created by the archived finished task [Test the sto
 
 ## Approach
 
-1. In `REUSED_FOREIGN_PID_DRIVER`, replace the `kill -0 "$foreign"` verdict with a state read that bypasses the driver's `ps()` stub: mirror `MOVED_STOP_DRIVER`'s `alive()` helper, running `command ps -p "$foreign" -o stat=`, and treat a non-zero exit, an empty state, and a state beginning with `Z` as dead. Keep `unset -f kill` before the probe so the logging `kill` stub cannot answer it, and keep the printed `foreign-alive` / `foreign-dead` tokens the Rust assertion reads.
-2. Rewrite the probe comment in place so it names both reasons for the shape: the real `ps` is reached past the driver's stub, and a zombie state is rejected because `kill -0` accepts it. Replace the current sentence that says the probe asks the real `kill`, rather than adding a second explanation beside it.
+1. In `REUSED_FOREIGN_PID_DRIVER`, replace the `kill -0 "$foreign"` verdict with a state read that bypasses the driver's `ps()` stub: mirror `MOVED_STOP_DRIVER`'s `alive()` helper, running `command ps -p "$foreign" -o stat=`, and treat a non-zero exit, an empty state, and a state beginning with `Z` as dead. Keep `unset -f kill` before the probe so the trailing `kill -9 "$foreign"` cleanup reaches the real builtin instead of the logging stub that appends to `$KILL_LOG`, and keep the printed `foreign-alive` / `foreign-dead` tokens the Rust assertion reads.
+2. Rewrite the comment above `unset -f kill` in place so it names every reason for the shape once: the unset keeps the trailing `kill -9 "$foreign"` cleanup off the logging stub, the probe reaches the real `ps` past the driver's `ps()` stub, and a zombie state is rejected because `kill -0` accepts it. Replace the current sentence that says the probe asks the real `kill`, rather than adding a second explanation beside it.
 3. Leave `do_stop`, the driver's `ps()` stub, the stdout assertions, and the empty kill-log assertion untouched.
-4. Prove the new probe with a staged fake `ps` earlier on `PATH` that prints `Z` for the state read: the test must fail on the `foreign-alive` assertion, and pass again once the fake `ps` is removed. Record both outcomes in the change's verification notes rather than committing the fake.
+4. Prove the new probe with a staged fake `ps` earlier on `PATH` that prints `Z` for the state read: the test must fail on the `foreign-alive` assertion, and pass again once the fake `ps` is removed.
 
 **Out of scope:** rewriting the closing `kill -0` probes in other drivers of the same file, such as `MOVED_STOP_DRIVER`'s `server-alive` / `server-dead` read; this task strengthens the foreign-PID driver's probe only.
 
@@ -49,7 +51,7 @@ The test and its driver were created by the archived finished task [Test the sto
 
 - In `REUSED_FOREIGN_PID_DRIVER`, the liveness verdict comes from `command ps -p "$foreign" -o stat=` and reports `foreign-alive` only for a non-empty state that does not begin with `Z`; the driver contains no `kill -0 "$foreign"` verdict.
 - The probe bypasses the driver's `ps()` stub, proven by the state read naming `command ps` (or an `unset -f ps` before it) while the stub still answers only `-ww`.
-- The probe comment names the stub bypass and the zombie rejection, and the old sentence that says the probe asks the real `kill` is gone, leaving one canonical explanation.
+- The comment above `unset -f kill` names the unset's reason — the trailing `kill -9 "$foreign"` cleanup must reach the real builtin rather than the logging stub — and names the probe's stub bypass and zombie rejection, with the old sentence that says the probe asks the real `kill` gone, leaving one canonical explanation.
 - The `task-viewer is not running` absence, the `Stopping task-viewer (PID: ` and `Force stopping...` lines, the `status=0` line, and the empty kill-log assertion are unchanged, and the driver still prints the `foreign-alive` / `foreign-dead` tokens the Rust assertion reads.
 - Staged check, run once and then reverted: put a fake `ps` first on `PATH` that prints `Z` for `-o stat= -p <pid>` and nothing else, run `cargo test -p task-viewer launcher_stop_guards_each_kill_against_a_foreign_pid`, and confirm it fails on the `foreign-alive` assertion; remove the fake and confirm the test passes again.
 - `make test` passes.
