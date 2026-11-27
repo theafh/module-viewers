@@ -172,6 +172,49 @@ input[type="search"] {
     font-size: 0.9rem;
 }
 
+/* The applied-filter strip: a readable summary, one removable chip per filter,
+   and the Clear link that returns to the project's unfiltered list. */
+.task-filters {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+}
+
+.task-filter-summary {
+    margin: 0;
+    color: var(--text-secondary);
+}
+
+.filter-chips {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.filter-chip {
+    display: inline-block;
+    padding: 0.2rem 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-primary);
+    text-decoration: none;
+}
+
+.filter-chip:hover,
+.filter-chip:focus-visible {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.filter-clear {
+    color: var(--text-secondary);
+}
+
 .task-list td code {
     /* A stored path is one unbroken token, so break it anywhere rather than
        let it set the table's min-content width and scroll the page. */

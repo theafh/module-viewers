@@ -30,6 +30,17 @@
     <a class="btn btn-secondary" href="/charts.csv?{{ charts_query }}">Charts CSV</a>
     <a class="btn btn-secondary" href="/charts.json?{{ charts_query }}">Charts JSON</a>
 </form>
+{% if filter_summary %}
+<div class="task-filters">
+    <p class="task-filter-summary">{{ filter_summary }}</p>
+    <ul class="filter-chips">
+        {% for chip in filter_chips %}
+        <li><a class="filter-chip" href="{{ chip.href }}" aria-label="Remove filter: {{ chip.label }}">{{ chip.label }} <span aria-hidden="true">×</span></a></li>
+        {% endfor %}
+    </ul>
+    <a class="filter-clear" href="{{ clear_href }}">Clear</a>
+</div>
+{% endif %}
 <table class="task-list">
     <thead>
         <tr>

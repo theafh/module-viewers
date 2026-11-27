@@ -2,9 +2,11 @@
 description: "Show the task list's active kind, date window, search, and scope filters as a readable summary with removable chips and a Clear link."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T15:25:47Z
-status: ready
+updated: 2026-11-27T00:49:39Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Show the task list's active filters

@@ -1853,6 +1853,142 @@ fn sort_task_rows(rows: &mut [series::TaskRecord], sort: TaskSort) {
     });
 }
 
+/// The readable summary of the filters a `/tasks` request applied, the chips
+/// that drop one filter each, and the Clear link that returns to the project's
+/// unfiltered list. Built from the resolved `TaskFilter`, so a literal the
+/// filter ignores never names a filter or rides a link.
+struct AppliedFilters {
+    summary: String,
+    chips: Vec<AppliedFilterView>,
+    clear_href: String,
+}
+
+/// One applied filter as a chip: its readable label and the link that
+/// re-requests the list without it.
+#[derive(Serialize)]
+struct AppliedFilterView {
+    label: String,
+    href: String,
+}
+
+/// The filter pairs the applied filters carry onto a chip link: the project,
+/// then every filter the request resolved to. The raw `q` rides along so the
+/// search text keeps its case, while the day axis and its window travel as one
+/// group because a windowless `date` narrows nothing.
+fn applied_pairs(filter: &TaskFilter, q: &str, project: &str) -> Vec<(&'static str, String)> {
+    let mut pairs = vec![("project", project.to_string())];
+    if let Some(kind) = filter.kind {
+        pairs.push(("kind", kind.as_str().to_string()));
+    }
+    if let Some(scope) = &filter.scope {
+        pairs.push(("scope", scope.clone()));
+    }
+    if filter.q.is_some() && !q.is_empty() {
+        pairs.push(("q", q.to_string()));
+    }
+    if filter.from.is_some() || filter.to.is_some() {
+        let axis = match filter.date {
+            DateAxis::Created => "created",
+            DateAxis::Shipped => "shipped",
+        };
+        pairs.push(("date", axis.to_string()));
+        if let Some(from) = filter.from {
+            pairs.push(("from", crate::dates::format_date(from)));
+        }
+        if let Some(to) = filter.to {
+            pairs.push(("to", crate::dates::format_date(to)));
+        }
+    }
+    pairs
+}
+
+/// The readable day-axis-and-window text shared by the summary and its chip,
+/// so the two always name the same filter.
+fn date_window_text(filter: &TaskFilter) -> Option<String> {
+    let axis = match filter.date {
+        DateAxis::Created => "created",
+        DateAxis::Shipped => "shipped",
+    };
+    let from = filter.from.map(crate::dates::format_date);
+    let to = filter.to.map(crate::dates::format_date);
+    match (from, to) {
+        (Some(from), Some(to)) => Some(format!("{axis} {from}–{to}")),
+        (Some(from), None) => Some(format!("{axis} since {from}")),
+        (None, Some(to)) => Some(format!("{axis} through {to}")),
+        (None, None) => None,
+    }
+}
+
+/// The chip link: every applied filter but the dropped one, then the current
+/// sort and direction so a chip never silently re-sorts the list.
+fn chip_href(filter: &TaskFilter, q: &str, project: &str, sort: TaskSort, drop: &str) -> String {
+    let drop_day = drop == "date";
+    let mut pairs = applied_pairs(filter, q, project)
+        .into_iter()
+        .filter(|(name, _)| *name != drop && !(drop_day && matches!(*name, "date" | "from" | "to")))
+        .collect::<Vec<_>>();
+    pairs.push(("sort", sort.key.as_str().to_string()));
+    pairs.push(("dir", sort.dir.as_str().to_string()));
+    format!("/tasks?{}", encode_pairs(&pairs))
+}
+
+/// Resolve the summary, chips, and Clear link from the filter the request
+/// applied. The project is page context and never a filter, so it stays on
+/// every link and is never named.
+fn applied_filters(
+    filter: &TaskFilter,
+    query: &TasksQuery,
+    project: &str,
+    sort: TaskSort,
+) -> AppliedFilters {
+    let q = query.q.trim();
+    let mut labels = Vec::new();
+    let mut chips = Vec::new();
+    if let Some(kind) = filter.kind {
+        let label = kind.as_str().to_string();
+        labels.push(label.clone());
+        chips.push(AppliedFilterView {
+            label,
+            href: chip_href(filter, q, project, sort, "kind"),
+        });
+    }
+    if let Some(scope) = &filter.scope {
+        let label = format!("scope {scope}");
+        labels.push(label.clone());
+        chips.push(AppliedFilterView {
+            label,
+            href: chip_href(filter, q, project, sort, "scope"),
+        });
+    }
+    if filter.q.is_some() && !q.is_empty() {
+        let label = format!("search “{q}”");
+        labels.push(label.clone());
+        chips.push(AppliedFilterView {
+            label,
+            href: chip_href(filter, q, project, sort, "q"),
+        });
+    }
+    if let Some(label) = date_window_text(filter) {
+        labels.push(label.clone());
+        chips.push(AppliedFilterView {
+            label,
+            href: chip_href(filter, q, project, sort, "date"),
+        });
+    }
+    let summary = if labels.is_empty() {
+        String::new()
+    } else {
+        format!("Filtered to {}", labels.join(" · "))
+    };
+    AppliedFilters {
+        summary,
+        chips,
+        // Clear drops every filter and the order, keeping the project, so the
+        // list returns to its default scope-then-path order.
+        clear_href: format!("/tasks?project={}", encode_query(project)),
+    }
+}
+
 /// The rows one `/tasks` request selects, shared by the HTML list and the CSV
 /// export so both read one filter.
 struct TaskSelection {
@@ -1898,6 +2034,8 @@ async fn render_tasks(
         None => "all".to_string(),
     };
     let sort = TaskSort::from_query(query);
+    let filter = TaskFilter::from_query(query);
+    let applied = applied_filters(&filter, query, &project, sort);
     let page = TasksPage {
         version: state.static_version.clone(),
         page: "tasks",
@@ -1915,6 +2053,9 @@ async fn render_tasks(
         sort: sort.key.as_str().to_string(),
         dir: sort.dir.as_str().to_string(),
         scopes: selection.scopes,
+        filter_summary: applied.summary,
+        filter_chips: applied.chips,
+        clear_href: applied.clear_href,
         headers: task_sort_headers(query, &project, sort),
         export_query: export_query(query, &project, sort),
         charts_query: format!("project={}", encode_query(&project)),
@@ -2653,6 +2794,13 @@ struct TasksPage {
     dir: String,
     /// The distinct scopes of the current project filter, for the scope select.
     scopes: Vec<String>,
+    /// The readable summary of the filters the request applied, empty when
+    /// none is applied so the page renders no filter strip.
+    filter_summary: String,
+    /// One removable chip per applied filter.
+    filter_chips: Vec<AppliedFilterView>,
+    /// The link that drops every filter and the order, keeping the project.
+    clear_href: String,
     /// The six sortable headers, with their links and active state.
     headers: Vec<TaskSortHeader>,
     /// The percent-encoded query the Export CSV link carries.
@@ -10767,6 +10915,100 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Covers: each of kind, the date axis plus window, the search text, and the
+    /// scope renders as a readable summary and one removable chip, a chip link
+    /// drops only its own filter while keeping the rest and the current order,
+    /// the Clear link returns to the project's unfiltered default-sorted list,
+    /// and a request whose literals the filter ignores shows no filter strip.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_active_filters_render_summary_chips_and_clear() {
+        let (state, path, alpha, _beta) = seeded_task_list("tasks_active_filters").await;
+        for (query, summary) in [
+            ("kind=live", "Filtered to live"),
+            ("scope=beta", "Filtered to scope beta"),
+            ("q=GAMMA", "Filtered to search “GAMMA”"),
+            (
+                "date=shipped&from=2026-05-10",
+                "Filtered to shipped since 2026-05-10",
+            ),
+            ("to=2026-03-01", "Filtered to created through 2026-03-01"),
+        ] {
+            let body = task_list_body(&state, query).await;
+            assert!(body.contains(summary), "{query} shows {summary}: {body}");
+        }
+
+        let query = format!(
+            "project={alpha}&kind=finished&scope=alpha&q=DONE&date=shipped&from=2026-05-10&to=2026-05-10&sort=path&dir=desc"
+        );
+        let body = task_list_body(&state, &query).await;
+        assert!(
+            body.contains(
+                "Filtered to finished · scope alpha · search “DONE” · shipped 2026-05-10–2026-05-10"
+            ),
+            "the summary names every applied filter: {body}"
+        );
+        assert_eq!(
+            body.matches("class=\"filter-chip\"").count(),
+            4,
+            "one chip per applied filter: {body}"
+        );
+        assert_eq!(
+            filter_chip_href(&body, "finished"),
+            format!(
+                "/tasks?project={alpha}&scope=alpha&q=DONE&date=shipped&from=2026-05-10&to=2026-05-10&sort=path&dir=desc"
+            ),
+            "the kind chip drops only the kind"
+        );
+        assert_eq!(
+            filter_chip_href(&body, "scope alpha"),
+            format!(
+                "/tasks?project={alpha}&kind=finished&q=DONE&date=shipped&from=2026-05-10&to=2026-05-10&sort=path&dir=desc"
+            ),
+            "the scope chip drops only the scope"
+        );
+        assert_eq!(
+            filter_chip_href(&body, "search “DONE”"),
+            format!(
+                "/tasks?project={alpha}&kind=finished&scope=alpha&date=shipped&from=2026-05-10&to=2026-05-10&sort=path&dir=desc"
+            ),
+            "the search chip drops only the search"
+        );
+        assert_eq!(
+            filter_chip_href(&body, "shipped 2026-05-10–2026-05-10"),
+            format!("/tasks?project={alpha}&kind=finished&scope=alpha&q=DONE&sort=path&dir=desc"),
+            "the day chip drops the axis and its window"
+        );
+        assert_eq!(
+            filter_clear_href(&body),
+            format!("/tasks?project={alpha}"),
+            "Clear keeps the project and drops every filter and the order"
+        );
+
+        let chip = filter_chip_href(&body, "finished");
+        let cleared =
+            task_list_body(&state, chip.strip_prefix("/tasks?").expect("chip href")).await;
+        assert!(
+            cleared.contains("Filtered to scope alpha · search “DONE” · shipped"),
+            "following the kind chip keeps the other filters: {cleared}"
+        );
+        assert!(
+            !cleared.contains("Filtered to finished"),
+            "following the kind chip drops the kind: {cleared}"
+        );
+
+        let ignored = task_list_body(&state, "kind=all&date=created&sort=path&dir=desc").await;
+        assert!(
+            !ignored.contains("task-filters") && !ignored.contains("Filtered to"),
+            "a kind=all and windowless date=created request names no filter: {ignored}"
+        );
+        let plain = task_list_body(&state, "").await;
+        assert!(
+            !plain.contains("class=\"task-filters\"") && !plain.contains(">Clear<"),
+            "an unfiltered list renders no summary or Clear link: {plain}"
+        );
+        cleanup(&path);
+    }
+
     /// Covers: the default view keeps the scope-then-path order when neither
     /// `sort` nor `dir` is present, and an explicit `scope`/`asc` request
     /// reproduces it.
@@ -11149,6 +11391,29 @@ mod tests {
         let rest = &cell[start..];
         let end = rest.find('"').expect("aria-sort end");
         Some(rest[..end].to_string())
+    }
+
+    /// One applied-filter chip's link, found by the label its `aria-label`
+    /// names, HTML-decoded.
+    fn filter_chip_href(body: &str, label: &str) -> String {
+        let marker = format!("aria-label=\"Remove filter: {label}\"");
+        let start = body
+            .find(&marker)
+            .unwrap_or_else(|| panic!("no filter chip labelled {label}: {body}"));
+        let before = &body[..start];
+        let href_start = before.rfind("href=\"").expect("chip href") + "href=\"".len();
+        let rest = &body[href_start..];
+        let end = rest.find('"').expect("chip href end");
+        html_unescape(&rest[..end])
+    }
+
+    /// The applied-filter strip's Clear link, HTML-decoded.
+    fn filter_clear_href(body: &str) -> String {
+        let marker = "class=\"filter-clear\" href=\"";
+        let start = body.find(marker).expect("clear link") + marker.len();
+        let rest = &body[start..];
+        let end = rest.find('"').expect("clear href end");
+        html_unescape(&rest[..end])
     }
 
     /// Parse a CSV body with the export's quoting rule: a double quote opens a
