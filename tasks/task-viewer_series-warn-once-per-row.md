@@ -11,7 +11,7 @@ reported-by: "Andreas Hoffmann"
 
 ## Goal
 
-Every warning the chart read path emits per render is logged once per process. Today that covers `series::dashboard`'s after-today created, ship, and deferred-leave scans and its pre-floor scan, `row_to_record`'s unparseable `updated`, and `load_tasks`'s unparseable `kind` or `created`, . Repeated dashboard reads, `/charts.json`, and `/charts.csv` do not repeat a warning because all three build through the shared `chart_board` payload builder.
+Every warning the chart read path emits per render is logged once per process. Today that covers `series::dashboard`'s after-today created, ship, and deferred-leave scans and its pre-floor scan, `row_to_record`'s unparseable `updated`, and `load_tasks`'s unparseable `kind` or `created`, keyed by repository id, path, the warning's own event, and the offending value or date. Repeated dashboard reads, `/charts.json`, and `/charts.csv` do not repeat a warning because all three build through the shared `chart_board` payload builder.
 
 ## Context
 
@@ -26,7 +26,7 @@ The set accepts any event label, so the sibling tasks' future warnings key throu
 3. Keep the production set process-wide. In a `#[cfg(test)]` build the gate always uses a thread-local set, so every test gets a fresh instance without opting in and parallel tests stay isolated, even where two existing fixtures share a key. The new warning tests call `series::dashboard` and `load_tasks` directly, because the web render paths run on `spawn_blocking` threads a thread-local override cannot reach; a page- or export-level test would silently use the process-wide set.
 4. Keep the warning text, fields, level, and target unchanged.
 5. Add a series test: two payload builds over the same bad row emit each of its warnings once; a row whose created and ship days are both after today warns twice and neither repeats; a deferred leave day after today and a pre-floor row each warn once across two builds; a second row with a different path emits its own; a fresh per-test set re-enables the first. Add a `load_tasks` test that loads the same row with an unparseable `kind` or `created` twice and observes its warning once, and one that loads a row with an unparseable `updated` twice and observes that warning once.
-6. Record the once-per-process rule where the warnings are stated: amend ARCHITECTURE.md's `## Extraction Rules` pre-floor sentence that says it "logs one warning naming its repository, path, and date", and TESTING.md's `Series:` and `Database:` bullets, to state that warning logs once per process, and widen the `Series:` bullet's after-today sentence to cover the created, ship, and deferred-leave warnings.
+6. Record the once-per-process rule where the warnings are stated: amend ARCHITECTURE.md's `## Extraction Rules` pre-floor sentence that says it "logs one warning naming its repository, path, and date", and TESTING.md's `Series:` and `Database:` bullets, to state that each warning logs once per process, and widen the `Series:` bullet's after-today sentence to cover the created, ship, and deferred-leave warnings.
 
 **Out of scope:** moving the check to store time. **Out of scope:** changing which rows warn.
 
