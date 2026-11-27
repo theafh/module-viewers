@@ -2,9 +2,11 @@
 description: "Drive do_stop past its early return with a foreign PID so the is_ours guard before each kill is actually exercised."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T15:11:45Z
-status: ready
+updated: 2026-11-27T21:12:35Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Test the stop guard against a foreign PID

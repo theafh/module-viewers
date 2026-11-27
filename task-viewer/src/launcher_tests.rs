@@ -895,6 +895,118 @@ fn launcher_stop_leaves_a_foreign_process_alone() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Pass the running check with a live foreign process, then answer every later
+/// probe as that process, so both `is_ours` guards before `do_stop`'s kills see
+/// a foreign PID. The fake `ps` models the PID-reuse race the guards exist for:
+/// the running check read the PID as this checkout's server, and the PID
+/// belonged to a foreign process by the time the kill sites re-checked it.
+const REUSED_FOREIGN_PID_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+port_pid() { :; }
+ps() {
+    case " $* " in
+        *" -ww "*)
+            # Only the liveness check answers as this checkout's binary; the
+            # guards and the re-test ask from `do_stop` and see the foreign line.
+            case " ${FUNCNAME[*]} " in
+                *" is_running "*) printf '%s\n' "$BINARY" ;;
+                *) printf '%s\n' "/bin/sleep 60" ;;
+            esac
+            ;;
+    esac
+}
+# Launch the foreign process before stubbing sleep: a stub in place first would
+# turn this background job into a no-op subshell, and the liveness probe below
+# would then read a process that is already gone.
+sleep 60 &
+foreign=$!
+echo "$foreign" >"$PID_FILE"
+sleep() { :; }
+kill() {
+    printf '%s\n' "$*" >>"$KILL_LOG"
+    return 0
+}
+do_stop
+echo "status=$?"
+# Drop the logging stub first, so the probe below asks the real `kill` about a
+# process the stub never signalled.
+unset -f kill
+if kill -0 "$foreign" 2>/dev/null; then
+    echo "foreign-alive"
+else
+    echo "foreign-dead"
+fi
+kill -9 "$foreign" 2>/dev/null || true
+wait "$foreign" 2>/dev/null || true
+"#;
+
+/// Covers: a stop that passes the running check with a PID a foreign process now
+/// owns reaches both kill sites and sends it no signal, so it stays alive.
+///
+/// The empty kill log is what makes each `is_ours` guard load-bearing: removing
+/// either `if is_ours "$pid"; then` wrapper around `kill "$pid"` or `kill -9
+/// "$pid"` in `do_stop` logs that signal here and fails this test, checked by
+/// deleting each guard from a copy of the launcher in turn.
+#[test]
+fn launcher_stop_guards_each_kill_against_a_foreign_pid() {
+    let dir = unique_temp_dir("launcher_reused_foreign_stop");
+    let launcher = stage_root(&dir);
+    let kill_log = dir.join("kills.log");
+
+    let output = run_driver(
+        &dir,
+        REUSED_FOREIGN_PID_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            (
+                "KILL_LOG",
+                kill_log.to_str().expect("the temp path is valid UTF-8"),
+            ),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !stdout.contains("task-viewer is not running"),
+        "the stop must pass the early return: {stdout}",
+    );
+    assert!(
+        stdout.contains("Stopping task-viewer (PID: "),
+        "the stop must read the foreign PID past the running check: {stdout}",
+    );
+    assert!(
+        stdout.contains("Force stopping..."),
+        "the stop must reach the second kill site: {stdout}",
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=0"),
+        "the stop must report success: {stdout}",
+    );
+    assert!(
+        stdout.lines().any(|line| line == "foreign-alive"),
+        "the foreign process must survive: {stdout}",
+    );
+    let signals = fs::read_to_string(&kill_log).unwrap_or_default();
+    assert!(
+        signals.is_empty(),
+        "no signal may reach the foreign process, logged: {signals}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Hold a PID the launcher must read as its own server while its kill does
 /// nothing, so the stop has to report a survivor.
 const SURVIVOR_DRIVER: &str = r#"#!/bin/bash
