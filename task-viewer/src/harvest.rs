@@ -1489,8 +1489,9 @@ fn parse_batch<R: BufRead>(
 /// What the walk's type gate decided about one entry, before anything is read.
 enum EntryGate {
     /// A regular file, or a symlink whose target is a regular file inside the
-    /// configured folder.
-    Pass,
+    /// configured folder. A symlink carries the canonical target the gate
+    /// accepted, so the caller reads the file the gate checked.
+    Pass { read_path: Option<PathBuf> },
     /// The entry contributes no row. Its warning names the reason, the entry's
     /// kind, and a symlink's target when it has one.
     Reject {
@@ -1508,6 +1509,11 @@ enum EntryGate {
 /// containment check. A symlink passes only when `fs::canonicalize` resolves it
 /// to a regular file under `root`; a target that does not resolve is a dangling
 /// link, which fails the gate like any other entry instead of failing the scan.
+///
+/// The check covers the tree as the walk saw it. A symlink that passes carries
+/// the canonical target it resolved to, and the caller reads the row through
+/// that target, so a link swapped between the check and the read cannot point
+/// the read outside the folder.
 fn gate_entry(entry: &walkdir::DirEntry, root: &Path) -> EntryGate {
     let file_type = entry.file_type();
     let is_link = walkdir::DirEntry::path_is_symlink;
@@ -1522,7 +1528,9 @@ fn gate_entry(entry: &walkdir::DirEntry, root: &Path) -> EntryGate {
             };
         };
         if target.is_file() && target.starts_with(root) {
-            return EntryGate::Pass;
+            return EntryGate::Pass {
+                read_path: Some(target),
+            };
         }
         return EntryGate::Reject {
             reason: SkipReason::EscapingSymlink,
@@ -1531,7 +1539,7 @@ fn gate_entry(entry: &walkdir::DirEntry, root: &Path) -> EntryGate {
         };
     }
     if file_type.is_file() {
-        return EntryGate::Pass;
+        return EntryGate::Pass { read_path: None };
     }
     EntryGate::Reject {
         reason: SkipReason::NonRegularEntry,
@@ -1615,26 +1623,31 @@ fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow
         // entry produces no row, so it cannot claim a name in `union_files`,
         // and it is never opened, so a directory or FIFO cannot fail or hang
         // the walk.
-        if let EntryGate::Reject {
-            reason,
-            kind,
-            target,
-        } = gate_entry(&entry, &root)
-        {
-            if has_task_name_shape(&rel) {
-                record_skip(skipped, reason);
+        let read_path = match gate_entry(&entry, &root) {
+            EntryGate::Reject {
+                reason,
+                kind,
+                target,
+            } => {
+                if has_task_name_shape(&rel) {
+                    record_skip(skipped, reason);
+                }
+                warn_skipped_entry(&rel, kind, reason, target.as_deref());
+                continue;
             }
-            warn_skipped_entry(&rel, kind, reason, target.as_deref());
-            continue;
-        }
-        // The real on-disk path the walk reached, kept beside the lossy stored
-        // path so an evicted row is re-read from the file it came from. It is
-        // taken from the walk entry, never re-derived from `rel`, because a
-        // name that is not valid UTF-8 makes `rel` name no file.
-        let disk = path.to_path_buf();
+            EntryGate::Pass { read_path } => read_path,
+        };
+        // The real on-disk path the walk reached, or the canonical target the
+        // gate accepted for a symlink, kept beside the lossy stored path so an
+        // evicted row is re-read from the file it came from. A symlink is read
+        // through the target the gate checked, so a swap between the check and
+        // the read cannot redirect it. It is taken from the walk entry, never
+        // re-derived from `rel`, because a name that is not valid UTF-8 makes
+        // `rel` name no file.
+        let disk = read_path.unwrap_or_else(|| path.to_path_buf());
         #[cfg(test)]
         worktree_read_count::record(repo);
-        let read = read_worktree_file(path);
+        let read = read_worktree_file(&disk);
         #[cfg(test)]
         worktree_read_count::record_bytes(repo, &rel, read.bytes);
         let row = match read.outcome {
@@ -1664,7 +1677,7 @@ fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow
             Err(reason) => {
                 // The byte count comes from the file's metadata, so a file that
                 // cannot be opened or is not UTF-8 still reports its real size.
-                let bytes = fs::metadata(path)
+                let bytes = fs::metadata(&disk)
                     .map(|metadata| metadata.len())
                     .unwrap_or(0);
                 if has_task_name_shape(&rel) {
@@ -12067,12 +12080,11 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
-    #[cfg(unix)]
     #[test]
     fn harvest_warns_once_for_each_skipped_working_tree_task() {
-        // An oversized, a non-UTF-8, and an unreadable working-tree task each
-        // warn once with their path, their metadata byte count, and their own
-        // reason, and none contributes a row.
+        // An oversized and a non-UTF-8 working-tree task each warn once with
+        // their path, their metadata byte count, and their own reason, and
+        // neither contributes a row.
         let repo = scratch("harvest_skip_warnings");
         fs::create_dir_all(repo.join("tasks")).expect("tasks");
 
@@ -12090,9 +12102,49 @@ mod tests {
             .expect("binary metadata")
             .len();
 
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("skipped files must not fail the harvest");
+        assert!(tasks.is_empty(), "no skipped file charts: {tasks:?}");
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 2, "one warning per skip: {warnings:?}");
+        let cases = [
+            (
+                "tasks/scope_huge.md",
+                huge_bytes,
+                "is larger than the 4 MiB cap",
+            ),
+            ("tasks/scope_binary.md", binary_bytes, "is not valid UTF-8"),
+        ];
+        for (path, bytes, reason) in cases {
+            let matching: Vec<_> = warnings
+                .iter()
+                .filter(|warning| warning.contains(path))
+                .collect();
+            assert_eq!(matching.len(), 1, "one warning names {path}: {warnings:?}");
+            assert!(
+                matching[0].contains(&format!("bytes={bytes}")),
+                "the warning names {path}'s metadata byte count: {matching:?}"
+            );
+            assert!(
+                matching[0].contains(reason),
+                "the warning names {path}'s reason: {matching:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harvest_warns_once_for_an_unreadable_working_tree_task() {
         // An unreadable regular file cannot be opened, whatever the platform.
         // A process that can read it anyway, such as root, cannot exercise this
         // case, so restore the mode and skip the test.
+        let repo = scratch("harvest_skip_unreadable");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+
         let unreadable = repo.join("tasks/scope_unreadable.md");
         fs::write(&unreadable, task_text("2026-05-01", "2026-05-01", "open"))
             .expect("unreadable task");
@@ -12117,20 +12169,12 @@ mod tests {
         assert!(tasks.is_empty(), "no skipped file charts: {tasks:?}");
 
         let warnings = captured.take();
-        assert_eq!(warnings.len(), 3, "one warning per skip: {warnings:?}");
-        let cases = [
-            (
-                "tasks/scope_huge.md",
-                huge_bytes,
-                "is larger than the 4 MiB cap",
-            ),
-            ("tasks/scope_binary.md", binary_bytes, "is not valid UTF-8"),
-            (
-                "tasks/scope_unreadable.md",
-                unreadable_bytes,
-                "could not be read",
-            ),
-        ];
+        assert_eq!(warnings.len(), 1, "one warning per skip: {warnings:?}");
+        let cases = [(
+            "tasks/scope_unreadable.md",
+            unreadable_bytes,
+            "could not be read",
+        )];
         for (path, bytes, reason) in cases {
             let matching: Vec<_> = warnings
                 .iter()
