@@ -2,8 +2,8 @@
 description: "Warn on an unparseable stored ship or leave day and fall back so a finished task always leaves the backlog."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T19:28:16Z
-status: implemented
+updated: 2026-11-27T19:34:12Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
@@ -28,7 +28,7 @@ An unparseable value becomes `None` with no warning. `created` and `kind` that f
 
 ## Approach
 
-1. Parse both days explicitly in `row_to_record` and in `load_prior_tasks`, warning once per bad field and naming the repository, path, field, and raw value. Both readers key the warning through the once-per-process set that [the warn-once task](archive/task-viewer_series-warn-once-per-row.md) introduces, keyed by repository, path, field, and raw value, so one stored value warns once per process; give the prior-task read the repository name it needs to name.
+1. Parse both days explicitly in `row_to_record` and in `load_prior_tasks`, warning once per bad field and naming the repository, path, field, and raw value. Both readers key the warning through the once-per-process set that [the warn-once task](task-viewer_series-warn-once-per-row.md) introduces, keyed by repository, path, field, and raw value, so one stored value warns once per process; give the prior-task read the repository name it needs to name.
 2. Fall back for a finished row so a missing ship day ships on its leave day: `ship = ship.or(leave)`, then `leave = leave.or(ship).or(updated).or(created)`, then `ship = ship.or(leave)`. A parseable pair stays unchanged.
 3. Fall back for a deferred row: `leave = leave.or(updated).or(created)`. That fallback also moves the row's weekly deferred bar onto the fallback day, because the bar is counted by `leave_date`; the deferred bars still sum to `counts.deferred`.
 4. A live row keeps no day.
