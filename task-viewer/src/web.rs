@@ -3434,7 +3434,11 @@ async fn run_scan(state: AppState) -> Result<ScanReport, Banner> {
     .await)
 }
 
-type HarvestFn = dyn Fn(&std::path::Path, &[PriorTask]) -> Result<harvest::Harvested, harvest::HarvestFailure>
+type HarvestFn = dyn Fn(
+        &std::path::Path,
+        &[PriorTask],
+        Option<&str>,
+    ) -> Result<harvest::Harvested, harvest::HarvestFailure>
     + Send
     + Sync;
 
@@ -3602,12 +3606,27 @@ async fn spawn_harvest(
             Vec::new()
         }
     };
+    // Read the stored history key in the same stage, so a harvest compares the
+    // history it reads against what the last store wrote rather than a snapshot
+    // taken when the run listed the repositories.
+    let stored_history_key = match db::load_history_key(pool, repository_id).await {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::error!(%error, repository_id, "the stored history key could not be read");
+            None
+        }
+    };
     // The harvest borrows the prior rows, and the store compares against the
     // same snapshot, so the join hands the snapshot back beside its outcome.
+    // The stored history key travels with it, so the harvest reuses a cached
+    // leave day only while the history it reads still matches.
     let harvest_prior = prior.clone();
     let harvest = Arc::clone(harvest);
     harvests.spawn(async move {
-        let outcome = tokio::task::spawn_blocking(move || harvest(&path, &harvest_prior)).await;
+        let outcome = tokio::task::spawn_blocking(move || {
+            harvest(&path, &harvest_prior, stored_history_key.as_deref())
+        })
+        .await;
         (repository_id, prior, outcome)
     });
 }
@@ -3667,8 +3686,14 @@ async fn store_outcome(
     match outcome {
         Ok(Ok(harvested)) => {
             let skipped = harvested.skipped_count();
-            if let Err(error) =
-                db::replace_tasks(pool, repository_id, &harvested.tasks, store_hook.as_ref()).await
+            if let Err(error) = db::replace_tasks(
+                pool,
+                repository_id,
+                &harvested.tasks,
+                harvested.history_key.as_deref(),
+                store_hook.as_ref(),
+            )
+            .await
             {
                 tracing::error!(%error, repository_id, "replace failed");
                 record_scan_error(pool, repository_id, SAVE_ERROR).await;
@@ -3752,9 +3777,20 @@ async fn refresh_one(
             Vec::new()
         }
     };
+    let stored_history_key = match db::load_history_key(pool, repository_id).await {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::error!(%error, repository_id, "the stored history key could not be read");
+            None
+        }
+    };
     let harvest_prior = prior.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        harvest::harvest_repository_with_prior(&owned, &harvest_prior)
+        harvest::harvest_repository_with_prior(
+            &owned,
+            &harvest_prior,
+            stored_history_key.as_deref(),
+        )
     })
     .await;
     store_outcome(pool, repository_id, outcome, &prior, store_hook)
@@ -4691,6 +4727,7 @@ mod tests {
             &state.pool,
             repository_id,
             &rows,
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -4796,6 +4833,7 @@ mod tests {
             &state.pool,
             fresh_id,
             &rows,
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -4840,6 +4878,7 @@ mod tests {
             &state.pool,
             id,
             &[parsed_task()],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -4879,6 +4918,7 @@ mod tests {
             &state.pool,
             repository_id,
             &[parsed_task()],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -5261,6 +5301,7 @@ mod tests {
             &state.pool,
             scanned_id,
             &[],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -5326,9 +5367,15 @@ mod tests {
                 ..parsed_task()
             },
         ];
-        db::replace_tasks(&state.pool, id, &rows, immediate_store_hook().as_ref())
-            .await
-            .expect("store rows");
+        db::replace_tasks(
+            &state.pool,
+            id,
+            &rows,
+            None,
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("store rows");
         let unscanned = live_repository("repo_counts_unscanned");
         db::insert_repository(&state.pool, "unscanned", &unscanned.to_string_lossy())
             .await
@@ -5367,6 +5414,7 @@ mod tests {
             &state.pool,
             id,
             &[parsed_task()],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -5640,7 +5688,7 @@ mod tests {
         let failed = status_json(&state).await;
         assert_eq!(failed["failed_repositories"], serde_json::json!(1));
 
-        db::replace_tasks(&state.pool, id, &[], immediate_store_hook().as_ref())
+        db::replace_tasks(&state.pool, id, &[], None, immediate_store_hook().as_ref())
             .await
             .expect("successful store");
         let recovered = status_json(&state).await;
@@ -5723,6 +5771,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(moved);
+        cleanup(&path);
+    }
+
+    /// Covers: relocating a repository to a clone whose task bytes are identical
+    /// but whose archive commit differs re-walks the archived path, so the
+    /// stored ship day is the new clone's own day instead of the day the old
+    /// history produced.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_relocate_rewalks_a_clone_with_a_different_history() {
+        fn archived_at(name: &str, date: &str) -> PathBuf {
+            let repo = unique_temp_dir(name);
+            std::fs::create_dir_all(repo.join("tasks/archive")).expect("tasks");
+            git(
+                &repo,
+                &["init", "-b", "main", "--template="],
+                "2026-05-01T12:00:00+00:00",
+            );
+            // Byte-identical task files, so only the history separates them.
+            std::fs::write(
+                repo.join("tasks/archive/scope_one.md"),
+                "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: finished\n---\n\n# Task\n",
+            )
+            .expect("task");
+            git(&repo, &["add", "-A"], date);
+            git(&repo, &["commit", "-m", "archive"], date);
+            // The same origin, so the ref tips alone decide the history key.
+            git(
+                &repo,
+                &["remote", "add", "origin", "https://example.com/shared.git"],
+                date,
+            );
+            repo
+        }
+
+        let (mut state, path) = app_state("relocate_history").await;
+        let first = archived_at("relocate_history_first", "2026-06-01T12:00:00+00:00");
+        let second = archived_at("relocate_history_second", "2026-07-01T12:00:00+00:00");
+        let picked = first.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        add_repository(State(state.clone())).await;
+        let repository = db::list_repositories(&state.pool).await.expect("list")[0].clone();
+
+        let picked = second.clone();
+        state.picker = Arc::new(move || Ok(picked_path(&picked)));
+        let response =
+            relocate_repository(State(state.clone()), UrlPath(repository.repository_id)).await;
+        assert_eq!(
+            redirect_location(&response),
+            "/repositories?notice=repository-relocated"
+        );
+        let rows = db::load_tasks(&state.pool, Some(repository.repository_id))
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 1, "the archived task charts");
+        assert_eq!(
+            rows[0].ship_date,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 1).expect("day")),
+            "the relocated clone's own archive commit dates the task"
+        );
+        assert_eq!(rows[0].leave_date, rows[0].ship_date);
+
+        let _ = std::fs::remove_dir_all(first);
+        let _ = std::fs::remove_dir_all(second);
         cleanup(&path);
     }
 
@@ -6469,7 +6580,7 @@ mod tests {
         let harvest: Arc<HarvestFn> = {
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
-            Arc::new(move |_: &Path, _: &[PriorTask]| {
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
                 let running = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(running, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(50));
@@ -6551,7 +6662,7 @@ mod tests {
         let peak_buffered = Arc::new(AtomicUsize::new(0));
         let harvest: Arc<HarvestFn> = {
             let completed = Arc::clone(&completed);
-            Arc::new(move |_: &Path, _: &[PriorTask]| {
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
                 std::thread::sleep(Duration::from_millis(10));
                 completed.fetch_add(1, Ordering::SeqCst);
                 Ok(harvest::Harvested::from(vec![parsed_task()]))
@@ -6656,9 +6767,15 @@ mod tests {
                 db::insert_repository(&pool, &format!("repo{index:02}"), &repo.to_string_lossy())
                     .await
                     .expect("insert");
-            db::replace_tasks(&pool, id, &[parsed_task()], immediate_store_hook().as_ref())
-                .await
-                .expect("prior rows");
+            db::replace_tasks(
+                &pool,
+                id,
+                &[parsed_task()],
+                None,
+                immediate_store_hook().as_ref(),
+            )
+            .await
+            .expect("prior rows");
             folders.push(repo);
         }
         let repositories = db::list_repositories(&pool).await.expect("list");
@@ -6679,7 +6796,7 @@ mod tests {
             let prior_reads = Arc::clone(&prior_reads);
             let harvests_started = Arc::clone(&harvests_started);
             let over_read = Arc::clone(&over_read);
-            Arc::new(move |_: &Path, _: &[PriorTask]| {
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
                 let started = harvests_started.fetch_add(1, Ordering::SeqCst) + 1;
                 if prior_reads.load(Ordering::SeqCst) > started + 1 {
                     over_read.fetch_add(1, Ordering::SeqCst);
@@ -6733,7 +6850,7 @@ mod tests {
             let entries = Arc::clone(&entries);
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
-            Arc::new(move |_: &Path, _: &[PriorTask]| {
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
                 let index = entries.fetch_add(1, Ordering::SeqCst);
                 let running = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(running, Ordering::SeqCst);
@@ -6797,7 +6914,7 @@ mod tests {
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let harvest: Arc<HarvestFn> = {
             let entries = Arc::new(AtomicUsize::new(0));
-            Arc::new(move |_: &Path, _: &[PriorTask]| {
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
                 let index = entries.fetch_add(1, Ordering::SeqCst);
                 let _ = entered_tx.blocking_send(());
                 if index == 0
@@ -6833,8 +6950,9 @@ mod tests {
         let repository_id = db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
             .await
             .expect("insert");
-        state.harvest =
-            Arc::new(|_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(vec![parsed_task()])));
+        state.harvest = Arc::new(|_: &Path, _: &[PriorTask], _: Option<&str>| {
+            Ok(harvest::Harvested::from(vec![parsed_task()]))
+        });
 
         let response = send(state.clone(), form_post("/scan", None, None)).await;
         let location = redirect_location(&response);
@@ -6877,7 +6995,7 @@ mod tests {
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let harvest: Arc<HarvestFn> = {
             let entries = Arc::clone(&entries);
-            Arc::new(move |_: &Path, _: &[PriorTask]| {
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
                 let index = entries.fetch_add(1, Ordering::SeqCst);
                 let _ = entered_tx.blocking_send(());
                 if index == 0
@@ -6943,8 +7061,9 @@ mod tests {
         db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
             .await
             .expect("insert");
-        state.harvest =
-            Arc::new(|_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(vec![parsed_task()])));
+        state.harvest = Arc::new(|_: &Path, _: &[PriorTask], _: Option<&str>| {
+            Ok(harvest::Harvested::from(vec![parsed_task()]))
+        });
 
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
@@ -7075,8 +7194,9 @@ mod tests {
         db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
             .await
             .expect("insert");
-        state.harvest =
-            Arc::new(|_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(vec![parsed_task()])));
+        state.harvest = Arc::new(|_: &Path, _: &[PriorTask], _: Option<&str>| {
+            Ok(harvest::Harvested::from(vec![parsed_task()]))
+        });
         let mut store = counting_store(None);
         state.store_hook = Arc::clone(&store.hook);
 
@@ -7199,7 +7319,7 @@ mod tests {
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let harvest: Arc<HarvestFn> = {
             let harvests = Arc::clone(&harvests);
-            Arc::new(move |_: &Path, _: &[PriorTask]| {
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
                 let call = harvests.fetch_add(1, Ordering::SeqCst);
                 let _ = entered_tx.blocking_send(());
                 if call == 0 {
@@ -7286,7 +7406,7 @@ mod tests {
             .expect("insert");
 
         let (harvest_tx, mut harvest_rx) = tokio::sync::mpsc::channel::<()>(8);
-        state.harvest = Arc::new(move |_: &Path, _: &[PriorTask]| {
+        state.harvest = Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
             let _ = harvest_tx.blocking_send(());
             Ok(harvest::Harvested::from(vec![parsed_task()]))
         });
@@ -7336,8 +7456,9 @@ mod tests {
         db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
             .await
             .expect("insert");
-        state.harvest =
-            Arc::new(|_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(vec![parsed_task()])));
+        state.harvest = Arc::new(|_: &Path, _: &[PriorTask], _: Option<&str>| {
+            Ok(harvest::Harvested::from(vec![parsed_task()]))
+        });
         let mut store = counting_store(None);
         state.store_hook = Arc::clone(&store.hook);
 
@@ -7374,8 +7495,9 @@ mod tests {
         db::insert_repository(&state.pool, "repo", &folder.to_string_lossy())
             .await
             .expect("insert");
-        state.harvest =
-            Arc::new(|_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(vec![parsed_task()])));
+        state.harvest = Arc::new(|_: &Path, _: &[PriorTask], _: Option<&str>| {
+            Ok(harvest::Harvested::from(vec![parsed_task()]))
+        });
         // The follow-up's store is entry one and panics, so that run ends
         // without publishing a result.
         let mut store = counting_store(Some(1));
@@ -7512,7 +7634,7 @@ mod tests {
                 None,
             ),
         ];
-        db::replace_tasks(&pool, id, &prior, immediate_store_hook().as_ref())
+        db::replace_tasks(&pool, id, &prior, None, immediate_store_hook().as_ref())
             .await
             .expect("prior store");
 
@@ -7537,7 +7659,9 @@ mod tests {
             scan_row("tasks/delta_new.md", TaskKind::Live, day(5, 3), None, None),
         ];
         let harvest: Arc<HarvestFn> =
-            Arc::new(move |_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(fresh.clone())));
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
+                Ok(harvest::Harvested::from(fresh.clone()))
+            });
         let report = scan_core(
             &pool,
             &repositories,
@@ -7592,7 +7716,7 @@ mod tests {
                 Some(day(5, 2)),
             ),
         ];
-        db::replace_tasks(&pool, id, &prior, immediate_store_hook().as_ref())
+        db::replace_tasks(&pool, id, &prior, None, immediate_store_hook().as_ref())
             .await
             .expect("prior store");
 
@@ -7615,7 +7739,9 @@ mod tests {
             ),
         ];
         let harvest: Arc<HarvestFn> =
-            Arc::new(move |_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(fresh.clone())));
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
+                Ok(harvest::Harvested::from(fresh.clone()))
+            });
         let report = scan_core(
             &pool,
             &repositories,
@@ -7658,7 +7784,9 @@ mod tests {
             scan_row("tasks/delta_live.md", TaskKind::Live, day(5, 2), None, None),
         ];
         let harvest: Arc<HarvestFn> =
-            Arc::new(move |_: &Path, _: &[PriorTask]| Ok(harvest::Harvested::from(fresh.clone())));
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
+                Ok(harvest::Harvested::from(fresh.clone()))
+            });
         let report = scan_core(
             &pool,
             &repositories,
@@ -8036,22 +8164,25 @@ mod tests {
         .expect("earlier rows");
 
         let repositories = db::list_repositories(&pool).await.expect("list");
-        let harvest: Arc<HarvestFn> = Arc::new(|path: &Path, prior: &[PriorTask]| {
-            let outcome = harvest::harvest_repository_with_prior(path, prior);
-            match &outcome {
-                Err(failure) => match &failure.error {
-                    HarvestError::Git(message) => assert!(
-                        message.contains("tasks/scope_vanished.md"),
-                        "the ref-union missing object must name its path: {message}"
-                    ),
-                    other => {
-                        panic!("expected a Git error naming the vanished path, got {other:?}")
+        let harvest: Arc<HarvestFn> =
+            Arc::new(|path: &Path, prior: &[PriorTask], _: Option<&str>| {
+                let outcome = harvest::harvest_repository_with_prior(path, prior, None);
+                match &outcome {
+                    Err(failure) => match &failure.error {
+                        HarvestError::Git(message) => assert!(
+                            message.contains("tasks/scope_vanished.md"),
+                            "the ref-union missing object must name its path: {message}"
+                        ),
+                        other => {
+                            panic!("expected a Git error naming the vanished path, got {other:?}")
+                        }
+                    },
+                    Ok(_) => {
+                        panic!("expected a Git error naming the vanished path, got {outcome:?}")
                     }
-                },
-                Ok(_) => panic!("expected a Git error naming the vanished path, got {outcome:?}"),
-            }
-            outcome
-        });
+                }
+                outcome
+            });
         scan_core(
             &pool,
             &repositories,
@@ -8251,20 +8382,23 @@ mod tests {
         .expect("earlier rows");
 
         let repositories = db::list_repositories(&pool).await.expect("list");
-        let harvest: Arc<HarvestFn> = Arc::new(|path: &Path, prior: &[PriorTask]| {
-            let outcome = harvest::harvest_repository_with_prior(path, prior);
-            match &outcome {
-                Err(failure) => match &failure.error {
-                    HarvestError::Git(message) => assert!(
-                        message.contains("simulated probe failure"),
-                        "the probe failure must carry git's stderr: {message}"
-                    ),
-                    other => panic!("expected a Git error carrying git's stderr, got {other:?}"),
-                },
-                Ok(_) => panic!("expected a Git error carrying git's stderr, got {outcome:?}"),
-            }
-            outcome
-        });
+        let harvest: Arc<HarvestFn> =
+            Arc::new(|path: &Path, prior: &[PriorTask], _: Option<&str>| {
+                let outcome = harvest::harvest_repository_with_prior(path, prior, None);
+                match &outcome {
+                    Err(failure) => match &failure.error {
+                        HarvestError::Git(message) => assert!(
+                            message.contains("simulated probe failure"),
+                            "the probe failure must carry git's stderr: {message}"
+                        ),
+                        other => {
+                            panic!("expected a Git error carrying git's stderr, got {other:?}")
+                        }
+                    },
+                    Ok(_) => panic!("expected a Git error carrying git's stderr, got {outcome:?}"),
+                }
+                outcome
+            });
         scan_core(
             &pool,
             &repositories,
@@ -8317,13 +8451,14 @@ mod tests {
             .expect("insert broken");
         let repositories = db::list_repositories(&pool).await.expect("list");
         let broken_path = broken.clone();
-        let harvest: Arc<HarvestFn> = Arc::new(move |path: &Path, _: &[PriorTask]| {
-            if path == broken_path {
-                Err(HarvestError::Git("no history".to_string()).into())
-            } else {
-                Ok(harvest::Harvested::from(Vec::new()))
-            }
-        });
+        let harvest: Arc<HarvestFn> =
+            Arc::new(move |path: &Path, _: &[PriorTask], _: Option<&str>| {
+                if path == broken_path {
+                    Err(HarvestError::Git("no history".to_string()).into())
+                } else {
+                    Ok(harvest::Harvested::from(Vec::new()))
+                }
+            });
         let report = scan_core(
             &pool,
             &repositories,
@@ -8357,7 +8492,7 @@ mod tests {
             .expect("insert");
         let repositories = db::list_repositories(&pool).await.expect("list");
         let harvest: Arc<HarvestFn> =
-            Arc::new(|_: &Path, _: &[PriorTask]| panic!("harvest stopped"));
+            Arc::new(|_: &Path, _: &[PriorTask], _: Option<&str>| panic!("harvest stopped"));
         let report = scan_core(
             &pool,
             &repositories,
@@ -8814,7 +8949,7 @@ mod tests {
             folders.push(folder);
         }
         let repositories = db::list_repositories(&state.pool).await.expect("list");
-        let harvest: Arc<HarvestFn> = Arc::new(|_: &Path, _: &[PriorTask]| {
+        let harvest: Arc<HarvestFn> = Arc::new(|_: &Path, _: &[PriorTask], _: Option<&str>| {
             Err(HarvestError::Git("no history".to_string()).into())
         });
         let report = scan_core(
@@ -10217,13 +10352,14 @@ mod tests {
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
-        let harvest: Arc<HarvestFn> = Arc::new(move |_: &Path, _: &[PriorTask]| {
-            let _ = entered_tx.blocking_send(());
-            if let Ok(release) = release_rx.lock() {
-                let _ = release.recv();
-            }
-            Ok(harvest::Harvested::from(vec![parsed_task()]))
-        });
+        let harvest: Arc<HarvestFn> =
+            Arc::new(move |_: &Path, _: &[PriorTask], _: Option<&str>| {
+                let _ = entered_tx.blocking_send(());
+                if let Ok(release) = release_rx.lock() {
+                    let _ = release.recv();
+                }
+                Ok(harvest::Harvested::from(vec![parsed_task()]))
+            });
         let scan_state = state.clone();
         let scan = tokio::spawn(async move {
             let _guard = scan_state.scan.lock().await;
@@ -10390,6 +10526,7 @@ mod tests {
             &state.pool,
             removed_id,
             &[parsed_task()],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -10494,6 +10631,7 @@ mod tests {
             &state.pool,
             id,
             &[parsed_task()],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -10531,6 +10669,7 @@ mod tests {
             &state.pool,
             id,
             &[parsed_task()],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -10904,6 +11043,7 @@ mod tests {
                     Some((2026, 5, 10)),
                 ),
             ],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -10929,6 +11069,7 @@ mod tests {
                     None,
                 ),
             ],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -11626,6 +11767,7 @@ mod tests {
                     Some((2026, 4, 1)),
                 ),
             ],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -11641,6 +11783,7 @@ mod tests {
                 None,
                 None,
             )],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -12122,6 +12265,7 @@ mod tests {
                 None,
                 None,
             )],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await
@@ -12866,6 +13010,7 @@ mod tests {
                     None,
                 ),
             ],
+            None,
             immediate_store_hook().as_ref(),
         )
         .await

@@ -28,13 +28,13 @@ pub type StoreHookFn = dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Se
 pub const SCHEMA: &str = include_str!("schema.sql");
 
 /// The schema version a database reaches after `init` runs its migrations.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The statements that move a database from version `version - 1` to
 /// `version`, or `None` when no such migration exists. The caller guards
 /// version 3 on the table's own column, so a database stamped below 3 that
 /// already carries `content_hash` migrates without repeating the `ALTER`, and
-/// guards each version-4 `ALTER` on its own column the same way.
+/// guards each version-4 and version-5 `ALTER` on its own column the same way.
 fn migration(version: i64) -> Option<&'static [&'static str]> {
     match version {
         2 => Some(&["DROP INDEX IF EXISTS tasks_repository_id"]),
@@ -43,6 +43,7 @@ fn migration(version: i64) -> Option<&'static [&'static str]> {
             "ALTER TABLE repositories ADD COLUMN last_error_at TEXT",
             "ALTER TABLE repositories ADD COLUMN last_outcome TEXT",
         ]),
+        5 => Some(&["ALTER TABLE repositories ADD COLUMN history_key TEXT"]),
         _ => None,
     }
 }
@@ -50,6 +51,11 @@ fn migration(version: i64) -> Option<&'static [&'static str]> {
 /// The version-4 columns, in the order `migration(4)` adds them, so the
 /// migration step can guard each `ALTER` on its own column.
 const VERSION_FOUR_COLUMNS: [&str; 2] = ["last_error_at", "last_outcome"];
+
+/// The version-5 column, in the order `migration(5)` adds it, so the migration
+/// step can guard the `ALTER` on its own column and a repaired or half-applied
+/// file still reaches the current version.
+const VERSION_FIVE_COLUMNS: [&str; 1] = ["history_key"];
 
 /// The tables and the columns each carries once a database reaches
 /// `SCHEMA_VERSION`. `verify_columns` reads them against the live tables after
@@ -70,6 +76,7 @@ const EXPECTED_COLUMNS: [(&str, &[&str]); 2] = [
             "last_error",
             "last_error_at",
             "last_outcome",
+            "history_key",
         ],
     ),
     (
@@ -399,6 +406,26 @@ async fn migrate_step(conn: &mut SqliteConnection, version: i64) -> Result<()> {
         }
         return stamp_version(conn, version).await;
     }
+    // The version-5 step adds one column, guarded on its own name, so a file
+    // stamped back with the column already present is stamped forward instead of
+    // failing on a duplicate `ALTER`.
+    if version == 5 && VERSION_FIVE_COLUMNS.len() != statements.len() {
+        anyhow::bail!(
+            "the version-5 migration lists {} statements but {} guarded columns; the two \
+             lists must name one column per statement, so a later statement cannot be \
+             skipped and the file stamped 5 with its column missing",
+            statements.len(),
+            VERSION_FIVE_COLUMNS.len()
+        );
+    }
+    if version == 5 {
+        for (column, statement) in VERSION_FIVE_COLUMNS.iter().zip(statements) {
+            if !column_exists(conn, "repositories", column).await? {
+                sqlx::query(statement).execute(&mut *conn).await?;
+            }
+        }
+        return stamp_version(conn, version).await;
+    }
     for statement in statements {
         sqlx::query(statement).execute(&mut *conn).await?;
     }
@@ -619,6 +646,7 @@ pub async fn replace_tasks(
     pool: &Pool<Sqlite>,
     repository_id: i64,
     tasks: &[ParsedTask],
+    history_key: Option<&str>,
     store_hook: &StoreHookFn,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -649,11 +677,15 @@ pub async fn replace_tasks(
     }
     // A success stamps the scan and records the outcome, and leaves the stored
     // error and its time in place, so a recovered repository still shows what
-    // failed last while the outcome stops it counting as failing.
+    // failed last while the outcome stops it counting as failing. The history
+    // key lands in the same transaction as the rows it dates, so a later
+    // harvest compares it against the history it reads.
     sqlx::query(
-        "UPDATE repositories SET scanned_at = ?, last_outcome = 'success' WHERE repository_id = ?",
+        "UPDATE repositories SET scanned_at = ?, last_outcome = 'success', history_key = ?
+         WHERE repository_id = ?",
     )
     .bind(now_stamp())
+    .bind(history_key)
     .bind(repository_id)
     .execute(&mut *tx)
     .await?;
@@ -698,6 +730,18 @@ pub async fn load_prior_tasks(pool: &Pool<Sqlite>, repository_id: i64) -> Result
             },
         )
         .collect())
+}
+
+/// The history key stored for one repository, or `None` when the row carries no
+/// key (a folder outside git) or the id no longer exists. A harvest compares it
+/// against the key it reads and reuses a cached leave day only on a match.
+pub async fn load_history_key(pool: &Pool<Sqlite>, repository_id: i64) -> Result<Option<String>> {
+    let stored: Option<Option<String>> =
+        sqlx::query_scalar("SELECT history_key FROM repositories WHERE repository_id = ?")
+            .bind(repository_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(stored.flatten())
 }
 
 pub async fn set_scan_error(pool: &Pool<Sqlite>, repository_id: i64, message: &str) -> Result<()> {
@@ -992,9 +1036,9 @@ mod tests {
     use super::{
         PathSource, SCHEMA, SCHEMA_VERSION, StoreHookFn, create_parent_dir, database_path,
         delete_repository, init, init_at, init_with, insert_repository, is_locked,
-        list_repositories, load_prior_tasks, load_tasks, migrate, now_stamp, replace_tasks,
-        repository_counts, set_scan_error, test_db, test_migration, test_version_read,
-        test_worker_name, update_repository_path,
+        list_repositories, load_history_key, load_prior_tasks, load_tasks, migrate, now_stamp,
+        replace_tasks, repository_counts, set_scan_error, test_db, test_migration,
+        test_version_read, test_worker_name, update_repository_path,
     };
     use crate::harvest::{ParsedTask, TaskKind};
     use crate::test_support::unique_temp_dir;
@@ -1494,7 +1538,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert_eq!(version, SCHEMA_VERSION);
         let columns = sqlx::query("PRAGMA table_info('tasks')")
             .fetch_all(&pool)
@@ -1613,7 +1657,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert_eq!(version, SCHEMA_VERSION);
         let columns = sqlx::query("PRAGMA table_info('repositories')")
             .fetch_all(&pool)
@@ -1690,7 +1734,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert_eq!(version, SCHEMA_VERSION);
 
         let columns = sqlx::query("PRAGMA table_info('repositories')")
@@ -1729,6 +1773,127 @@ mod tests {
         remove_scratch(&path);
     }
 
+    /// Covers: a version-4 database upgrades to version 5 with the
+    /// `repositories.history_key` column and keeps every repository and task
+    /// row, and the stored key round-trips through `load_history_key` while a
+    /// migrated row starts with none.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_migrates_a_version_four_database_adding_history_key() {
+        let dir = unique_temp_dir("db_migrates_v4");
+        std::fs::create_dir_all(&dir).expect("db scratch");
+        let path = dir.join("test.db");
+        let version_four = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("version four");
+        sqlx::query(SCHEMA)
+            .execute(&version_four)
+            .await
+            .expect("baseline schema");
+        sqlx::query("DROP INDEX IF EXISTS tasks_repository_id")
+            .execute(&version_four)
+            .await
+            .expect("version two migration");
+        sqlx::query("ALTER TABLE tasks ADD COLUMN content_hash TEXT")
+            .execute(&version_four)
+            .await
+            .expect("version three migration");
+        for statement in [
+            "ALTER TABLE repositories ADD COLUMN last_error_at TEXT",
+            "ALTER TABLE repositories ADD COLUMN last_outcome TEXT",
+        ] {
+            sqlx::query(statement)
+                .execute(&version_four)
+                .await
+                .expect("version four migration");
+        }
+        sqlx::query("PRAGMA user_version = 4")
+            .execute(&version_four)
+            .await
+            .expect("version stamp");
+        sqlx::query(
+            "INSERT INTO repositories (name, path, created_at, scanned_at, last_outcome)
+             VALUES ('ai-modules', '/tmp/ai-modules', '2026-01-01 00:00',
+                     '2026-01-02 00:00', 'success')",
+        )
+        .execute(&version_four)
+        .await
+        .expect("repository");
+        sqlx::query(
+            "INSERT INTO tasks (repository_id, path, scope, kind, created, updated, content_hash)
+             VALUES (1, 'tasks/scope_one.md', 'scope', 'live', '2026-01-01', '2026-01-01', 'hash')",
+        )
+        .execute(&version_four)
+        .await
+        .expect("task");
+        version_four.close().await;
+
+        let pool = init_at(&path).await.expect("init migrates");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        assert_eq!(version, 5);
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let columns = sqlx::query("PRAGMA table_info('repositories')")
+            .fetch_all(&pool)
+            .await
+            .expect("table info");
+        let names: Vec<String> = columns
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("name").ok())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "history_key"),
+            "the upgraded table carries history_key: {names:?}"
+        );
+        let history_key_columns = names.iter().filter(|name| *name == "history_key").count();
+        assert_eq!(history_key_columns, 1);
+
+        let repositories = list_repositories(&pool).await.expect("list");
+        assert_eq!(repositories.len(), 1, "the repository row survives");
+        assert_eq!(repositories[0].name, "ai-modules");
+        assert_eq!(
+            load_history_key(&pool, 1).await.expect("key"),
+            None,
+            "a migrated repository starts without a key, so the next harvest re-walks"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks")
+            .fetch_one(&pool)
+            .await
+            .expect("task count");
+        assert_eq!(rows, 1, "the task row survives");
+        let content_hash: Option<String> = sqlx::query_scalar("SELECT content_hash FROM tasks")
+            .fetch_one(&pool)
+            .await
+            .expect("content hash");
+        assert_eq!(content_hash.as_deref(), Some("hash"));
+
+        // A successful store writes the key beside the rows, and the reader
+        // returns it for the next harvest.
+        replace_tasks(
+            &pool,
+            1,
+            &[task()],
+            Some("remote:repo\n\nabc"),
+            immediate_hook().as_ref(),
+        )
+        .await
+        .expect("store the key");
+        assert_eq!(
+            load_history_key(&pool, 1).await.expect("key"),
+            Some("remote:repo\n\nabc".to_string())
+        );
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
     /// Covers: a success after an error keeps the error text and its time as
     /// history, stamps the success, and stops the repository counting as
     /// failing.
@@ -1747,7 +1912,7 @@ mod tests {
         assert_eq!(failed[0].last_outcome.as_deref(), Some("error"));
         assert!(failed[0].failing());
 
-        replace_tasks(&pool, id, &[task()], immediate_hook().as_ref())
+        replace_tasks(&pool, id, &[task()], None, immediate_hook().as_ref())
             .await
             .expect("successful store");
         let recovered = list_repositories(&pool).await.expect("list");
@@ -1784,7 +1949,7 @@ mod tests {
         let id = insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
             .await
             .expect("insert");
-        replace_tasks(&pool, id, &[task()], immediate_hook().as_ref())
+        replace_tasks(&pool, id, &[task()], None, immediate_hook().as_ref())
             .await
             .expect("successful store");
         let succeeded = list_repositories(&pool).await.expect("list");
@@ -1952,8 +2117,8 @@ mod tests {
         );
         let last_migration = statements
             .iter()
-            .rposition(|statement| trimmed(statement) == "PRAGMA user_version = 4")
-            .expect("the last migration stamps version 4");
+            .rposition(|statement| trimmed(statement) == "PRAGMA user_version = 5")
+            .expect("the last migration stamps version 5");
         assert!(
             commits[0] > last_migration,
             "the commit follows the last migration: {statements:?}"
@@ -2077,6 +2242,11 @@ mod tests {
                 "repositories",
                 "last_outcome",
                 "ALTER TABLE repositories DROP COLUMN last_outcome",
+            ),
+            (
+                "repositories",
+                "history_key",
+                "ALTER TABLE repositories DROP COLUMN history_key",
             ),
             (
                 "tasks",
@@ -2348,7 +2518,7 @@ mod tests {
             .await
             .expect("insert");
         let tasks = vec![task()];
-        replace_tasks(&pool, id, &tasks, immediate_hook().as_ref())
+        replace_tasks(&pool, id, &tasks, None, immediate_hook().as_ref())
             .await
             .expect("replace");
         let prior = load_prior_tasks(&pool, id).await.expect("prior");
@@ -2440,7 +2610,7 @@ mod tests {
                 None,
             ),
         ];
-        replace_tasks(&pool, busy, &rows, immediate_hook().as_ref())
+        replace_tasks(&pool, busy, &rows, None, immediate_hook().as_ref())
             .await
             .expect("replace");
 
@@ -2473,7 +2643,7 @@ mod tests {
         let id = super::insert_repository(&pool, "moved", "/tmp/old")
             .await
             .expect("insert");
-        replace_tasks(&pool, id, &[task()], immediate_hook().as_ref())
+        replace_tasks(&pool, id, &[task()], None, immediate_hook().as_ref())
             .await
             .expect("replace");
 
@@ -2560,7 +2730,7 @@ mod tests {
             .expect("insert");
         let mut row = task();
         row.updated = date(2026, 6, 15);
-        replace_tasks(&pool, id, &[row], immediate_hook().as_ref())
+        replace_tasks(&pool, id, &[row], None, immediate_hook().as_ref())
             .await
             .expect("replace");
         let loaded = load_tasks(&pool, None).await.expect("load");
@@ -2653,7 +2823,7 @@ mod tests {
         let id = super::insert_repository(&pool, "repo", &repo.display().to_string())
             .await
             .expect("insert");
-        replace_tasks(&pool, id, &parsed, immediate_hook().as_ref())
+        replace_tasks(&pool, id, &parsed, None, immediate_hook().as_ref())
             .await
             .expect("store");
 
@@ -2710,7 +2880,7 @@ mod tests {
             .expect("insert");
         let mut uncached = task();
         uncached.content_hash = None;
-        replace_tasks(&pool, id, &[uncached], immediate_hook().as_ref())
+        replace_tasks(&pool, id, &[uncached], None, immediate_hook().as_ref())
             .await
             .expect("replace");
         let prior = load_prior_tasks(&pool, id).await.expect("prior");
@@ -2764,7 +2934,7 @@ mod tests {
         let store = tokio::spawn({
             let pool = pool.clone();
             let hook = Arc::clone(&hook);
-            async move { replace_tasks(&pool, id, &[task()], hook.as_ref()).await }
+            async move { replace_tasks(&pool, id, &[task()], None, hook.as_ref()).await }
         });
         tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
             .await
@@ -2812,7 +2982,7 @@ mod tests {
             .collect();
 
         captured_statements().lock().expect("statement log").clear();
-        replace_tasks(&pool, id, &tasks, immediate_hook().as_ref())
+        replace_tasks(&pool, id, &tasks, None, immediate_hook().as_ref())
             .await
             .expect("replace");
         let loaded = load_tasks(&pool, Some(id)).await.expect("load");
@@ -2865,7 +3035,7 @@ mod tests {
             with_path("tasks/keep_two.md"),
             with_path("tasks/keep_three.md"),
         ];
-        replace_tasks(&pool, id, &original, immediate_hook().as_ref())
+        replace_tasks(&pool, id, &original, None, immediate_hook().as_ref())
             .await
             .expect("seed");
 
@@ -2876,7 +3046,7 @@ mod tests {
             .map(|index| with_path(&format!("tasks/bulk_{index:04}.md")))
             .collect();
         replacement.push(with_path("tasks/bulk_0000.md"));
-        let error = replace_tasks(&pool, id, &replacement, immediate_hook().as_ref())
+        let error = replace_tasks(&pool, id, &replacement, None, immediate_hook().as_ref())
             .await
             .expect_err("a repeated path fails the insert");
         assert!(
@@ -2978,10 +3148,10 @@ mod tests {
                 Some("b2"),
             ),
         ];
-        replace_tasks(&pool, zeta, &zeta_tasks, immediate_hook().as_ref())
+        replace_tasks(&pool, zeta, &zeta_tasks, None, immediate_hook().as_ref())
             .await
             .expect("zeta rows");
-        replace_tasks(&pool, alpha, &alpha_tasks, immediate_hook().as_ref())
+        replace_tasks(&pool, alpha, &alpha_tasks, None, immediate_hook().as_ref())
             .await
             .expect("alpha rows");
 

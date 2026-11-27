@@ -2,9 +2,11 @@
 description: "Reuse a cached leave day only when the repository identity, the folder's place in it, and the ref tips match the history it was computed from."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T15:16:30Z
-status: ready
+updated: 2026-11-27T06:57:55Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: Andreas Hoffmann
+design-extended: true
 ---
 
 # Key cached leave days to the repository's history

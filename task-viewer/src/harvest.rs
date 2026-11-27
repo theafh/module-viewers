@@ -159,18 +159,21 @@ impl std::fmt::Display for GitFailure {
 
 #[cfg(test)]
 pub fn harvest_repository(repo: &Path) -> Result<Vec<ParsedTask>, HarvestFailure> {
-    harvest_repository_with_prior(repo, &[]).map(|harvested| harvested.tasks)
+    harvest_repository_with_prior(repo, &[], None).map(|harvested| harvested.tasks)
 }
 
 /// Harvest `repo`, reusing the stored leave day of every archived path whose
-/// content hash still matches the row the database holds. Prior rows arrive as
-/// an argument, so harvest stays read-only of the database. The returned rows
-/// carry the task files the harvest charted, and the tally says how many task
-/// files it skipped and why. A failure carries the tally it had recorded, so a
-/// scan that fails after a skip still counts that skip.
+/// content hash still matches the row the database holds and whose stored
+/// history key names the same history. Prior rows and the stored key arrive as
+/// arguments, so harvest stays read-only of the database. The returned rows
+/// carry the task files the harvest charted, the tally says how many task files
+/// it skipped and why, and `history_key` names the history those cached days
+/// belong to. A failure carries the tally it had recorded, so a scan that fails
+/// after a skip still counts that skip.
 pub fn harvest_repository_with_prior(
     repo: &Path,
     prior: &[PriorTask],
+    stored_history_key: Option<&str>,
 ) -> Result<Harvested, HarvestFailure> {
     let repo =
         fs::canonicalize(repo).map_err(|error| HarvestFailure::from(HarvestError::from(error)))?;
@@ -187,6 +190,17 @@ pub fn harvest_repository_with_prior(
     // an enclosing one. A folder outside git is charted from its files.
     let git = GitContext::resolve(&repo)
         .map_err(|failure| HarvestFailure::from(HarvestError::Git(failure.to_string())))?;
+    // The key names the history this harvest reads, so a cached leave day is
+    // reused only when the stored key equals it. Relocating to a clone with a
+    // different origin or different ref tips changes the key and re-walks every
+    // archived path instead of reusing a day from a history the dashboard no
+    // longer reads.
+    let current_history_key = repository_history_key(&repo, &git)
+        .map_err(|failure| HarvestFailure::from(HarvestError::Git(failure.to_string())))?;
+    let history = HistoryCache {
+        reuse: matches!(&current_history_key, Some(current) if stored_history_key == Some(current.as_str())),
+        current: current_history_key.as_deref(),
+    };
     match git.repository() {
         Some((root, dir)) => {
             // A `.git` that git cannot open fails the scan; charting frontmatter
@@ -221,6 +235,7 @@ pub fn harvest_repository_with_prior(
                 chosen,
                 worktree,
                 prior,
+                history,
                 &mut skipped,
             )
         }
@@ -237,7 +252,7 @@ pub fn harvest_repository_with_prior(
                 error,
                 skipped: std::mem::take(&mut skipped),
             })?;
-            harvest_files(&repo, &git, files, prior, &mut skipped)
+            harvest_files(&repo, &git, files, prior, history, &mut skipped)
         }
     }
 }
@@ -332,6 +347,17 @@ impl GitContext {
     }
 }
 
+/// The history a harvest's cached leave days belong to: the current key and
+/// whether the repository's stored key equals it. A mismatch ignores every
+/// cached day for that repository, so a relocate to a clone whose history
+/// differs re-walks the archived paths instead of reusing a day from the old
+/// history.
+#[derive(Debug, Clone, Copy)]
+struct HistoryCache<'a> {
+    current: Option<&'a str>,
+    reuse: bool,
+}
+
 /// Every task file the working tree or any local or remote-tracking ref holds,
 /// one row per task.
 ///
@@ -396,12 +422,17 @@ impl SkipReason {
 /// How many task files one harvest skipped, keyed by why.
 pub type SkipTally = std::collections::BTreeMap<SkipReason, usize>;
 
-/// What one repository harvest produced: the rows it charted and the task files
-/// it skipped, keyed by why.
+/// What one repository harvest produced: the rows it charted, the task files it
+/// skipped, keyed by why, and the history key its cached leave days are stored
+/// against.
 #[derive(Debug, Default)]
 pub struct Harvested {
     pub tasks: Vec<ParsedTask>,
     pub skipped: SkipTally,
+    /// The key the store writes beside the repository, so a later harvest reuses
+    /// a cached leave day only when it reads the same history. `None` for a
+    /// folder outside git, which has no history to key on.
+    pub history_key: Option<String>,
 }
 
 impl Harvested {
@@ -416,6 +447,7 @@ impl From<Vec<ParsedTask>> for Harvested {
         Self {
             tasks,
             skipped: SkipTally::default(),
+            history_key: None,
         }
     }
 }
@@ -650,6 +682,7 @@ fn harvest_chosen(
     chosen: Vec<ChosenFile>,
     mut worktree: WorktreeFiles,
     prior: &[PriorTask],
+    history: HistoryCache<'_>,
     skipped: &mut SkipTally,
 ) -> Result<Harvested, HarvestFailure> {
     let blobs: Vec<String> = chosen
@@ -719,7 +752,7 @@ fn harvest_chosen(
             state.harvest_file(&path, &text, path_is_lossy, skipped);
         }
     }
-    let tasks = match state.finish(repo, git, prior) {
+    let tasks = match state.finish(repo, git, prior, history) {
         Ok(tasks) => tasks,
         Err(error) => {
             return Err(HarvestFailure {
@@ -731,6 +764,7 @@ fn harvest_chosen(
     Ok(Harvested {
         tasks,
         skipped: std::mem::take(skipped),
+        history_key: history.current.map(str::to_string),
     })
 }
 
@@ -1027,11 +1061,12 @@ impl HarvestState {
         repo: &Path,
         git: &GitContext,
         prior: &[PriorTask],
+        history: HistoryCache<'_>,
     ) -> Result<Vec<ParsedTask>, HarvestError> {
         let pending_len = self.pending.len();
         let mut from_git = 0usize;
         let mut fallback_rows: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for (index, leave_day) in leave_dates(repo, git, &self.pending, prior)
+        for (index, leave_day) in leave_dates(repo, git, &self.pending, prior, history)
             .map_err(|failure| HarvestError::Git(failure.to_string()))?
         {
             let Some(task) = self.tasks.get_mut(index) else {
@@ -1131,6 +1166,7 @@ fn harvest_files(
     git: &GitContext,
     files: Vec<WorktreeRow>,
     prior: &[PriorTask],
+    history: HistoryCache<'_>,
     skipped: &mut SkipTally,
 ) -> Result<Harvested, HarvestFailure> {
     let mut state = HarvestState::default();
@@ -1172,7 +1208,7 @@ fn harvest_files(
             state.harvest_file(&row.path, &text, row.lossy, skipped);
         }
     }
-    let tasks = match state.finish(repo, git, prior) {
+    let tasks = match state.finish(repo, git, prior, history) {
         Ok(tasks) => tasks,
         Err(error) => {
             return Err(HarvestFailure {
@@ -1184,6 +1220,7 @@ fn harvest_files(
     Ok(Harvested {
         tasks,
         skipped: std::mem::take(skipped),
+        history_key: history.current.map(str::to_string),
     })
 }
 
@@ -2622,6 +2659,7 @@ fn leave_dates(
     git: &GitContext,
     jobs: &[LeaveJob],
     prior: &[PriorTask],
+    history: HistoryCache<'_>,
 ) -> Result<LeaveDays, GitFailure> {
     // A folder outside git has no commit to offer. Return once instead of
     // spawning a failing git process for every archived task; the `updated`
@@ -2636,9 +2674,13 @@ fn leave_dates(
     jobs.iter()
         .map(|(index, rel, status, hash)| {
             // An unchanged file keeps the leave day the database already holds,
-            // so its history walk is skipped. A changed hash or a missing row
-            // falls through to the walk.
-            if let Some(row) = cached.get(rel.as_str())
+            // so its history walk is skipped, but only when the stored history
+            // key equals this harvest's key: a relocate to a clone whose origin
+            // or ref tips differ reads a different history, so every cached day
+            // for that repository is ignored and the archived paths re-walk. A
+            // changed hash or a missing row falls through to the walk too.
+            if history.reuse
+                && let Some(row) = cached.get(rel.as_str())
                 && row.content_hash.as_deref() == Some(hash.as_str())
             {
                 return Ok((*index, row.leave_date));
@@ -3455,13 +3497,105 @@ fn normalize_origin_url(url: &str) -> String {
     trimmed.to_string()
 }
 
+/// The key a repository's cached leave days are stored against: the repository's
+/// identity, the configured folder's place inside it, and the sorted tip commit
+/// ids of the ref set `git log --all` walks.
+///
+/// The identity follows the same rule `repository_identity` applies to a folder
+/// with its own `.git` — the canonical `origin` URL, or the canonical git common
+/// directory when there is no remote — but it is read from the resolved
+/// enclosing repository, so a folder without its own `.git` keys on the
+/// repository that charts it. `repository_identity` itself stays unchanged,
+/// because Add must not report two configured subfolders of one enclosing
+/// repository as clones.
+///
+/// A folder outside git has no history, so it has no key and keeps the
+/// `updated` fallback. A git command that cannot read the refs fails the scan,
+/// as every other read-only git failure does, rather than silently reusing a
+/// cached day under an unreadable history.
+fn repository_history_key(repo: &Path, git: &GitContext) -> Result<Option<String>, GitFailure> {
+    let Some((root, dir)) = git.repository() else {
+        return Ok(None);
+    };
+    let identity = match repository_identity(root) {
+        RepositoryIdentity::Remote(url) => format!("remote:{url}"),
+        RepositoryIdentity::CommonDir(common) => format!("common:{}", common.display()),
+        // An unreadable identity leaves no key, so no cached day is reused and
+        // the next harvest re-walks the archived paths.
+        RepositoryIdentity::None => return Ok(None),
+    };
+    let tips = ref_tips(repo, dir)?;
+    Ok(Some(format!(
+        "{identity}\n{}\n{}",
+        git.prefix,
+        tips.join(",")
+    )))
+}
+
+/// The sorted tip commit ids of the ref set `git log --all` actually walks:
+/// every ref under `refs/`, plus `HEAD`, with an annotated tag peeled to the
+/// commit it names, because `%(objectname)` on a tag names the tag object.
+///
+/// A ref that names no commit (an annotated tag of a tree, say) contributes
+/// nothing, matching the log walk that skips it. An empty repository has no
+/// HEAD to resolve, which leaves an empty tip set rather than failing.
+fn ref_tips(repo: &Path, dir: &Path) -> Result<Vec<String>, GitFailure> {
+    let mut command = git_dir_command(repo, dir);
+    scrub_git_env(&mut command);
+    command.args([
+        "for-each-ref",
+        "--format=%(objectname) %(objecttype) %(*objectname) %(*objecttype)",
+        "refs/",
+    ]);
+    let output = run_git_command(command, None, git_deadline(repo))?;
+    if !output.status.success() {
+        return Err(GitFailure::Other(git_exit_message(&output)));
+    }
+    let mut tips = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(object), Some(object_type)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let peeled = fields.next();
+        let peeled_type = fields.next();
+        let tip = match (object_type, peeled, peeled_type) {
+            ("commit", _, _) => Some(object),
+            ("tag", Some(peeled), Some("commit")) => Some(peeled),
+            _ => None,
+        };
+        if let Some(tip) = tip {
+            tips.insert(tip.to_string());
+        }
+    }
+    // `git log --all` also walks HEAD, which may name a commit no ref reaches.
+    let mut head = git_dir_command(repo, dir);
+    scrub_git_env(&mut head);
+    head.args(["rev-parse", "--verify", "--quiet", "HEAD"]);
+    match run_git_command(head, None, git_deadline(repo)) {
+        Ok(output) if output.status.success() => {
+            if let Some(line) = String::from_utf8_lossy(&output.stdout).lines().next() {
+                let tip = line.trim();
+                if !tip.is_empty() {
+                    tips.insert(tip.to_string());
+                }
+            }
+        }
+        // An empty repository has no HEAD to resolve; that is not a failure.
+        Ok(_) => {}
+        Err(GitFailure::Timeout(reason)) => return Err(GitFailure::Timeout(reason)),
+        Err(_) => {}
+    }
+    Ok(tips.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
     use super::git_override;
     use super::{
         BlobContent, CONTENT_HASH_REVISION, ChosenFile, GIT_COMMAND_TIMEOUT, GitContext,
-        GitFailure, HarvestError, HarvestState, LogLookup, MAX_TASK_FILE_BYTES,
+        GitFailure, HarvestError, HarvestState, HistoryCache, LogLookup, MAX_TASK_FILE_BYTES,
         MAX_WORKTREE_CACHE_BYTES, ParsedTask, PriorTask, RepositoryIdentity, SkipReason, SkipTally,
         TaskKind, WorktreeFiles, WorktreeRow, archive_log_args, archived_leave_lookup, blob_days,
         blob_days_log_args, content_hash, drain_reader, enclosing_prefix, escape_posix_ere,
@@ -3494,6 +3628,15 @@ mod tests {
         let path = unique_temp_dir(name);
         fs::create_dir_all(&path).expect("scratch");
         path
+    }
+
+    /// A history cache that reuses nothing, for a test that drives the harvest
+    /// internals without a stored key.
+    fn no_history_cache() -> HistoryCache<'static> {
+        HistoryCache {
+            current: None,
+            reuse: false,
+        }
     }
 
     /// Collect a streaming archive-log walk into the record list the whole
@@ -4382,7 +4525,9 @@ mod tests {
             "2026-06-01T12:00:00+00:00",
         );
 
-        let first = harvest_repository(&repo).expect("first harvest");
+        let first = harvest_repository_with_prior(&repo, &[], None).expect("first harvest");
+        let key = first.history_key.clone();
+        let first = first.tasks;
         assert_eq!(take_leave_walk_count(&repo), 2);
         let prior: Vec<PriorTask> = first
             .iter()
@@ -4395,13 +4540,13 @@ mod tests {
                 ship_date: task.ship_date,
             })
             .collect();
-        let second = harvest_repository_with_prior(&repo, &prior)
+        let second = harvest_repository_with_prior(&repo, &prior, key.as_deref())
             .expect("second harvest")
             .tasks;
         assert_eq!(
             take_leave_walk_count(&repo),
             0,
-            "matching prior rows skip every leave-day walk"
+            "matching prior rows under the stored history key skip every leave-day walk"
         );
         assert_eq!(first, second, "the cached dates stay identical");
 
@@ -4426,6 +4571,362 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
         );
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// The prior rows a store would keep for `tasks`, so a cache test can hand
+    /// the next harvest the same snapshot the database would.
+    fn prior_rows(tasks: &[ParsedTask]) -> Vec<PriorTask> {
+        tasks
+            .iter()
+            .map(|task| PriorTask {
+                path: task.path.clone(),
+                leave_date: task.leave_date,
+                content_hash: task.content_hash.clone(),
+                kind: Some(task.kind),
+                created: Some(task.created),
+                ship_date: task.ship_date,
+            })
+            .collect()
+    }
+
+    /// A base repository holding one live task, cloned once per `names` entry so
+    /// each clone shares the base's origin URL.
+    fn base_with_live_task(name: &str, clones: &[&str]) -> (PathBuf, Vec<PathBuf>) {
+        let root = scratch(name);
+        let base = root.join("base");
+        fs::create_dir_all(base.join("tasks")).expect("base tasks");
+        git(
+            &base,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&base, "tasks/scope_one.md", "2026-05-01", "open");
+        commit_all(&base, "live task", "2026-05-01T12:00:00+00:00");
+        let mut destinations = Vec::new();
+        for name in clones {
+            let destination = root.join(name);
+            git(
+                &root,
+                &[
+                    "clone",
+                    base.to_str().expect("utf-8 base"),
+                    destination.to_str().expect("utf-8 clone"),
+                ],
+                "2026-05-01T12:00:00+00:00",
+            );
+            destinations.push(destination);
+        }
+        (root, destinations)
+    }
+
+    /// Archive the live task in `clone` with byte-identical content to every
+    /// other clone, dating the archive commit at `date`.
+    fn archive_live_task(clone: &Path, date: &str) {
+        fs::remove_file(clone.join("tasks/scope_one.md")).expect("remove live copy");
+        write_task_dated(
+            clone,
+            "tasks/archive/scope_one.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        commit_all(clone, "archive the task", date);
+    }
+
+    #[test]
+    fn harvest_rewalks_a_relocated_clone_with_a_different_history() {
+        // Two clones hold byte-identical archived files but archive them at
+        // different commits. Relocate keeps the repository id and re-harvests
+        // the new folder, so a prior row from the first clone must not hand its
+        // day to the second: the stored history key names a different history.
+        let (root, clones) = base_with_live_task("harvest_relocate_clones", &["a", "b", "c"]);
+        let (a, b, c) = (&clones[0], &clones[1], &clones[2]);
+        archive_live_task(a, "2026-06-01T12:00:00+00:00");
+        archive_live_task(b, "2026-07-01T12:00:00+00:00");
+        archive_live_task(c, "2026-08-01T12:00:00+00:00");
+        // `b` is a fork: its origin names a different remote, so its identity
+        // alone already differs. `c` keeps the base's origin and differs only in
+        // its ref tips, so the key must carry the tips as well.
+        git(
+            b,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/fork.git",
+            ],
+            "2026-07-01T12:00:00+00:00",
+        );
+
+        let first = harvest_repository_with_prior(a, &[], None).expect("harvest a");
+        let key_a = first.history_key.clone();
+        let prior = prior_rows(&first.tasks);
+        let day_a = first.tasks[0].leave_date;
+
+        let forked =
+            harvest_repository_with_prior(b, &prior, key_a.as_deref()).expect("harvest the fork");
+        assert_ne!(
+            forked.history_key, key_a,
+            "a fork's origin changes the history key"
+        );
+        assert!(
+            take_leave_walk_count(b) > 0,
+            "the fork re-walks the archived path instead of reusing clone a's day"
+        );
+        assert_eq!(
+            forked.tasks[0].leave_date,
+            Some(utc_day(2026, 7, 1)),
+            "the fork stores its own archive day"
+        );
+        assert_ne!(forked.tasks[0].leave_date, day_a);
+
+        let same_origin = harvest_repository_with_prior(c, &prior, key_a.as_deref())
+            .expect("harvest the same-origin clone");
+        assert_ne!(
+            same_origin.history_key, key_a,
+            "different ref tips change the history key"
+        );
+        assert!(
+            take_leave_walk_count(c) > 0,
+            "a same-origin clone at different tips re-walks the archived path"
+        );
+        assert_eq!(
+            same_origin.tasks[0].leave_date,
+            Some(utc_day(2026, 8, 1)),
+            "the same-origin clone stores its own archive day"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn harvest_reuses_cached_days_in_a_same_origin_clone_at_identical_ref_tips() {
+        // A clone that reaches the same origin and the same ref tips reads the
+        // same history, so its cached leave days are reused and no archive walk
+        // runs.
+        let (root, clones) = base_with_live_task("harvest_relocate_same_tips", &["a", "b"]);
+        let (a, b) = (&clones[0], &clones[1]);
+        archive_live_task(a, "2026-06-01T12:00:00+00:00");
+        // Give `b` the archive commit without changing its origin URL, so only
+        // the ref tips decide the key.
+        git(
+            b,
+            &["fetch", a.to_str().expect("utf-8 a"), "main"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        git(
+            b,
+            &["merge", "--ff-only", "FETCH_HEAD"],
+            "2026-06-01T12:00:00+00:00",
+        );
+
+        let first = harvest_repository_with_prior(a, &[], None).expect("harvest a");
+        let key_a = first.history_key.clone();
+        let prior = prior_rows(&first.tasks);
+        let second = harvest_repository_with_prior(b, &prior, key_a.as_deref()).expect("harvest b");
+        assert_eq!(
+            second.history_key, key_a,
+            "the same origin and ref tips produce the same history key"
+        );
+        assert_eq!(
+            take_leave_walk_count(b),
+            0,
+            "matching history reuses the stored leave day without a walk"
+        );
+        assert_eq!(second.tasks, first.tasks, "the cached rows stay identical");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn harvest_rewalks_after_a_ref_tip_moves() {
+        let repo = scratch("harvest_ref_tip_moves");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_one.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        commit_all(&repo, "archive", "2026-06-01T12:00:00+00:00");
+
+        let first = harvest_repository_with_prior(&repo, &[], None).expect("first harvest");
+        let key = first.history_key.clone();
+        let prior = prior_rows(&first.tasks);
+        let _ = take_leave_walk_count(&repo);
+
+        // A new tip that touches no task file still changes the history the
+        // archive walk reads, so the cached day must be re-walked.
+        git(
+            &repo,
+            &["commit", "--allow-empty", "-m", "move the tip"],
+            "2026-06-02T12:00:00+00:00",
+        );
+        let second =
+            harvest_repository_with_prior(&repo, &prior, key.as_deref()).expect("second harvest");
+        assert_ne!(second.history_key, key, "a moved tip changes the key");
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            1,
+            "a moved ref tip re-walks the archived path"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_keys_a_commit_reachable_only_from_a_tag() {
+        let repo = scratch("harvest_tag_only_tip");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_one.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        commit_all(&repo, "archive", "2026-06-01T12:00:00+00:00");
+
+        let first = harvest_repository_with_prior(&repo, &[], None).expect("first harvest");
+        let key = first.history_key.clone();
+        let prior = prior_rows(&first.tasks);
+        let _ = take_leave_walk_count(&repo);
+
+        // The commit is reachable only from the tag: `%(objectname)` names the
+        // tag object, so the key must carry the peeled commit.
+        git(
+            &repo,
+            &["commit", "--allow-empty", "-m", "tag-only tip"],
+            "2026-06-02T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["tag", "-a", "v1", "-m", "v1"],
+            "2026-06-02T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["reset", "--hard", "HEAD~1"],
+            "2026-06-02T12:00:00+00:00",
+        );
+        let second =
+            harvest_repository_with_prior(&repo, &prior, key.as_deref()).expect("second harvest");
+        assert_ne!(
+            second.history_key, key,
+            "a commit reachable only from a tag changes the key"
+        );
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            1,
+            "a tag-only tip re-walks the archived path"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_keys_a_commit_reachable_only_from_head() {
+        let repo = scratch("harvest_head_only_tip");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_one.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        commit_all(&repo, "archive", "2026-06-01T12:00:00+00:00");
+
+        let first = harvest_repository_with_prior(&repo, &[], None).expect("first harvest");
+        let key = first.history_key.clone();
+        let prior = prior_rows(&first.tasks);
+        let _ = take_leave_walk_count(&repo);
+
+        // Move the branch back and check out the new commit, so only HEAD names
+        // it. `git log --all` walks HEAD, so the key must too.
+        git(
+            &repo,
+            &["commit", "--allow-empty", "-m", "head-only tip"],
+            "2026-06-02T12:00:00+00:00",
+        );
+        let tip = git_stdout(&repo, &["rev-parse", "HEAD"], "2026-06-02T12:00:00+00:00");
+        git(
+            &repo,
+            &["reset", "--hard", "HEAD~1"],
+            "2026-06-02T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "--detach", &tip],
+            "2026-06-02T12:00:00+00:00",
+        );
+        let second =
+            harvest_repository_with_prior(&repo, &prior, key.as_deref()).expect("second harvest");
+        assert_ne!(
+            second.history_key, key,
+            "a commit reachable only from HEAD changes the key"
+        );
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            1,
+            "a HEAD-only tip re-walks the archived path"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_rewalks_a_relocated_subfolder_at_the_same_ref_tips() {
+        // Both subfolders hold byte-identical archived tasks in one commit, so
+        // only the folder's place inside the repository separates them.
+        let parent = scratch("harvest_relocate_subfolder");
+        git(
+            &parent,
+            &["init", "-b", "main", "--template="],
+            "2026-06-01T12:00:00+00:00",
+        );
+        for folder in ["repo/a", "repo/b"] {
+            write_task_dated(
+                &parent,
+                &format!("{folder}/tasks/archive/scope_one.md"),
+                "2026-05-01",
+                "2026-05-01",
+                "finished",
+            );
+        }
+        commit_all(&parent, "archive both", "2026-06-01T12:00:00+00:00");
+
+        let first =
+            harvest_repository_with_prior(&parent.join("repo/a"), &[], None).expect("harvest a");
+        let key = first.history_key.clone();
+        let prior = prior_rows(&first.tasks);
+        let _ = take_leave_walk_count(&parent.join("repo/a"));
+
+        let second = harvest_repository_with_prior(&parent.join("repo/b"), &prior, key.as_deref())
+            .expect("harvest b");
+        assert_ne!(
+            second.history_key, key,
+            "the folder's place inside the repository changes the key"
+        );
+        assert_eq!(
+            take_leave_walk_count(&parent.join("repo/b")),
+            1,
+            "relocating to another subfolder re-walks the archived path"
+        );
+        assert_eq!(
+            second.tasks[0].leave_date,
+            Some(utc_day(2026, 6, 1)),
+            "the archived path keeps its first archive day"
+        );
+        let _ = fs::remove_dir_all(&parent);
     }
 
     #[test]
@@ -4531,7 +5032,11 @@ mod tests {
             ship_date: Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day")),
         }];
 
-        let tasks = harvest_repository_with_prior(&repo, &prior)
+        let key = harvest_repository_with_prior(&repo, &[], None)
+            .expect("key harvest")
+            .history_key;
+        let _ = take_leave_walk_count(&repo);
+        let tasks = harvest_repository_with_prior(&repo, &prior, key.as_deref())
             .expect("harvest")
             .tasks;
         assert_eq!(
@@ -4743,7 +5248,11 @@ mod tests {
             ship_date: Some(NaiveDate::from_ymd_opt(2026, 6, 1).expect("day")),
         }];
 
-        let tasks = harvest_repository_with_prior(&repo, &prior)
+        let key = harvest_repository_with_prior(&repo, &[], None)
+            .expect("key harvest")
+            .history_key;
+        let _ = take_leave_walk_count(&repo);
+        let tasks = harvest_repository_with_prior(&repo, &prior, key.as_deref())
             .expect("harvest")
             .tasks;
         assert_eq!(
@@ -6296,7 +6805,7 @@ mod tests {
             "2026-07-01T12:00:00+00:00",
         );
 
-        let second = harvest_repository_with_prior(&repo, &prior)
+        let second = harvest_repository_with_prior(&repo, &prior, None)
             .expect("second harvest")
             .tasks;
         assert_eq!(
@@ -6351,7 +6860,9 @@ mod tests {
         let lossy = "tasks/archive/scope_bad\u{FFFD}.md";
         let fallback = NaiveDate::from_ymd_opt(2026, 5, 20).expect("day");
 
-        let first = harvest_repository(&repo).expect("first harvest");
+        let first = harvest_repository_with_prior(&repo, &[], None).expect("first harvest");
+        let key = first.history_key.clone();
+        let first = first.tasks;
         assert_eq!(
             take_leave_walk_count(&repo),
             1,
@@ -6378,7 +6889,7 @@ mod tests {
             })
             .collect();
 
-        let second = harvest_repository_with_prior(&repo, &prior)
+        let second = harvest_repository_with_prior(&repo, &prior, key.as_deref())
             .expect("second harvest")
             .tasks;
         assert_eq!(
@@ -7352,9 +7863,9 @@ mod tests {
             ship_date: None,
         }];
 
-        let first = harvest_repository_with_prior(&repo, &prior)
-            .expect("harvest")
-            .tasks;
+        let first = harvest_repository_with_prior(&repo, &prior, None).expect("harvest");
+        let key = first.history_key.clone();
+        let first = first.tasks;
         assert!(
             take_leave_walk_count(&repo) > 0,
             "the r5 row must re-walk its leave day once"
@@ -7382,7 +7893,7 @@ mod tests {
                 ship_date: task.ship_date,
             })
             .collect();
-        harvest_repository_with_prior(&repo, &prior).expect("harvest");
+        harvest_repository_with_prior(&repo, &prior, key.as_deref()).expect("harvest");
         assert_eq!(
             take_leave_walk_count(&repo),
             0,
@@ -8070,7 +8581,7 @@ mod tests {
             ship_date: Some(utc_day(2026, 2, 1)),
         }];
 
-        let tasks = harvest_repository_with_prior(&parent.join("proj2"), &prior)
+        let tasks = harvest_repository_with_prior(&parent.join("proj2"), &prior, None)
             .expect("harvest")
             .tasks;
         assert_eq!(
@@ -8653,7 +9164,7 @@ mod tests {
             "open",
         );
 
-        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        let harvested = harvest_repository_with_prior(&repo, &[], None).expect("harvest");
         assert_eq!(
             harvested.skipped.get(&SkipReason::Oversized).copied(),
             Some(1),
@@ -8685,7 +9196,7 @@ mod tests {
         )
         .expect("write an empty-status task");
 
-        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        let harvested = harvest_repository_with_prior(&repo, &[], None).expect("harvest");
         assert_eq!(
             harvested.tasks.len(),
             1,
@@ -8704,7 +9215,7 @@ mod tests {
         // A stray README.md under tasks/ is not a task the person lost, so it
         // contributes no tally entry.
         fs::write(repo.join("tasks/README.md"), "# Notes\n").expect("write a stray readme");
-        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        let harvested = harvest_repository_with_prior(&repo, &[], None).expect("harvest");
         assert_eq!(
             harvested.skipped_count(),
             1,
@@ -8725,7 +9236,7 @@ mod tests {
         write_task(&repo, "tasks/scope_valid.md", "2026-05-01", "open");
         write_non_utf8_task(&repo, "tasks/README.md", "2026-05-01", "2026-05-01", "open");
 
-        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        let harvested = harvest_repository_with_prior(&repo, &[], None).expect("harvest");
         assert_eq!(harvested.tasks.len(), 1, "the valid task still charts");
         assert_eq!(harvested.tasks[0].path, "tasks/scope_valid.md");
         assert_eq!(
@@ -8742,7 +9253,7 @@ mod tests {
             vec![b'a'; MAX_TASK_FILE_BYTES + 1],
         )
         .expect("oversized stray file");
-        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        let harvested = harvest_repository_with_prior(&repo, &[], None).expect("harvest");
         assert_eq!(harvested.tasks.len(), 1);
         assert_eq!(
             harvested.skipped_count(),
@@ -8785,7 +9296,7 @@ mod tests {
         );
         git(&repo, &["checkout", "main"], "2026-06-02T12:00:00+00:00");
 
-        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        let harvested = harvest_repository_with_prior(&repo, &[], None).expect("harvest");
         assert_eq!(harvested.tasks.len(), 1, "the valid task still charts");
         assert_eq!(
             harvested.skipped_count(),
@@ -8824,7 +9335,7 @@ mod tests {
         )
         .expect("write a task with no status value");
 
-        let harvested = harvest_repository_with_prior(&repo, &[]).expect("harvest");
+        let harvested = harvest_repository_with_prior(&repo, &[], None).expect("harvest");
         assert!(
             harvested.tasks.is_empty(),
             "no file charts a row: {:?}",
@@ -9453,9 +9964,10 @@ mod tests {
 
         let captured = CapturedWarnings::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
-        let tasks =
-            tracing::subscriber::with_default(subscriber, || state.finish(&repo, &git, &[]))
-                .expect("the synthetic rows finish");
+        let tasks = tracing::subscriber::with_default(subscriber, || {
+            state.finish(&repo, &git, &[], no_history_cache())
+        })
+        .expect("the synthetic rows finish");
 
         let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
         assert_eq!(
@@ -9525,9 +10037,10 @@ mod tests {
 
         let captured = CapturedWarnings::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
-        let tasks =
-            tracing::subscriber::with_default(subscriber, || state.finish(&repo, &git, &[]))
-                .expect("the synthetic rows finish");
+        let tasks = tracing::subscriber::with_default(subscriber, || {
+            state.finish(&repo, &git, &[], no_history_cache())
+        })
+        .expect("the synthetic rows finish");
 
         assert_eq!(tasks.len(), 1, "the two names chart one row: {tasks:?}");
         let warnings = captured.take();
@@ -9586,8 +10099,15 @@ mod tests {
             skip: None,
         };
 
-        let harvested = harvest_files(&repo, &git, vec![row], &[], &mut SkipTally::default())
-            .expect("the carried path charts the row");
+        let harvested = harvest_files(
+            &repo,
+            &git,
+            vec![row],
+            &[],
+            no_history_cache(),
+            &mut SkipTally::default(),
+        )
+        .expect("the carried path charts the row");
         assert_eq!(harvested.tasks.len(), 1, "{:?}", harvested.tasks);
         assert_eq!(
             harvested.tasks[0].path, stored,
@@ -9626,7 +10146,14 @@ mod tests {
         let captured = CapturedWarnings::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         let harvested = tracing::subscriber::with_default(subscriber, || {
-            harvest_files(&repo, &git, vec![row], &[], &mut SkipTally::default())
+            harvest_files(
+                &repo,
+                &git,
+                vec![row],
+                &[],
+                no_history_cache(),
+                &mut SkipTally::default(),
+            )
         })
         .expect("a vanished file does not fail the harvest");
         assert!(harvested.tasks.is_empty(), "{:?}", harvested.tasks);
@@ -9731,6 +10258,7 @@ mod tests {
             chosen,
             WorktreeFiles::default(),
             &[],
+            no_history_cache(),
             &mut SkipTally::default(),
         )
         .expect("the carried path charts the chosen row");
