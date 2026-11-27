@@ -447,14 +447,17 @@ async fn refuse_foreign_schema(
     .await?;
 
     for (name, kind) in &objects {
-        if !OWNED_TABLES.contains(&name.as_str()) {
+        // An unrelated view is not evidence the file is another application's;
+        // only an unowned table is. A non-table object that reuses an owned
+        // name is still refused, because the tool would fail on it later.
+        if !OWNED_TABLES.contains(&name.as_str()) && kind == "table" {
             anyhow::bail!(
                 "the database at {} is not task-viewer's: it carries a {kind} named {name} \
                  that task-viewer does not own; an empty file or a new path is needed",
                 path.display()
             );
         }
-        if kind != "table" {
+        if kind != "table" && OWNED_TABLES.contains(&name.as_str()) {
             anyhow::bail!(
                 "the database at {} is not task-viewer's: its {name} {kind} is not the table \
                  task-viewer owns; an empty file or a new path is needed",
@@ -464,9 +467,9 @@ async fn refuse_foreign_schema(
     }
 
     if version == 0 {
-        if let Some((name, _)) = objects.first() {
+        if let Some((name, kind)) = objects.first() {
             anyhow::bail!(
-                "the database at {} claims to be new but already carries the {name} table; \
+                "the database at {} claims to be new but already carries the {name} {kind}; \
                  an empty file or a new path is needed",
                 path.display()
             );
@@ -479,6 +482,10 @@ async fn refuse_foreign_schema(
     let current = shape_at(SCHEMA_VERSION);
     let mut present: Vec<(&str, Vec<String>)> = Vec::new();
     for (name, _) in &objects {
+        // An unrelated view's columns are not part of the claimed schema.
+        if !OWNED_TABLES.contains(&name.as_str()) {
+            continue;
+        }
         let columns = table_columns(conn, name).await?;
         for column in &columns {
             let known = current
@@ -2639,6 +2646,50 @@ mod tests {
             .expect("raw connection")
     }
 
+    /// Covers: an unrelated view added to a genuine task-viewer database is not
+    /// foreign evidence, so the file still opens, while a view that reuses an
+    /// owned table's name is still refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_accepts_a_genuine_file_with_an_unrelated_view() {
+        let path = temp_database();
+        let pool = init_at(&path).await.expect("init");
+        sqlx::query("CREATE VIEW helper AS SELECT 1 AS one")
+            .execute(&pool)
+            .await
+            .expect("unrelated view");
+        pool.close().await;
+        let pool = init_at(&path)
+            .await
+            .expect("a genuine file with an unrelated view still opens");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        pool.close().await;
+        remove_scratch(&path);
+
+        let shadow = temp_database();
+        let pool = init_at(&shadow).await.expect("init");
+        sqlx::query("DROP TABLE tasks")
+            .execute(&pool)
+            .await
+            .expect("drop tasks");
+        sqlx::query("CREATE VIEW tasks AS SELECT 1 AS one")
+            .execute(&pool)
+            .await
+            .expect("shadowing view");
+        pool.close().await;
+        let error = init_at(&shadow)
+            .await
+            .expect_err("a view named tasks is refused");
+        assert!(
+            format!("{error:#}").contains("tasks view is not the table"),
+            "the refusal names the shadowing view: {error:#}"
+        );
+        remove_scratch(&shadow);
+    }
+
     /// Covers: a non-empty file that is not task-viewer's is refused at
     /// start-up, naming its path and the offending table or column and saying
     /// an empty file or a new path is needed, while its tables, rows, and
@@ -2778,6 +2829,20 @@ mod tests {
                 "the refusal names {needle}: {message}"
             );
         }
+        let after = raw_pool(&mixed).await;
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&after)
+            .await
+            .expect("version");
+        assert_eq!(version, 2, "the refused file keeps its stamped version");
+        let scope: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'scope'",
+        )
+        .fetch_one(&after)
+        .await
+        .expect("column count");
+        assert_eq!(scope, 0, "the refused file gained no missing column");
+        after.close().await;
         remove_scratch(&mixed);
 
         // A file at any version from 1 through `SCHEMA_VERSION` carrying an
@@ -2805,6 +2870,16 @@ mod tests {
                     "the version-{version} refusal names {needle}: {message}"
                 );
             }
+            let after = raw_pool(&unknown).await;
+            let stamped: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&after)
+                .await
+                .expect("version");
+            assert_eq!(
+                stamped, version,
+                "the version-{version} refusal keeps its stamped version"
+            );
+            after.close().await;
             remove_scratch(&unknown);
         }
 
