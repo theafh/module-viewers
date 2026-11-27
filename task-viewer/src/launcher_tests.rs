@@ -1280,8 +1280,9 @@ fn launcher_status_waits_for_the_lock_holder() {
 fn launcher_status_exit_code_reports_whether_the_server_runs() {
     let dir = unique_temp_dir("launcher_status_exit");
     let launcher = stage_launcher(&dir);
-    // `is_running` is overridden rather than faked through `ps`, so the test
-    // measures `do_status`'s own contract and nothing about process lookup.
+    // Both `is_running` and `ps` are stubbed, so the test measures `do_status`'s
+    // own output and exit codes. A `-ww` read prints nothing, so
+    // `started_from_path` cannot add a Started-from line for the faked PID.
     let driver = format!(
         r#"#!/bin/bash
 set -u
@@ -1289,6 +1290,7 @@ set -- source-guard-probe
 . "{launcher}"
 get_pid() {{ echo 4242; }}
 is_running() {{ return 0; }}
+ps() {{ return 0; }}
 do_status || exit 10
 echo "---stopped---"
 is_running() {{ return 1; }}
