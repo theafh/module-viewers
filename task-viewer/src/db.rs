@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use sqlx::{
     Pool, QueryBuilder, Sqlite,
     sqlite::{
@@ -987,7 +987,8 @@ pub async fn replace_tasks(
 /// unchanged file can reuse its stored leave day instead of walking git again
 /// and an Update run can tell a new row from one that newly shipped. A stored
 /// value that does not parse stays `None` rather than dropping the row, so its
-/// leave day still reaches the harvest.
+/// leave day still reaches the harvest, and each bad ship or leave day logs one
+/// warning naming the repository, path, field, and raw value.
 pub async fn load_prior_tasks(pool: &Pool<Sqlite>, repository_id: i64) -> Result<Vec<PriorTask>> {
     let rows = sqlx::query_as::<
         _,
@@ -998,10 +999,13 @@ pub async fn load_prior_tasks(pool: &Pool<Sqlite>, repository_id: i64) -> Result
             String,
             String,
             Option<String>,
+            String,
         ),
     >(
-        "SELECT path, leave_date, content_hash, kind, created, ship_date
-         FROM tasks WHERE repository_id = ?",
+        "SELECT t.path, t.leave_date, t.content_hash, t.kind, t.created, t.ship_date, r.name
+         FROM tasks t
+         INNER JOIN repositories r ON r.repository_id = t.repository_id
+         WHERE t.repository_id = ?",
     )
     .bind(repository_id)
     .fetch_all(pool)
@@ -1009,16 +1013,58 @@ pub async fn load_prior_tasks(pool: &Pool<Sqlite>, repository_id: i64) -> Result
     Ok(rows
         .into_iter()
         .map(
-            |(path, leave_date, content_hash, kind, created, ship_date)| PriorTask {
+            |(path, leave_date, content_hash, kind, created, ship_date, repository)| PriorTask {
+                leave_date: parse_stored_day(
+                    leave_date.as_deref(),
+                    warn_once::UNPARSEABLE_LEAVE_DATE,
+                    repository_id,
+                    &repository,
+                    &path,
+                    "leave_date",
+                ),
+                ship_date: parse_stored_day(
+                    ship_date.as_deref(),
+                    warn_once::UNPARSEABLE_SHIP_DATE,
+                    repository_id,
+                    &repository,
+                    &path,
+                    "ship_date",
+                ),
                 path,
-                leave_date: leave_date.and_then(|value| crate::dates::parse_iso_date(&value)),
                 content_hash,
                 kind: crate::harvest::TaskKind::parse(&kind),
                 created: crate::dates::parse_iso_date(&created),
-                ship_date: ship_date.as_deref().and_then(crate::dates::parse_iso_date),
             },
         )
         .collect())
+}
+
+/// Parse one stored day, warning once per process when the raw value does not
+/// parse. The event label keeps the ship and leave warnings about one row
+/// distinct, and the once-per-process gate keys on the repository, path, and
+/// raw value, so a repeated dashboard read or harvest read stays silent. A
+/// missing value is simply `None` and warns about nothing.
+fn parse_stored_day(
+    stored: Option<&str>,
+    event: &str,
+    repository_id: i64,
+    repository: &str,
+    path: &str,
+    field: &str,
+) -> Option<NaiveDate> {
+    let value = stored?;
+    let parsed = crate::dates::parse_iso_date(value);
+    if parsed.is_none() && warn_once::first_sighting(event, repository_id, path, value) {
+        tracing::warn!(
+            repository = %repository,
+            path = %path,
+            field = %field,
+            value = %value,
+            "stored task row's {} did not parse",
+            field
+        );
+    }
+    parsed
 }
 
 /// The history key stored for one repository, or `None` when the row carries no
@@ -1183,14 +1229,22 @@ fn row_to_record(
     let Some(created) = crate::dates::parse_iso_date(&row.created) else {
         return Err(UnparsedRow::new(&row));
     };
-    let ship_date = row
-        .ship_date
-        .as_deref()
-        .and_then(crate::dates::parse_iso_date);
-    let leave_date = row
-        .leave_date
-        .as_deref()
-        .and_then(crate::dates::parse_iso_date);
+    let ship_date = parse_stored_day(
+        row.ship_date.as_deref(),
+        warn_once::UNPARSEABLE_SHIP_DATE,
+        repository_id,
+        &project,
+        &row.path,
+        "ship_date",
+    );
+    let leave_date = parse_stored_day(
+        row.leave_date.as_deref(),
+        warn_once::UNPARSEABLE_LEAVE_DATE,
+        repository_id,
+        &project,
+        &row.path,
+        "leave_date",
+    );
     // A stored `updated` day another writer left unreadable only costs the
     // staleness card its point for this row, so it stays a charted row with no
     // updated day instead of dropping out of every series.
@@ -1210,6 +1264,23 @@ fn row_to_record(
             "stored task row's updated day did not parse; charted without it"
         );
     }
+    // A finished or deferred row always leaves the backlog on some day, so an
+    // unparseable stored day cannot leave it counted in the live backlog and
+    // mean age forever. A finished row ships on its leave day when the ship day
+    // is missing, then takes its leave day from the ship day, the stored
+    // `updated` day, or `created`, and keeps ship equal to leave. A deferred
+    // row takes its leave day from `updated`, then `created`, so its weekly bar
+    // moves onto the fallback day. A parseable pair stays unchanged, and a live
+    // row keeps no day.
+    let (ship_date, leave_date) = match kind {
+        crate::harvest::TaskKind::Finished => {
+            let ship = ship_date.or(leave_date);
+            let leave = leave_date.or(ship).or(updated).or(Some(created));
+            (ship.or(leave), leave)
+        }
+        crate::harvest::TaskKind::Deferred => (ship_date, leave_date.or(updated).or(Some(created))),
+        crate::harvest::TaskKind::Live => (ship_date, leave_date),
+    };
     Ok(crate::series::TaskRecord {
         repository_id,
         project,
@@ -1519,6 +1590,38 @@ mod tests {
         task
     }
 
+    /// Store one raw row, including day strings the app never writes, so a test
+    /// can hold the read path to a foreign or partial write. A `None` day lands
+    /// as SQL `NULL`.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_raw_row(
+        pool: &sqlx::SqlitePool,
+        repository_id: i64,
+        path: &str,
+        kind: &str,
+        created: &str,
+        updated: &str,
+        ship: Option<&str>,
+        leave: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO tasks
+                (repository_id, path, scope, kind, created, updated, ship_date, leave_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(repository_id)
+        .bind(path)
+        .bind("scope")
+        .bind(kind)
+        .bind(created)
+        .bind(updated)
+        .bind(ship)
+        .bind(leave)
+        .execute(pool)
+        .await
+        .expect("raw task row");
+    }
+
     /// The name prefix this test gives its sqlx worker threads. The subscriber
     /// below captures only statements from those threads, because sqlx logs a
     /// statement on the connection's worker thread rather than the caller's.
@@ -1605,6 +1708,8 @@ mod tests {
         kind: Option<String>,
         created: Option<String>,
         updated: Option<String>,
+        field: Option<String>,
+        value: Option<String>,
     }
 
     impl WarningFields {
@@ -1618,6 +1723,8 @@ mod tests {
                 ("kind", &self.kind),
                 ("created", &self.created),
                 ("updated", &self.updated),
+                ("field", &self.field),
+                ("value", &self.value),
             ] {
                 if let Some(value) = value {
                     line.push(' ');
@@ -1637,6 +1744,8 @@ mod tests {
                 "kind" => &mut self.kind,
                 "created" => &mut self.created,
                 "updated" => &mut self.updated,
+                "field" => &mut self.field,
+                "value" => &mut self.value,
                 _ => return,
             };
             *slot = Some(value.to_string());
@@ -3744,6 +3853,489 @@ mod tests {
             warnings[0].contains("repository=ai-modules"),
             "{warnings:?}"
         );
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a finished row whose stored leave day does not parse logs one
+    /// warning naming its field and raw value, ships on its stored ship day,
+    /// and leaves the live backlog and mean age on that day.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_falls_back_a_finished_rows_bad_leave_day_to_its_ship_day() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        insert_raw_row(
+            &pool,
+            id,
+            "tasks/archive/scope_bad_leave.md",
+            "finished",
+            "2026-05-01",
+            "2026-06-01",
+            Some("2026-05-20"),
+            Some("not-a-leave"),
+        )
+        .await;
+
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(WarningCapture {
+            warnings: std::sync::Arc::clone(&warnings),
+        });
+        // The process-wide capture is shared and sibling tests clear it, so this
+        // test installs its own thread-local capture and counts only its row.
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let loaded = load_tasks(&pool, None).await.expect("load");
+        assert_eq!(loaded.len(), 1, "the row still charts");
+        assert_eq!(loaded[0].ship_date, Some(date(2026, 5, 20)));
+        assert_eq!(
+            loaded[0].leave_date,
+            Some(date(2026, 5, 20)),
+            "a bad leave day falls back to the ship day"
+        );
+        let mine: Vec<String> = warnings
+            .lock()
+            .expect("warning log")
+            .iter()
+            .filter(|warning| warning.contains("tasks/archive/scope_bad_leave.md"))
+            .cloned()
+            .collect();
+        assert_eq!(mine.len(), 1, "{mine:?}");
+        assert!(mine[0].contains("repository=ai-modules"), "{mine:?}");
+        assert!(
+            mine[0].contains("path=tasks/archive/scope_bad_leave.md"),
+            "{mine:?}"
+        );
+        assert!(mine[0].contains("field=leave_date"), "{mine:?}");
+        assert!(mine[0].contains("value=not-a-leave"), "{mine:?}");
+
+        let again = load_tasks(&pool, None).await.expect("second load");
+        assert_eq!(again.len(), 1);
+        let repeated = warnings
+            .lock()
+            .expect("warning log")
+            .iter()
+            .filter(|warning| warning.contains("tasks/archive/scope_bad_leave.md"))
+            .count();
+        assert_eq!(repeated, 1, "the second read of the value stays silent");
+
+        let board = crate::series::dashboard(
+            &loaded,
+            date(2026, 5, 25),
+            crate::series::RadarMode::Scope,
+            "ai-modules",
+        );
+        let before = board
+            .live_backlog
+            .iter()
+            .find(|point| point.date == "2026-05-19")
+            .expect("the day before the ship day");
+        assert_eq!(before.live, 1, "the row is still in the backlog");
+        let on_ship = board
+            .live_backlog
+            .iter()
+            .find(|point| point.date == "2026-05-20")
+            .expect("the ship day");
+        assert_eq!(
+            on_ship.live, 0,
+            "the row leaves the backlog on its ship day"
+        );
+        assert!(
+            board
+                .mean_age
+                .iter()
+                .all(|point| point.date != "2026-05-20"),
+            "the mean age drops the row on the day it leaves"
+        );
+        assert_eq!(board.counts.finished, 1);
+
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a finished row whose stored ship and leave days both fail to
+    /// parse leaves on its `updated` day, then on its `created` day when
+    /// `updated` fails too, and its ship day equals its leave day.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_falls_back_a_finished_rows_two_bad_days_to_updated_then_created() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        insert_raw_row(
+            &pool,
+            id,
+            "tasks/archive/scope_both_bad.md",
+            "finished",
+            "2026-05-01",
+            "2026-06-10",
+            Some("bad-ship"),
+            Some("bad-leave"),
+        )
+        .await;
+        insert_raw_row(
+            &pool,
+            id,
+            "tasks/archive/scope_both_bad_created.md",
+            "finished",
+            "2026-05-02",
+            "not-a-day",
+            Some("bad-ship-2"),
+            Some("bad-leave-2"),
+        )
+        .await;
+
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(WarningCapture {
+            warnings: std::sync::Arc::clone(&warnings),
+        });
+        // The process-wide capture is shared and sibling tests clear it, so this
+        // test installs its own thread-local capture and counts only its rows.
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let loaded = load_tasks(&pool, None).await.expect("load");
+        let find = |path: &str| {
+            loaded
+                .iter()
+                .find(|task| task.path == path)
+                .unwrap_or_else(|| panic!("{path} charts"))
+        };
+        let updated = find("tasks/archive/scope_both_bad.md");
+        assert_eq!(updated.ship_date, Some(date(2026, 6, 10)));
+        assert_eq!(
+            updated.leave_date,
+            Some(date(2026, 6, 10)),
+            "two bad days fall back to the stored updated day"
+        );
+        let created = find("tasks/archive/scope_both_bad_created.md");
+        assert_eq!(created.ship_date, Some(date(2026, 5, 2)));
+        assert_eq!(
+            created.leave_date,
+            Some(date(2026, 5, 2)),
+            "two bad days and a bad updated day fall back to created"
+        );
+        assert_eq!(
+            updated.ship_date, updated.leave_date,
+            "the fallback keeps ship equal to leave"
+        );
+        assert_eq!(created.ship_date, created.leave_date);
+
+        let warnings = warnings.lock().expect("warning log").clone();
+        for (path, field, value) in [
+            ("tasks/archive/scope_both_bad.md", "ship_date", "bad-ship"),
+            ("tasks/archive/scope_both_bad.md", "leave_date", "bad-leave"),
+            (
+                "tasks/archive/scope_both_bad_created.md",
+                "ship_date",
+                "bad-ship-2",
+            ),
+            (
+                "tasks/archive/scope_both_bad_created.md",
+                "leave_date",
+                "bad-leave-2",
+            ),
+        ] {
+            let mine = warnings
+                .iter()
+                .filter(|warning| warning.contains(path) && warning.contains(field))
+                .collect::<Vec<_>>();
+            assert_eq!(mine.len(), 1, "{path} names its {field}: {warnings:?}");
+            assert!(
+                mine[0].contains(&format!("value={value}")),
+                "{path} names {value}: {mine:?}"
+            );
+            assert!(mine[0].contains("repository=ai-modules"), "{mine:?}");
+        }
+
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a deferred row whose stored leave day does not parse leaves on
+    /// its `updated` day, and its weekly deferred bar sits on that day while the
+    /// deferred bars still sum to the deferred count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_falls_back_a_deferred_rows_bad_leave_day_to_its_updated_day() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        insert_raw_row(
+            &pool,
+            id,
+            "tasks/archive/scope_deferred_bad_leave.md",
+            "deferred",
+            "2026-05-04",
+            "2026-06-08",
+            None,
+            Some("not-a-leave"),
+        )
+        .await;
+
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(WarningCapture {
+            warnings: std::sync::Arc::clone(&warnings),
+        });
+        // The process-wide capture is shared and sibling tests clear it, so this
+        // test installs its own thread-local capture and counts only its row.
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let loaded = load_tasks(&pool, None).await.expect("load");
+        assert_eq!(loaded.len(), 1, "the row still charts");
+        assert_eq!(loaded[0].ship_date, None, "a deferred row has no ship day");
+        assert_eq!(
+            loaded[0].leave_date,
+            Some(date(2026, 6, 8)),
+            "a bad leave day falls back to the updated day"
+        );
+        let mine: Vec<String> = warnings
+            .lock()
+            .expect("warning log")
+            .iter()
+            .filter(|warning| warning.contains("tasks/archive/scope_deferred_bad_leave.md"))
+            .cloned()
+            .collect();
+        assert_eq!(mine.len(), 1, "{mine:?}");
+        assert!(mine[0].contains("field=leave_date"), "{mine:?}");
+        assert!(mine[0].contains("value=not-a-leave"), "{mine:?}");
+
+        let board = crate::series::dashboard(
+            &loaded,
+            date(2026, 7, 1),
+            crate::series::RadarMode::Scope,
+            "ai-modules",
+        );
+        assert_eq!(board.counts.deferred, 1);
+        let fallback_week = board
+            .weekly
+            .iter()
+            .find(|point| point.week == "2026-06-08")
+            .expect("the fallback day's week");
+        assert_eq!(
+            fallback_week.deferred, 1,
+            "the weekly bar sits on the fallback day's week"
+        );
+        assert_eq!(
+            board.weekly.iter().map(|point| point.deferred).sum::<i64>(),
+            board.counts.deferred as i64,
+            "the deferred bars still reach the deferred count"
+        );
+        let on_fallback = board
+            .live_backlog
+            .iter()
+            .find(|point| point.date == "2026-06-08")
+            .expect("the fallback day");
+        assert_eq!(
+            on_fallback.live, 0,
+            "the deferred row leaves the backlog on its fallback day"
+        );
+
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a deferred row whose stored leave day and `updated` day both fail
+    /// to parse leaves on its `created` day.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_falls_back_a_deferred_rows_two_bad_days_to_its_created_day() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        insert_raw_row(
+            &pool,
+            id,
+            "tasks/archive/scope_deferred_both_bad.md",
+            "deferred",
+            "2026-05-04",
+            "not-a-day",
+            None,
+            Some("not-a-leave"),
+        )
+        .await;
+
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(WarningCapture {
+            warnings: std::sync::Arc::clone(&warnings),
+        });
+        // The process-wide capture is shared and sibling tests clear it, so this
+        // test installs its own thread-local capture and counts only its row.
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let loaded = load_tasks(&pool, None).await.expect("load");
+        assert_eq!(loaded.len(), 1, "the row still charts");
+        assert_eq!(
+            loaded[0].leave_date,
+            Some(date(2026, 5, 4)),
+            "a bad leave day and a bad updated day fall back to created"
+        );
+
+        let board = crate::series::dashboard(
+            &loaded,
+            date(2026, 6, 1),
+            crate::series::RadarMode::Scope,
+            "ai-modules",
+        );
+        assert_eq!(board.counts.deferred, 1);
+        assert_eq!(
+            board.weekly.iter().map(|point| point.deferred).sum::<i64>(),
+            board.counts.deferred as i64,
+            "the deferred bar still reaches the deferred count"
+        );
+        let on_created = board
+            .live_backlog
+            .iter()
+            .find(|point| point.date == "2026-05-04")
+            .expect("the created day");
+        assert_eq!(
+            on_created.live, 0,
+            "the deferred row leaves the backlog on its created day"
+        );
+
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a finished row whose stored ship and leave days both parse keeps
+    /// them unchanged and logs no day warning.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_keeps_a_parseable_ship_and_leave_pair() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        insert_raw_row(
+            &pool,
+            id,
+            "tasks/archive/scope_parseable_pair.md",
+            "finished",
+            "2026-05-01",
+            "2026-06-01",
+            Some("2026-05-20"),
+            Some("2026-05-20"),
+        )
+        .await;
+
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(WarningCapture {
+            warnings: std::sync::Arc::clone(&warnings),
+        });
+        // The process-wide capture is shared and sibling tests clear it, so this
+        // test installs its own thread-local capture and counts only its row.
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let loaded = load_tasks(&pool, None).await.expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].ship_date, Some(date(2026, 5, 20)));
+        assert_eq!(loaded[0].leave_date, Some(date(2026, 5, 20)));
+        let mine = warnings
+            .lock()
+            .expect("warning log")
+            .iter()
+            .filter(|warning| warning.contains("tasks/archive/scope_parseable_pair.md"))
+            .count();
+        assert_eq!(mine, 0, "a parseable pair logs no day warning");
+
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: the prior-task read logs one warning naming the repository, path,
+    /// field, and raw value for a bad ship or leave day, and a second read of
+    /// the same stored value in the same process stays silent. The prior read
+    /// keeps the unparseable day as `None` so the harvest still re-walks it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_warns_once_from_the_prior_read_for_a_bad_ship_or_leave_day() {
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        insert_raw_row(
+            &pool,
+            id,
+            "tasks/archive/scope_prior_bad_leave.md",
+            "finished",
+            "2026-05-01",
+            "2026-06-01",
+            Some("2026-05-20"),
+            Some("not-a-prior-leave"),
+        )
+        .await;
+        insert_raw_row(
+            &pool,
+            id,
+            "tasks/archive/scope_prior_bad_ship.md",
+            "finished",
+            "2026-05-01",
+            "2026-06-01",
+            Some("not-a-prior-ship"),
+            Some("2026-05-20"),
+        )
+        .await;
+
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(WarningCapture {
+            warnings: std::sync::Arc::clone(&warnings),
+        });
+        // The process-wide capture is shared and sibling tests clear it, so this
+        // test installs its own thread-local capture and counts only its rows.
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let first = load_prior_tasks(&pool, id).await.expect("first prior read");
+        let second = load_prior_tasks(&pool, id)
+            .await
+            .expect("second prior read");
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        let bad_leave = first
+            .iter()
+            .find(|prior| prior.path == "tasks/archive/scope_prior_bad_leave.md")
+            .expect("bad leave row");
+        assert_eq!(
+            bad_leave.leave_date, None,
+            "the unparseable leave day stays unset for the harvest"
+        );
+        assert_eq!(bad_leave.ship_date, Some(date(2026, 5, 20)));
+        let bad_ship = first
+            .iter()
+            .find(|prior| prior.path == "tasks/archive/scope_prior_bad_ship.md")
+            .expect("bad ship row");
+        assert_eq!(bad_ship.ship_date, None);
+        assert_eq!(bad_ship.leave_date, Some(date(2026, 5, 20)));
+
+        let warnings = warnings.lock().expect("warning log").clone();
+        for (path, field, value) in [
+            (
+                "tasks/archive/scope_prior_bad_leave.md",
+                "leave_date",
+                "not-a-prior-leave",
+            ),
+            (
+                "tasks/archive/scope_prior_bad_ship.md",
+                "ship_date",
+                "not-a-prior-ship",
+            ),
+        ] {
+            let mine = warnings
+                .iter()
+                .filter(|warning| warning.contains(path) && warning.contains(field))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mine.len(),
+                1,
+                "the prior read warns once across two reads for {path}: {warnings:?}"
+            );
+            assert!(mine[0].contains("repository=ai-modules"), "{mine:?}");
+            assert!(mine[0].contains(&format!("value={value}")), "{mine:?}");
+        }
+
         pool.close().await;
         remove_scratch(&path);
     }

@@ -16,6 +16,8 @@ pub(crate) const SHIPPED_AFTER_TODAY: &str = "shipped-after-today";
 pub(crate) const DEFERRED_AFTER_TODAY: &str = "deferred-after-today";
 pub(crate) const BEFORE_FLOOR: &str = "before-floor";
 pub(crate) const UNPARSEABLE_UPDATED: &str = "unparseable-updated";
+pub(crate) const UNPARSEABLE_SHIP_DATE: &str = "unparseable-ship-date";
+pub(crate) const UNPARSEABLE_LEAVE_DATE: &str = "unparseable-leave-date";
 pub(crate) const UNPARSEABLE_KIND_OR_CREATED: &str = "unparseable-kind-or-created";
 
 /// The identity of one warning: its event, the repository the row belongs to,

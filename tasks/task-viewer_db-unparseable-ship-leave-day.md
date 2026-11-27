@@ -2,9 +2,11 @@
 description: "Warn on an unparseable stored ship or leave day and fall back so a finished task always leaves the backlog."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
-status: ready
+updated: 2026-11-27T19:28:16Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Warn and fall back on an unparseable ship or leave day
