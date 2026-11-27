@@ -2,7 +2,7 @@
 description: "Log each per-render row warning once per process instead of on every dashboard, JSON, and CSV render."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T18:40:08Z
+updated: 2026-11-27T18:52:51Z
 status: implemented
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

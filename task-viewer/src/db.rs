@@ -3615,7 +3615,6 @@ mod tests {
     /// the gate keys the warning by repository, path, and offending value.
     #[tokio::test(flavor = "current_thread")]
     async fn db_warns_once_across_repeated_loads_for_a_row_that_does_not_parse() {
-        install_capture();
         let path = temp_database();
         test_db::set(path.clone());
         let pool = init().await.expect("init");
@@ -3658,8 +3657,13 @@ mod tests {
         .expect("unparseable created row");
         drop(conn);
 
-        let warnings = captured_warnings();
-        warnings.lock().expect("warning log").clear();
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(WarningCapture {
+            warnings: std::sync::Arc::clone(&warnings),
+        });
+        // The process-wide capture is shared and sibling tests clear it, so this
+        // test installs its own thread-local capture and counts only its rows.
+        let _capture = tracing::subscriber::set_default(subscriber);
         let first = load_tasks(&pool, None).await.expect("first load");
         let second = load_tasks(&pool, None).await.expect("second load");
         assert!(first.is_empty(), "the unparseable rows chart nothing");
@@ -3692,7 +3696,6 @@ mod tests {
     /// logs its warning once across two loads.
     #[tokio::test(flavor = "current_thread")]
     async fn db_warns_once_across_repeated_loads_for_an_unparseable_updated_day() {
-        install_capture();
         let path = temp_database();
         test_db::set(path.clone());
         let pool = init().await.expect("init");
@@ -3713,8 +3716,13 @@ mod tests {
         .await
         .expect("unparseable updated row");
 
-        let warnings = captured_warnings();
-        warnings.lock().expect("warning log").clear();
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(WarningCapture {
+            warnings: std::sync::Arc::clone(&warnings),
+        });
+        // The process-wide capture is shared and sibling tests clear it, so this
+        // test installs its own thread-local capture and counts only its row.
+        let _capture = tracing::subscriber::set_default(subscriber);
         let first = load_tasks(&pool, None).await.expect("first load");
         let second = load_tasks(&pool, None).await.expect("second load");
         assert_eq!(first.len(), 1, "the row still charts on the first load");
@@ -3732,6 +3740,10 @@ mod tests {
             "the updated warning fires once across two loads: {warnings:?}"
         );
         assert!(warnings[0].contains("updated=not-a-day"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("repository=ai-modules"),
+            "{warnings:?}"
+        );
         pool.close().await;
         remove_scratch(&path);
     }
