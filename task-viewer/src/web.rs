@@ -1007,7 +1007,8 @@ struct ThemeForm {
 /// other form route uses, so only this page's own form sets it. A `theme` that
 /// names neither theme sets no cookie and still redirects to the safe `next`.
 async fn set_theme(Form(form): Form<ThemeForm>) -> Response {
-    let mut response = Redirect::to(safe_theme_next(form.next.trim())).into_response();
+    let next = safe_theme_next(form.next.trim());
+    let mut response = Redirect::to(&encode_theme_next(next)).into_response();
     let theme = form.theme.trim();
     if theme == "light" || theme == "dark" {
         let cookie =
@@ -4050,6 +4051,53 @@ fn encode_query(value: &str) -> String {
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => out.push(byte as char),
+            b' ' => out.push_str("%20"),
+            _ => {
+                let _ = write!(
+                    out,
+                    "%{}{}",
+                    HEX[usize::from(byte >> 4)] as char,
+                    HEX[usize::from(byte & 0x0f)] as char
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Percent-encode a local theme `next` for a redirect `Location`, writing into
+/// one `String`. The keep-set is `A-Z a-z 0-9 - . _ ~` plus the delimiters
+/// `/ ? & = #`, so the path and its query structure survive, and a literal `+`
+/// stays because the page's own GET form encodes a search space as `+`. A `%`
+/// that opens a valid `%XX` escape in either hex case stays as it is, because
+/// `page_next` hands on an already-encoded path, while any other `%` becomes
+/// `%25`. Every other byte becomes `%XX` from the uppercase hex table, so a
+/// space becomes `%20` and each UTF-8 byte of a non-ASCII character becomes its
+/// own escape.
+fn encode_theme_next(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'/'
+            | b'?'
+            | b'&'
+            | b'='
+            | b'#'
+            | b'+' => out.push(byte as char),
+            b'%' if bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit) =>
+            {
+                out.push('%');
+            }
             b' ' => out.push_str("%20"),
             _ => {
                 let _ = write!(
@@ -9488,10 +9536,14 @@ mod tests {
     }
 
     /// Covers: `POST /theme` sets the theme cookie for a safe local `next` and
-    /// redirects there, while an absolute URL, a scheme, a `//` prefix, a
-    /// backslash, and an empty value all fall back to `/`. A theme naming
-    /// neither theme sets no cookie, and a cross-origin post is refused before
-    /// the route runs.
+    /// redirects there, percent-encoding the local path so a raw non-ASCII
+    /// value yields `/caf%C3%A9` with an all-ASCII `Location`, a space yields
+    /// `%20`, each non-ASCII UTF-8 byte becomes its own escape, an existing
+    /// `%XX` escape in either hex case and a literal `+` survive, a `%` that
+    /// opens no escape becomes `%25`, and `&` separators survive. An absolute
+    /// URL, a scheme, a `//` prefix, a backslash, and an empty value all fall
+    /// back to `/`. A theme naming neither theme sets no cookie, and a
+    /// cross-origin post is refused before the route runs.
     #[tokio::test(flavor = "current_thread")]
     async fn web_theme_post_sets_the_cookie_and_returns_to_a_safe_next() {
         let (state, path) = app_state("theme_post").await;
@@ -9507,6 +9559,21 @@ mod tests {
             ("theme=light&next=%2F%2Fevil.example%2Fx", "/"),
             ("theme=light&next=%2Fhttp%3A%2F%2Fevil.example", "/"),
             ("theme=light&next=%2F%5Cevil.example", "/"),
+            ("theme=dark&next=%2Ftasks%3Fq%3Da%2Bb", "/tasks?q=a+b"),
+            (
+                "theme=dark&next=%2Ftasks%3Fq%3Dcaf%25C3%25A9",
+                "/tasks?q=caf%C3%A9",
+            ),
+            (
+                "theme=dark&next=%2Ftasks%3Fq%3Dcaf%25c3%25a9",
+                "/tasks?q=caf%c3%a9",
+            ),
+            ("theme=dark&next=%2Ftasks%3Fq%3Da%20b", "/tasks?q=a%20b"),
+            ("theme=dark&next=%2Ftasks%3Fq%3D100%25", "/tasks?q=100%25"),
+            (
+                "theme=dark&next=%2Ftasks%3Fkind%3Dlive%26dir%3Ddesc",
+                "/tasks?kind=live&dir=desc",
+            ),
         ];
         for (body, target) in safe {
             let response = send(state.clone(), themed_post("/theme", body, None)).await;
@@ -9519,6 +9586,23 @@ mod tests {
             };
             assert_eq!(set_cookie(&response).as_deref(), Some(expected), "{body}");
         }
+
+        let non_ascii = send(
+            state.clone(),
+            themed_post("/theme", "theme=dark&next=/café", None),
+        )
+        .await;
+        assert_eq!(non_ascii.status(), StatusCode::SEE_OTHER);
+        let location = redirect_location(&non_ascii);
+        assert_eq!(location, "/caf%C3%A9");
+        assert!(
+            location.is_ascii(),
+            "the Location holds only ASCII bytes: {location:?}"
+        );
+        assert_eq!(
+            set_cookie(&non_ascii).as_deref(),
+            Some("task_viewer_theme=dark; Path=/; Max-Age=31536000; SameSite=Lax")
+        );
 
         let unknown = send(
             state.clone(),
