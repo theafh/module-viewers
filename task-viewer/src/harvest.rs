@@ -483,7 +483,7 @@ fn union_files(
     Ok((chosen, worktree, ref_holds_tasks))
 }
 
-/// Every distinct `(path, blob, lossy)` triple the repository's refs list under
+/// Every distinct `(path, blob)` pair the repository's refs list under
 /// the folder's `tasks/`, in first-seen ref order.
 ///
 /// A ref is read by the commit id it names, never by its ref name: a ref name
