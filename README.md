@@ -48,7 +48,7 @@ make stop
 make status
 ```
 
-The launcher keeps its state in `~/Library/Logs/task-viewer/` on macOS and in `${XDG_STATE_HOME:-~/.local/state}/task-viewer/` on Linux: the PID file, the server log, the build log, the binary stamp, and a lock directory it removes when the command finishes. The directory is mode `700` and every file the launcher creates there is mode `600`. `make start` and a click on the icon rebuild the release binary first, so after a source change they restart the server on the new code; a failed build is reported and nothing stale is started, and a missing `cargo` fails the start with a message naming `make build`. The launcher stops only the release binary from this checkout; when another program holds port 7880, start reports that and leaves it running.
+The launcher keeps its state in `~/Library/Logs/task-viewer/` on macOS and in `${XDG_STATE_HOME:-~/.local/state}/task-viewer/` on Linux: the PID file, the server log, the build log, the binary stamp, and a lock directory it removes when the command finishes. The directory is mode `700` and every file the launcher creates there is mode `600`. `make start` and a click on the icon rebuild the release binary first, so after a source change they restart the server on the new code; a failed build is reported and nothing stale is started, and a missing `cargo` fails the start with a message naming `make build`. The launcher stops only a task-viewer release binary — this checkout's, or one started from another path after the checkout moved or was renamed, whose started-from path it reports — and when another program holds port 7880, start reports that and leaves it running.
 
 ## Build
 

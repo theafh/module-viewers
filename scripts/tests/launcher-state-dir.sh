@@ -51,10 +51,15 @@ fail() {
 # and a private state parent. Nothing here resolves to a live directory.
 make_root() {
     local root="$1"
-    mkdir -p "$root/scripts" "$root/target/release" "$root/home" "$root/state"
+    mkdir -p "$root/scripts" "$root/target/release" "$root/home" "$root/state" "$root/bin"
     cp "$LAUNCHER_SOURCE" "$root/scripts/"
     printf '#!/bin/bash\nexit 0\n' >"$root/target/release/task-viewer"
     chmod +x "$root/target/release/task-viewer"
+    # The launcher treats any task-viewer release binary on the shared port as
+    # its server, so a live one on this machine would turn the stopped-status
+    # case into a running one. An empty `lsof` names no listener.
+    printf '#!/bin/bash\nexit 0\n' >"$root/bin/lsof"
+    chmod +x "$root/bin/lsof"
 }
 
 # The launcher's state directory for a given home, mirroring its own rule. `$2`
@@ -104,6 +109,7 @@ run_status() {
     local root="$1"
     run_launcher "$FAST_DEADLINE" \
         env HOME="$root/home" XDG_STATE_HOME="$root/state" \
+        TASK_VIEWER_PATH_FALLBACK="$root/bin" \
         bash "$root/scripts/task-viewer.sh" status
 }
 

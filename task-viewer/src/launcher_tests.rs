@@ -218,15 +218,23 @@ check absolute-arg yes "$BINARY --serve"
 check relative yes "./target/release/task-viewer"
 check relative-plain yes "target/release/task-viewer"
 check bare yes "task-viewer"
+check moved yes "/old/mv/target/release/task-viewer"
+check moved-space yes "/old/My Projects/target/release/task-viewer"
+check moved-arg yes "/old/mv/target/release/task-viewer --serve"
 check foreign-absolute no "/somewhere/else/task-viewer"
 check foreign-relative no "../elsewhere/task-viewer"
+check foreign-interpreter no "python3 /old/mv/target/release/task-viewer"
+check foreign-interpreter-abs no "/usr/bin/python3 /old/mv/target/release/task-viewer"
+check foreign-backup no "/old/mv/target/release/task-viewer-backup"
 check empty no ""
 "#;
 
 /// Covers: `is_ours` accepts a staged `ps` line printing the binary as
 /// `./target/release/task-viewer`, one printing the absolute binary followed by
 /// an argument, and one printing a bare `task-viewer` name resolved on `PATH`,
-/// and rejects a path outside the checkout.
+/// plus a release binary at another checkout's path (a path holding a space and
+/// a trailing argument included), and rejects a path outside the checkout, a
+/// `task-viewer-backup`, and an interpreter whose argument names such a binary.
 #[test]
 fn launcher_is_ours_resolves_every_printed_form() {
     let dir = unique_temp_dir("launcher_is_ours");
@@ -253,8 +261,14 @@ fn launcher_is_ours_resolves_every_printed_form() {
         "relative-ok",
         "relative-plain-ok",
         "bare-ok",
+        "moved-ok",
+        "moved-space-ok",
+        "moved-arg-ok",
         "foreign-absolute-ok",
         "foreign-relative-ok",
+        "foreign-interpreter-ok",
+        "foreign-interpreter-abs-ok",
+        "foreign-backup-ok",
         "empty-ok",
     ] {
         assert!(
@@ -295,8 +309,14 @@ fn launcher_is_ours_accepts_a_checkout_path_with_a_space() {
         "relative-ok",
         "relative-plain-ok",
         "bare-ok",
+        "moved-ok",
+        "moved-space-ok",
+        "moved-arg-ok",
         "foreign-absolute-ok",
         "foreign-relative-ok",
+        "foreign-interpreter-ok",
+        "foreign-interpreter-abs-ok",
+        "foreign-backup-ok",
         "empty-ok",
     ] {
         assert!(
@@ -304,6 +324,436 @@ fn launcher_is_ours_accepts_a_checkout_path_with_a_space() {
             "missing {marker} under a space path in: {stdout}",
         );
     }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Report a `status` for a PID whose `ps` line names another checkout's release
+/// binary, which is what a checkout moved after its server started leaves.
+const MOVED_STATUS_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+ps() {
+    case " $* " in
+        *" -ww "*) printf '%s\n' "$MOVED_PATH" ;;
+    esac
+}
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+port_pid() { :; }
+echo 4242 >"$PID_FILE"
+do_status
+echo "status=$?"
+"#;
+
+/// Covers: `status` reports a server started from a checkout that has since
+/// moved as running, naming its PID and the path it was started from as a third
+/// line, and exits 0.
+#[test]
+fn launcher_status_reports_a_moved_checkout() {
+    let dir = unique_temp_dir("launcher_moved_status");
+    let launcher = stage_root(&dir);
+    // A path that no longer exists, holding a space, followed by a trailing
+    // argument, so the verbatim recovery, the space, and the argument rule are
+    // all exercised.
+    let reported = dir
+        .join("gone/My Projects/target/release/task-viewer")
+        .to_string_lossy()
+        .into_owned();
+    let moved = format!("{reported} --serve");
+
+    let output = run_driver(
+        &dir,
+        MOVED_STATUS_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            ("MOVED_PATH", &moved),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=0"),
+        "a moved server must read as running: {stdout}",
+    );
+    assert!(
+        stdout.contains("task-viewer is running (PID: 4242)"),
+        "the moved server's PID must be named: {stdout}",
+    );
+    let third = format!("Started from: {reported}");
+    assert!(
+        stdout.lines().any(|line| line == third),
+        "the started-from path must be reported intact: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Stop a real process the launcher reads as a moved checkout's release binary.
+/// The fake `ps` answers only while the target is alive and not a zombie, so the
+/// stop's own liveness loop observes the signal taking effect.
+const MOVED_STOP_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+alive() {
+    local state
+    state=$(command ps -p "$TARGET" -o stat= 2>/dev/null) || return 1
+    case "$state" in
+        ""|Z*) return 1 ;;
+    esac
+}
+ps() {
+    case " $* " in
+        *" -ww "*) alive && printf '%s\n' "$MOVED_PATH" ;;
+    esac
+}
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+port_pid() { :; }
+sleep 60 &
+target=$!
+TARGET=$target
+echo "$target" >"$PID_FILE"
+do_stop
+echo "status=$?"
+if kill -0 "$target" 2>/dev/null; then echo "server-alive"; else echo "server-dead"; fi
+kill -9 "$target" 2>/dev/null || true
+wait "$target" 2>/dev/null || true
+"#;
+
+/// Covers: a moved server whose `ps` line carries a trailing argument is
+/// signalled by `stop`, and `stop` reports success only once it is gone.
+#[test]
+fn launcher_stop_reaches_a_moved_server() {
+    let dir = unique_temp_dir("launcher_moved_stop");
+    let launcher = stage_root(&dir);
+    // Vanished path with a space and a trailing argument, so the recovery and
+    // the trailing-argument rule both run.
+    let moved = dir
+        .join("gone/My Projects/target/release/task-viewer --serve")
+        .to_string_lossy()
+        .into_owned();
+
+    let output = run_driver(
+        &dir,
+        MOVED_STOP_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            ("MOVED_PATH", &moved),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=0"),
+        "the stop must report success: {stdout}",
+    );
+    assert!(
+        stdout.contains("task-viewer stopped"),
+        "the stop must report a stop: {stdout}",
+    );
+    assert!(
+        stdout.lines().any(|line| line == "server-dead"),
+        "the moved server must be gone: {stdout}",
+    );
+    assert!(
+        !stdout.contains("task-viewer is not running"),
+        "a moved server must not read as not running: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Hold a PID the launcher reads as a moved checkout's release binary while its
+/// kill does nothing, so the stop has to report a survivor.
+const MOVED_SURVIVOR_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+ps() {
+    case " $* " in
+        *" -ww "*) printf '%s\n' "$MOVED_PATH" ;;
+    esac
+}
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+sleep() { :; }
+kill() { return 0; }
+echo 4242 >"$PID_FILE"
+do_stop
+echo "status=$?"
+"#;
+
+/// Covers: a moved-class process that survives `kill -9` exits non-zero and is
+/// named, instead of falling through to a reported stop.
+#[test]
+fn launcher_stop_reports_a_moved_survivor() {
+    let dir = unique_temp_dir("launcher_moved_survivor");
+    let launcher = stage_root(&dir);
+    let moved = dir
+        .join("gone/target/release/task-viewer")
+        .to_string_lossy()
+        .into_owned();
+
+    let output = run_driver(
+        &dir,
+        MOVED_SURVIVOR_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            ("MOVED_PATH", &moved),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=1"),
+        "a moved survivor must exit non-zero: {stdout}",
+    );
+    assert!(
+        stdout.contains("task-viewer did not stop (PID: 4242 is still running)"),
+        "the survivor must be named: {stdout}",
+    );
+    assert!(
+        !stdout.contains("task-viewer stopped"),
+        "a survivor must not read as stopped: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Run `start` against an already-running moved server, with the binary counted
+/// as current so the already-running branch runs.
+const MOVED_START_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+ps() {
+    case " $* " in
+        *" -ww "*) printf '%s\n' "$MOVED_PATH" ;;
+    esac
+}
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+open() { :; }
+xdg-open() { :; }
+port_pid() { :; }
+is_outdated() { return 1; }
+echo 4242 >"$PID_FILE"
+start_binary
+echo "status=$?"
+"#;
+
+/// Covers: `start` reports an already-running moved server by its PID and its
+/// started-from path instead of calling it another process.
+#[test]
+fn launcher_start_names_a_moved_server() {
+    let dir = unique_temp_dir("launcher_moved_start");
+    let launcher = stage_root(&dir);
+    let moved = dir
+        .join("gone/My Projects/target/release/task-viewer")
+        .to_string_lossy()
+        .into_owned();
+
+    let output = run_driver(
+        &dir,
+        MOVED_START_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            ("MOVED_PATH", &moved),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=0"),
+        "an already-running start must succeed: {stdout}",
+    );
+    assert!(
+        stdout.contains("task-viewer is already running (PID: 4242)"),
+        "the running server must be named: {stdout}",
+    );
+    let third = format!("Started from: {moved}");
+    assert!(
+        stdout.lines().any(|line| line == third),
+        "the moved path must be reported intact: {stdout}",
+    );
+    assert!(
+        !stdout.contains("another process"),
+        "the moved server must not read as a stranger: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Run the outdated-binary restart branch against a moved server whose stop
+/// fails, so the branch's own message has to name the running path.
+const MOVED_RESTART_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+ps() {
+    case " $* " in
+        *" -ww "*) printf '%s\n' "$MOVED_PATH" ;;
+    esac
+}
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+port_pid() { :; }
+is_outdated() { return 0; }
+do_stop() { return 1; }
+echo 4242 >"$PID_FILE"
+start_binary
+echo "status=$?"
+"#;
+
+/// Covers: the restart branch names a moved server's started-from path instead
+/// of treating it as an anonymous process.
+#[test]
+fn launcher_restart_names_a_moved_server() {
+    let dir = unique_temp_dir("launcher_moved_restart");
+    let launcher = stage_root(&dir);
+    let moved = dir
+        .join("gone/My Projects/target/release/task-viewer")
+        .to_string_lossy()
+        .into_owned();
+
+    let output = run_driver(
+        &dir,
+        MOVED_RESTART_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            ("MOVED_PATH", &moved),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=1"),
+        "a failed restart must exit non-zero: {stdout}",
+    );
+    assert!(
+        stdout.contains("restarting on it"),
+        "the restart branch must run: {stdout}",
+    );
+    let named = format!("The running server was started from: {moved}");
+    assert!(
+        stdout.lines().any(|line| line == named),
+        "the restart must name the moved path: {stdout}",
+    );
+    assert!(
+        !stdout.contains("another process"),
+        "the moved server must not read as a stranger: {stdout}",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Hold the port with a process whose command line is not a release binary and
+/// record every signal the launcher sends.
+const FOREIGN_PORT_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+ps() {
+    case " $* " in
+        *" -ww "*) printf '%s\n' "/bin/sleep 60" ;;
+    esac
+}
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+port_pid() { echo 4242; }
+kill() {
+    printf '%s\n' "$*" >>"$KILL_LOG"
+    return 0
+}
+start_binary
+echo "status=$?"
+"#;
+
+/// Covers: an unrelated listener on the port still gets the "held by another
+/// process" refusal and is never signalled.
+#[test]
+fn launcher_start_refuses_an_unrelated_listener() {
+    let dir = unique_temp_dir("launcher_foreign_port");
+    let launcher = stage_root(&dir);
+    let kill_log = dir.join("kills.log");
+
+    let output = run_driver(
+        &dir,
+        FOREIGN_PORT_DRIVER,
+        &[
+            (
+                "SCRIPT_PATH",
+                launcher.to_str().expect("the temp path is valid UTF-8"),
+            ),
+            (
+                "KILL_LOG",
+                kill_log.to_str().expect("the temp path is valid UTF-8"),
+            ),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.lines().any(|line| line == "status=1"),
+        "the start must refuse: {stdout}",
+    );
+    assert!(
+        stdout.contains("Port 7880 is held by another process (PID: 4242)"),
+        "the unrelated listener must be named: {stdout}",
+    );
+    let signals = fs::read_to_string(&kill_log).unwrap_or_default();
+    assert!(
+        signals.is_empty(),
+        "no signal may reach the unrelated listener, logged: {signals}",
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -606,6 +1056,13 @@ fn launcher_status_waits_for_the_lock_holder() {
     let lock = state_dir(&home, &xdg).join("task-viewer.lock");
     fs::create_dir_all(&lock).expect("hold the lock");
     fs::write(lock.join("pid"), format!("{}\n", std::process::id())).expect("holder pid");
+    // Isolate the port probe: the widened ownership rule adopts any task-viewer
+    // release binary on the shared port, and a live server on this machine would
+    // otherwise make this stopped-status check read as running. An empty `lsof`
+    // names no listener.
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).expect("stub bin dir");
+    write_executable(&bin.join("lsof"), "#!/bin/bash\nexit 0\n");
 
     let mut child = Command::new("bash")
         .arg("--noprofile")
@@ -614,6 +1071,7 @@ fn launcher_status_waits_for_the_lock_holder() {
         .arg("status")
         .env("HOME", &home)
         .env("XDG_STATE_HOME", &xdg)
+        .env("TASK_VIEWER_PATH_FALLBACK", &bin)
         .env_remove("TASK_VIEWER_PORT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

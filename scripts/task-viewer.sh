@@ -296,26 +296,119 @@ notify() {
     esac
 }
 
-# True when the PID is this checkout's release binary. A live PID alone is not
-# enough: PIDs are reused, and another program may own the port. `ps` prints the
-# argv the process was started with, so compare the whole line against this
-# checkout's binary first, which keeps a checkout path holding a space intact,
-# then fall back to its first token: an absolute path as written, a path holding
-# a `/` resolved against this checkout (every launcher-started server inherits
-# it as its working directory), or a bare name resolved on PATH. A trailing
-# argument is allowed, and a token that resolves to nothing is not ours.
-is_ours() {
+# Collapse `.` and `..` components without touching the filesystem, so a path
+# recorded for a checkout that has since moved still compares equal to the same
+# path written plainly. An absolute path keeps its leading `/`; a relative one
+# keeps a leading `..` that has nothing to cancel.
+normalize_path() {
+    local path="$1" part last out absolute=0
+    local -a parts=()
+    case "$path" in
+        /*) absolute=1 ;;
+    esac
+    local IFS='/'
+    for part in $path; do
+        case "$part" in
+            ''|.) ;;
+            ..)
+                last=$((${#parts[@]} - 1))
+                if [ "$last" -ge 0 ] && [ "${parts[$last]}" != ".." ]; then
+                    unset "parts[$last]"
+                elif [ "$absolute" -eq 0 ]; then
+                    parts+=("..")
+                fi
+                ;;
+            *) parts+=("$part") ;;
+        esac
+    done
+    if [ "${#parts[@]}" -eq 0 ]; then
+        if [ "$absolute" -eq 1 ]; then
+            printf '/\n'
+        else
+            printf '.\n'
+        fi
+        return 0
+    fi
+    out=$(IFS=/; printf '%s' "${parts[*]}")
+    if [ "$absolute" -eq 1 ]; then
+        printf '/%s\n' "$out"
+    else
+        printf '%s\n' "$out"
+    fi
+}
+
+# Print the binary path a live PID was started from when that path is a
+# task-viewer release binary, and fail for any other process. `ps` prints the
+# argv the process was started with, so two classes count:
+#
+# - this checkout's `$BINARY`, compared as the whole line so a checkout path
+#   holding a space stays intact, with a trailing argument allowed;
+# - another checkout's release binary, matched on the line's last
+#   `/target/release/task-viewer` at an argument boundary. The text before it is
+#   one span, spaces included, and is the started-from directory only when it
+#   ends on a non-whitespace character, opens with a path-like token (starts
+#   with `/` or `.`, or holds a `/`), and carries no later token that starts
+#   with `/` or `-`. That keeps a checkout path holding a space intact and keeps
+#   a line whose argument merely names such a binary, such as
+#   `python3 /old/mv/target/release/task-viewer`, foreign. Tokens after the
+#   binary are trailing arguments and are ignored. The directory no longer
+#   exists after a move, so the path is recovered verbatim and lexically
+#   normalised, and canonicalised only while its directory still exists.
+#
+# Failing both, fall back to the line's first token: an absolute path as
+# written, a path holding a `/` resolved against this checkout (every
+# launcher-started server inherits it as its working directory), or a bare name
+# resolved on PATH. A token that resolves to nothing is not ours.
+started_from_path() {
     local candidate="$1"
     [ -n "$candidate" ] || return 1
-    local args token resolved dir
+    local args token resolved dir path prefix rest first part
     # -ww keeps procps from truncating a long command line to the terminal
     # width, so Linux reads the same full path macOS prints.
     args=$(ps -ww -p "$candidate" -o args= 2>/dev/null) || return 1
+    [ -n "$args" ] || return 1
     # Compare the whole line at an argument boundary before splitting it, so a
     # path whose own name holds a space still matches the binary it names.
     case "$args" in
-        "$BINARY"|"$BINARY "*) return 0 ;;
+        "$BINARY"|"$BINARY "*) printf '%s\n' "$BINARY"; return 0 ;;
     esac
+    rest=${args##*"/target/release/task-viewer"}
+    if [ "$rest" != "$args" ]; then
+        case "$rest" in
+            ''|[[:space:]]*)
+                prefix=${args%"$rest"}
+                prefix=${prefix%"/target/release/task-viewer"}
+                # The prefix must end on a path character, not whitespace.
+                case "$prefix" in
+                    *[![:space:]]) ;;
+                    *) prefix="" ;;
+                esac
+                if [ -n "$prefix" ]; then
+                    first=${prefix%%[[:space:]]*}
+                    case "$first" in
+                        /*|.*|*/*) ;;
+                        *) prefix="" ;;
+                    esac
+                fi
+                if [ -n "$prefix" ]; then
+                    for part in ${prefix#"$first"}; do
+                        case "$part" in
+                            /*|-*) prefix="" ;;
+                        esac
+                    done
+                fi
+                if [ -n "$prefix" ]; then
+                    path=$(normalize_path "$prefix/target/release/task-viewer")
+                    if [ -d "$(dirname -- "$path")" ]; then
+                        resolved=$(canonical_path "$path") || resolved=""
+                        [ -n "$resolved" ] && path="$resolved"
+                    fi
+                    printf '%s\n' "$path"
+                    return 0
+                fi
+                ;;
+        esac
+    fi
     token=${args%%[[:space:]]*}
     [ -n "$token" ] || return 1
     case "$token" in
@@ -326,7 +419,16 @@ is_ours() {
             ;;
         *) resolved=$(command -v "$token" 2>/dev/null) || return 1 ;;
     esac
-    [ "$resolved" = "$BINARY" ]
+    [ "$resolved" = "$BINARY" ] || return 1
+    printf '%s\n' "$BINARY"
+}
+
+# True when the PID is a task-viewer release binary: this checkout's, or one
+# started from another checkout's path that a move or rename left behind. A live
+# PID alone is not enough: PIDs are reused, and another program may own the
+# port. A listener whose command line is not a release binary stays foreign.
+is_ours() {
+    started_from_path "$1" >/dev/null 2>&1
 }
 
 # The PID listening on the port, from lsof or else ss (minimal Linux installs
@@ -418,8 +520,15 @@ build_binary() {
 # Start the server on the binary already built. The build stays with the
 # callers, so one Dock click builds once instead of once per call.
 start_binary() {
+    local started
     if is_running && is_outdated; then
         echo "A newer task-viewer binary exists; restarting on it."
+        # Name the path a moved checkout's server runs from, so a restart does
+        # not read as replacing an anonymous process.
+        started=$(started_from_path "$(get_pid)" 2>/dev/null)
+        if [ -n "$started" ] && [ "$started" != "$BINARY" ]; then
+            echo "The running server was started from: $started"
+        fi
         # A stop that cannot take the old server down is not a restart: report it
         # instead of falling through to the already-running success below.
         do_stop || return 1
@@ -427,6 +536,10 @@ start_binary() {
     if is_running; then
         echo "task-viewer is already running (PID: $(get_pid))"
         echo "Access at: http://127.0.0.1:$PORT"
+        started=$(started_from_path "$(get_pid)" 2>/dev/null)
+        if [ -n "$started" ] && [ "$started" != "$BINARY" ]; then
+            echo "Started from: $started"
+        fi
         case "$(uname -s)" in
             Darwin) open "http://127.0.0.1:$PORT" >/dev/null 2>&1 || true ;;
             Linux)  xdg-open "http://127.0.0.1:$PORT" >/dev/null 2>&1 || true ;;
@@ -613,14 +726,23 @@ do_stop() {
 }
 
 do_status() {
+    local started
     if is_running; then
         echo "task-viewer is running (PID: $(get_pid))"
         echo "Access at: http://127.0.0.1:$PORT"
+        # A server started from a checkout that has since moved runs from a path
+        # this checkout no longer names; say where it was started from instead
+        # of leaving that implicit.
+        started=$(started_from_path "$(get_pid)" 2>/dev/null)
+        if [ -n "$started" ] && [ "$started" != "$BINARY" ]; then
+            echo "Started from: $started"
+        fi
     else
         echo "task-viewer is not running"
         # A stopped server is a non-zero status, so a script can branch on
         # `make status` the way it would on `systemctl is-active`. This branch
-        # prints one line; the running branch adds the PID and the URL.
+        # prints one line; the running branch adds the PID and the URL, plus the
+        # started-from path when the server runs from another checkout's path.
         return 1
     fi
 }
