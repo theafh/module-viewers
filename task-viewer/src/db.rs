@@ -1881,14 +1881,14 @@ mod tests {
             &pool,
             1,
             &[task()],
-            Some("remote:repo\n\nabc"),
+            Some("history-v1:0123456789abcdef"),
             immediate_hook().as_ref(),
         )
         .await
         .expect("store the key");
         assert_eq!(
             load_history_key(&pool, 1).await.expect("key"),
-            Some("remote:repo\n\nabc".to_string())
+            Some("history-v1:0123456789abcdef".to_string())
         );
         pool.close().await;
         remove_scratch(&path);

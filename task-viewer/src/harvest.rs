@@ -3587,8 +3587,10 @@ fn ref_tips(repo: &Path, dir: &Path) -> Result<Vec<String>, GitFailure> {
         }
         // An empty repository has no HEAD to resolve; that is not a failure.
         Ok(_) => {}
-        Err(GitFailure::Timeout(reason)) => return Err(GitFailure::Timeout(reason)),
-        Err(_) => {}
+        // A probe that could not run is a real git failure, exactly like the
+        // `for-each-ref` read above: swallowing it would build the key from
+        // `refs/` alone and could hide a commit reachable only from HEAD.
+        Err(failure) => return Err(failure),
     }
     Ok(tips.into_iter().collect())
 }
