@@ -2,8 +2,8 @@
 description: "Detect a shallow repository and fail its scan with a message naming the repository, instead of silently dating archived tasks from the shallow boundary commit."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T07:44:40Z
-status: implemented
+updated: 2026-11-27T07:49:30Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
