@@ -2,9 +2,11 @@
 description: "Confirm a status pickaxe hit against the commit's frontmatter, so a status: line in a body example cannot date a task."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T15:14:30Z
-status: ready
+updated: 2026-11-27T01:09:25Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Date an unusual archived status from its frontmatter only

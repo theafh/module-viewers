@@ -1951,12 +1951,17 @@ fn archive_log_args(rel: &str) -> Vec<String> {
 }
 
 /// The `git log` arguments for the pickaxe lookup in `run_git_log`.
+///
+/// `-z --name-only` prints each candidate commit's path raw, so the lookup can
+/// read that commit's blob back and confirm the status sits in the frontmatter.
+/// `--no-patch` must stay out: git rejects it beside `--name-only`.
 fn pickaxe_log_args(flag: &str, pattern: &str, rel: &str) -> Vec<String> {
     git_log_args(&[
+        "-z",
         "--follow",
         "--diff-merges=first-parent",
-        "--no-patch",
-        "--format=%cI",
+        "--name-only",
+        "--format=%cI %H",
         // Every ref counts, so a task archived on a branch that is not checked
         // out keeps its ship day.
         "--all",
@@ -2975,8 +2980,11 @@ fn is_not_a_repository_answer(line: &str) -> bool {
 /// classifies and before the archive walk matches it, skips an empty status,
 /// and warns on an unparseable `updated` instead of dropping it silently. r5
 /// dates a record by the folder's place at that commit, so a row stored before
-/// it kept a folder rename's commit day and must re-walk its leave day once.
-const CONTENT_HASH_REVISION: &str = "r5";
+/// it kept a folder rename's commit day and must re-walk its leave day once. r6
+/// confirms a status pickaxe hit against the commit's frontmatter, so a row
+/// stored before it that was dated from a body example re-walks its leave day
+/// once.
+const CONTENT_HASH_REVISION: &str = "r6";
 
 /// The bare 64-bit FNV-1a digest of `text`. Only equality matters: a changed
 /// file changes the digest.
@@ -3001,18 +3009,21 @@ fn is_archived_path(path: &str) -> bool {
     path.split('/').any(|part| part == "archive")
 }
 
-fn has_archived_status(text: &str, expected: &str) -> bool {
+/// The status the frontmatter block carries, trimmed, or `None` when the file
+/// has no frontmatter block or no status value.
+fn frontmatter_status(text: &str) -> Option<String> {
     frontmatter(text)
         .and_then(|fields| fields.get("status").cloned())
-        .is_some_and(|status| match expected {
-            // Trim here too, so a quoted status padded with spaces compares as
-            // the same value the classification path reads.
-            "finished" => {
-                let status = status.trim();
-                status == "finished" || status == "implemented"
-            }
-            other => status.trim() == other,
-        })
+        .map(|status| status.trim().to_string())
+}
+
+fn has_archived_status(text: &str, expected: &str) -> bool {
+    frontmatter_status(text).is_some_and(|status| match expected {
+        // Trim here too, so a quoted status padded with spaces compares as
+        // the same value the classification path reads.
+        "finished" => status == "finished" || status == "implemented",
+        other => status == other,
+    })
 }
 
 /// Backslash-escape every POSIX extended regex metacharacter so a status value
@@ -3031,15 +3042,20 @@ fn escape_posix_ere(value: &str) -> String {
     escaped
 }
 
-/// The committer day of the earliest commit that introduces `status` on `rel`,
-/// across every accepted spelling of the status.
+/// The committer day of the earliest commit whose task blob at `rel` carries
+/// `status` in its frontmatter, across every accepted spelling of the status.
 ///
 /// The three `-S` literals match the exact spellings, and the anchored `-G`
 /// pattern widens the search to a status quoted with padding inside its quotes,
-/// which the frontmatter reader trims before it reaches this lookup. Each
-/// pattern's hit is folded into the earliest day, so a task first written
-/// `status: "open"` and later rewritten `status: open` keeps the day of the
-/// earlier commit instead of the day of the first spelling that happens to hit.
+/// which the frontmatter reader trims before it reaches this lookup. The
+/// pickaxe reports each candidate commit and the path it named, and each
+/// candidate's blob is read back through `cat-file` and checked against the
+/// same frontmatter reader the archive walk uses. A candidate whose match sits
+/// only in the body — a fenced example, a table, or a quoted snippet — is
+/// skipped, so it cannot date the task. Each accepted candidate is folded into
+/// the earliest day, so a task first written `status: "open"` and later
+/// rewritten `status: open` keeps the day of the earlier commit instead of the
+/// day of the first spelling that happens to hit.
 fn first_status_commit_date(
     repo: &Path,
     git: &GitContext,
@@ -3072,7 +3088,7 @@ fn first_status_commit_date(
     ];
     let mut earliest: Option<NaiveDate> = None;
     for (flag, pattern) in patterns {
-        if let Some(day) = git_pickaxe(repo, git, rel, flag, &pattern)? {
+        if let Some(day) = git_pickaxe(repo, git, rel, flag, &pattern, status)? {
             earliest = Some(match earliest {
                 Some(current) => current.min(day),
                 None => day,
@@ -3082,8 +3098,17 @@ fn first_status_commit_date(
     Ok(earliest)
 }
 
+/// One pickaxe candidate: a commit that touched the task file, its committer
+/// day, and the path that commit named for the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PickaxeRecord {
+    day: NaiveDate,
+    commit: String,
+    path: String,
+}
+
 enum LogLookup {
-    Found(NaiveDate),
+    Found(Vec<PickaxeRecord>),
     Miss,
     Failed(GitFailure),
 }
@@ -3100,43 +3125,85 @@ fn run_git_log(
     scrub_git_env(&mut command);
     command.args(pickaxe_log_args(flag, pattern, rel));
     // Earliest hit. Do not use `--reverse` with `--follow` (drops renames).
-    let mut earliest: Option<NaiveDate> = None;
+    let mut records = Vec::new();
     let result = run_git_streaming(command, None, git_deadline(repo), |reader| {
-        scan_log_dates(reader, |day| {
-            earliest = Some(match earliest {
-                Some(current) => current.min(day),
-                None => day,
+        parse_archive_log(reader, |day, commit, path| {
+            records.push(PickaxeRecord {
+                day,
+                commit: commit.to_string(),
+                path: path.to_string(),
             });
         })
     });
     match result {
         Err(failure) => LogLookup::Failed(failure),
-        Ok(()) => match earliest {
-            Some(day) => LogLookup::Found(day),
-            None => LogLookup::Miss,
-        },
+        Ok(()) if records.is_empty() => LogLookup::Miss,
+        Ok(()) => LogLookup::Found(records),
     }
 }
 
-/// Report each `%cI` date of a pickaxe log stream as its line parses.
-fn scan_log_dates<R: BufRead>(
-    mut reader: R,
-    mut on_date: impl FnMut(NaiveDate),
-) -> Result<(), GitFailure> {
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let read = reader.read_until(b'\n', &mut line).map_err(read_failure)?;
-        if read == 0 {
-            break;
+/// The earliest pickaxe candidate whose task blob at that commit carries
+/// `status` in its frontmatter.
+///
+/// Every candidate is read back through one `cat-file --batch` pass, and a
+/// candidate whose only matching line sits in the body is skipped, so a body
+/// example cannot date the task. A path holding a newline is skipped before its
+/// expression is formed, because `cat-file` reads one expression per line and
+/// such a path would shift every later answer onto the wrong record.
+fn pickaxe_frontmatter_day(
+    repo: &Path,
+    dir: Option<&Path>,
+    records: &[PickaxeRecord],
+    status: &str,
+) -> Result<Option<NaiveDate>, GitFailure> {
+    let mut exprs: Vec<String> = Vec::new();
+    let mut slots: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut record_slots: Vec<Option<usize>> = Vec::with_capacity(records.len());
+    for record in records {
+        if record.path.contains('\n') {
+            record_slots.push(None);
+            continue;
         }
-        let text = std::str::from_utf8(&line)
-            .map_err(|_| GitFailure::Other("git printed output that is not UTF-8".to_string()))?;
-        if let Some(day) = parse_iso_date(text.trim_end_matches(['\n', '\r'])) {
-            on_date(day);
-        }
+        let expr = format!("{}:{}", record.commit, record.path);
+        let slot = match slots.get(&expr) {
+            Some(&slot) => slot,
+            None => {
+                let slot = exprs.len();
+                slots.insert(expr.clone(), slot);
+                exprs.push(expr);
+                slot
+            }
+        };
+        record_slots.push(Some(slot));
     }
-    Ok(())
+    let mut carries_status = vec![false; exprs.len()];
+    let mut position = 0usize;
+    read_blobs(repo, dir, &exprs, |content| {
+        let slot = position;
+        position += 1;
+        let BlobContent::Text(text) = content else {
+            return;
+        };
+        if frontmatter_status(&text).as_deref() == Some(status.trim())
+            && let Some(flag) = carries_status.get_mut(slot)
+        {
+            *flag = true;
+        }
+    })?;
+    let mut earliest: Option<NaiveDate> = None;
+    for (record, slot) in records.iter().zip(record_slots) {
+        let Some(slot) = slot else {
+            continue;
+        };
+        if !carries_status.get(slot).copied().unwrap_or(false) {
+            continue;
+        }
+        earliest = Some(match earliest {
+            Some(current) => current.min(record.day),
+            None => record.day,
+        });
+    }
+    Ok(earliest)
 }
 
 fn git_dir_command(repo: &Path, dir: &Path) -> Command {
@@ -3159,6 +3226,7 @@ fn git_pickaxe(
     rel: &str,
     flag: &str,
     pattern: &str,
+    status: &str,
 ) -> Result<Option<NaiveDate>, GitFailure> {
     // 1) Explicit --git-dir beats an inherited GIT_DIR (Cursor sets one).
     // Fall back to -C only when the folder has no own `.git` or that call fails
@@ -3166,7 +3234,9 @@ fn git_pickaxe(
     let mut first_failure = None;
     if let Some(dir) = &git.dir {
         match run_git_log(repo, git_dir_command(repo, dir), flag, pattern, rel) {
-            LogLookup::Found(day) => return Ok(Some(day)),
+            LogLookup::Found(records) => {
+                return pickaxe_frontmatter_day(repo, Some(dir), &records, status);
+            }
             LogLookup::Miss => return Ok(None),
             LogLookup::Failed(GitFailure::Timeout(reason)) => {
                 return Err(GitFailure::Timeout(reason));
@@ -3178,7 +3248,7 @@ fn git_pickaxe(
     let mut command = Command::new(git_program(repo));
     command.arg("-C").arg(repo);
     match run_git_log(repo, command, flag, pattern, rel) {
-        LogLookup::Found(day) => Ok(Some(day)),
+        LogLookup::Found(records) => pickaxe_frontmatter_day(repo, None, &records, status),
         LogLookup::Miss => Ok(None),
         LogLookup::Failed(GitFailure::Timeout(reason)) => Err(GitFailure::Timeout(reason)),
         // A folder with its own `.git` that git cannot read, or a resolved
@@ -3299,8 +3369,8 @@ mod tests {
         git_dir_command, git_log_args, git_path, git_program, git_read, git_timeout,
         harvest_chosen, harvest_files, harvest_repository, harvest_repository_with_prior,
         normalize_origin_url, parse_archive_log, parse_batch, pickaxe_log_args, read_blobs,
-        repository_identity, run_git_command, run_git_log, run_git_streaming, scan_log_dates,
-        scrub_git_env, stream_blob_days, take_leave_walk_count, take_recursive_ls_tree_count,
+        repository_identity, run_git_command, run_git_log, run_git_streaming, scrub_git_env,
+        stream_blob_days, take_leave_walk_count, take_recursive_ls_tree_count,
         take_worktree_cache_peak, take_worktree_read_bytes, take_worktree_read_count, union_files,
         worktree_content,
     };
@@ -3686,23 +3756,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_log_dates_reports_the_first_date_before_the_reader_is_exhausted() {
-        let stream = b"2026-05-10T12:00:00+00:00\n2026-06-10T12:00:00+00:00\n".to_vec();
-        let (reader, exhausted) = ChunkedReader::new(bounded_chunks(&stream, 13));
-        let mut dates = Vec::new();
-        scan_log_dates(reader, |day| dates.push((day, exhausted.get()))).expect("scan log dates");
-        assert_eq!(dates.len(), 2);
-        assert!(
-            !dates[0].1,
-            "the first date must arrive before the reader is exhausted"
-        );
-        assert_eq!(
-            dates[0].0,
-            NaiveDate::from_ymd_opt(2026, 5, 10).expect("day")
-        );
-    }
-
-    #[test]
     fn every_log_and_cat_file_command_streams_child_stdout() {
         let source = include_str!("harvest.rs");
         let (production, tests) = source
@@ -3882,10 +3935,11 @@ mod tests {
                 "tasks/archive/scope_one.md",
             ],
             &[
+                "-z",
                 "--follow",
                 "--diff-merges=first-parent",
-                "--no-patch",
-                "--format=%cI",
+                "--name-only",
+                "--format=%cI %H",
                 "--all",
                 "-S",
                 "status: finished",
@@ -6967,6 +7021,179 @@ mod tests {
         assert_eq!(
             task.leave_date,
             Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// A task whose body holds a fenced `status: open` example, with `status`
+    /// in its frontmatter and `updated` on `updated`.
+    fn body_example_task(status: &str, updated: &str) -> String {
+        format!(
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: {updated}T10:00:00\nstatus: {status}\n---\n\n# Task\n\n```\nstatus: open\n```\n"
+        )
+    }
+
+    /// Commit a body `status: open` example at 2026-05-10, then the real
+    /// frontmatter status at 2026-06-10, and return the repository.
+    fn body_example_then_frontmatter_fixture(name: &str) -> std::path::PathBuf {
+        let repo = scratch(name);
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::write(
+            repo.join("tasks/archive/scope_body.md"),
+            body_example_task("ready", "2026-05-01"),
+        )
+        .expect("write body example");
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "body example"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        fs::write(
+            repo.join("tasks/archive/scope_body.md"),
+            body_example_task("open", "2026-06-01"),
+        )
+        .expect("write frontmatter status");
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "frontmatter status"],
+            "2026-06-10T12:00:00+00:00",
+        );
+        repo
+    }
+
+    #[test]
+    fn harvest_first_status_commit_skips_a_body_example() {
+        // The earlier commit adds only a fenced `status: open` example, so the
+        // later commit whose frontmatter carries the status dates the task.
+        let repo = body_example_then_frontmatter_fixture("harvest_body_example_status");
+
+        let git = GitContext::resolve(&repo).expect("git context");
+        let day = first_status_commit_date(&repo, &git, "tasks/archive/scope_body.md", "open")
+            .expect("lookup");
+        assert_eq!(
+            day,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day")),
+            "only the commit whose frontmatter carries the status dates the task"
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day")),
+            "the stored leave day is the frontmatter commit, not the example"
+        );
+        assert_ne!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_keeps_the_updated_fallback_when_only_the_body_matches() {
+        // The working-tree frontmatter says `open`, but that edit is
+        // uncommitted, so the only committed matching line is the body example
+        // and no commit dates the task.
+        let repo = scratch("harvest_body_only_fallback");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::create_dir_all(repo.join("tasks/archive")).expect("archive");
+        fs::write(
+            repo.join("tasks/archive/scope_body.md"),
+            body_example_task("ready", "2026-05-01"),
+        )
+        .expect("write body example");
+        git(&repo, &["add", "-A"], "2026-05-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "body example"],
+            "2026-05-10T12:00:00+00:00",
+        );
+        fs::write(
+            repo.join("tasks/archive/scope_body.md"),
+            body_example_task("open", "2026-07-01"),
+        )
+        .expect("uncommitted frontmatter status");
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        let task = tasks.first().expect("task");
+        assert_eq!(task.kind, TaskKind::Deferred);
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 7, 1).expect("day")),
+            "no commit carries the status in its frontmatter, so `updated` stays"
+        );
+        assert_ne!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day"))
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_rewalks_a_body_dated_prior_row_after_the_frontmatter_revision() {
+        // A row stored before r6 could carry a day the pickaxe found in a body
+        // example. The revision bump mismatches its hash once, so the row
+        // re-walks and stores the frontmatter commit day.
+        let repo = body_example_then_frontmatter_fixture("harvest_body_dated_prior_row");
+        let text =
+            fs::read_to_string(repo.join("tasks/archive/scope_body.md")).expect("read task bytes");
+        let prior = vec![PriorTask {
+            path: "tasks/archive/scope_body.md".to_string(),
+            leave_date: Some(NaiveDate::from_ymd_opt(2026, 5, 10).expect("day")),
+            content_hash: Some(format!("r5:{}", fnv1a_digest(&text))),
+            kind: Some(TaskKind::Deferred),
+            created: Some(NaiveDate::from_ymd_opt(2026, 5, 1).expect("day")),
+            ship_date: None,
+        }];
+
+        let first = harvest_repository_with_prior(&repo, &prior)
+            .expect("harvest")
+            .tasks;
+        assert!(
+            take_leave_walk_count(&repo) > 0,
+            "the r5 row must re-walk its leave day once"
+        );
+        let task = first.first().expect("task");
+        assert_eq!(
+            task.leave_date,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 10).expect("day")),
+            "the frontmatter commit day replaces the body-dated prior day"
+        );
+        assert_ne!(
+            CONTENT_HASH_REVISION, "r5",
+            "the reader revision must move past r5 so stored rows re-parse"
+        );
+        assert_eq!(task.content_hash, Some(content_hash(&text)));
+
+        let prior: Vec<PriorTask> = first
+            .iter()
+            .map(|task| PriorTask {
+                path: task.path.clone(),
+                leave_date: task.leave_date,
+                content_hash: task.content_hash.clone(),
+                kind: Some(task.kind),
+                created: Some(task.created),
+                ship_date: task.ship_date,
+            })
+            .collect();
+        harvest_repository_with_prior(&repo, &prior).expect("harvest");
+        assert_eq!(
+            take_leave_walk_count(&repo),
+            0,
+            "the current revision reuses the stored leave day"
         );
         let _ = fs::remove_dir_all(&repo);
     }
