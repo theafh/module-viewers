@@ -2,7 +2,7 @@
 description: "Stop reporting a moved checkout's running server as stopped and as another process, and never claim a stop while the server still serves the port."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-27T20:22:12Z
+updated: 2026-11-27T20:29:50Z
 status: implemented
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"

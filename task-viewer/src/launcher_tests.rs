@@ -398,6 +398,60 @@ fn launcher_status_reports_a_moved_checkout() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Report a `status` for a PID whose `ps` line names this checkout's own release
+/// binary, which is what a server started from this checkout leaves.
+const SAME_CHECKOUT_STATUS_DRIVER: &str = r#"#!/bin/bash
+set -u
+set -- source-guard-probe
+ps() {
+    case " $* " in
+        *" -ww "*) printf '%s\n' "$BINARY" ;;
+    esac
+}
+# shellcheck source=/dev/null
+. "$SCRIPT_PATH"
+notify() { :; }
+port_pid() { :; }
+echo 4242 >"$PID_FILE"
+do_status
+echo "status=$?"
+"#;
+
+/// Covers: `status` for a server started from this checkout prints exactly its
+/// two lines, the PID line and the `Access at:` URL, with no `Started from:`
+/// line, and exits 0.
+#[test]
+fn launcher_status_keeps_two_lines_for_a_same_checkout_server() {
+    let dir = unique_temp_dir("launcher_same_checkout_status");
+    let launcher = stage_root(&dir);
+
+    let output = run_driver(
+        &dir,
+        SAME_CHECKOUT_STATUS_DRIVER,
+        &[(
+            "SCRIPT_PATH",
+            launcher.to_str().expect("the temp path is valid UTF-8"),
+        )],
+    );
+    assert!(
+        output.status.success(),
+        "the driver failed ({:?})\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout,
+        "task-viewer is running (PID: 4242)\n\
+         Access at: http://127.0.0.1:7880\n\
+         status=0\n",
+        "a same-checkout server must print exactly its two status lines",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Stop a real process the launcher reads as a moved checkout's release binary.
 /// The fake `ps` answers only while the target is alive and not a zombie, so the
 /// stop's own liveness loop observes the signal taking effect.
