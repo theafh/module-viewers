@@ -164,9 +164,31 @@
     tips.forEach(function (tip) { tip.hidden = true; });
   }
 
+  // A tooltip a pointer showed hides when the page or a chart frame scrolls:
+  // it is fixed to the viewport, so it would otherwise stay where it was while
+  // its mark moved away. A tooltip a mark's focus shows is exempt, because the
+  // browser scrolls a newly focused mark into view, the tooltip measures its
+  // position after that scroll, and the scroll that brings the mark into view
+  // must not hide the count focus just revealed. The focus tooltip still hides
+  // on blur.
+  function hidePointerTips() {
+    tips.forEach(function (tip) {
+      if (!tip.focusShown) {
+        tip.hidden = true;
+      }
+    });
+  }
+
   function tipFor(frame) {
     var tip = frame.querySelector(".tooltip");
-    tips.push(tip);
+    // Repeated View switches redraw the same card, so the shared registry takes
+    // each card's tooltip once instead of growing on every draw.
+    if (tips.indexOf(tip) < 0) {
+      tips.push(tip);
+    }
+    // Whether the tooltip's last reveal came from a mark's focus rather than a
+    // pointer, which the scroll hide reads.
+    tip.focusShown = false;
     // The tooltip is fixed to the viewport, so a mark near the right or bottom
     // edge would paint it off-window where it is clipped. The pointer's own
     // offset stays 12px whenever there is room, and the measured box pulls the
@@ -191,6 +213,7 @@
     }
     return {
       show: function (event, text) {
+        tip.focusShown = false;
         tip.hidden = false;
         tip.textContent = text;
         place(event.clientX, event.clientY);
@@ -198,12 +221,14 @@
       // A focus event carries no pointer coordinates, so a mark revealed by the
       // keyboard anchors its tooltip to its own box.
       showAt: function (node, text) {
+        tip.focusShown = true;
         tip.hidden = false;
         tip.textContent = text;
         var box = node.getBoundingClientRect();
         place(box.left + box.width / 2, box.top);
       },
       hide: function () {
+        tip.focusShown = false;
         tip.hidden = true;
       }
     };
@@ -1208,8 +1233,10 @@
   }
 
   function renderAll() {
-    // A redraw replaces every tooltip node, so the pointerdown registry starts
-    // empty for the draw that follows.
+    // A redraw replaces every tooltip node, so the open tooltips hide before
+    // the pointerdown registry starts empty for the draw that follows. Hiding
+    // them first leaves no stale count on screen while the charts redraw.
+    hideAllTips();
     tips = [];
     // Every card is redrawn, so every failed-download message is stale.
     Object.keys(exportMessages).forEach(clearExportMessage);
@@ -1501,6 +1528,17 @@
 
   window.addEventListener("task-viewer-theme", recolor);
   document.addEventListener("pointerdown", hideAllTips);
+  // The page's own scroll and each chart frame's own scroll both move a mark
+  // away from its viewport-fixed tooltip. A frame's `scroll` event does not
+  // bubble, so every frame carries a listener of its own beside the document
+  // one.
+  document.addEventListener("scroll", hidePointerTips);
+  var chartFrames = typeof document.querySelectorAll === "function"
+    ? document.querySelectorAll(".chart-frame")
+    : [];
+  Array.prototype.slice.call(chartFrames).forEach(function (frame) {
+    frame.addEventListener("scroll", hidePointerTips);
+  });
 
   // The project picker submits as soon as a project is chosen, so changing the
   // filter is one click. The form keeps its Show button for a page without
@@ -1513,6 +1551,11 @@
     weeklySelect.value = weeklyView;
     weeklySelect.addEventListener("change", function () {
       weeklyView = weeklySelect.value;
+      // The redraw replaces the bars the open tooltip described, so the tooltip
+      // hides first instead of keeping the previous view's count. The shared
+      // registry stays as it is: another card's open tooltip must remain
+      // reachable by the document pointerdown listener.
+      hideAllTips();
       renderCard("weekly", drawWeekly);
     });
   }

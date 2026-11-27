@@ -2,9 +2,11 @@
 description: "Hide an open chart tooltip before a redraw, a weekly View change, or a page scroll, so it never shows text for a mark that is gone."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-26T16:18:16Z
-status: ready
+updated: 2026-11-27T00:17:29Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Hide a tooltip before its mark is redrawn

@@ -312,6 +312,7 @@
     root.attrs.class = "chart-card";
     var svg = new Node("svg", CHART_KIND[name]);
     var frame = new Node("frame");
+    frame.attrs.class = "chart-frame";
     var tip = new Node("tip");
     var summary = new Node("summary");
     // The card header's PNG control, hidden until `dashboard.js` wires it the
@@ -374,9 +375,13 @@
       return null;
     };
     // The page nests the chart inside the card, so `contains` reaches a mark
-    // through the card root, the SVG, and the mark's own parent chain.
+    // through the card root, the chart frame, the SVG, and the mark's own
+    // parent chain. The frame is a real descendant so a document-level
+    // `querySelectorAll(".chart-frame")` finds the frame the page wires.
     root.appendChild(header);
-    root.appendChild(svg);
+    frame.appendChild(svg);
+    frame.appendChild(tip);
+    root.appendChild(frame);
     cards[name] = root;
   });
   CARD_NAMES.forEach(function (name) {

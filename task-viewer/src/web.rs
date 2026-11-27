@@ -17199,6 +17199,212 @@ mod tests {
         );
     }
 
+    /// Covers: a tooltip a hover shows hides on the next full redraw, on a
+    /// weekly View change, on a document scroll, and on a chart frame's own
+    /// scroll, while the View change still redraws the card and updates its
+    /// summary. Every `.chart-frame` carries exactly one `scroll` listener of
+    /// its own, so an unbubbling frame scroll still hides the tooltip.
+    #[test]
+    fn browser_tooltip_hides_on_redraw_view_change_and_scroll() {
+        let payload = fixture_payload().to_string();
+        let config = browser_config(false, false, Some(&payload), serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function tip(name) {
+    return env.cards[name].querySelector(".tooltip");
+  }
+  // A mark's own mousemove listener is the hover path, so the tooltip it shows
+  // is a pointer tooltip rather than one a focus listener revealed.
+  function show(name) {
+    var svg = env.cards[name].querySelector("svg");
+    var mark = svg.children.filter(function (node) {
+      return node.attrs["data-tip"] && node.listeners && node.listeners.mousemove;
+    })[0];
+    mark.listeners.mousemove[0]({ type: "mousemove", clientX: 120, clientY: 80 });
+  }
+  function redraw() {
+    env.window.dispatchEvent(new env.Event("resize"));
+    env.timeouts[env.timeouts.length - 1].handler();
+  }
+  function bars(name) {
+    return env.cards[name].querySelector("svg").children.filter(function (node) {
+      return node.name === "rect" && node.attrs.fill !== "transparent";
+    }).length;
+  }
+  var weeklyTip = tip("weekly");
+  show("weekly");
+  var shownForRedraw = weeklyTip.hidden;
+  redraw();
+  var afterRedraw = { hidden: weeklyTip.hidden, text: weeklyTip.textContent };
+
+  show("weekly");
+  env.document.dispatchEvent({ type: "scroll" });
+  var afterDocumentScroll = weeklyTip.hidden;
+
+  show("weekly");
+  env.cards["shipped-calendar"].querySelector(".chart-frame").dispatchEvent({ type: "scroll" });
+  var afterFrameScroll = weeklyTip.hidden;
+
+  show("weekly");
+  var select = globalThis.document.getElementById("weekly-mode");
+  select.value = "shipped";
+  select.dispatchEvent({ type: "change" });
+  var afterView = {
+    hidden: weeklyTip.hidden,
+    bars: bars("weekly"),
+    summary: env.cards["weekly"].querySelector(".summary").textContent
+  };
+
+  var frames = env.cardNames.map(function (name) {
+    var frame = env.cards[name].querySelector(".chart-frame");
+    return { name: name, listeners: (frame.listeners.scroll || []).length };
+  });
+  return JSON.stringify({
+    shownForRedraw: shownForRedraw,
+    afterRedraw: afterRedraw,
+    afterDocumentScroll: afterDocumentScroll,
+    afterFrameScroll: afterFrameScroll,
+    afterView: afterView,
+    frames: frames
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["shownForRedraw"],
+            serde_json::json!(false),
+            "the hover shows the tooltip before the redraw"
+        );
+        assert_eq!(
+            result["afterRedraw"]["hidden"],
+            serde_json::json!(true),
+            "a full redraw hides the tooltip the previous draw left open: {}",
+            result["afterRedraw"]
+        );
+        assert_eq!(
+            result["afterDocumentScroll"],
+            serde_json::json!(true),
+            "a page scroll hides a hover tooltip"
+        );
+        assert_eq!(
+            result["afterFrameScroll"],
+            serde_json::json!(true),
+            "a chart frame's own scroll hides a hover tooltip"
+        );
+        let after_view = &result["afterView"];
+        assert_eq!(
+            after_view["hidden"],
+            serde_json::json!(true),
+            "a weekly View change hides the tooltip the old view left open: {after_view:?}"
+        );
+        assert_eq!(
+            after_view["bars"].as_u64(),
+            Some(2),
+            "the View change still redraws the card with only the shipped bars: {after_view:?}"
+        );
+        assert_eq!(
+            after_view["summary"],
+            serde_json::json!("3 shipped · Monday weeks"),
+            "the View change still updates the card's summary: {after_view:?}"
+        );
+        let frames = result["frames"].as_array().expect("frame listeners");
+        assert_eq!(
+            frames.len(),
+            template_card_names().len(),
+            "one frame per chart card"
+        );
+        for frame in frames {
+            assert_eq!(
+                frame["listeners"].as_u64(),
+                Some(1),
+                "the {} frame carries its own scroll listener: {frame:?}",
+                frame["name"]
+            );
+        }
+    }
+
+    /// Covers: a tooltip a mark's focus shows survives the document and frame
+    /// scroll that bring the mark into view, still hides on blur, and a
+    /// pointer-shown tooltip on the same card still hides on a scroll.
+    #[test]
+    fn browser_focus_tooltip_survives_its_focus_scroll() {
+        let payload = fixture_payload().to_string();
+        let config = browser_config(false, false, Some(&payload), serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var card = env.cards["shipped-calendar"];
+  var tip = card.querySelector(".tooltip");
+  var frame = card.querySelector(".chart-frame");
+  var cells = card.querySelector("svg").children.filter(function (node) {
+    return node.attrs.tabindex !== undefined;
+  });
+  cells[0].focus();
+  var focused = { hidden: tip.hidden, text: tip.textContent };
+  env.document.dispatchEvent({ type: "scroll" });
+  var afterDocumentScroll = tip.hidden;
+  frame.dispatchEvent({ type: "scroll" });
+  var afterFrameScroll = tip.hidden;
+  cells[0].blur();
+  var afterBlur = tip.hidden;
+  // A pointer tooltip on the same card is not exempt: the scroll hide follows
+  // how the tooltip was shown, not which card it belongs to.
+  cells[0].dispatchEvent({ type: "mousemove", clientX: 40, clientY: 40 });
+  var pointerShown = tip.hidden;
+  env.document.dispatchEvent({ type: "scroll" });
+  var pointerAfterScroll = tip.hidden;
+  return JSON.stringify({
+    focused: focused,
+    afterDocumentScroll: afterDocumentScroll,
+    afterFrameScroll: afterFrameScroll,
+    afterBlur: afterBlur,
+    pointerShown: pointerShown,
+    pointerAfterScroll: pointerAfterScroll
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["focused"]["hidden"],
+            serde_json::json!(false),
+            "focus shows the mark's tooltip"
+        );
+        assert!(
+            result["focused"]["text"]
+                .as_str()
+                .expect("focus tooltip text")
+                .contains("shipped"),
+            "the focus tooltip names the mark's count: {}",
+            result["focused"]
+        );
+        assert_eq!(
+            result["afterDocumentScroll"],
+            serde_json::json!(false),
+            "a focus-shown tooltip survives the page scroll that brought its mark into view"
+        );
+        assert_eq!(
+            result["afterFrameScroll"],
+            serde_json::json!(false),
+            "a focus-shown tooltip survives its frame's own scroll"
+        );
+        assert_eq!(
+            result["afterBlur"],
+            serde_json::json!(true),
+            "a focus-shown tooltip still hides on blur"
+        );
+        assert_eq!(
+            result["pointerShown"],
+            serde_json::json!(false),
+            "the same card's pointer tooltip shows before the scroll"
+        );
+        assert_eq!(
+            result["pointerAfterScroll"],
+            serde_json::json!(true),
+            "a pointer-shown tooltip on the same card still hides on a scroll"
+        );
+    }
+
     /// Covers: every chart card's SVG names itself from its heading and
     /// describes itself from the summary line the draw fills.
     #[tokio::test(flavor = "current_thread")]
