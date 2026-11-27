@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::harvest::{ParsedTask, PriorTask};
+use crate::warn_once;
 
 /// A hook `replace_tasks` awaits between its delete and its inserts, inside the
 /// open write transaction. Production installs one that resolves at once; a
@@ -1099,13 +1100,21 @@ pub async fn load_tasks(
         match row_to_record(row, repository_id, Arc::clone(&project)) {
             Ok(task) => tasks.push(task),
             Err(unparsed) => {
-                tracing::warn!(
-                    repository = %project,
-                    path = %unparsed.path,
-                    kind = %unparsed.kind,
-                    created = %unparsed.created,
-                    "stored task row did not parse; no row charted"
-                );
+                let value = format!("{}|{}", unparsed.kind, unparsed.created);
+                if warn_once::first_sighting(
+                    warn_once::UNPARSEABLE_KIND_OR_CREATED,
+                    repository_id,
+                    &unparsed.path,
+                    &value,
+                ) {
+                    tracing::warn!(
+                        repository = %project,
+                        path = %unparsed.path,
+                        kind = %unparsed.kind,
+                        created = %unparsed.created,
+                        "stored task row did not parse; no row charted"
+                    );
+                }
             }
         }
     }
@@ -1186,7 +1195,14 @@ fn row_to_record(
     // staleness card its point for this row, so it stays a charted row with no
     // updated day instead of dropping out of every series.
     let updated = crate::dates::parse_iso_date(&row.updated);
-    if updated.is_none() {
+    if updated.is_none()
+        && warn_once::first_sighting(
+            warn_once::UNPARSEABLE_UPDATED,
+            repository_id,
+            &row.path,
+            &row.updated,
+        )
+    {
         tracing::warn!(
             repository = %project,
             path = %row.path,
@@ -3590,6 +3606,132 @@ mod tests {
             "{warning}"
         );
         assert!(warning.contains("updated=not-a-day"), "{warning}");
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a stored row whose `kind` or `created` does not parse drops out
+    /// of the charted rows and logs its warning once across two loads, because
+    /// the gate keys the warning by repository, path, and offending value.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_warns_once_across_repeated_loads_for_a_row_that_does_not_parse() {
+        install_capture();
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        // The schema's CHECK constraint refuses an unknown kind on an ordinary
+        // connection, so the bogus kind lands on a connection that ignores it,
+        // the way a foreign or older writer could leave one.
+        let mut conn = pool.acquire().await.expect("connection");
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&mut *conn)
+            .await
+            .expect("ignore check constraints");
+        sqlx::query(
+            "INSERT INTO tasks (repository_id, path, scope, kind, created, updated)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("tasks/scope_bad_kind.md")
+        .bind("scope")
+        .bind("bogus")
+        .bind("2026-01-01")
+        .bind("2026-01-01")
+        .execute(&mut *conn)
+        .await
+        .expect("unparseable kind row");
+        sqlx::query(
+            "INSERT INTO tasks (repository_id, path, scope, kind, created, updated)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("tasks/scope_bad_created.md")
+        .bind("scope")
+        .bind("live")
+        .bind("not-a-date")
+        .bind("2026-01-01")
+        .execute(&mut *conn)
+        .await
+        .expect("unparseable created row");
+        drop(conn);
+
+        let warnings = captured_warnings();
+        warnings.lock().expect("warning log").clear();
+        let first = load_tasks(&pool, None).await.expect("first load");
+        let second = load_tasks(&pool, None).await.expect("second load");
+        assert!(first.is_empty(), "the unparseable rows chart nothing");
+        assert!(second.is_empty(), "the repeated load charts nothing either");
+        let warnings = warnings.lock().expect("warning log").clone();
+        for (path, expected) in [
+            ("tasks/scope_bad_kind.md", "kind=bogus"),
+            ("tasks/scope_bad_created.md", "created=not-a-date"),
+        ] {
+            let mine = warnings
+                .iter()
+                .filter(|warning| warning.contains(path))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mine.len(),
+                1,
+                "{path} warns once across two loads: {warnings:?}"
+            );
+            assert!(
+                mine[0].contains(expected),
+                "{path} names {expected}: {mine:?}"
+            );
+            assert!(mine[0].contains("repository=ai-modules"), "{mine:?}");
+        }
+        pool.close().await;
+        remove_scratch(&path);
+    }
+
+    /// Covers: a row whose stored `updated` does not parse still charts and
+    /// logs its warning once across two loads.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_warns_once_across_repeated_loads_for_an_unparseable_updated_day() {
+        install_capture();
+        let path = temp_database();
+        test_db::set(path.clone());
+        let pool = init().await.expect("init");
+        let id = super::insert_repository(&pool, "ai-modules", "/tmp/ai-modules")
+            .await
+            .expect("insert");
+        sqlx::query(
+            "INSERT INTO tasks (repository_id, path, scope, kind, created, updated)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("tasks/scope_bad_updated_twice.md")
+        .bind("scope")
+        .bind("live")
+        .bind("2026-01-01")
+        .bind("not-a-day")
+        .execute(&pool)
+        .await
+        .expect("unparseable updated row");
+
+        let warnings = captured_warnings();
+        warnings.lock().expect("warning log").clear();
+        let first = load_tasks(&pool, None).await.expect("first load");
+        let second = load_tasks(&pool, None).await.expect("second load");
+        assert_eq!(first.len(), 1, "the row still charts on the first load");
+        assert_eq!(second.len(), 1, "the row still charts on the second load");
+        let warnings = warnings
+            .lock()
+            .expect("warning log")
+            .iter()
+            .filter(|warning| warning.contains("tasks/scope_bad_updated_twice.md"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the updated warning fires once across two loads: {warnings:?}"
+        );
+        assert!(warnings[0].contains("updated=not-a-day"), "{warnings:?}");
         pool.close().await;
         remove_scratch(&path);
     }

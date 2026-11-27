@@ -8,6 +8,7 @@ mod launcher_tests;
 mod series;
 #[cfg(test)]
 mod test_support;
+mod warn_once;
 mod web;
 
 use anyhow::Context as _;

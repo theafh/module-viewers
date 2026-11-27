@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::dates::{PLAUSIBLE_FLOOR, SERIES_FLOOR};
 use crate::harvest::TaskKind;
+use crate::warn_once;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
@@ -175,7 +176,14 @@ pub fn dashboard(
     // too, because the backlog, the mean age, and the weekly deferred bar all
     // count it on today.
     for task in tasks {
-        if task.created > today {
+        if task.created > today
+            && warn_once::first_sighting(
+                warn_once::CREATED_AFTER_TODAY,
+                task.repository_id,
+                &task.path,
+                &crate::dates::format_date(task.created),
+            )
+        {
             tracing::warn!(
                 repository = %task.project,
                 path = %task.path,
@@ -186,6 +194,12 @@ pub fn dashboard(
         if task.kind == TaskKind::Finished
             && let Some(day) = task.ship_date
             && day > today
+            && warn_once::first_sighting(
+                warn_once::SHIPPED_AFTER_TODAY,
+                task.repository_id,
+                &task.path,
+                &crate::dates::format_date(day),
+            )
         {
             tracing::warn!(
                 repository = %task.project,
@@ -197,6 +211,12 @@ pub fn dashboard(
         if task.kind == TaskKind::Deferred
             && let Some(day) = task.leave_date
             && day > today
+            && warn_once::first_sighting(
+                warn_once::DEFERRED_AFTER_TODAY,
+                task.repository_id,
+                &task.path,
+                &crate::dates::format_date(day),
+            )
         {
             tracing::warn!(
                 repository = %task.project,
@@ -222,7 +242,14 @@ pub fn dashboard(
             .flatten()
             .filter(|day| *day < PLAUSIBLE_FLOOR)
             .min();
-        if let Some(day) = earliest {
+        if let Some(day) = earliest
+            && warn_once::first_sighting(
+                warn_once::BEFORE_FLOOR,
+                task.repository_id,
+                &task.path,
+                &crate::dates::format_date(day),
+            )
+        {
             tracing::warn!(
                 repository = %task.project,
                 path = %task.path,
@@ -2060,6 +2087,203 @@ mod tests {
                     .contains("path=tasks/alpha_shipped_early.md")
                     && warning.contains("date=0026-03-02")),
             "the ship-only row names its ship day once: {warnings:?}"
+        );
+    }
+
+    /// Build one payload under a thread-scoped warning capture and return the
+    /// warnings it logged, so a test reads them without a process-wide
+    /// subscriber and a spawned thread gets its own capture.
+    fn warnings_for(tasks: &[TaskRecord], today: NaiveDate) -> Vec<String> {
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let _board = dashboard(tasks, today, RadarMode::Scope, "alpha");
+        drop(guard);
+        captured.take()
+    }
+
+    /// Covers: two payload builds over the same bad rows emit each of their
+    /// warnings once, so a row whose created and ship days are both after today
+    /// warns twice in total and neither repeats, while a deferred leave day
+    /// after today and a pre-floor row each warn once across both builds.
+    #[test]
+    fn series_warns_once_across_repeated_payload_builds() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![
+            task(
+                "alpha",
+                "future",
+                TaskKind::Finished,
+                day(2027, 1, 5),
+                Some(day(2027, 1, 6)),
+                Some(day(2027, 1, 6)),
+            ),
+            task(
+                "alpha",
+                "deferred",
+                TaskKind::Deferred,
+                day(2026, 6, 1),
+                None,
+                Some(day(2027, 1, 6)),
+            ),
+            task(
+                "alpha",
+                "ancient",
+                TaskKind::Live,
+                day(26, 3, 1),
+                None,
+                None,
+            ),
+        ];
+        let first = warnings_for(&tasks, today);
+        let second = warnings_for(&tasks, today);
+        let warnings = first.into_iter().chain(second).collect::<Vec<_>>();
+        assert_eq!(
+            warnings.len(),
+            4,
+            "two builds warn four times in total, one per event: {warnings:?}"
+        );
+        for (needle, expected) in [
+            (
+                "path=tasks/alpha_future.md date=2027-01-05",
+                "the created-after-today warning",
+            ),
+            (
+                "path=tasks/alpha_future.md date=2027-01-06",
+                "the shipped-after-today warning",
+            ),
+            (
+                "path=tasks/alpha_deferred.md date=2027-01-06",
+                "the deferred-after-today warning",
+            ),
+            (
+                "path=tasks/alpha_ancient.md date=0026-03-01",
+                "the before-floor warning",
+            ),
+        ] {
+            assert_eq!(
+                warnings
+                    .iter()
+                    .filter(|warning| warning.contains(needle))
+                    .count(),
+                1,
+                "{expected} fires once across both builds: {warnings:?}"
+            );
+        }
+    }
+
+    /// Covers: a second row with a different path emits its own warning, two
+    /// repositories that store the same path each warn on their own build, and
+    /// a row whose after-today created day moves to a second after-today day
+    /// warns again, so the repository id and the offending value are part of
+    /// the key.
+    #[test]
+    fn series_keys_each_warning_by_repository_path_and_offending_value() {
+        let today = day(2026, 6, 10);
+        let mut first = task(
+            "alpha",
+            "shared",
+            TaskKind::Live,
+            day(2027, 1, 5),
+            None,
+            None,
+        );
+        first.repository_id = 1;
+        first.path = "tasks/shared.md".to_string();
+        let mut second = task(
+            "beta",
+            "shared",
+            TaskKind::Live,
+            day(2027, 1, 6),
+            None,
+            None,
+        );
+        second.repository_id = 2;
+        second.path = "tasks/shared.md".to_string();
+        let other = task(
+            "alpha",
+            "other",
+            TaskKind::Live,
+            day(2027, 1, 7),
+            None,
+            None,
+        );
+
+        let shared = warnings_for(&[first.clone(), second.clone(), other], today);
+        assert_eq!(
+            shared.len(),
+            3,
+            "the two repositories' shared path and the other row each warn: {shared:?}"
+        );
+        assert!(
+            shared
+                .iter()
+                .any(|warning| warning.contains("repository=alpha")
+                    && warning.contains("path=tasks/shared.md")
+                    && warning.contains("date=2027-01-05")),
+            "the first repository's shared path warns: {shared:?}"
+        );
+        assert!(
+            shared
+                .iter()
+                .any(|warning| warning.contains("repository=beta")
+                    && warning.contains("path=tasks/shared.md")
+                    && warning.contains("date=2027-01-06")),
+            "the second repository's shared path warns instead of staying silent: {shared:?}"
+        );
+        assert!(
+            shared
+                .iter()
+                .any(|warning| warning.contains("path=tasks/alpha_other.md")),
+            "the second row with a different path emits its own warning: {shared:?}"
+        );
+
+        assert!(
+            warnings_for(&[first.clone(), second.clone()], today).is_empty(),
+            "a repeated build stays silent"
+        );
+        first.created = day(2027, 1, 8);
+        let moved = warnings_for(&[first, second], today);
+        assert_eq!(
+            moved.len(),
+            1,
+            "only the row whose offending day moved warns again: {moved:?}"
+        );
+        assert!(
+            moved[0].contains("repository=alpha")
+                && moved[0].contains("path=tasks/shared.md")
+                && moved[0].contains("date=2027-01-08"),
+            "the moved day warns under its new value: {moved:?}"
+        );
+    }
+
+    /// Covers: the test build's gate is thread-local, so two threads rendering
+    /// the same bad row each see its warning and neither clears the other's
+    /// keys.
+    #[test]
+    fn series_warning_gate_is_thread_local_in_a_test_build() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![task(
+            "alpha",
+            "future",
+            TaskKind::Live,
+            day(2027, 1, 5),
+            None,
+            None,
+        )];
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| warnings_for(&tasks, today));
+            let second = scope.spawn(|| warnings_for(&tasks, today));
+            (
+                first.join().expect("first render"),
+                second.join().expect("second render"),
+            )
+        });
+        assert_eq!(first.len(), 1, "the first thread sees its warning");
+        assert_eq!(
+            second.len(),
+            1,
+            "the second thread sees the same row's warning instead of the first thread's key silencing it"
         );
     }
 

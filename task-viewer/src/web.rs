@@ -101,6 +101,10 @@ pub struct AppState {
     /// check runs on the async worker. Production never reads it.
     offloaded_fs_calls: Arc<AtomicUsize>,
     harvest: Arc<HarvestFn>,
+    /// The test-only barrier `render_charts_json` waits at, armed only by the
+    /// `TASK_VIEWER_TEST_CHART_BARRIER_DIR` and `..._COUNT` variable pair.
+    /// Production carries `None`, so the closure renders at once.
+    chart_barrier: Option<Arc<ChartBarrier>>,
     /// The one-shot banners. The lock is synchronous because a dashboard read
     /// that is dropped before its render finishes puts the claimed slot back
     /// from `Drop`, and a destructor cannot await.
@@ -122,6 +126,8 @@ impl AppState {
         let raw = std::env::var("TASK_VIEWER_SCAN_WORKERS").ok();
         let store_pause = std::env::var("TASK_VIEWER_TEST_STORE_PAUSE_MS").ok();
         let store_marker = std::env::var_os("TASK_VIEWER_TEST_STORE_MARKER").map(PathBuf::from);
+        let barrier_dir = std::env::var_os("TASK_VIEWER_TEST_CHART_BARRIER_DIR").map(PathBuf::from);
+        let barrier_count = std::env::var("TASK_VIEWER_TEST_CHART_BARRIER_COUNT").ok();
         let static_version = static_version(&static_dir())?;
         Ok(Self {
             pool,
@@ -134,6 +140,7 @@ impl AppState {
             prior_read_hook: Arc::new(|_| Box::pin(ready(()))),
             offloaded_fs_calls: Arc::new(AtomicUsize::new(0)),
             harvest: Arc::new(harvest::harvest_repository_with_prior),
+            chart_barrier: chart_barrier_from(barrier_dir, barrier_count.as_deref()),
             flash: Arc::new(std::sync::Mutex::new(FlashStore::default())),
             held_clone: Arc::new(Mutex::new(HeldCloneStore::default())),
             static_version,
@@ -211,6 +218,90 @@ fn store_hook_from(pause: Option<&str>, marker: Option<PathBuf>) -> Arc<StoreHoo
             tokio::time::sleep(Duration::from_millis(pause_ms)).await;
         })
     })
+}
+
+/// How long one `render_charts_json` closure waits at the test-only barrier
+/// before it gives up and renders anyway. The deadline keeps a request that
+/// fails before the closure from hanging the renders that did reach it.
+const BARRIER_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The test-only barrier `render_charts_json` waits at, so a process-level test
+/// can hold several chart exports in flight together and prove the warning gate
+/// is process-wide rather than per thread. Production never arms it.
+struct ChartBarrier {
+    dir: PathBuf,
+    count: usize,
+}
+
+/// Read the barrier variable pair the way `store_hook_from` reads the store
+/// pause's pair: a whole-number count arms the barrier, and a value that is not
+/// a whole number falls back to no barrier with a warning, so a stray value
+/// never holds a render. The directory is the one the caller named; a marker
+/// write that fails there logs its own warning and lets the render continue.
+fn chart_barrier_from(dir: Option<PathBuf>, count: Option<&str>) -> Option<Arc<ChartBarrier>> {
+    let dir = dir?;
+    let raw = count?;
+    let count = match raw.trim().parse::<usize>() {
+        Ok(count) if count > 0 => count,
+        _ => {
+            tracing::warn!(
+                value = %raw,
+                "TASK_VIEWER_TEST_CHART_BARRIER_COUNT is not a positive whole number; the chart barrier stays off"
+            );
+            return None;
+        }
+    };
+    Some(Arc::new(ChartBarrier { dir, count }))
+}
+
+impl ChartBarrier {
+    /// Write this render's marker and wait until the directory holds the named
+    /// number of markers, re-reading it after a short sleep so the waiting
+    /// threads cannot starve each other. A deadline that passes first logs one
+    /// warning naming the markers it saw and lets the render proceed, so a
+    /// request that never reaches the closure fails the test instead of
+    /// hanging the renders that did.
+    fn hold(&self) {
+        let marker = self.dir.join(format!("{:?}", std::thread::current().id()));
+        if let Err(error) = std::fs::write(&marker, b"waiting\n") {
+            tracing::warn!(
+                %error,
+                path = %marker.display(),
+                "the test chart barrier marker could not be written"
+            );
+            return;
+        }
+        let deadline = Instant::now() + BARRIER_DEADLINE;
+        loop {
+            let markers = self.markers();
+            if markers.len() >= self.count {
+                return;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    path = %self.dir.display(),
+                    markers = ?markers,
+                    expected = self.count,
+                    "the test chart barrier deadline passed; rendering without waiting"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The marker file names the directory holds, so a deadline warning names
+    /// the renders that did arrive.
+    fn markers(&self) -> Vec<String> {
+        std::fs::read_dir(&self.dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// How many banners the flash store keeps. Eviction drops the oldest slot once
@@ -1412,6 +1503,7 @@ async fn render_charts_json(state: &AppState, project: &str) -> anyhow::Result<S
         ..
     } = selection;
     let project = chart_project(selected);
+    let barrier = state.chart_barrier.clone();
     #[cfg(test)]
     let recorded = Arc::clone(&state.export_threads);
     // The chart computation and the JSON serialization are CPU work over every
@@ -1424,6 +1516,9 @@ async fn render_charts_json(state: &AppState, project: &str) -> anyhow::Result<S
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((project.clone(), std::thread::current().id()));
+        if let Some(barrier) = barrier.as_ref() {
+            barrier.hold();
+        }
         let board = chart_board(&tasks, mode, &label, &project);
         chart_payload(&board)
     })
