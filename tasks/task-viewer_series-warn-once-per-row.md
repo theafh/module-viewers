@@ -2,7 +2,7 @@
 description: "Log each per-render row warning once per process instead of on every dashboard, JSON, and CSV render."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T00:40:41Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -17,7 +17,7 @@ Every warning the chart read path emits per render is logged once per process, k
 
 `series::dashboard` in `task-viewer/src/series.rs` emits the after-today created and ship warnings and the before-floor warning from inside the function that builds every payload, and `web.rs` calls it per dashboard request and per export. `row_to_record` in `db.rs` warns for an unparseable `updated` on every load, and `load_tasks` warns and drops a row whose stored `kind` or `created` does not parse. A single mistyped year therefore writes the same warnings on every page load, forever, while harvest logs its equivalents once per scan.
 
-Two live sibling tasks add further per-render warnings in these functions and expect this set: [the unparseable ship/leave task](task-viewer_db-unparseable-ship-leave-day.md) warns in `row_to_record` and `load_prior_tasks` keyed by repository, path, field, and raw value, and [the future deferred leave task](task-viewer_deferred-future-leave-fold.md) adds a deferred leave-after-today warning to the after-today scan and leaves de-duplication here. The existing warning tests capture on the exact tracing target `task_viewer::series` and `task_viewer::db`.
+Two live sibling tasks add further per-render warnings in these functions and expect this set: [the unparseable ship/leave task](task-viewer_db-unparseable-ship-leave-day.md) warns in `row_to_record` and `load_prior_tasks` keyed by repository, path, field, and raw value, and [the future deferred leave task](archive/task-viewer_deferred-future-leave-fold.md) adds a deferred leave-after-today warning to the after-today scan and leaves de-duplication here. The existing warning tests capture on the exact tracing target `task_viewer::series` and `task_viewer::db`.
 
 ## Approach
 

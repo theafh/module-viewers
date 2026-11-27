@@ -2,8 +2,8 @@
 description: "Treat a deferred task's future leave day as today in the backlog and mean age, matching the weekly bar's fold, and warn about it."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T00:38:25Z
-status: implemented
+updated: 2026-11-27T00:40:41Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
