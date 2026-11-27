@@ -38,7 +38,7 @@ The charts container is already held as `chartsSection` (`document.querySelector
 6. Update the planned browser-guard cases in [`task-viewer_chart-focus-survives-resize.md`](task-viewer_chart-focus-survives-resize.md) so each changes the compared width before every `resize` it dispatches; that sibling plans three same-width resize cases, which the skip turns into no-ops.
 7. Record the rule in `FEATURES.md`'s `## 4. Charts` paragraph and `TESTING.md`'s `- Browser guards:` bullet.
 
-**Out of scope:** the focus-restore fix in `task-viewer_chart-focus-survives-resize.md`, the tooltip-hide fix in [`task-viewer_chart-tooltip-survives-redraw.md`](task-viewer_chart-tooltip-survives-redraw.md), and partial per-card redraws.
+**Out of scope:** the focus-restore fix in `task-viewer_chart-focus-survives-resize.md`, the tooltip-hide fix in [`task-viewer_chart-tooltip-survives-redraw.md`](archive/task-viewer_chart-tooltip-survives-redraw.md), and partial per-card redraws.
 
 ## Acceptance
 
