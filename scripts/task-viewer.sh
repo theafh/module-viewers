@@ -307,6 +307,9 @@ normalize_path() {
         /*) absolute=1 ;;
     esac
     local IFS='/'
+    # A component holding `*`, `?`, or `[` must survive verbatim, so globbing is
+    # off while the loop word-splits the path.
+    set -f
     for part in $path; do
         case "$part" in
             ''|.) ;;
@@ -321,6 +324,7 @@ normalize_path() {
             *) parts+=("$part") ;;
         esac
     done
+    set +f
     if [ "${#parts[@]}" -eq 0 ]; then
         if [ "$absolute" -eq 1 ]; then
             printf '/\n'
@@ -391,11 +395,15 @@ started_from_path() {
                     esac
                 fi
                 if [ -n "$prefix" ]; then
+                    # A component holding `*`, `?`, or `[` must survive verbatim,
+                    # so globbing is off while the loop word-splits the prefix.
+                    set -f
                     for part in ${prefix#"$first"}; do
                         case "$part" in
                             /*|-*) prefix="" ;;
                         esac
                     done
+                    set +f
                 fi
                 if [ -n "$prefix" ]; then
                     path=$(normalize_path "$prefix/target/release/task-viewer")
@@ -424,9 +432,9 @@ started_from_path() {
 }
 
 # True when the PID is a task-viewer release binary: this checkout's, or one
-# started from another checkout's path that a move or rename left behind. A live
-# PID alone is not enough: PIDs are reused, and another program may own the
-# port. A listener whose command line is not a release binary stays foreign.
+# started from any other checkout's path, a moved or renamed checkout included.
+# A live PID alone is not enough: PIDs are reused, and another program may own
+# the port. A listener whose command line is not a release binary stays foreign.
 is_ours() {
     started_from_path "$1" >/dev/null 2>&1
 }
