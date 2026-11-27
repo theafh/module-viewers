@@ -2,8 +2,8 @@
 description: "Make the foreign-PID stop test's liveness probe read the child's process state, so an exited or zombie child cannot print foreign-alive and pass the test for the wrong reason."
 scope: task-viewer
 created: 2026-11-27T21:24:30Z
-updated: 2026-11-27T23:07:33Z
-status: implemented
+updated: 2026-11-27T23:10:49Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -34,7 +34,7 @@ The driver also defines a `ps()` shell function that answers only a `-ww` read, 
 
 The same file already carries the shape this task needs: `MOVED_STOP_DRIVER` defines an `alive()` helper that runs `command ps -p "$TARGET" -o stat=` and rejects an empty state or one beginning with `Z`. This task applies that shape to the foreign-PID driver's probe.
 
-The test and its driver were created by the archived finished task [Test the stop guard against a foreign PID](archive/task-viewer_launcher-foreign-pid-stop-test.md), whose acceptance already promised that the foreign process "stays alive"; this task makes that half of the test able to observe a dead child. A sibling task, [Stub `ps` in the launcher status exit-code test](archive/task-viewer_launcher-status-exit-code-test-ps-stub.md) (archived), adds a `ps` stub to a different driver in the same file, so the two edits share the file and no driver.
+The test and its driver were created by the archived finished task [Test the stop guard against a foreign PID](task-viewer_launcher-foreign-pid-stop-test.md), whose acceptance already promised that the foreign process "stays alive"; this task makes that half of the test able to observe a dead child. A sibling task, [Stub `ps` in the launcher status exit-code test](task-viewer_launcher-status-exit-code-test-ps-stub.md) (archived), adds a `ps` stub to a different driver in the same file, so the two edits share the file and no driver.
 
 `TESTING.md`'s `- Launcher process safety:` bullet states `a stop aimed at an unrelated PID sends it no signal`. This task changes only how the test observes that outcome, so the sentence stays accurate and unchanged.
 
