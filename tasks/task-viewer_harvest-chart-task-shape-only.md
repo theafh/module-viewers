@@ -2,7 +2,7 @@
 description: "Chart only files shaped like tasks and carrying task frontmatter, so a README with created and status is not counted as a task."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T17:15:33Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -11,7 +11,7 @@ reported-by: "Andreas Hoffmann"
 
 ## Goal
 
-A file under `tasks/` contributes a row only when its name has the task shape (`<scope>_<name>.md`, with a non-empty scope) and its frontmatter carries a parseable `created` and a non-empty `status`. Any other markdown file charts nothing, adds no radar spoke, and logs at debug level.
+A file under `tasks/` contributes a row only when its name has the task shape (`<scope>_<name>.md`, with a non-empty scope) and its frontmatter carries a parseable `created` and a non-empty `status`. Any markdown file whose name fails the task shape charts nothing, adds no radar spoke, and logs at debug level.
 
 ## Context
 
@@ -32,7 +32,7 @@ A `tasks/README.md` that carries `created:` and `status:` therefore charts as a 
 2. Keep the frontmatter requirements: parseable `created`, non-empty `status`.
 3. A file that fails the name gate charts nothing, logs at debug level, and adds nothing to the skip tally, at the charting path and the read-level `record_skip` sites alike. A `_draft.md` with bad frontmatter therefore logs at debug and adds no tally, matching the existing stray-file rule.
 4. A file that passes the name gate (task shape and a non-empty scope) but fails the frontmatter keeps its current warning and skip count.
-5. Add tests: a `tasks/README.md` with `created` and `status` charts no row and no radar spoke; a `scope_name.md` charts; a `_draft.md` charts nothing and adds no tally; the working-tree and committed-blob paths agree; and a thread-scoped subscriber captures one debug line and no warning for that `tasks/README.md`. Extend `CapturedWarnings` to record DEBUG, because it drops anything below WARN today.
+5. Add tests: a `tasks/README.md` with `created` and `status` charts no row and no radar spoke; a `scope_name.md` charts; a `_draft.md` charts nothing and adds no tally; the working-tree and committed-blob paths agree; and a thread-scoped subscriber captures one debug line and no warning for that `tasks/README.md`. Keep `CapturedWarnings::take()` WARN-only and add a `take_debug()` that returns the DEBUG lines, so the exact-count assertions in `harvest_keeps_stray_files_out_of_the_drop_warnings` and the `tasks/README.md` stray case keep seeing only warnings.
 6. Record the rule in `ARCHITECTURE.md`'s extraction rules, `FEATURES.md`'s Update paragraph, and `TESTING.md`'s harvest bullet. [task-viewer_harvest-inner-symlink-and-special-files.md](task-viewer_harvest-inner-symlink-and-special-files.md), [task-viewer_harvest-follow-inner-directory-symlinks.md](task-viewer_harvest-follow-inner-directory-symlinks.md), and [task-viewer_harvest-ref-listing-dedupe.md](archive/task-viewer_harvest-ref-listing-dedupe.md) edit overlapping passages, so land these doc edits last, in one pass with a single writer after those siblings, each task adding its own sentence to the shared bullet.
 
 **Out of scope:** accepting a task file without an underscore, and changing the scope split for shaped names.

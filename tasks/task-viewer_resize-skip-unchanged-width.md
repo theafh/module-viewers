@@ -2,7 +2,7 @@
 description: "Skip the ten-chart redraw when a resize leaves the chart width unchanged, so a mobile URL bar does not rebuild every SVG."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T17:15:33Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -33,7 +33,7 @@ The charts container is already held as `chartsSection` (`document.querySelector
 1. Record the rendered width of the charts container once per `renderAll`, from `chartsSection.clientWidth`, in a module-level variable.
 2. In the resize handler, compare the current `chartsSection.clientWidth` with the recorded width and return before scheduling a redraw when they match. Keep the 100 ms debounce and the full redraw on a real width change.
 3. Add a writable per-instance `clientWidth` to the fixture's `.charts` node in `task-viewer/testdata/browser_guards.js`, the way `.chart-frame` already carries one, so a guard case can change the compared width between draws.
-4. Update the three resize-driven browser-guard cases in `task-viewer/src/web.rs` — `browser_calendar_pins_again_when_a_narrow_frame_gains_a_range`, `browser_calendar_tab_stop_starts_on_the_newest_day`, and `browser_calendar_redraw_keeps_focus_only_when_it_held_it` — so each changes the `.charts` width before every `resize` it dispatches. The two calendar cases write only `frame.clientWidth` today, so the skip would leave their `scrollLeft` and tab stop unrefreshed, and the focus case changes no width at all, so with the skip in place it stops redrawing and its `activeIsStop` assertion fails rather than passing.
+4. Update the five resize-driven browser-guard cases in `task-viewer/src/web.rs` — `browser_calendar_pins_again_when_a_narrow_frame_gains_a_range`, `browser_calendar_tab_stop_starts_on_the_newest_day`, `browser_calendar_redraw_keeps_focus_only_when_it_held_it`, `browser_chart_download_failure_shows_a_message`, and `browser_tooltip_hides_on_redraw_view_change_and_scroll` — so each changes the `.charts` width before every `resize` it dispatches. The two calendar cases write only `frame.clientWidth` today, so the skip would leave their `scrollLeft` and tab stop unrefreshed; the focus case changes no width at all, so with the skip in place it stops redrawing and its `activeIsStop` assertion fails rather than passing; and the download-failure and tooltip cases dispatch `resize` to trigger the redraw their assertions depend on.
 5. Add a browser-guard case: the initial render draws every card, two resize events at an unchanged width add no draw, and a changed width adds one draw.
 6. Update the planned browser-guard cases in [`task-viewer_chart-focus-survives-resize.md`](task-viewer_chart-focus-survives-resize.md) so each changes the compared width before every `resize` it dispatches; that sibling plans three same-width resize cases, which the skip turns into no-ops.
 7. Record the rule in `FEATURES.md`'s `## 4. Charts` paragraph and `TESTING.md`'s `- Browser guards:` bullet.

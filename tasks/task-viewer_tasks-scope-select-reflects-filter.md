@@ -2,7 +2,7 @@
 description: "Make the task list's scope select show the scope actually filtered on when that scope is no longer in the project's stored rows."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T17:15:33Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -44,5 +44,5 @@ One live task and one finished task rewrite the same two guardrail passages: [ta
 
 - A requested scope absent from the project's stored scopes appears as a selected option in the scope select, and the list stays filtered to it.
 - The new web test passes, and it asserts the ghost case plus the stored-scope and missing-or-empty-scope regression cases.
-- The `TaskSelection` doc comment, the `TasksPage` `scopes` field comment, and the existing test's doc comment describe the ghost-scope rule and no longer claim the options are only the project's stored scopes.
+- The `TaskSelection` doc comment states that `scopes` holds the project's stored scopes and that `render_tasks` adds an applied scope the project does not store; the `TasksPage` `scopes` field comment and the existing test's doc comment describe the option list the select renders, ghost value included.
 - The `FEATURES.md` `GET /tasks` paragraph and the `TESTING.md` Task list bullet state that the select also offers an applied scope the project does not store, and no longer claim the options are only the current project's scopes.

@@ -2,7 +2,7 @@
 description: "Follow directory symlinks inside tasks/ when their target stays in the repository, and warn and ignore any target outside it."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T17:15:33Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -21,11 +21,11 @@ A directory symlink under `tasks/` is followed when its target stays inside the 
 
 1. Build the walk as `WalkDir::new(tasks_root).follow_links(true).into_iter().filter_entry(...)`, so a rejected link's subtree is never entered.
 2. In the `filter_entry` predicate, a directory symlink is recognised by `entry.path_is_symlink()`, which stays true under `follow_links(true)` where `entry.file_type()` reports the target, together with a directory target. Canonicalize it and require the target to start with the canonical repository root. An outside target logs one warning naming the link path and the target and returns `false`, so its subtree is never walked and it contributes no row. File symlinks are left untouched, so the sibling task keeps a live `entry.file_type().is_file()` gate and this task owns only the directory-link decision.
-3. A walk error for a broken link or a link cycle logs one warning naming the path and continues with the rest of the walk instead of failing the scan; every other walk error still fails the scan. Distinguish a broken link from a vanished directory by `Error::path()` and `loop_ancestor()`, not by the io kind, because a vanished directory carries no path.
+3. A link cycle (`error.loop_ancestor().is_some()`) logs one warning naming the link path and continues with the rest of the walk. A broken link is an error whose `error.path()` names a path where `fs::symlink_metadata(path)` reports a symlink and `fs::metadata(path)` fails because the target does not resolve; it logs one warning naming the link path and its dangling target and continues. An error whose path is a directory symlink is classified by its canonical target before the walk fails: when the target leaves the folder, warn naming the link and target and continue, even when the target could not be opened; when the target stays inside and the directory cannot be read, the scan still fails. Apply the outside-link case before the broken-link check, because walkdir opens the link target before `filter_entry` sees the entry. Every other walk error still fails the scan.
 4. Keep stored paths relative to the walk root, so a followed directory still charts under `tasks/<subpath>`.
 5. Keep the existing root-link rule: an outside `tasks/` root still fails the scan.
 6. Add tests under `#[cfg(unix)]`: an inner link to a directory inside the repository charts its tasks; an inner link outside warns, charts nothing, and leaves the rest of the scan intact; a broken inner link and a link cycle each warn and the scan completes.
-7. Record the rule in `ARCHITECTURE.md`'s extraction rules, `FEATURES.md`'s Update paragraph, `TESTING.md`'s `Scan:` bullet (its `tasks/`-symlink sentence), and the `files_on_disk` doc comment in `task-viewer/src/harvest.rs`, restating it so a walk error fails the scan except for a link loop or a broken link.
+7. Record the rule in `ARCHITECTURE.md`'s extraction rules, `FEATURES.md`'s Update paragraph, `TESTING.md`'s `Scan:` bullet (its `tasks/`-symlink sentence), and the `files_on_disk` doc comment in `task-viewer/src/harvest.rs`, restating it so a walk error fails the scan except for a link loop, a broken link, or a directory symlink whose target leaves the folder.
 
 **Out of scope:** following a link whose target is another repository on the machine, changing the root-link failure, and the symlinked-file and non-regular-entry cases, which the sibling `task-viewer_harvest-inner-symlink-and-special-files.md` owns.
 

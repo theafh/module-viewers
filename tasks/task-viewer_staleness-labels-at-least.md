@@ -2,7 +2,7 @@
 description: "Say 30+/90+/180+ days in the staleness legend, summary, and tooltip, matching the at-least test the series actually applies."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T17:21:28Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -21,7 +21,7 @@ The staleness paragraph in `FEATURES.md` states the same "at least 30, 90, or 18
 
 A task exactly 30 days behind is therefore counted under a label that says more than 30.
 
-Two live tasks share this edit surface: [the weekly-bars task](task-viewer_weekly-bars-two-year-window.md) refreshes `task-viewer/testdata/dashboard_draw_snapshots.json`, and [the shared-day-axis task](task-viewer_chart-payload-shared-day-axis.md) rewrites `drawStaleness`'s `rows`/`dates` handling in the same function while keeping that snapshot unchanged. Whichever lands second re-derives the label wiring, and the weekly task re-derives the snapshot.
+Three live tasks share this edit surface: [the weekly-bars task](task-viewer_weekly-bars-two-year-window.md) refreshes `task-viewer/testdata/dashboard_draw_snapshots.json`, [the shared-day-axis task](task-viewer_chart-payload-shared-day-axis.md) rewrites `drawStaleness`'s `rows`/`dates` handling in the same function while keeping that snapshot unchanged, and [chart focus across a resize](task-viewer_chart-focus-survives-resize.md) also edits `drawStaleness` and regenerates the same snapshot for its `data-focus-key`. Whichever lands later re-derives the label wiring, and the weekly task and the focus task each re-derive the snapshot.
 
 ## Approach
 

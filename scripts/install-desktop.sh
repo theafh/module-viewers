@@ -311,9 +311,61 @@ dock_pin_guidance() {
     echo "To add it by hand, open that bundle once, then choose Options → Keep in Dock."
 }
 
+# Print the login account's home directory, resolved from the account database
+# rather than $HOME. It returns non-zero when the account name or its home
+# cannot be read or is not an absolute path, so a caller refuses to touch the
+# live Dock instead of guessing. `dscl` answers on macOS; `eval echo "~$user"`
+# is the fallback whenever `dscl` is missing or prints something that is not an
+# absolute path.
+login_account_home() {
+    local user home
+    if ! user="$(id -un)" || [ -z "$user" ]; then
+        return 1
+    fi
+    home=""
+    if command -v dscl >/dev/null 2>&1; then
+        home="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null)" || home=""
+        home="${home#NFSHomeDirectory: }"
+    fi
+    if [ -z "$home" ] || [ "${home#/}" = "$home" ]; then
+        home="$(eval echo "~$user" 2>/dev/null)" || home=""
+    fi
+    if [ -z "$home" ] || [ "${home#/}" = "$home" ]; then
+        return 1
+    fi
+    printf '%s\n' "$home"
+}
+
 # Pin an .app to the Dock. Prefer dockutil; otherwise edit Dock prefs and restart Dock.
+# The pin reaches the login account's live Dock whatever HOME says, so it runs
+# only from that account's own home. TASK_VIEWER_DOCK_PIN=force pins anyway and
+# =skip skips; any other value, including unset, takes the guarded auto path.
 pin_to_dock() {
     local app_bundle="$1"
+    local pin_mode="${TASK_VIEWER_DOCK_PIN:-auto}"
+
+    case "$pin_mode" in
+        force)
+            ;;
+        skip)
+            echo "Skipping the Dock pin: TASK_VIEWER_DOCK_PIN=skip."
+            dock_pin_guidance "$app_bundle"
+            return 0
+            ;;
+        *)
+            local login_home
+            if ! login_home="$(login_account_home)"; then
+                echo "Skipping the Dock pin: cannot determine the login account's home."
+                dock_pin_guidance "$app_bundle"
+                return 0
+            fi
+            if [ "$HOME" != "$login_home" ]; then
+                echo "Skipping the Dock pin: HOME ($HOME) is not the login account's home."
+                dock_pin_guidance "$app_bundle"
+                return 0
+            fi
+            ;;
+    esac
 
     if command -v dockutil >/dev/null 2>&1; then
         dockutil --remove "$APP_NAME" --no-restart 2>/dev/null || true

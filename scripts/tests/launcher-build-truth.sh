@@ -273,7 +273,9 @@ case_missing_python3_fails_install_with_explanation() {
     done
     bash_bin=$(command -v bash)
     bundle="$root/home/Applications/Task Viewer.app"
-    out=$(HOME="$root/home" PATH="$root/bin" \
+    # The home guard would skip the pin from this throwaway home; force reaches
+    # the missing-python3 branch this case measures.
+    out=$(HOME="$root/home" TASK_VIEWER_DOCK_PIN=force PATH="$root/bin" \
         "$bash_bin" "$root/scripts/install-desktop.sh" 2>&1)
     status=$?
     if [ "$status" -ne 0 ] &&
@@ -351,7 +353,7 @@ case_failing_dockutil_prints_guidance() {
     printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
     printf '#!/bin/bash\nexit 1\n' >"$root/bin/dockutil"
     chmod +x "$root/bin/uname" "$root/bin/dockutil"
-    out=$(HOME="$root/home" PATH="$root/bin:/usr/bin:/bin" \
+    out=$(HOME="$root/home" TASK_VIEWER_DOCK_PIN=force PATH="$root/bin:/usr/bin:/bin" \
         bash "$root/scripts/install-desktop.sh" 2>&1)
     status=$?
     if [ "$status" -ne 0 ] &&
@@ -388,7 +390,7 @@ EOS
     if [ -n "$py" ]; then
         python_dir="$(dirname "$py"):"
     fi
-    out=$(HOME="$root/home" PATH="$root/bin:${python_dir}/usr/bin:/bin" \
+    out=$(HOME="$root/home" TASK_VIEWER_DOCK_PIN=force PATH="$root/bin:${python_dir}/usr/bin:/bin" \
         bash "$root/scripts/install-desktop.sh" 2>&1)
     status=$?
     if [ "$status" -ne 0 ] &&
@@ -418,7 +420,7 @@ EOS
     marker="$root/home/Applications/Task Viewer.app/Contents/old-bundle-marker"
     mkdir -p "$(dirname "$marker")"
     printf 'previous\n' >"$marker"
-    out=$(HOME="$root/home" DOCKUTIL_LOG="$root/dockutil.log" PATH="$root/bin:/usr/bin:/bin" \
+    out=$(HOME="$root/home" TASK_VIEWER_DOCK_PIN=force DOCKUTIL_LOG="$root/dockutil.log" PATH="$root/bin:/usr/bin:/bin" \
         bash "$root/scripts/install-desktop.sh" 2>&1)
     status=$?
     leftovers="$(find "$root/home/Applications" -maxdepth 1 \
@@ -434,6 +436,125 @@ EOS
         fail "a clean install replaces the bundle and pins it (status $status)"
         printf '%s\n' "$out" | sed 's/^/    /'
         printf '%s\n' "$leftovers" | sed 's/^/    leftover: /'
+    fi
+}
+
+# A redirected HOME must never reach the live Dock. With no dockutil present the
+# python3 fallback would export com.apple.dock; the guard skips before either
+# mechanism runs, and the bundle still installs.
+case_redirected_home_skips_dock_pin() {
+    local root="$TMP/installer-redirected-home" out status bundle
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    cat >"$root/bin/defaults" <<'EOS'
+#!/bin/bash
+printf '%s\n' "$*" >>"$DEFAULTS_LOG"
+exit 0
+EOS
+    chmod +x "$root/bin/uname" "$root/bin/defaults"
+    bundle="$root/home/Applications/Task Viewer.app"
+    out=$(HOME="$root/home" DEFAULTS_LOG="$root/defaults.log" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    if [ "$status" -eq 0 ] &&
+        [ ! -e "$root/defaults.log" ] &&
+        printf '%s\n' "$out" | grep -q "is not the login account's home" &&
+        [ -x "$bundle/Contents/MacOS/task-viewer-launcher" ]; then
+        pass "a redirected HOME skips the Dock pin and still installs the bundle"
+    else
+        fail "a redirected HOME skips the Dock pin and still installs the bundle (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# When the account database reports the case's own home, HOME matches it and the
+# pin runs.
+case_login_home_pins_dock() {
+    local root="$TMP/installer-login-home" out status
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    printf '#!/bin/bash\nprintf "fakeuser\\n"\n' >"$root/bin/id"
+    cat >"$root/bin/dscl" <<'EOS'
+#!/bin/bash
+printf 'NFSHomeDirectory: %s\n' "$FAKE_LOGIN_HOME"
+EOS
+    cat >"$root/bin/dockutil" <<'EOS'
+#!/bin/bash
+printf '%s\n' "$*" >>"$DOCKUTIL_LOG"
+exit 0
+EOS
+    chmod +x "$root/bin/uname" "$root/bin/id" "$root/bin/dscl" "$root/bin/dockutil"
+    out=$(HOME="$root/home" FAKE_LOGIN_HOME="$root/home" \
+        DOCKUTIL_LOG="$root/dockutil.log" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    if [ "$status" -eq 0 ] &&
+        grep -q -- '--add' "$root/dockutil.log" 2>/dev/null; then
+        pass "an install from the login home pins the Dock"
+    else
+        fail "an install from the login home pins the Dock (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# An account whose home cannot be read must skip the pin rather than fall back
+# to writing the live Dock, and the install still finishes clean.
+case_unknown_login_home_skips_dock_pin() {
+    local root="$TMP/installer-unknown-home" out status
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    printf '#!/bin/bash\nprintf "no-such-account-tv\\n"\n' >"$root/bin/id"
+    printf '#!/bin/bash\nexit 1\n' >"$root/bin/dscl"
+    cat >"$root/bin/defaults" <<'EOS'
+#!/bin/bash
+printf '%s\n' "$*" >>"$DEFAULTS_LOG"
+exit 0
+EOS
+    cat >"$root/bin/dockutil" <<'EOS'
+#!/bin/bash
+printf '%s\n' "$*" >>"$DOCKUTIL_LOG"
+exit 0
+EOS
+    chmod +x "$root/bin/uname" "$root/bin/id" "$root/bin/dscl" "$root/bin/defaults" "$root/bin/dockutil"
+    out=$(HOME="$root/home" DEFAULTS_LOG="$root/defaults.log" DOCKUTIL_LOG="$root/dockutil.log" \
+        PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    if [ "$status" -eq 0 ] &&
+        printf '%s\n' "$out" | grep -q 'Cannot pin Task Viewer to the Dock automatically.' &&
+        [ ! -e "$root/defaults.log" ] &&
+        [ ! -e "$root/dockutil.log" ]; then
+        pass "an unknown login home skips the Dock pin and finishes clean"
+    else
+        fail "an unknown login home skips the Dock pin and finishes clean (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# The explicit skip override skips the pin even where the guard would skip it.
+case_dock_pin_skip_override_skips() {
+    local root="$TMP/installer-skip" out status
+    make_root "$root"
+    mkdir -p "$root/bin"
+    printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    cat >"$root/bin/dockutil" <<'EOS'
+#!/bin/bash
+printf '%s\n' "$*" >>"$DOCKUTIL_LOG"
+exit 0
+EOS
+    chmod +x "$root/bin/uname" "$root/bin/dockutil"
+    out=$(HOME="$root/home" TASK_VIEWER_DOCK_PIN=skip \
+        DOCKUTIL_LOG="$root/dockutil.log" PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/install-desktop.sh" 2>&1)
+    status=$?
+    if [ "$status" -eq 0 ] && [ ! -e "$root/dockutil.log" ]; then
+        pass "TASK_VIEWER_DOCK_PIN=skip skips the Dock pin"
+    else
+        fail "TASK_VIEWER_DOCK_PIN=skip skips the Dock pin (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
     fi
 }
 
@@ -673,6 +794,10 @@ case_icon_resize_failure_falls_back_to_png
 case_failing_dockutil_prints_guidance
 case_failing_defaults_prints_guidance
 case_clean_install_replaces_bundle
+case_redirected_home_skips_dock_pin
+case_login_home_pins_dock
+case_unknown_login_home_skips_dock_pin
+case_dock_pin_skip_override_skips
 case_restore_success_with_failed_cleanup
 case_success_with_failed_cleanup_reports_leftover
 case_detach_refuses_without_python3_or_setsid

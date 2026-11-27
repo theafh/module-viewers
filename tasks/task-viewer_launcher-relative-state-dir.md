@@ -2,7 +2,7 @@
 description: "Refuse a relative state directory composed from XDG_STATE_HOME or HOME before the launcher creates it, instead of creating it in one directory and locking in another."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T17:27:02Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -24,6 +24,8 @@ The launcher derives its state directory as an absolute path or exits non-zero n
 (the `STATE_DIR` case block in `scripts/task-viewer.sh`; the Darwin branch instead uses `$HOME/Library/Logs/task-viewer` and never reads `XDG_STATE_HOME`), then creates and hardens it before changing directory. The script later runs `cd "$PROJECT_DIR"`, and every path built from `$STATE_DIR` — the PID file, log, build log, stamp, and `$LOCK_DIR` — resolves against the new working directory from then on. On the non-Darwin branch a relative `XDG_STATE_HOME` therefore creates `<caller cwd>/relstate/task-viewer` and then tries to lock `<project>/relstate/task-viewer/task-viewer.lock`, whose parent does not exist.
 
 The result is exit 1 with `Cannot take or reclaim the task-viewer lock in: relstate/task-viewer` and `Check that the state directory is writable, then try again.`, plus a stray `relstate/` in the caller's directory. The named directory is writable; the message sends the user to the wrong cause. The XDG spec requires a state path to be absolute and says an implementation should treat a relative one as invalid and ignore it; this task instead refuses it, so the user learns the cause from a failed command rather than a silent fallback.
+
+The launcher paragraph in `FEATURES.md`, the launcher sentence in `README.md`, and the `SECURITY.md` Data paragraph are also rewritten by [task-viewer_launcher-moved-checkout-ownership.md](task-viewer_launcher-moved-checkout-ownership.md), and the `FEATURES.md` and `README.md` launcher paragraphs by [task-viewer_launcher-rebuild-progress.md](task-viewer_launcher-rebuild-progress.md); whichever lands later merges its wording into theirs.
 
 ## Approach
 

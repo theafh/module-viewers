@@ -35,10 +35,10 @@ make install
 ```
 
 - **Linux:** application-menu entry you can pin to favorites.
-- **macOS:** `~/Applications/Task Viewer.app`, pinned to the Dock automatically.
+- **macOS:** `~/Applications/Task Viewer.app`, pinned to the Dock automatically when `make install` runs from your own account's home.
   Click toggles start/stop and opens the browser when starting.
 
-A reinstall builds the new bundle in a hidden `.Task Viewer.app.staging.*` directory beside `~/Applications/Task Viewer.app` and swaps it in only after its executable and `Info.plist` exist, so a failure before the swap leaves the previous app in place. A failed install can leave that staging directory beside the bundle, a restore that itself fails leaves the previous bundle in the `.Task Viewer.app.backup.*` directory the installer names, and a successful swap whose backup cleanup fails leaves that backup directory behind and names it. When the icon build fails, the install reports that the icon build was skipped and copies the PNG instead, so the bundle still carries an icon; when the Dock pin fails, it prints how to add the app by hand.
+A reinstall builds the new bundle in a hidden `.Task Viewer.app.staging.*` directory beside `~/Applications/Task Viewer.app` and swaps it in only after its executable and `Info.plist` exist, so a failure before the swap leaves the previous app in place. A failed install can leave that staging directory beside the bundle, a restore that itself fails leaves the previous bundle in the `.Task Viewer.app.backup.*` directory the installer names, and a successful swap whose backup cleanup fails leaves that backup directory behind and names it. When the icon build fails, the install reports that the icon build was skipped and copies the PNG instead, so the bundle still carries an icon; when the Dock pin fails, it prints how to add the app by hand. The Dock pin runs only from the login account's own home: an install with a redirected `HOME`, or one whose account home cannot be determined, still installs the bundle and prints the manual-pin guidance without touching `com.apple.dock`. Set `TASK_VIEWER_DOCK_PIN=force` to pin from any home, or `TASK_VIEWER_DOCK_PIN=skip` to skip the pin.
 
 Manual control:
 

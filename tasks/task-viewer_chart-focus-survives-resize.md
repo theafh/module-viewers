@@ -2,7 +2,7 @@
 description: "Return keyboard focus to the equivalent chart mark after a resize redraw, instead of dropping it to body on eight of the ten cards."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T17:27:02Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -32,7 +32,7 @@ Verified live: focusing the cumulative overlay, a weekly bar, and a radar spoke 
 1. Generalise the calendar's held-focus pattern. Before each draw clears its SVG, record whether the card's root contains `document.activeElement` and a stable key for the mark: the weekly week day joined to its series name (`2026-01-05:created`), the radar spoke's full label, or the line or staleness overlay itself.
 2. Give each generated mark a `data-focus-key` carrying that key. After the draw has wired its focus — its `roving(...)` call where it uses one, since that call rewrites every mark's `tabindex`, or the overlay's own handlers — focus the mark whose key matches. When the key no longer exists, fall to the same card's mark with the nearest drawn index, clamped into range, measured by the mark's position in the card's own focus order. That fallback is defensive: the payload is parsed once at load and never rebuilt, and the only redraw that changes a card's mark set (the weekly View picker) runs with focus on the select, so a resize rebuilds the same keys.
 3. Apply it to `drawWeekly`, `drawLine` (refocus the overlay), `drawStaleness` (refocus the overlay), and the radar draw. The overlay's focus handler re-announces the first drawn day on focus, which the task keeps as the overlay's intended behaviour. Leave `drawCalendar` on its existing behaviour.
-4. Adding `data-focus-key` changes every non-calendar card's serialized markup; regenerate `task-viewer/testdata/dashboard_draw_snapshots.json` so `browser_chart_markup_matches_the_pre_change_snapshots` still passes.
+4. Adding `data-focus-key` changes every non-calendar card's serialized markup; regenerate `task-viewer/testdata/dashboard_draw_snapshots.json` so `browser_chart_markup_matches_the_pre_change_snapshots` still passes. Three live siblings edit the same surface: [the weekly-bars task](task-viewer_weekly-bars-two-year-window.md) refreshes the snapshot, [the shared-day-axis task](task-viewer_chart-payload-shared-day-axis.md) rewrites the daily rows and keeps the snapshot unchanged, and [the staleness-labels task](task-viewer_staleness-labels-at-least.md) refreshes the staleness entry; whichever lands later regenerates the snapshot against the others' geometry.
 5. Record the new guarantee in `FEATURES.md`'s chart-interaction paragraph, scoped to the cards that draw fresh marks: a redraw returns focus to the mark that held it, while the calendars keep their existing rule, that a redrawn calendar puts focus on its newest day when the frame scrolls or its first day when the frame fits, whichever day held focus before.
 6. Add browser-guard cases: focus a weekly bar, dispatch `resize`, assert the same week's bar is focused; focus a line overlay, dispatch `resize`, assert the overlay is focused; focus a mark in one card and dispatch `resize`, assert a different card's active element is unchanged. Each case compares identity against a node taken from the redrawn SVG, as the calendar guard does, because the test stub leaves the detached node as `document.activeElement`; an attribute or non-null check would pass without the restore.
 

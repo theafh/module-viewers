@@ -2,7 +2,7 @@
 description: "Show a banner naming an unparseable from or to bound on the task list instead of silently widening the window."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T17:15:33Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -21,7 +21,7 @@ reported-by: "Andreas Hoffmann"
 
 1. Detect a `from` or `to` whose trimmed value is non-empty and whose `parse_iso_date` returns `None`, and carry the field name and the trimmed value into `TasksPage`.
 2. Render a banner above the list naming each ignored bound and its trimmed value, as a page-local inline message with `role="status"` whose value passes the template auto-escaper. It never goes through the one-shot `Banner`/flash path, which only accepts a code from its closed set. Keep the list usable with the bound not applied.
-3. Leave the ignored value out of `filtered_pairs`, the one function that feeds both the sort-header links and `export_query`, so the CSV and the headers match the rows shown.
+3. Leave the ignored value out of `filtered_pairs`, the one function that feeds both the sort-header links and `export_query`, so the CSV and the headers match the rows shown. Amend the `filtered_pairs` doc comment ("then every non-empty filter") and the `export_query` doc comment ("every filter the request set") to say every applied filter.
 4. Keep the filter form's hidden `from`/`to` inputs echoing the value, so Show re-requests it and repeats the banner.
 5. Keep a valid bound applied and carried as today.
 6. Note the overlap with the active-filter summary task: `tasks/archive/task-viewer_tasks-visible-active-filters.md` renders a summary of the non-default filters above the same table and rewrites the same `FEATURES.md` task-list paragraph and `TESTING.md` task-list bullet. An ignored bound is not an applied filter, so that summary lists only applied filters and an ignored bound appears only in this banner; whichever task lands second merges both sentences into the shared passages.

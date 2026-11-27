@@ -2,7 +2,7 @@
 description: "Treat an empty or invalid RUST_LOG as the documented default and warn naming the value, instead of silently narrowing to ERROR."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T17:15:33Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -26,7 +26,7 @@ An unset or blank `RUST_LOG` uses `task_viewer=info`. A value the parser rejects
 5. Extract the parsing into a small helper that takes `Option<&OsStr>` and returns the filter plus an optional warning, so it is unit-testable without changing the process environment.
 6. Add tests: unset and blank yield the default; an invalid directive yields the default and a warning naming the value; a non-UTF-8 value yields the default and a warning naming `RUST_LOG`; `off` yields a filter that disables info; `task_viewer=debug` is honored as written.
 7. Rewrite `ARCHITECTURE.md`'s environment paragraph and `README.md`'s configuration paragraph so each states the unset, blank, invalid, and non-UTF-8 fallback to `task_viewer=info` with one warning naming `RUST_LOG`.
-8. Sequence the documentation edits with [Log the database path and schema version](task-viewer_startup-database-log.md), which rewrites the same `ARCHITECTURE.md` environment paragraph, the adjacent `README.md` database paragraph, and the same `main.rs` startup logging, so each edit lands on the other's final wording.
+8. Sequence the documentation edits with [Log the database path and schema version](task-viewer_startup-database-log.md), which rewrites the same `ARCHITECTURE.md` environment paragraph and the adjacent `README.md` database paragraph, and with [Cover the shipped features in the README](task-viewer_readme-feature-coverage.md), which adds the `TASK_VIEWER_DB` sentence to the same `README.md` configuration paragraph this task rewrites, so each edit lands on the other's final wording.
 
 **Out of scope:** changing the default directive or the log format, and reinterpreting a bare word the parser accepts as a target directive, which is honored as written.
 
