@@ -1954,7 +1954,8 @@ fn archive_log_args(rel: &str) -> Vec<String> {
 ///
 /// `-z --name-only` prints each candidate commit's path raw, so the lookup can
 /// read that commit's blob back and confirm the status sits in the frontmatter.
-/// `--no-patch` must stay out: git rejects it beside `--name-only`.
+/// `--no-patch` must stay out: it suppresses the path list beside
+/// `--name-only`, so the lookup would print no path to read back.
 fn pickaxe_log_args(flag: &str, pattern: &str, rel: &str) -> Vec<String> {
     git_log_args(&[
         "-z",
@@ -3235,7 +3236,13 @@ fn git_pickaxe(
     if let Some(dir) = &git.dir {
         match run_git_log(repo, git_dir_command(repo, dir), flag, pattern, rel) {
             LogLookup::Found(records) => {
-                return pickaxe_frontmatter_day(repo, Some(dir), &records, status);
+                match pickaxe_frontmatter_day(repo, Some(dir), &records, status) {
+                    Ok(day) => return Ok(day),
+                    Err(GitFailure::Timeout(reason)) => {
+                        return Err(GitFailure::Timeout(reason));
+                    }
+                    Err(reason) => first_failure = Some(reason),
+                }
             }
             LogLookup::Miss => return Ok(None),
             LogLookup::Failed(GitFailure::Timeout(reason)) => {
