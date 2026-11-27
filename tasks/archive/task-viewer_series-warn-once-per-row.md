@@ -2,8 +2,8 @@
 description: "Log each per-render row warning once per process instead of on every dashboard, JSON, and CSV render."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T18:52:51Z
-status: implemented
+updated: 2026-11-27T18:55:19Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -19,7 +19,7 @@ Every warning the chart read path emits per render is logged once per process. T
 
 `series::dashboard` in `task-viewer/src/series.rs` emits the after-today created, ship, and deferred-leave warnings and the before-floor warning from inside the function that builds every payload, and `web.rs` calls it per dashboard request and per export. `row_to_record` in `db.rs` warns for an unparseable `updated` on every load, and `load_tasks` warns and drops a row whose stored `kind` or `created` does not parse. A single mistyped year therefore writes the same warnings on every page load, forever, while harvest logs its equivalents once per scan.
 
-The set accepts any event label, so the sibling tasks' future warnings key through it. The sibling tasks shape this set: [the unparseable ship/leave task](task-viewer_db-unparseable-ship-leave-day.md) will warn in `row_to_record` and `load_prior_tasks` keyed by repository, path, field, and raw value, and [the archived future deferred leave task](archive/task-viewer_deferred-future-leave-fold.md) already added the deferred leave-after-today warning and left de-duplication here. The existing warning tests capture on the exact tracing target `task_viewer::series` and `task_viewer::db`.
+The set accepts any event label, so the sibling tasks' future warnings key through it. The sibling tasks shape this set: [the unparseable ship/leave task](../task-viewer_db-unparseable-ship-leave-day.md) will warn in `row_to_record` and `load_prior_tasks` keyed by repository, path, field, and raw value, and [the archived future deferred leave task](task-viewer_deferred-future-leave-fold.md) already added the deferred leave-after-today warning and left de-duplication here. The existing warning tests capture on the exact tracing target `task_viewer::series` and `task_viewer::db`.
 
 ## Approach
 
