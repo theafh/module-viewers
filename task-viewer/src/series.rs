@@ -171,7 +171,9 @@ pub fn dashboard(
     // decides the fold, so a ship folded into both the weekly and the
     // cumulative series is named once instead of once per series. The event is
     // still counted in the last charted point, so a mistyped future year stays
-    // visible instead of vanishing.
+    // visible instead of vanishing. A deferred leave day after today is named
+    // too, because the backlog, the mean age, and the weekly deferred bar all
+    // count it on today.
     for task in tasks {
         if task.created > today {
             tracing::warn!(
@@ -190,6 +192,17 @@ pub fn dashboard(
                 path = %task.path,
                 date = %crate::dates::format_date(day),
                 "task shipped after today; counted in the last charted point"
+            );
+        }
+        if task.kind == TaskKind::Deferred
+            && let Some(day) = task.leave_date
+            && day > today
+        {
+            tracing::warn!(
+                repository = %task.project,
+                path = %task.path,
+                date = %crate::dates::format_date(day),
+                "task deferred after today; counted in the last charted point"
             );
         }
     }
@@ -403,6 +416,23 @@ fn calendar(counter: &BTreeMap<NaiveDate, i64>, today: NaiveDate) -> (Vec<DayCou
     (rows, peak)
 }
 
+/// The day a task leaves the backlog and the mean-age average. The backlog
+/// cannot lose a task before it exists, so a leave day before `created` counts
+/// from `created`. A deferred task whose leave day lies after today counts as
+/// today, the day the weekly deferred bar folds it into, so the card and the
+/// backlog agree; a finished task keeps its own ship day, and a row created
+/// after today keeps its raw removal day because the walk never reaches it.
+fn leave_day(task: &TaskRecord, today: NaiveDate) -> Option<NaiveDate> {
+    task.leave_date.map(|leave| {
+        let day = leave.max(task.created);
+        if task.kind == TaskKind::Deferred && task.created <= today {
+            day.min(today)
+        } else {
+            day
+        }
+    })
+}
+
 fn live_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<LivePoint> {
     if tasks.is_empty() {
         return Vec::new();
@@ -410,11 +440,11 @@ fn live_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<LivePoint> {
     let mut delta: BTreeMap<NaiveDate, i64> = BTreeMap::new();
     for task in tasks {
         *delta.entry(task.created).or_insert(0) += 1;
-        if let Some(leave) = task.leave_date {
-            // The backlog cannot lose a task before it exists; a leave day
-            // before `created` counts from `created`. The stored row keeps its
-            // real ship day for the weekly and cumulative walks.
-            *delta.entry(leave.max(task.created)).or_insert(0) -= 1;
+        if let Some(leave) = leave_day(task, today) {
+            // A deferred leave day after today counts as today, while a
+            // finished task keeps its ship day. The stored row keeps its real
+            // ship day for the weekly and cumulative walks.
+            *delta.entry(leave).or_insert(0) -= 1;
         }
     }
     let start = tasks.iter().map(|task| task.created).min().unwrap_or(today);
@@ -429,11 +459,7 @@ fn live_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<LivePoint> {
     // from their own day.
     let mut stock = 0_i64;
     for task in tasks {
-        if task.created < start
-            && task
-                .leave_date
-                .is_none_or(|leave| leave.max(task.created) >= start)
-        {
+        if task.created < start && leave_day(task, today).is_none_or(|leave| leave >= start) {
             stock += 1;
         }
     }
@@ -541,7 +567,10 @@ fn age_points(tasks: &[TaskRecord], today: NaiveDate) -> Vec<AgePoint> {
 /// A task is active from its `created` day until its leave day, and it drops out
 /// on that leave day. A leave day before `created` counts from `created`, the
 /// way `live_points` clamps it, so a record whose dates are out of order is
-/// added and removed on the same day and counts on no day. The running total is
+/// added and removed on the same day and counts on no day. A deferred leave day
+/// after today counts as today, so the mean age drops the task on the same day
+/// the backlog and the weekly deferred bar do, while a finished task keeps its
+/// ship day. The running total is
 /// `count * day - sum_created`, which equals the sum of `day - created` over the
 /// active tasks without touching each task on each day.
 ///
@@ -562,8 +591,8 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
         let add = adds.entry(task.created).or_insert((0, 0));
         add.0 += 1;
         add.1 += created;
-        if let Some(leave) = task.leave_date {
-            let remove = removes.entry(leave.max(task.created)).or_insert((0, 0));
+        if let Some(leave) = leave_day(task, today) {
+            let remove = removes.entry(leave).or_insert((0, 0));
             remove.0 += 1;
             remove.1 += created;
         }
@@ -583,11 +612,7 @@ fn age_points_counted(tasks: &[TaskRecord], today: NaiveDate) -> (Vec<AgePoint>,
     let mut count = 0_i64;
     let mut sum_created = 0_i64;
     for task in tasks {
-        if task.created < start
-            && task
-                .leave_date
-                .is_none_or(|leave| leave.max(task.created) >= start)
-        {
+        if task.created < start && leave_day(task, today).is_none_or(|leave| leave >= start) {
             count += 1;
             sum_created += i64::from(task.created.num_days_from_ce());
         }
@@ -2148,6 +2173,168 @@ mod tests {
             today_age.avg_age.to_bits(),
             9.0_f64.to_bits(),
             "the task is nine days old on today"
+        );
+    }
+
+    /// Covers: a deferred leave day in 2099 counts as today, so the task is
+    /// absent from today's backlog and mean age, still counted in today's
+    /// weekly deferred bar, and named by one warning, while a finished task
+    /// with a future ship day stays in both today's backlog and mean age.
+    #[test]
+    fn series_folds_a_future_deferred_leave_day_to_today() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![
+            task(
+                "alpha",
+                "deferred",
+                TaskKind::Deferred,
+                day(2026, 5, 31),
+                None,
+                Some(day(2099, 1, 1)),
+            ),
+            task(
+                "alpha",
+                "finished",
+                TaskKind::Finished,
+                day(2026, 6, 1),
+                Some(day(2026, 6, 20)),
+                Some(day(2026, 6, 20)),
+            ),
+            task("alpha", "live", TaskKind::Live, day(2026, 6, 2), None, None),
+        ];
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        drop(guard);
+        let warnings = captured.take();
+
+        let yesterday = board
+            .live_backlog
+            .iter()
+            .find(|point| point.date == "2026-06-09")
+            .expect("the day before today");
+        assert_eq!(
+            yesterday.live, 3,
+            "the deferred task still counts the day before today"
+        );
+        let last = board.live_backlog.last().expect("the last backlog row");
+        assert_eq!(last.date, "2026-06-10");
+        assert_eq!(
+            last.live, 2,
+            "the future-leaving deferred task leaves today while the finished and live tasks stay"
+        );
+
+        let today_age = board
+            .mean_age
+            .iter()
+            .find(|point| point.date == "2026-06-10")
+            .expect("today's mean-age point");
+        assert_eq!(
+            today_age.n, 2,
+            "the deferred task leaves today's average while the finished and live tasks stay"
+        );
+        assert_eq!(
+            today_age.avg_age.to_bits(),
+            8.5_f64.to_bits(),
+            "the mean of the finished task's nine days and the live task's eight days"
+        );
+
+        let this_week = board
+            .weekly
+            .iter()
+            .find(|point| point.week == crate::dates::format_date(monday(today)))
+            .expect("today's week");
+        assert_eq!(
+            this_week.deferred, 1,
+            "the future leave day still counts in today's deferred bar"
+        );
+
+        assert_eq!(
+            warnings.len(),
+            2,
+            "the future deferred leave and the future finished ship each warn once: {warnings:?}"
+        );
+        let deferred_warnings: Vec<&String> = warnings
+            .iter()
+            .filter(|warning| warning.contains("path=tasks/alpha_deferred.md"))
+            .collect();
+        assert_eq!(
+            deferred_warnings.len(),
+            1,
+            "exactly one warning names the future deferred leave day: {warnings:?}"
+        );
+        assert!(
+            deferred_warnings[0].contains("repository=alpha")
+                && deferred_warnings[0].contains("date=2099-01-01"),
+            "the warning names the row's repository, path, and future leave day: {warnings:?}"
+        );
+    }
+
+    /// Covers: a deferred row whose `created` and leave day both lie after
+    /// today never enters the walk, so today's backlog stays non-negative and
+    /// keeps every live task, while a deferred row that left before today is
+    /// unchanged.
+    #[test]
+    fn series_keeps_a_future_dated_deferred_row_out_of_the_backlog() {
+        let today = day(2026, 6, 10);
+        let tasks = vec![
+            task(
+                "alpha",
+                "future",
+                TaskKind::Deferred,
+                day(2099, 1, 1),
+                None,
+                Some(day(2099, 2, 1)),
+            ),
+            task(
+                "alpha",
+                "left",
+                TaskKind::Deferred,
+                day(2026, 6, 1),
+                None,
+                Some(day(2026, 6, 5)),
+            ),
+            task("alpha", "live", TaskKind::Live, day(2026, 6, 1), None, None),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        assert!(
+            board.live_backlog.iter().all(|point| point.live >= 0),
+            "the backlog never goes negative"
+        );
+        let june_fourth = board
+            .live_backlog
+            .iter()
+            .find(|point| point.date == "2026-06-04")
+            .expect("the day before the leave day");
+        assert_eq!(
+            june_fourth.live, 2,
+            "the deferred task counts until its leave day and the future row adds nothing"
+        );
+        let june_fifth = board
+            .live_backlog
+            .iter()
+            .find(|point| point.date == "2026-06-05")
+            .expect("the leave day");
+        assert_eq!(
+            june_fifth.live, 1,
+            "a deferred leave day on or before today is unchanged"
+        );
+        let last = board.live_backlog.last().expect("the last backlog row");
+        assert_eq!(
+            last.live, 1,
+            "only the live task remains, so every live task is still counted"
+        );
+        let today_age = board
+            .mean_age
+            .iter()
+            .find(|point| point.date == "2026-06-10")
+            .expect("today's mean-age point");
+        assert_eq!(today_age.n, 1, "the future row adds nothing to the average");
+        assert_eq!(
+            today_age.avg_age.to_bits(),
+            9.0_f64.to_bits(),
+            "the live task is nine days old on today"
         );
     }
 
