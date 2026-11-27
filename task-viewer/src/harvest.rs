@@ -483,8 +483,8 @@ fn union_files(
     Ok((chosen, worktree, ref_holds_tasks))
 }
 
-/// Every `(path, blob, lossy)` triple the repository's refs list under the
-/// folder's `tasks/`, in ref order.
+/// Every distinct `(path, blob, lossy)` triple the repository's refs list under
+/// the folder's `tasks/`, in first-seen ref order.
 ///
 /// A ref is read by the commit id it names, never by its ref name: a ref name
 /// that is not valid UTF-8 decodes lossily and names no object git can resolve,
@@ -494,6 +494,14 @@ fn union_files(
 /// branches that touched other parts of the tree cost one recursive listing. A
 /// ref that holds no `tasks/` contributes nothing and is skipped before its
 /// recursive listing.
+///
+/// A `(path, blob)` pair enters the union once even when several distinct
+/// `tasks/` subtrees list it, which is what a repository keeping one branch per
+/// task produces: each branch's edit gives it a distinct subtree, so every such
+/// branch lists the whole tree, while only the edited task's pair is new. The
+/// pairs are filtered on insert and pushed in first-seen order, because the
+/// candidate set's later sort and tie-break depend on that order. A ref whose
+/// subtree yields no new pair adds nothing and costs no union growth.
 fn ref_task_files(
     root: &Path,
     dir: &Path,
@@ -516,6 +524,8 @@ fn ref_task_files(
     let mut found: Vec<(String, String, bool)> = Vec::new();
     let mut listed_commits: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut listed_trees: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_pairs: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for line in listing.lines() {
         let Some((commit, _reference)) = line.trim().split_once(' ') else {
             continue;
@@ -539,13 +549,13 @@ fn ref_task_files(
         let tree = git_read_bytes(root, dir, &["ls-tree", "-r", "-z", commit, "--", &pathspec])
             .map_err(HarvestError::Git)?;
         let (paths, blobs, lossy) = markdown_blobs(&tree, prefix);
-        found.extend(
-            paths
-                .into_iter()
-                .zip(blobs)
-                .zip(lossy)
-                .map(|((path, blob), path_is_lossy)| (path, blob, path_is_lossy)),
-        );
+        for ((path, blob), path_is_lossy) in paths.into_iter().zip(blobs).zip(lossy) {
+            // A different version of one path has a different blob, so it
+            // still enters; only an identical path+blob pair is dropped.
+            if seen_pairs.insert((path.clone(), blob.clone())) {
+                found.push((path, blob, path_is_lossy));
+            }
+        }
     }
     Ok(found)
 }
@@ -3376,8 +3386,8 @@ mod tests {
         git_dir_command, git_log_args, git_path, git_program, git_read, git_timeout,
         harvest_chosen, harvest_files, harvest_repository, harvest_repository_with_prior,
         normalize_origin_url, parse_archive_log, parse_batch, pickaxe_log_args, read_blobs,
-        repository_identity, run_git_command, run_git_log, run_git_streaming, scrub_git_env,
-        stream_blob_days, take_leave_walk_count, take_recursive_ls_tree_count,
+        ref_task_files, repository_identity, run_git_command, run_git_log, run_git_streaming,
+        scrub_git_env, stream_blob_days, take_leave_walk_count, take_recursive_ls_tree_count,
         take_worktree_cache_peak, take_worktree_read_bytes, take_worktree_read_count, union_files,
         worktree_content,
     };
@@ -5886,6 +5896,99 @@ mod tests {
             vec!["tasks/scope_shared.md"],
             "the branch without `tasks/` charts nothing: {tasks:?}"
         );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_union_lists_each_path_and_blob_once() {
+        // A repository kept as one branch per task: each branch edits one task,
+        // so its `tasks/` subtree differs and every branch lists the whole tree.
+        // The union holds each `(path, blob)` pair once, so it grows by the
+        // edited task alone instead of by the whole tree on every branch.
+        let repo = scratch("harvest_union_dedupe");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let scopes = ["alpha", "beta", "gamma"];
+        for scope in scopes {
+            write_task(
+                &repo,
+                &format!("tasks/{scope}_task.md"),
+                "2026-05-01",
+                "open",
+            );
+        }
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "base tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        let base = git_stdout(&repo, &["rev-parse", "HEAD"], "2026-05-01T12:00:00+00:00");
+        for (offset, scope) in scopes.iter().enumerate() {
+            let day = format!("2026-06-0{}", offset + 1);
+            let date = format!("{day}T12:00:00+00:00");
+            git(
+                &repo,
+                &["checkout", "-b", &format!("edit-{scope}"), &base],
+                &date,
+            );
+            write_task_dated(
+                &repo,
+                &format!("tasks/{scope}_task.md"),
+                "2026-05-01",
+                &day,
+                "open",
+            );
+            git(&repo, &["add", "-A"], &date);
+            git(&repo, &["commit", "-m", &format!("edit {scope}")], &date);
+        }
+        // A branch that holds no `tasks/`, so the working tree does not outrank
+        // the committed versions and the newest commit decides each task.
+        git(
+            &repo,
+            &["checkout", "--orphan", "empty"],
+            "2026-06-10T12:00:00+00:00",
+        );
+        git(&repo, &["rm", "-rf", "."], "2026-06-10T12:00:00+00:00");
+        fs::write(repo.join("README.md"), "# No tasks\n").expect("readme");
+        git(&repo, &["add", "-A"], "2026-06-10T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "no tasks"],
+            "2026-06-10T12:00:00+00:00",
+        );
+
+        let found = ref_task_files(&repo, &repo.join(".git"), "").expect("ref listing");
+        assert_eq!(
+            found.len(),
+            6,
+            "three base pairs plus one edited pair per branch, not one copy of the whole tree per branch: {found:?}"
+        );
+        let unique: HashSet<(String, String)> = found
+            .iter()
+            .map(|(path, blob, _)| (path.clone(), blob.clone()))
+            .collect();
+        assert_eq!(
+            unique.len(),
+            found.len(),
+            "every listed pair is distinct: {found:?}"
+        );
+
+        let tasks = harvest_repository(&repo).expect("harvest");
+        for (offset, scope) in scopes.iter().enumerate() {
+            let row = tasks
+                .iter()
+                .find(|task| task.path == format!("tasks/{scope}_task.md"))
+                .unwrap_or_else(|| panic!("{scope} charts"));
+            assert_eq!(
+                row.updated,
+                NaiveDate::from_ymd_opt(2026, 6, offset as u32 + 1).expect("day"),
+                "{scope} charts the newest commit's version"
+            );
+        }
         let _ = fs::remove_dir_all(&repo);
     }
 
