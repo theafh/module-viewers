@@ -3509,6 +3509,10 @@ fn normalize_origin_url(url: &str) -> String {
 /// because Add must not report two configured subfolders of one enclosing
 /// repository as clones.
 ///
+/// The stored value is a fixed-width digest of those parts, so an `origin` URL
+/// that carries an embedded credential is never written to the database and
+/// the column stays bounded as refs accumulate.
+///
 /// A folder outside git has no history, so it has no key and keeps the
 /// `updated` fallback. A git command that cannot read the refs fails the scan,
 /// as every other read-only git failure does, rather than silently reusing a
@@ -3525,11 +3529,11 @@ fn repository_history_key(repo: &Path, git: &GitContext) -> Result<Option<String
         RepositoryIdentity::None => return Ok(None),
     };
     let tips = ref_tips(repo, dir)?;
-    Ok(Some(format!(
-        "{identity}\n{}\n{}",
-        git.prefix,
-        tips.join(",")
-    )))
+    // Store a fixed-width digest, not the raw parts: the identity can be an
+    // origin URL that carries a credential, and the tip list grows with every
+    // ref. Only equality matters, so the digest compares the same histories.
+    let raw = format!("{identity}\n{}\n{}", git.prefix, tips.join(","));
+    Ok(Some(format!("history-v1:{}", fnv1a_digest(&raw))))
 }
 
 /// The sorted tip commit ids of the ref set `git log --all` actually walks:
@@ -4879,6 +4883,49 @@ mod tests {
             take_leave_walk_count(&repo),
             1,
             "a HEAD-only tip re-walks the archived path"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_stores_a_bounded_digest_for_the_history_key() {
+        let repo = scratch("harvest_history_key_digest");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-06-01T12:00:00+00:00",
+        );
+        // An origin URL that carries a credential must never reach the database.
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://x-access-token:ghp_SECRET123@example.com/org/repo.git",
+            ],
+            "2026-06-01T12:00:00+00:00",
+        );
+        write_task_dated(
+            &repo,
+            "tasks/archive/scope_one.md",
+            "2026-05-01",
+            "2026-05-01",
+            "finished",
+        );
+        commit_all(&repo, "archive", "2026-06-01T12:00:00+00:00");
+
+        let harvested = harvest_repository_with_prior(&repo, &[], None).expect("harvest");
+        let key = harvested.history_key.expect("a git repository has a key");
+        assert!(key.starts_with("history-v1:"), "{key}");
+        assert_eq!(
+            key.len(),
+            "history-v1:".len() + 16,
+            "the key is a fixed-width digest: {key}"
+        );
+        assert!(
+            !key.contains("ghp_SECRET123"),
+            "the origin credential is not stored: {key}"
         );
         let _ = fs::remove_dir_all(&repo);
     }
