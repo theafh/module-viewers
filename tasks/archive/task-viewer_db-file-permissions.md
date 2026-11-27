@@ -2,8 +2,8 @@
 description: "Create the database file and its WAL sidecars mode 0600 and tighten an existing one, so repository and task paths are not group- or world-readable."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T09:16:47Z
-status: implemented
+updated: 2026-11-27T09:26:37Z
+status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: true
 reported-by: "Andreas Hoffmann"
@@ -29,7 +29,7 @@ SQLite copies the database file's mode only when it creates a `-wal` or `-shm` f
 4. Add a `#[cfg(unix)]` test that holds a connection from the returned pool while it reads the modes, because the migration connection's close deletes the sidecars: a newly created database and its `-wal` and `-shm` are 0600 while that held connection keeps them alive; a database seeded 0644 is 0600 after `init`; a database whose valid `-wal` and `-shm` are kept open by a held WAL connection that writes so both files are non-empty, then chmod'ed 0644, has both sidecars tightened to 0600 by a second `init`; a 0644 foreign file refused by the guard keeps 0644 after the failed `init`; and an existing parent directory's mode reads the same before and after `init`, while a parent the build creates carries the same mode as a control directory `create_dir_all` makes under the same umask.
 5. Record the rule as a new sentence in `SECURITY.md`'s `## Data` section, in the `## Components` paragraph of `ARCHITECTURE.md` that opens `**`task-viewer/src/db.rs`**` (append to that paragraph, which other live database tasks also extend, rather than replacing its text), and in `TESTING.md`'s `- Database:` bullet under `## What Must Be Covered`.
 
-The foreign-file refusal from the finished [task-viewer_db-refuse-foreign-sqlite-file](archive/task-viewer_db-refuse-foreign-sqlite-file.md) runs inside `migrate_locked` before `SCHEMA`, so the tighten runs after that check and before `SCHEMA`, and a file the check refuses keeps the mode it was found with.
+The foreign-file refusal from the finished [task-viewer_db-refuse-foreign-sqlite-file](task-viewer_db-refuse-foreign-sqlite-file.md) runs inside `migrate_locked` before `SCHEMA`, so the tighten runs after that check and before `SCHEMA`, and a file the check refuses keeps the mode it was found with.
 
 **Out of scope:** changing the default database location; chmod'ing the user's home directory.
 
