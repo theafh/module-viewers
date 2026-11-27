@@ -96,6 +96,80 @@ const EXPECTED_COLUMNS: [(&str, &[&str]); 2] = [
     ),
 ];
 
+/// The tables task-viewer owns, so the foreign-file guard can tell one of its
+/// own tables from another application's.
+const OWNED_TABLES: [&str; 2] = ["repositories", "tasks"];
+
+/// The `application_id` this build writes into a database it creates: the
+/// ASCII `TV` and a format number, so an external reader inspecting a copy can
+/// recognize the file even though its schema looks like any SQLite database's.
+const APPLICATION_ID: i64 = 0x5456_0001;
+
+/// The tables and columns each schema version carries, derived from `SCHEMA`
+/// (version 1) and the columns `migration` adds at versions 3, 4, and 5. The
+/// foreign-file guard builds a file's claimed shape from it, so a
+/// `SCHEMA_VERSION` bump extends this list beside `EXPECTED_COLUMNS` instead of
+/// drifting from it. Version 0 claims no table at all, because a brand-new file
+/// is empty until the baseline runs.
+fn shape_at(version: i64) -> Vec<(&'static str, Vec<&'static str>)> {
+    if version <= 0 {
+        return Vec::new();
+    }
+    let mut shape: Vec<(&'static str, Vec<&'static str>)> = vec![
+        (
+            "repositories",
+            vec![
+                "repository_id",
+                "name",
+                "path",
+                "created_at",
+                "scanned_at",
+                "last_error",
+            ],
+        ),
+        (
+            "tasks",
+            vec![
+                "task_id",
+                "repository_id",
+                "path",
+                "scope",
+                "kind",
+                "created",
+                "updated",
+                "ship_date",
+                "leave_date",
+            ],
+        ),
+    ];
+    if version >= 3 {
+        add_columns(&mut shape, "tasks", &["content_hash"]);
+    }
+    if version >= 4 {
+        add_columns(
+            &mut shape,
+            "repositories",
+            &["last_error_at", "last_outcome"],
+        );
+    }
+    if version >= 5 {
+        add_columns(&mut shape, "repositories", &["history_key"]);
+    }
+    shape
+}
+
+/// Append `columns` to the table `table` in `shape`, leaving a shape that names
+/// no such table untouched.
+fn add_columns(
+    shape: &mut [(&'static str, Vec<&'static str>)],
+    table: &str,
+    columns: &[&'static str],
+) {
+    if let Some((_, present)) = shape.iter_mut().find(|(name, _)| *name == table) {
+        present.extend_from_slice(columns);
+    }
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Repository {
     pub repository_id: i64,
@@ -297,6 +371,12 @@ async fn migrate_locked(conn: &mut SqliteConnection, path: &Path) -> Result<()> 
              {SCHEMA_VERSION}, the latest this binary knows"
         );
     }
+    // Refuse a file that is clearly not task-viewer's before the baseline and
+    // again before each later step, so a foreign table is never adopted and a
+    // foreign file keeps its tables, rows, and stamp instead of gaining
+    // task-viewer's columns. The check runs after the newer-than-binary bail,
+    // so a file this binary cannot read keeps that message.
+    refuse_foreign_schema(conn, path, version).await?;
     if version == 0 {
         sqlx::query(SCHEMA)
             .execute(&mut *conn)
@@ -304,6 +384,15 @@ async fn migrate_locked(conn: &mut SqliteConnection, path: &Path) -> Result<()> 
             .with_context(|| {
                 format!(
                     "the baseline schema could not be created in {}",
+                    path.display()
+                )
+            })?;
+        sqlx::query(&format!("PRAGMA application_id = {APPLICATION_ID}"))
+            .execute(&mut *conn)
+            .await
+            .with_context(|| {
+                format!(
+                    "the task-viewer application id could not be written to {}",
                     path.display()
                 )
             })?;
@@ -317,6 +406,7 @@ async fn migrate_locked(conn: &mut SqliteConnection, path: &Path) -> Result<()> 
     }
     while version < SCHEMA_VERSION {
         let next = version + 1;
+        refuse_foreign_schema(conn, path, version).await?;
         migrate_step(conn, next).await.with_context(|| {
             format!(
                 "the database schema migration to version {next} failed for {}",
@@ -327,6 +417,134 @@ async fn migrate_locked(conn: &mut SqliteConnection, path: &Path) -> Result<()> 
     }
     verify_columns(conn, path, version).await?;
     Ok(())
+}
+
+/// Refuse a non-empty file whose schema is clearly not task-viewer's, before
+/// the baseline and before each later migration step. The rule is deliberately
+/// narrow: a file is foreign when it carries a table or column no task-viewer
+/// version has, or when it is missing a table or column its claimed version
+/// must have while carrying one that version cannot have. A file that matches
+/// an older task-viewer version migrates, and a half-applied file whose only
+/// difference is extra later columns with nothing required missing is accepted.
+///
+/// A file that is merely missing a required table or column is left to the
+/// migration and to `verify_columns`, which name it; refusing it here would
+/// report a damaged task-viewer file as another application's. A view, or any
+/// other non-table object, that reuses a name task-viewer owns is refused
+/// instead of passing a `type = 'table'` check and failing later with a
+/// migration error that names no cause.
+async fn refuse_foreign_schema(
+    conn: &mut SqliteConnection,
+    path: &Path,
+    version: i64,
+) -> Result<()> {
+    let objects: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, type FROM sqlite_master
+         WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+
+    for (name, kind) in &objects {
+        if !OWNED_TABLES.contains(&name.as_str()) {
+            anyhow::bail!(
+                "the database at {} is not task-viewer's: it carries a {kind} named {name} \
+                 that task-viewer does not own; an empty file or a new path is needed",
+                path.display()
+            );
+        }
+        if kind != "table" {
+            anyhow::bail!(
+                "the database at {} is not task-viewer's: its {name} {kind} is not the table \
+                 task-viewer owns; an empty file or a new path is needed",
+                path.display()
+            );
+        }
+    }
+
+    if version == 0 {
+        if let Some((name, _)) = objects.first() {
+            anyhow::bail!(
+                "the database at {} claims to be new but already carries the {name} table; \
+                 an empty file or a new path is needed",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    // Every column the current version knows is the union of all versions'
+    // columns, because each migration only adds columns.
+    let current = shape_at(SCHEMA_VERSION);
+    let mut present: Vec<(&str, Vec<String>)> = Vec::new();
+    for (name, _) in &objects {
+        let columns = table_columns(conn, name).await?;
+        for column in &columns {
+            let known = current
+                .iter()
+                .any(|(table, known)| table == name && known.contains(&column.as_str()));
+            if !known {
+                anyhow::bail!(
+                    "the database at {} is not task-viewer's: its {name} table carries the \
+                     {column} column, which no task-viewer schema version has; an empty file \
+                     or a new path is needed",
+                    path.display()
+                );
+            }
+        }
+        present.push((name.as_str(), columns));
+    }
+
+    let allowed = shape_at(version);
+    let mut missing: Option<String> = None;
+    for (table, columns) in &allowed {
+        match present.iter().find(|(name, _)| name == table) {
+            None => {
+                if missing.is_none() {
+                    missing = Some(format!("{table} table"));
+                }
+            }
+            Some((_, present_columns)) => {
+                for column in columns {
+                    if !present_columns.iter().any(|name| name == column) && missing.is_none() {
+                        missing = Some(format!("{table}.{column} column"));
+                    }
+                }
+            }
+        }
+    }
+    let mut future: Option<String> = None;
+    for (table, columns) in &present {
+        for column in columns {
+            let allowed_column = allowed.iter().any(|(allowed_table, allowed_columns)| {
+                allowed_table == table && allowed_columns.contains(&column.as_str())
+            });
+            if !allowed_column && future.is_none() {
+                future = Some(format!("{table}.{column}"));
+            }
+        }
+    }
+    if let (Some(missing), Some(future)) = (missing, future) {
+        anyhow::bail!(
+            "the database at {} claims schema version {version} but is missing the {missing} \
+             while carrying {future}, which version {version} cannot have; an empty file or a \
+             new path is needed",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// The columns of one table, read through SQLite's own table info so the guard
+/// needs no schema text of its own. The name is bound, not interpolated, so a
+/// name that came from `sqlite_master` cannot change the statement.
+async fn table_columns(conn: &mut SqliteConnection, table: &str) -> Result<Vec<String>> {
+    let columns = sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await?;
+    Ok(columns)
 }
 
 /// Confirm the tables and columns `SCHEMA_VERSION` promises are present after
@@ -2351,6 +2569,289 @@ mod tests {
             "{message}"
         );
         remove_scratch(&path);
+    }
+
+    /// Builds a file carrying `version`'s shape: the baseline plus the columns
+    /// each later migration adds, stamped at `version`. It mirrors `shape_at`,
+    /// so a test can hand `init_at` a legacy or a foreign file without
+    /// repeating the migration SQL.
+    async fn file_at_version(path: &std::path::Path, version: i64) -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("versioned file");
+        if version >= 1 {
+            sqlx::query(SCHEMA)
+                .execute(&pool)
+                .await
+                .expect("baseline schema");
+        }
+        if version >= 2 {
+            sqlx::query("DROP INDEX IF EXISTS tasks_repository_id")
+                .execute(&pool)
+                .await
+                .expect("version two migration");
+        }
+        if version >= 3 {
+            sqlx::query("ALTER TABLE tasks ADD COLUMN content_hash TEXT")
+                .execute(&pool)
+                .await
+                .expect("version three migration");
+        }
+        if version >= 4 {
+            for statement in [
+                "ALTER TABLE repositories ADD COLUMN last_error_at TEXT",
+                "ALTER TABLE repositories ADD COLUMN last_outcome TEXT",
+            ] {
+                sqlx::query(statement)
+                    .execute(&pool)
+                    .await
+                    .expect("version four migration");
+            }
+        }
+        if version >= 5 {
+            sqlx::query("ALTER TABLE repositories ADD COLUMN history_key TEXT")
+                .execute(&pool)
+                .await
+                .expect("version five migration");
+        }
+        sqlx::query(&format!("PRAGMA user_version = {version}"))
+            .execute(&pool)
+            .await
+            .expect("version stamp");
+        pool
+    }
+
+    async fn raw_pool(path: &std::path::Path) -> sqlx::SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("raw connection")
+    }
+
+    /// Covers: a non-empty file that is not task-viewer's is refused at
+    /// start-up, naming its path and the offending table or column and saying
+    /// an empty file or a new path is needed, while its tables, rows, and
+    /// `user_version` stay unchanged; a legacy file at an older version still
+    /// migrates; a file missing a required table or column while carrying one
+    /// its stamped version cannot have is refused; a current-version file that
+    /// merely lacks a selected column is the `verify_columns` refusal, not this
+    /// guard; and an empty file initializes with the task-viewer
+    /// `application_id`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_refuses_a_foreign_sqlite_file() {
+        // A version-0 file holding a foreign table keeps that table and its
+        // row, and gains neither task-viewer table nor a version stamp.
+        let foreign = temp_database();
+        let raw = raw_pool(&foreign).await;
+        sqlx::query("CREATE TABLE notes (body TEXT)")
+            .execute(&raw)
+            .await
+            .expect("foreign table");
+        sqlx::query("INSERT INTO notes (body) VALUES ('kept')")
+            .execute(&raw)
+            .await
+            .expect("foreign row");
+        raw.close().await;
+
+        let error = init_at(&foreign)
+            .await
+            .expect_err("a foreign table is refused");
+        let message = format!("{error:#}");
+        for needle in [
+            foreign.display().to_string(),
+            "notes".to_string(),
+            "empty file or a new path is needed".to_string(),
+        ] {
+            assert!(
+                message.contains(&needle),
+                "the refusal names {needle}: {message}"
+            );
+        }
+
+        let raw = raw_pool(&foreign).await;
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes")
+            .fetch_one(&raw)
+            .await
+            .expect("the foreign table survives");
+        assert_eq!(kept, 1, "the foreign row survives");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&raw)
+            .await
+            .expect("version");
+        assert_eq!(version, 0, "the refusal leaves the stamp untouched");
+        for table in ["tasks", "repositories"] {
+            let present: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(&raw)
+            .await
+            .expect("table count");
+            assert_eq!(present, 0, "the refusal adds no {table} table");
+        }
+        raw.close().await;
+        remove_scratch(&foreign);
+
+        // A legacy task-viewer file at version 2 still migrates, and so does
+        // one at version 3, so the sampled versions prove the version-generic
+        // shape table rather than a single lucky case.
+        for legacy in [2, 3] {
+            let path = temp_database();
+            file_at_version(&path, legacy).await.close().await;
+            let pool = init_at(&path)
+                .await
+                .expect("a legacy task-viewer file migrates");
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&pool)
+                .await
+                .expect("version");
+            assert_eq!(version, SCHEMA_VERSION, "version {legacy} reaches current");
+            pool.close().await;
+            remove_scratch(&path);
+        }
+
+        // A version-2 file missing `tasks` while carrying a foreign table is
+        // refused on the foreign table.
+        let missing = temp_database();
+        let raw = file_at_version(&missing, 2).await;
+        sqlx::query("DROP TABLE tasks")
+            .execute(&raw)
+            .await
+            .expect("drop tasks");
+        sqlx::query("CREATE TABLE notes (body TEXT)")
+            .execute(&raw)
+            .await
+            .expect("foreign table");
+        raw.close().await;
+        let error = init_at(&missing)
+            .await
+            .expect_err("a file missing tasks with a foreign table is refused");
+        let message = format!("{error:#}");
+        for needle in ["notes", &missing.display().to_string()] {
+            assert!(
+                message.contains(needle),
+                "the refusal names {needle}: {message}"
+            );
+        }
+        assert!(
+            message.contains("empty file or a new path is needed"),
+            "{message}"
+        );
+        remove_scratch(&missing);
+
+        // A version-2 file missing a required column while carrying a version-3
+        // column is refused: the missing-and-future pair proves the file is not
+        // a damaged task-viewer file.
+        let mixed = temp_database();
+        let raw = file_at_version(&mixed, 2).await;
+        sqlx::query("ALTER TABLE tasks ADD COLUMN content_hash TEXT")
+            .execute(&raw)
+            .await
+            .expect("a version-3 column");
+        sqlx::query("ALTER TABLE tasks DROP COLUMN scope")
+            .execute(&raw)
+            .await
+            .expect("drop a required column");
+        raw.close().await;
+        let error = init_at(&mixed)
+            .await
+            .expect_err("a missing column beside a future one is refused");
+        let message = format!("{error:#}");
+        for needle in [
+            "scope".to_string(),
+            "content_hash".to_string(),
+            mixed.display().to_string(),
+        ] {
+            assert!(
+                message.contains(&needle),
+                "the refusal names {needle}: {message}"
+            );
+        }
+        remove_scratch(&mixed);
+
+        // A file at any version from 1 through `SCHEMA_VERSION` carrying an
+        // unknown column is refused, so the check is version-generic rather
+        // than one sampled stamp.
+        for version in 1..=SCHEMA_VERSION {
+            let unknown = temp_database();
+            let raw = file_at_version(&unknown, version).await;
+            sqlx::query("ALTER TABLE tasks ADD COLUMN mood TEXT")
+                .execute(&raw)
+                .await
+                .expect("an unknown column");
+            raw.close().await;
+            let error = init_at(&unknown)
+                .await
+                .expect_err("an unknown column is refused at every version");
+            let message = format!("{error:#}");
+            for needle in [
+                "mood".to_string(),
+                unknown.display().to_string(),
+                "empty file or a new path is needed".to_string(),
+            ] {
+                assert!(
+                    message.contains(&needle),
+                    "the version-{version} refusal names {needle}: {message}"
+                );
+            }
+            remove_scratch(&unknown);
+        }
+
+        // A current-version file merely missing `history_key` is the existing
+        // `verify_columns` refusal, not this guard: it names the column and
+        // never asks for an empty file or a new path.
+        let missing_column = temp_database();
+        let raw = file_at_version(&missing_column, SCHEMA_VERSION).await;
+        sqlx::query("ALTER TABLE repositories DROP COLUMN history_key")
+            .execute(&raw)
+            .await
+            .expect("drop the selected column");
+        raw.close().await;
+        let error = init_at(&missing_column)
+            .await
+            .expect_err("a missing selected column fails start-up");
+        let message = format!("{error:#}");
+        assert!(message.contains("history_key"), "{message}");
+        assert!(
+            message.contains("lacks"),
+            "the column refusal names what it lacks: {message}"
+        );
+        assert!(
+            !message.contains("empty file or a new path is needed"),
+            "a merely incomplete task-viewer file is not called foreign: {message}"
+        );
+        remove_scratch(&missing_column);
+
+        // An empty or missing file initializes and carries the task-viewer
+        // application id, so an external reader can recognize a copy.
+        let fresh = temp_database();
+        let pool = init_at(&fresh).await.expect("a missing file initializes");
+        let application_id: i64 = sqlx::query_scalar("PRAGMA application_id")
+            .fetch_one(&pool)
+            .await
+            .expect("application id");
+        assert_eq!(
+            application_id, 0x5456_0001,
+            "a task-viewer file carries the TV application id"
+        );
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        pool.close().await;
+        remove_scratch(&fresh);
     }
 
     /// Covers: every store commits under `synchronous=NORMAL`, SQLite's 1.
