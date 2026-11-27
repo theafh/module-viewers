@@ -2,8 +2,8 @@
 description: "Percent-encode the theme form's local next path so a non-ASCII value yields an RFC-valid Location."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-27T10:32:23Z
-status: implemented
+updated: 2026-11-27T10:38:04Z
+status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: false
 reported-by: "Andreas Hoffmann"
