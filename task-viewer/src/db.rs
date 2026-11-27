@@ -377,6 +377,10 @@ async fn migrate_locked(conn: &mut SqliteConnection, path: &Path) -> Result<()> 
     // task-viewer's columns. The check runs after the newer-than-binary bail,
     // so a file this binary cannot read keeps that message.
     refuse_foreign_schema(conn, path, version).await?;
+    // The file is task-viewer's, so it is made owner-only before the baseline or
+    // any later step writes. A refused file returned above and keeps the mode it
+    // was found with.
+    tighten_permissions(path)?;
     if version == 0 {
         sqlx::query(SCHEMA)
             .execute(&mut *conn)
@@ -416,6 +420,64 @@ async fn migrate_locked(conn: &mut SqliteConnection, path: &Path) -> Result<()> 
         version = next;
     }
     verify_columns(conn, path, version).await?;
+    Ok(())
+}
+
+/// The mode a task-viewer database file and its sidecars carry on Unix: the
+/// owner reads and writes, no group or other access.
+#[cfg(unix)]
+const DATABASE_FILE_MODE: u32 = 0o600;
+
+/// The path of one sidecar beside `path`: SQLite appends `-wal` and `-shm` to
+/// the database file's own name, so the suffix lands on the whole path and not
+/// on an extension.
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Make the database file, and any `-wal` and `-shm` sidecar already beside it,
+/// owner-only. A sidecar SQLite creates after this point copies the database
+/// file's mode, so only a sidecar that predates the tighten needs the explicit
+/// change. A missing sidecar is not an error: SQLite creates it on the next
+/// write. A failure names the path it could not change and fails start-up, as
+/// `connect` and `migrate` do.
+#[cfg(unix)]
+fn tighten_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(DATABASE_FILE_MODE))
+        .with_context(|| {
+            format!(
+                "the database at {} could not be set to mode {DATABASE_FILE_MODE:o}",
+                path.display()
+            )
+        })?;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sidecar_path(path, suffix);
+        match std::fs::set_permissions(
+            &sidecar,
+            std::fs::Permissions::from_mode(DATABASE_FILE_MODE),
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "the database sidecar {} could not be set to mode {DATABASE_FILE_MODE:o}",
+                        sidecar.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A non-Unix build leaves every file mode as the process umask set it.
+#[cfg(not(unix))]
+fn tighten_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1274,7 +1336,7 @@ mod tests {
         PathSource, SCHEMA, SCHEMA_VERSION, StoreHookFn, create_parent_dir, database_path,
         delete_repository, init, init_at, init_with, insert_repository, is_locked,
         list_repositories, load_history_key, load_prior_tasks, load_tasks, migrate, now_stamp,
-        replace_tasks, repository_counts, set_scan_error, test_db, test_migration,
+        replace_tasks, repository_counts, set_scan_error, sidecar_path, test_db, test_migration,
         test_version_read, test_worker_name, update_repository_path,
     };
     use crate::harvest::{ParsedTask, TaskKind};
@@ -2966,6 +3028,152 @@ mod tests {
         assert_eq!(tables, 1);
         pool.close().await;
         remove_scratch(&path);
+    }
+
+    /// Covers: on Unix the database file and the `-wal` and `-shm` sidecars
+    /// beside it are mode 0600, whether this build created them or found them
+    /// already there and looser; a foreign file the guard refuses keeps the mode
+    /// it was found with; and an existing parent directory keeps its own mode
+    /// while a parent the build creates keeps the mode `create_dir_all` gives a
+    /// control directory under the same umask.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_tightens_the_database_and_its_sidecars_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path)
+                .unwrap_or_else(|error| panic!("{} must have metadata: {error}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        }
+
+        #[cfg(unix)]
+        fn widen(path: &std::path::Path) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+                .unwrap_or_else(|error| panic!("{} must be widened: {error}", path.display()));
+        }
+
+        // A newly created database is 0600, and the sidecars its held
+        // connection creates after the tighten copy that mode.
+        let fresh = unique_temp_dir("db_mode_fresh");
+        let path = fresh.join("test.db");
+        let pool = init_at(&path).await.expect("init");
+        assert_eq!(mode(&path), 0o600, "a new database file is owner-only");
+        let mut held = pool.acquire().await.expect("a held connection");
+        sqlx::query(
+            "INSERT INTO repositories (name, path, created_at)
+             VALUES ('fresh', '/tmp/fresh', '2026-01-01 00:00')",
+        )
+        .execute(&mut *held)
+        .await
+        .expect("the held connection writes");
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sidecar_path(&path, suffix);
+            assert_eq!(
+                mode(&sidecar),
+                0o600,
+                "the {suffix} the connection created is owner-only"
+            );
+        }
+        drop(held);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&fresh);
+
+        // A database seeded 0644 is tightened when this build opens it.
+        let seeded = unique_temp_dir("db_mode_seeded");
+        let path = seeded.join("test.db");
+        let first = init_at(&path).await.expect("init");
+        first.close().await;
+        widen(&path);
+        assert_eq!(mode(&path), 0o644, "the seed starts looser than 0600");
+        let pool = init_at(&path).await.expect("init tightens");
+        assert_eq!(mode(&path), 0o600, "an existing 0644 database is tightened");
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&seeded);
+
+        // A database whose valid sidecars a held WAL connection keeps open and
+        // non-empty, chmod'ed 0644, has both tightened by a second init.
+        let existing = unique_temp_dir("db_mode_sidecars");
+        let path = existing.join("test.db");
+        let held_pool = init_at(&path).await.expect("init");
+        let mut held = held_pool.acquire().await.expect("a held connection");
+        sqlx::query(
+            "INSERT INTO repositories (name, path, created_at)
+             VALUES ('existing', '/tmp/existing', '2026-01-01 00:00')",
+        )
+        .execute(&mut *held)
+        .await
+        .expect("the held connection writes");
+        let wal = sidecar_path(&path, "-wal");
+        let shm = sidecar_path(&path, "-shm");
+        for sidecar in [&wal, &shm] {
+            let length = std::fs::metadata(sidecar)
+                .unwrap_or_else(|error| panic!("{} must exist: {error}", sidecar.display()))
+                .len();
+            assert!(length > 0, "{} must be non-empty", sidecar.display());
+            widen(sidecar);
+        }
+        let second = init_at(&path).await.expect("a second init tightens");
+        assert_eq!(mode(&path), 0o600, "the database file stays owner-only");
+        assert_eq!(mode(&wal), 0o600, "an existing -wal is tightened");
+        assert_eq!(mode(&shm), 0o600, "an existing -shm is tightened");
+        second.close().await;
+        drop(held);
+        held_pool.close().await;
+        let _ = std::fs::remove_dir_all(&existing);
+
+        // A file the foreign-file refusal rejects keeps the mode it was found
+        // with, because the tighten runs after the refusal.
+        let foreign = unique_temp_dir("db_mode_foreign");
+        std::fs::create_dir_all(&foreign).expect("foreign scratch");
+        let path = foreign.join("test.db");
+        let raw = raw_pool(&path).await;
+        sqlx::query("CREATE TABLE notes (body TEXT)")
+            .execute(&raw)
+            .await
+            .expect("foreign table");
+        raw.close().await;
+        widen(&path);
+        init_at(&path).await.expect_err("a foreign file is refused");
+        assert_eq!(
+            mode(&path),
+            0o644,
+            "a refused file keeps the mode it was found with"
+        );
+        let _ = std::fs::remove_dir_all(&foreign);
+
+        // An existing parent directory keeps its mode, and a parent the build
+        // creates keeps the umask mode `create_dir_all` gives any new directory.
+        let parent_root = unique_temp_dir("db_mode_parent");
+        let parent = parent_root.join("state");
+        std::fs::create_dir_all(&parent).expect("parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o750))
+            .expect("set the parent mode");
+        let path = parent.join("test.db");
+        let pool = init_at(&path).await.expect("init");
+        pool.close().await;
+        assert_eq!(
+            mode(&parent),
+            0o750,
+            "an existing parent directory keeps its mode"
+        );
+        let _ = std::fs::remove_dir_all(&parent_root);
+
+        let created_root = unique_temp_dir("db_mode_parent_created");
+        let created = created_root.join("nested").join("state");
+        let control = created_root.join("control");
+        std::fs::create_dir_all(&control).expect("control directory");
+        let path = created.join("test.db");
+        let pool = init_at(&path).await.expect("init creates the parent");
+        pool.close().await;
+        assert_eq!(
+            mode(&created),
+            mode(&control),
+            "a created parent keeps the umask mode a plain create_dir_all gives"
+        );
+        let _ = std::fs::remove_dir_all(&created_root);
     }
 
     #[tokio::test(flavor = "current_thread")]
