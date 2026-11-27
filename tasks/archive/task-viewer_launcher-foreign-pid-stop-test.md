@@ -2,8 +2,8 @@
 description: "Drive do_stop past its early return with a foreign PID so the is_ours guard before each kill is actually exercised."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T21:12:35Z
-status: implemented
+updated: 2026-11-27T21:16:25Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -28,7 +28,7 @@ fi
 
 and guards both kills with `if is_ours "$pid"; then`. The existing `launcher_stop_leaves_a_foreign_process_alone` test stubs `port_pid` to return nothing, so `is_running` is false and `do_stop` returns at the early return; the `is_ours` guards before `do_stop`'s kills are never reached. A lens deleted both guards from a copy of the launcher and the test still passed with the same output.
 
-The test targets the post-change `is_ours` and `do_stop`: [the moved-checkout ownership task](archive/task-viewer_launcher-moved-checkout-ownership.md) changes both and adds launcher tests in the same file, so this work follows it.
+The test targets the post-change `is_ours` and `do_stop`: [the moved-checkout ownership task](task-viewer_launcher-moved-checkout-ownership.md) changes both and adds launcher tests in the same file, so this work follows it.
 
 ## Approach
 
