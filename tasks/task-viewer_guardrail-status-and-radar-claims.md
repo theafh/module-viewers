@@ -2,9 +2,11 @@
 description: "Correct the status-line and radar drill-down claims in the guardrail docs, the launcher comment, and the launcher test so all four match the code."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-26T15:08:35Z
-status: ready
+updated: 2026-11-27T01:45:59Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Correct two guardrail claims that do not match the code

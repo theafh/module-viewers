@@ -649,7 +649,9 @@ fn launcher_status_waits_for_the_lock_holder() {
 }
 
 /// Covers: `status` exits 0 while a server is running and 1 while it is not,
-/// so a script can branch on the command instead of parsing its text.
+/// so a script can branch on the command instead of parsing its text, and each
+/// branch prints its own lines: the running branch the PID and the URL, the
+/// stopped branch one line.
 #[test]
 fn launcher_status_exit_code_reports_whether_the_server_runs() {
     let dir = unique_temp_dir("launcher_status_exit");
@@ -663,9 +665,10 @@ set -- source-guard-probe
 . "{launcher}"
 get_pid() {{ echo 4242; }}
 is_running() {{ return 0; }}
-do_status >/dev/null || exit 10
+do_status || exit 10
+echo "---stopped---"
 is_running() {{ return 1; }}
-if do_status >/dev/null; then exit 11; fi
+if do_status; then exit 11; fi
 exit 0
 "#,
         launcher = launcher.display(),
@@ -676,6 +679,15 @@ exit 0
         "status exit codes are wrong ({:?})\nstderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout,
+        "task-viewer is running (PID: 4242)\n\
+         Access at: http://127.0.0.1:7880\n\
+         ---stopped---\n\
+         task-viewer is not running\n",
+        "each status branch must print its own lines",
     );
 
     let _ = fs::remove_dir_all(&dir);

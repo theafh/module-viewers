@@ -619,8 +619,8 @@ do_status() {
     else
         echo "task-viewer is not running"
         # A stopped server is a non-zero status, so a script can branch on
-        # `make status` the way it would on `systemctl is-active`. The text
-        # stays the same; only the exit code carries the answer.
+        # `make status` the way it would on `systemctl is-active`. This branch
+        # prints one line; the running branch adds the PID and the URL.
         return 1
     fi
 }
