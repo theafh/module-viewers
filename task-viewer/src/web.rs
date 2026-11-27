@@ -537,12 +537,11 @@ pub fn remaining(deadline: Instant) -> Duration {
 /// shutdown stops accepting and drains the open connections; a store that holds
 /// `state.scan` from listing through the last store — an Update scan, Add's,
 /// Relocate's, or Confirm's detached store — is waited for under the same
-/// deadline. The database close
-/// then runs under
-/// the time the deadline has left and is dropped once it is spent, leaving an
-/// unfinished store to the WAL rollback on the next open. A listener that ends
-/// before any signal arrives skips the drain and still closes the pool within
-/// `grace`, so an ended server leaves no open handle on the database.
+/// deadline. The database close then runs under the time the deadline has left
+/// and is dropped once it is spent, leaving an unfinished store to the WAL
+/// rollback on the next open. A listener that ends before any signal arrives
+/// skips the drain and still closes the pool within `grace`, so an ended server
+/// leaves no open handle on the database.
 pub async fn serve(
     listener: TcpListener,
     app: Router,
@@ -2941,10 +2940,9 @@ async fn duplicate_clone(existing: &[Repository], path: &std::path::Path) -> Opt
 
 /// Store the held path of a duplicate-clone Add once the person confirmed it.
 /// The token take and the store run in their own task that takes the scan lock
-/// itself, so a request that disconnects drops only the handler: the store keeps
-/// the lock and finishes, and a take cannot consume the token without storing
-/// the held path. One held path is stored at most once, and a token the store no
-/// longer holds reports the not-found code.
+/// itself, so a request that disconnects drops only the handler and cannot
+/// abandon the store after the token is taken. One held path is stored at most
+/// once, and a token the store no longer holds reports the not-found code.
 async fn confirm_repository(State(state): State<AppState>, Path(token): Path<String>) -> Response {
     let store_state = state.clone();
     let store = tokio::spawn(async move {
@@ -3259,12 +3257,11 @@ async fn scan_all(State(state): State<AppState>, Form(form): Form<ProjectForm>) 
 
 /// List the repositories, harvest them, and store each result while holding the
 /// scan lock. The lock is held across the whole list-then-harvest-then-store
-/// sequence, the detached Add, Relocate, and Confirm store tasks and
-/// `fn remove_repository` take the same lock, and `scan_core` never takes it.
-/// Taking the lock is the wait for a
-/// scan that already runs, and the pending-scan slot is emptied right after it,
-/// so a later click starts a new follow-up instead of joining a run that may
-/// already be reading files.
+/// sequence, the detached Add, Relocate, and Confirm store tasks and `fn
+/// remove_repository` take the same lock, and `scan_core` never takes it.
+/// Taking the lock is the wait for a scan that already runs, and the
+/// pending-scan slot is emptied right after it, so a later click starts a new
+/// follow-up instead of joining a run that may already be reading files.
 async fn run_scan(state: AppState) -> Result<ScanReport, Banner> {
     let _guard = state.scan.lock().await;
     {
