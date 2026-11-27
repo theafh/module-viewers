@@ -81,6 +81,11 @@ pub enum HarvestError {
     // Git could not read a repository that has a `.git`. Charting frontmatter
     // dates instead would pile every task onto its last bulk `updated` day.
     Git(String),
+    // The repository holding the configured folder is a shallow clone, so its
+    // history stops at the shallow boundary. The payload is the configured
+    // folder's basename, so a subfolder configured inside a shallow clone is
+    // named by its own name instead of the enclosing repository's.
+    Shallow(String),
 }
 
 impl std::fmt::Display for HarvestError {
@@ -89,6 +94,12 @@ impl std::fmt::Display for HarvestError {
             Self::MissingTasks => formatter.write_str("That folder has no tasks directory."),
             Self::Io(error) => write!(formatter, "The scan could not read the repository: {error}"),
             Self::Git(reason) => write!(formatter, "Git could not read the history: {reason}"),
+            // The fix comes first, so the 200-character cut in
+            // `git_scan_message` can never drop it from the stored message.
+            Self::Shallow(folder) => write!(
+                formatter,
+                "git fetch --unshallow in {folder}; its clone is shallow, so its incomplete history cannot date archived tasks"
+            ),
         }
     }
 }
@@ -203,6 +214,23 @@ pub fn harvest_repository_with_prior(
     };
     match git.repository() {
         Some((root, dir)) => {
+            // A shallow clone's history stops at its boundary commit, and the
+            // archive walk's `log.showRoot=true` would date every task still
+            // present at that boundary from the boundary commit's day instead
+            // of its real archive commit. Refuse the scan instead of charting
+            // that guess. The probe sits outside the `git.dir.is_some()` guard
+            // below, so a configured subfolder without its own `.git` still
+            // detects the enclosing repository's shallow history. A probe that
+            // cannot run fails the scan too, so it is never read as "not
+            // shallow".
+            let shallow = git_read(&repo, dir, &["rev-parse", "--is-shallow-repository"])
+                .map_err(|reason| HarvestFailure::from(HarvestError::Git(reason)))?;
+            if shallow.trim() == "true" {
+                return Err(HarvestFailure {
+                    error: HarvestError::Shallow(folder_basename(&repo)),
+                    skipped,
+                });
+            }
             // A `.git` that git cannot open fails the scan; charting frontmatter
             // dates instead would pile every task onto its last bulk `updated`
             // day. A failed enclosing probe already fails `GitContext::resolve`,
@@ -255,6 +283,16 @@ pub fn harvest_repository_with_prior(
             harvest_files(&repo, &git, files, prior, history, &mut skipped)
         }
     }
+}
+
+/// The configured folder's own name, which a shallow-repository error names so
+/// the person sees which folder to unshallow. A folder whose path has no final
+/// component falls back to the whole path.
+fn folder_basename(folder: &Path) -> String {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| folder.display().to_string())
 }
 
 /// Whether a folder holds a `tasks/` tree: its working tree has a `tasks/`
@@ -4342,6 +4380,213 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A source repository whose archived task is dated 2026-06-01 while its
+    /// 2026-07-01 tip still holds that task, plus a `--depth 1` `file://` clone
+    /// that sees only the tip. A shallow scan would date the task from the tip,
+    /// so every shallow test asserts the refusal instead.
+    fn shallow_clone_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let root = scratch(name);
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("source");
+        git(
+            &source,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&source, "tasks/scope_live.md", "2026-05-01", "open");
+        commit_all(&source, "live task", "2026-05-01T12:00:00+00:00");
+        fs::remove_file(source.join("tasks/scope_live.md")).expect("remove live copy");
+        write_task_dated(
+            &source,
+            "tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        commit_all(&source, "archive task", "2026-06-01T12:00:00+00:00");
+        fs::write(source.join("README.md"), "# later change\n").expect("readme");
+        commit_all(&source, "later change", "2026-07-01T12:00:00+00:00");
+
+        let clone = root.join("clone");
+        let url = format!("file://{}", source.display());
+        git(
+            &root,
+            &[
+                "clone",
+                "--depth",
+                "1",
+                &url,
+                clone.to_str().expect("utf-8 clone path"),
+            ],
+            "2026-07-01T12:00:00+00:00",
+        );
+        (root, clone)
+    }
+
+    /// Covers: a shallow clone fails its scan with the unshallow fix first and
+    /// the configured folder's name, while a full clone of the same source
+    /// charts the real archive day and a folder outside git still charts its
+    /// files.
+    #[test]
+    fn harvest_shallow_clone_fails_and_a_full_clone_charts_the_archive_day() {
+        let (root, shallow) = shallow_clone_fixture("harvest_shallow_clone");
+        assert_eq!(
+            git_stdout(
+                &shallow,
+                &["rev-parse", "--is-shallow-repository"],
+                "2026-07-01T12:00:00+00:00"
+            ),
+            "true",
+            "the fixture clone must be shallow"
+        );
+
+        let failure = harvest_repository(&shallow).expect_err("a shallow clone must fail its scan");
+        match &failure.error {
+            HarvestError::Shallow(folder) => {
+                assert_eq!(folder, "clone", "the error names the configured folder");
+            }
+            other => panic!("expected a Shallow error, got {other:?}"),
+        }
+        let message = failure.error.to_string();
+        assert!(
+            message.starts_with("git fetch --unshallow"),
+            "the fix comes first so a 200-character cut keeps it: {message}"
+        );
+        assert!(
+            message.contains("clone"),
+            "the fixed message names the configured folder: {message}"
+        );
+
+        // A full clone of the same source dates the task from the commit that
+        // archived it, not from the tip that still holds it.
+        let full = root.join("full");
+        let url = format!("file://{}", root.join("source").display());
+        git(
+            &root,
+            &["clone", &url, full.to_str().expect("utf-8 full path")],
+            "2026-07-01T12:00:00+00:00",
+        );
+        let tasks = harvest_repository(&full).expect("a full clone harvests");
+        let archived = tasks
+            .iter()
+            .find(|task| task.path.ends_with("scope_done.md"))
+            .expect("the archived task charts");
+        assert_eq!(archived.kind, TaskKind::Finished);
+        assert_eq!(archived.ship_date, Some(utc_day(2026, 6, 1)));
+        assert_eq!(archived.leave_date, Some(utc_day(2026, 6, 1)));
+
+        // A folder outside git takes the file-only path and never runs the probe.
+        let plain = root.join("plain");
+        fs::create_dir_all(plain.join("tasks")).expect("plain tasks");
+        write_task(&plain, "tasks/scope_plain.md", "2026-05-01", "open");
+        let rows = harvest_repository(&plain).expect("a folder outside git harvests");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, TaskKind::Live);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Covers: a configured subfolder with no `.git` of its own still detects the
+    /// enclosing shallow clone, so the error names the subfolder instead of the
+    /// repository.
+    #[test]
+    fn harvest_shallow_clone_names_an_enclosing_subfolder() {
+        let root = scratch("harvest_shallow_subfolder");
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("source");
+        git(
+            &source,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&source, "sub/tasks/scope_live.md", "2026-05-01", "open");
+        commit_all(&source, "live task", "2026-05-01T12:00:00+00:00");
+        fs::remove_file(source.join("sub/tasks/scope_live.md")).expect("remove live copy");
+        write_task_dated(
+            &source,
+            "sub/tasks/archive/scope_done.md",
+            "2026-05-01",
+            "2026-06-01",
+            "finished",
+        );
+        commit_all(&source, "archive task", "2026-06-01T12:00:00+00:00");
+        fs::write(source.join("README.md"), "# later change\n").expect("readme");
+        commit_all(&source, "later change", "2026-07-01T12:00:00+00:00");
+
+        let clone = root.join("clone");
+        let url = format!("file://{}", source.display());
+        git(
+            &root,
+            &[
+                "clone",
+                "--depth",
+                "1",
+                &url,
+                clone.to_str().expect("utf-8 clone path"),
+            ],
+            "2026-07-01T12:00:00+00:00",
+        );
+        let subfolder = clone.join("sub");
+        assert!(
+            !subfolder.join(".git").exists(),
+            "the configured subfolder must have no .git of its own"
+        );
+
+        let failure =
+            harvest_repository(&subfolder).expect_err("the enclosing shallow clone must fail");
+        match &failure.error {
+            HarvestError::Shallow(folder) => {
+                assert_eq!(folder, "sub", "the error names the configured subfolder");
+            }
+            other => panic!("expected a Shallow error, got {other:?}"),
+        }
+        let message = failure.error.to_string();
+        assert!(
+            message.starts_with("git fetch --unshallow") && message.contains("sub"),
+            "the message names the subfolder behind the fix: {message}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Covers: a shallow probe that cannot run fails the scan with the git
+    /// error instead of being read as "not shallow".
+    #[cfg(unix)]
+    #[test]
+    fn harvest_failed_shallow_probe_fails_the_scan() {
+        let repo = scratch("harvest_shallow_probe_failure");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_live.md", "2026-05-01", "open");
+        commit_all(&repo, "live task", "2026-05-01T12:00:00+00:00");
+        let bin = scratch("harvest_shallow_probe_failure_bin");
+        let script = fake_git_script(
+            &bin,
+            "git",
+            &format!(
+                "case \"$*\" in\n  *--is-shallow-repository*) echo 'fatal: simulated shallow probe failure' >&2; exit 128 ;;\n  *) exec {} \"$@\" ;;\nesac",
+                git_bin()
+            ),
+        );
+        register_fake_git_with_deadline(&repo, &script, Duration::from_secs(5));
+
+        let failure = harvest_repository(&repo).expect_err("a failed shallow probe must fail");
+        match &failure.error {
+            HarvestError::Git(message) => assert!(
+                message.contains("simulated shallow probe failure"),
+                "the scan error carries the probe's stderr: {message}"
+            ),
+            other => panic!("expected a Git error, got {other:?}"),
+        }
+
+        clear_fake_git(&repo);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bin);
     }
 
     /// Run git in `dir` at `date` and return its trimmed stdout.

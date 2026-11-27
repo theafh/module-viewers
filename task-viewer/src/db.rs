@@ -744,6 +744,18 @@ pub async fn load_history_key(pool: &Pool<Sqlite>, repository_id: i64) -> Result
     Ok(stored.flatten())
 }
 
+/// Clear the history key stored for one repository, leaving its rows and its
+/// stored scan error in place. A scan that cannot confirm the history it reads
+/// calls this, so a leave day cached against that history is never reused; the
+/// next full-history scan re-walks the archived paths and stores the real days.
+pub async fn clear_history_key(pool: &Pool<Sqlite>, repository_id: i64) -> Result<()> {
+    sqlx::query("UPDATE repositories SET history_key = NULL WHERE repository_id = ?")
+        .bind(repository_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn set_scan_error(pool: &Pool<Sqlite>, repository_id: i64, message: &str) -> Result<()> {
     sqlx::query(
         "UPDATE repositories SET last_error = ?, last_error_at = ?, last_outcome = 'error'

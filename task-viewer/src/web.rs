@@ -3659,6 +3659,20 @@ async fn record_scan_error(pool: &sqlx::SqlitePool, repository_id: i64, message:
     }
 }
 
+/// Clear one repository's stored history key after a scan could not confirm the
+/// history it reads, so a cached leave day from that history is never reused. A
+/// write that fails is logged, because the key is what keeps a wrong cached day
+/// from surviving the next full scan.
+async fn clear_stored_history_key(pool: &sqlx::SqlitePool, repository_id: i64) {
+    if let Err(error) = db::clear_history_key(pool, repository_id).await {
+        tracing::error!(
+            %error,
+            repository_id,
+            "the stored history key could not be cleared"
+        );
+    }
+}
+
 /// The message stored for a git history read that failed: the fixed sentence
 /// followed by the failure's first line, trimmed and cut at 200 characters, so
 /// the repository names a cause instead of one fixed sentence.
@@ -3717,7 +3731,7 @@ async fn store_outcome(
             // The failure carries the task files the harvest skipped before it
             // failed, so the banner counts them beside the failure reason.
             let skipped = failure.skipped_count();
-            match failure.error {
+            match &failure.error {
                 HarvestError::MissingTasks => {
                     record_scan_error(pool, repository_id, MISSING_TASKS_ERROR).await;
                     StoredOutcome {
@@ -3727,9 +3741,30 @@ async fn store_outcome(
                         shipped: 0,
                     }
                 }
+                HarvestError::Shallow(folder) => {
+                    tracing::error!(folder, repository_id, "the repository is a shallow clone");
+                    // The stored key could have been written by a build that
+                    // charted this shallow history, so it is cleared before the
+                    // scan error is stored. The rows stay, and the next scan
+                    // after `git fetch --unshallow` re-walks every archived path.
+                    clear_stored_history_key(pool, repository_id).await;
+                    let message = git_scan_message(&failure.error.to_string());
+                    record_scan_error(pool, repository_id, &message).await;
+                    StoredOutcome {
+                        banner: Some(Banner::GitUnreadable),
+                        skipped,
+                        new_tasks: 0,
+                        shipped: 0,
+                    }
+                }
                 HarvestError::Git(reason) => {
                     tracing::error!(%reason, repository_id, "git could not read the history");
-                    let message = git_scan_message(&reason);
+                    // A failed read cannot confirm the history its cached days
+                    // belong to, so the key is cleared and the next successful
+                    // scan re-walks the archived paths instead of reusing a day
+                    // the failure left unverified.
+                    clear_stored_history_key(pool, repository_id).await;
+                    let message = git_scan_message(reason);
                     record_scan_error(pool, repository_id, &message).await;
                     StoredOutcome {
                         banner: Some(Banner::GitUnreadable),
@@ -4016,11 +4051,11 @@ mod tests {
         PriorReadHookFn, ProjectForm, STOPPED_ERROR, ScanFailure, ScanReport, StoreHookFn,
         add_repository, canonical_path_text, charts_csv_text, claim_banner, confirm_repository,
         encode_query, flash_banner, git_scan_message, human_stamp, init_templates, is_local_host,
-        local_offset, osascript_outcome, query_banner, record_scan_error, relocate_repository,
-        remaining, remove_repository, render_blocking_thread, render_home, render_repositories_at,
-        router, scan_all, scan_core, scan_flash, scan_instant, scan_label_at, scan_response,
-        scan_worker_cap, serve, serve_until_stopped, static_version, store_hook_from,
-        store_repository, zenity_outcome,
+        local_offset, osascript_outcome, query_banner, record_scan_error, refresh_one,
+        relocate_repository, remaining, remove_repository, render_blocking_thread, render_home,
+        render_repositories_at, router, scan_all, scan_core, scan_flash, scan_instant,
+        scan_label_at, scan_response, scan_worker_cap, serve, serve_until_stopped, static_version,
+        store_hook_from, store_outcome, store_repository, zenity_outcome,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -9749,6 +9784,181 @@ mod tests {
         assert!(rows.is_empty(), "a failed first harvest stores no rows");
         let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
+    }
+
+    /// Covers: a shallow scan stores the unshallow fix, keeps the prior rows,
+    /// and clears the stored history key, so a rescan after `git fetch
+    /// --unshallow` charts the real archive day instead of the shallow
+    /// boundary's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_shallow_scan_keeps_rows_clears_the_key_and_rescans_the_real_day() {
+        let path = temp_database("web_shallow_scan");
+        db::test_db::set(path.clone());
+        let pool = db::init().await.expect("init");
+
+        let root = unique_temp_dir("web_shallow_scan_repo");
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("tasks")).expect("tasks");
+        git(
+            &source,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::write(
+            source.join("tasks/scope_live.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Live\n",
+        )
+        .expect("live task");
+        git(&source, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &source,
+            &["commit", "-m", "live task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        std::fs::remove_file(source.join("tasks/scope_live.md")).expect("remove live copy");
+        std::fs::create_dir_all(source.join("tasks/archive")).expect("archive");
+        write_archived(&source, 0, "2026-06-01", "# Done");
+        git(&source, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &source,
+            &["commit", "-m", "archive task"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        // A later commit still holds the archived task, so a depth-1 clone's
+        // boundary root would date it from 2026-07-01.
+        std::fs::write(source.join("README.md"), "# later change\n").expect("readme");
+        git(&source, &["add", "-A"], "2026-07-01T12:00:00+00:00");
+        git(
+            &source,
+            &["commit", "-m", "later change"],
+            "2026-07-01T12:00:00+00:00",
+        );
+
+        let clone = root.join("clone");
+        let url = format!("file://{}", source.display());
+        git(
+            &root,
+            &[
+                "clone",
+                "--depth",
+                "1",
+                &url,
+                clone.to_str().expect("utf-8 clone path"),
+            ],
+            "2026-07-01T12:00:00+00:00",
+        );
+
+        let id = db::insert_repository(&pool, "shallow", &clone.to_string_lossy())
+            .await
+            .expect("insert repository");
+        // A row a shallow scan would have stored: the task dated from the
+        // boundary commit, keyed against that shallow history.
+        let boundary_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).expect("boundary day");
+        let seeded = vec![ParsedTask {
+            path: "tasks/archive/scope_0.md".to_string(),
+            scope: "scope".to_string(),
+            kind: TaskKind::Finished,
+            created: chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("created day"),
+            updated: chrono::NaiveDate::from_ymd_opt(2026, 6, 1).expect("updated day"),
+            ship_date: Some(boundary_day),
+            leave_date: Some(boundary_day),
+            content_hash: Some("stale".to_string()),
+            path_is_lossy: false,
+        }];
+        let seed_hook = immediate_store_hook();
+        db::replace_tasks(
+            &pool,
+            id,
+            &seeded,
+            Some("history-v1:stale"),
+            seed_hook.as_ref(),
+        )
+        .await
+        .expect("seed prior rows");
+        let prior = db::load_prior_tasks(&pool, id).await.expect("prior rows");
+
+        let outcome = Ok(harvest::harvest_repository_with_prior(
+            &clone,
+            &prior,
+            Some("history-v1:stale"),
+        ));
+        let stored = store_outcome(&pool, id, outcome, &prior, &immediate_store_hook()).await;
+        assert_eq!(stored.banner, Some(Banner::GitUnreadable));
+
+        let repositories = db::list_repositories(&pool).await.expect("list");
+        let error = repositories[0]
+            .last_error
+            .as_deref()
+            .expect("the shallow scan stores an error");
+        assert!(
+            error.contains("git fetch --unshallow"),
+            "the Repositories page shows the unshallow fix: {error}"
+        );
+        assert!(
+            error.contains("clone"),
+            "the stored message names the configured folder: {error}"
+        );
+        let rows = db::load_tasks(&pool, Some(id)).await.expect("rows");
+        assert_eq!(rows.len(), 1, "the prior rows stay");
+        assert_eq!(
+            rows[0].ship_date,
+            Some(boundary_day),
+            "the prior row keeps the day it had"
+        );
+        assert_eq!(
+            db::load_history_key(&pool, id).await.expect("key"),
+            None,
+            "the shallow failure clears the stored history key"
+        );
+
+        git(
+            &clone,
+            &["fetch", "--unshallow"],
+            "2026-07-01T12:00:00+00:00",
+        );
+        let banner = refresh_one(&pool, &immediate_store_hook(), id, &clone).await;
+        assert_eq!(banner, None, "the unshallowed rescan succeeds");
+        let real_day = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).expect("real day");
+        let rows = db::load_tasks(&pool, Some(id)).await.expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].ship_date,
+            Some(real_day),
+            "the rescan charts the real archive day, not the boundary day"
+        );
+        assert_eq!(rows[0].leave_date, Some(real_day));
+        assert!(
+            db::load_history_key(&pool, id)
+                .await
+                .expect("key")
+                .is_some(),
+            "the full-history scan stores its history key"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        cleanup(&path);
+    }
+
+    /// Covers: the 200-character cut in `git_scan_message` keeps the unshallow
+    /// fix even when the folder's basename is long, because the fixed sentence
+    /// puts the fix first.
+    #[test]
+    fn web_shallow_scan_message_keeps_the_unshallow_fix_after_the_cut() {
+        let long_folder = "f".repeat(400);
+        let message = git_scan_message(&HarvestError::Shallow(long_folder).to_string());
+        assert!(
+            message.starts_with(GIT_ERROR),
+            "the stored message opens with the fixed git sentence: {message}"
+        );
+        assert!(
+            message.contains("git fetch --unshallow"),
+            "the 200-character cut keeps the fix: {message}"
+        );
+        assert_eq!(
+            message.chars().count(),
+            GIT_ERROR.chars().count() + 1 + 200,
+            "the reason is cut at 200 characters"
+        );
     }
 
     /// Covers: a failed git read stores only the failure's first line, trimmed,
