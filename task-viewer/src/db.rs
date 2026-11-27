@@ -431,6 +431,7 @@ const DATABASE_FILE_MODE: u32 = 0o600;
 /// The path of one sidecar beside `path`: SQLite appends `-wal` and `-shm` to
 /// the database file's own name, so the suffix lands on the whole path and not
 /// on an extension.
+#[cfg(unix)]
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
@@ -1332,11 +1333,13 @@ pub(crate) mod test_worker_name {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::sidecar_path;
     use super::{
         PathSource, SCHEMA, SCHEMA_VERSION, StoreHookFn, create_parent_dir, database_path,
         delete_repository, init, init_at, init_with, insert_repository, is_locked,
         list_repositories, load_history_key, load_prior_tasks, load_tasks, migrate, now_stamp,
-        replace_tasks, repository_counts, set_scan_error, sidecar_path, test_db, test_migration,
+        replace_tasks, repository_counts, set_scan_error, test_db, test_migration,
         test_version_read, test_worker_name, update_repository_path,
     };
     use crate::harvest::{ParsedTask, TaskKind};
