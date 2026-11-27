@@ -2,8 +2,8 @@
 description: "Keep the tasks/ walk to regular files inside the configured folder, so an inner symlink cannot chart outside content and a directory or FIFO cannot hang or shadow a task."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-27T22:00:48Z
-status: implemented
+updated: 2026-11-27T22:06:57Z
+status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: true
 reported-by: "Andreas Hoffmann"

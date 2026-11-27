@@ -2,7 +2,7 @@
 description: "Follow directory symlinks inside tasks/ when their target stays in the repository, and warn and ignore any target outside it."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T17:15:33Z
+updated: 2026-11-27T22:07:09Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -27,7 +27,7 @@ A directory symlink under `tasks/` is followed when its target stays inside the 
 6. Add tests under `#[cfg(unix)]`: an inner link to a directory inside the repository charts its tasks; an inner link outside warns, charts nothing, and leaves the rest of the scan intact; a broken inner link and a link cycle each warn and the scan completes.
 7. Record the rule in `ARCHITECTURE.md`'s extraction rules, `FEATURES.md`'s Update paragraph, `TESTING.md`'s `Scan:` bullet (its `tasks/`-symlink sentence), and the `files_on_disk` doc comment in `task-viewer/src/harvest.rs`, restating it so a walk error fails the scan except for a link loop, a broken link, or a directory symlink whose target leaves the folder.
 
-**Out of scope:** following a link whose target is another repository on the machine, changing the root-link failure, and the symlinked-file and non-regular-entry cases, which the sibling `task-viewer_harvest-inner-symlink-and-special-files.md` owns.
+**Out of scope:** following a link whose target is another repository on the machine, changing the root-link failure, and the symlinked-file and non-regular-entry cases, which the sibling [task-viewer_harvest-inner-symlink-and-special-files.md](archive/task-viewer_harvest-inner-symlink-and-special-files.md) owns.
 
 ## Acceptance
 
