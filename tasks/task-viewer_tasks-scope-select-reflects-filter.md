@@ -28,7 +28,7 @@ let mut scopes = tasks
 
 The page then reads `0 tasks` with "All scopes" showing, and clicking Show drops the scope instead of applying what the control displays. The existing test `web_tasks_search_and_scope_controls_narrow_the_list` sends `project=alpha&scope=beta` but asserts only the row set, not the control.
 
-Two live tasks rewrite the same two guardrail passages: [tasks/task-viewer_tasks-visible-active-filters.md](archive/task-viewer_tasks-visible-active-filters.md) and [tasks/task-viewer_tasks-invalid-date-bound-banner.md](task-viewer_tasks-invalid-date-bound-banner.md) both edit the `GET /tasks` paragraph in `FEATURES.md` and the task-list bullet in `TESTING.md`, and the second also edits `render_tasks`, `TasksPage`, and `filtered_pairs`, which feeds `export_query`, so this task's `render_tasks` change and its two doc passages land alongside theirs.
+One live task and one finished task rewrite the same two guardrail passages: [tasks/archive/task-viewer_tasks-visible-active-filters.md](archive/task-viewer_tasks-visible-active-filters.md) and [tasks/task-viewer_tasks-invalid-date-bound-banner.md](task-viewer_tasks-invalid-date-bound-banner.md) both edit the `GET /tasks` paragraph in `FEATURES.md` and the task-list bullet in `TESTING.md`, and the second also edits `render_tasks`, `TasksPage`, and `filtered_pairs`, which feeds `export_query`, so this task's `render_tasks` change and its two doc passages land alongside theirs.
 
 ## Approach
 
