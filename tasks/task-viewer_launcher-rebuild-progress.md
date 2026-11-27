@@ -2,7 +2,7 @@
 description: "Announce every launcher rebuild and print one wait line when a second command waits on the lock, instead of a silent multi-minute click."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T19:06:35Z
+updated: 2026-11-27T01:48:47Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -29,7 +29,7 @@ Every later rebuild after a source change sends cargo's output to `$BUILD_LOG` a
 
 An icon click has no terminal attached: the macOS bundle execs the launcher directly and the Linux desktop entry sets `Terminal=false`, so a printed line alone reaches nobody on that path. The first wait therefore also notifies, through the same helper the build announcement uses.
 
-Three documents carry the launcher's behaviour and are edited by sibling tasks as well. The launcher paragraph in `FEATURES.md` and the launcher state paragraph in `README.md` are both written by [task-viewer_launcher-relative-state-dir.md](task-viewer_launcher-relative-state-dir.md), and the `FEATURES.md` paragraph plus a planned status line-set assertion in `task-viewer/src/launcher_tests.rs` are written by [task-viewer_guardrail-status-and-radar-claims.md](task-viewer_guardrail-status-and-radar-claims.md); whichever of the two lands second rebases its sentence onto the other. The launcher process-safety bullet in `TESTING.md` is the coverage ledger the launcher test suites extend.
+Three documents carry the launcher's behaviour and are edited by sibling tasks as well. The launcher paragraph in `FEATURES.md` and the launcher state paragraph in `README.md` are both written by [task-viewer_launcher-relative-state-dir.md](task-viewer_launcher-relative-state-dir.md), and the `FEATURES.md` paragraph plus a planned status line-set assertion in `task-viewer/src/launcher_tests.rs` are written by [task-viewer_guardrail-status-and-radar-claims.md](archive/task-viewer_guardrail-status-and-radar-claims.md); whichever of the two lands second rebases its sentence onto the other. The launcher process-safety bullet in `TESTING.md` is the coverage ledger the launcher test suites extend.
 
 ## Approach
 

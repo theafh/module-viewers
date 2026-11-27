@@ -2,8 +2,8 @@
 description: "Correct the status-line and radar drill-down claims in the guardrail docs, the launcher comment, and the launcher test so all four match the code."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-27T01:45:59Z
-status: implemented
+updated: 2026-11-27T01:48:34Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -38,8 +38,8 @@ else
 
 ## Approach
 
-1. Rewrite the `FEATURES.md` status sentence to say the running branch prints the PID and the URL while the stopped branch prints one line, and that the exit code carries the answer; phrase it so it stays true once the moved-checkout status output in [task-viewer_launcher-moved-checkout-ownership.md](task-viewer_launcher-moved-checkout-ownership.md) lands and adds the binary path to the running output. Fix the two stopped-branch comment lines in `scripts/task-viewer.sh` to match.
-2. Rewrite the `TESTING.md` launcher bullet's "printing the same lines either way" to state what each branch prints, and add an assertion for the running and stopped line sets in `launcher_tests.rs`. The bullet is co-edited: [task-viewer_launcher-foreign-pid-stop-test.md](task-viewer_launcher-foreign-pid-stop-test.md), [task-viewer_launcher-port-conflict-test.md](task-viewer_launcher-port-conflict-test.md), and [task-viewer_test-free-port-race.md](task-viewer_test-free-port-race.md) append coverage to the same bullet, so this rewrite keeps their additions and each of those edits keeps this status clause.
+1. Rewrite the `FEATURES.md` status sentence to say the running branch prints the PID and the URL while the stopped branch prints one line, and that the exit code carries the answer; phrase it so it stays true once the moved-checkout status output in [task-viewer_launcher-moved-checkout-ownership.md](../task-viewer_launcher-moved-checkout-ownership.md) lands and adds the binary path to the running output. Fix the two stopped-branch comment lines in `scripts/task-viewer.sh` to match.
+2. Rewrite the `TESTING.md` launcher bullet's "printing the same lines either way" to state what each branch prints, and add an assertion for the running and stopped line sets in `launcher_tests.rs`. The bullet is co-edited: [task-viewer_launcher-foreign-pid-stop-test.md](../task-viewer_launcher-foreign-pid-stop-test.md), [task-viewer_launcher-port-conflict-test.md](../task-viewer_launcher-port-conflict-test.md), and [task-viewer_test-free-port-race.md](../task-viewer_test-free-port-race.md) append coverage to the same bullet, so this rewrite keeps their additions and each of those edits keeps this status clause.
 3. Split the chart-drill-down radar sentence in `FEATURES.md`: with all projects selected a spoke carries its repository and kind; with one project selected it carries the page's project, kind, and scope; neither carries a window.
 4. Leave the code paths unchanged.
 

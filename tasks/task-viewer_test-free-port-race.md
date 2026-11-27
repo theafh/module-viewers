@@ -2,7 +2,7 @@
 description: "Stop reserving a process-test port by binding and releasing it, and retry start on the next candidate when the port is taken."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
+updated: 2026-11-27T01:48:47Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -23,7 +23,7 @@ Each launcher copy carries one `PORT=7880` line, which `Root::from_dir` rewrites
 
 The launcher tests that never start a server keep `free_loopback_port`: the reused-PID, symlinked-alias, and lock-renamed-away cases probe a port they never bind. The port-conflict task deliberately holds a port so `start` refuses.
 
-Live siblings share `TESTING.md`'s `- Launcher process safety:` bullet: [the port-conflict task](task-viewer_launcher-port-conflict-test.md) and [the guardrail claims task](task-viewer_guardrail-status-and-radar-claims.md) rewrite it, [the moved-checkout task](task-viewer_launcher-moved-checkout-ownership.md) rewrites the port-holder branch this retry keys on, and the foreign-PID stop task verifies one of its sentences and adds none. This task's bullet edit merges into one pass with theirs.
+Live siblings share `TESTING.md`'s `- Launcher process safety:` bullet: [the port-conflict task](task-viewer_launcher-port-conflict-test.md) and [the guardrail claims task](archive/task-viewer_guardrail-status-and-radar-claims.md) rewrite it, [the moved-checkout task](task-viewer_launcher-moved-checkout-ownership.md) rewrites the port-holder branch this retry keys on, and the foreign-PID stop task verifies one of its sentences and adds none. This task's bullet edit merges into one pass with theirs.
 
 ## Approach
 
