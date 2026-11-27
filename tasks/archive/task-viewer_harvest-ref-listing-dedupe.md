@@ -2,8 +2,8 @@
 description: "Dedupe the ref union by path and blob so a branch-per-task repository copies each existing task's path once, not once per branch; each distinct tasks/ subtree still pays one recursive listing."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T01:29:19Z
-status: implemented
+updated: 2026-11-27T01:31:52Z
+status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: false
 reported-by: "Andreas Hoffmann"
