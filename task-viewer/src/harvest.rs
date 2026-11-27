@@ -417,7 +417,7 @@ type ChosenFile = (String, Option<String>, bool, Option<PathBuf>);
 
 /// Why a task file contributed no row.
 ///
-/// The first three reasons are read-level: the file never reached the
+/// The first five reasons are read-level: the entry never reached the
 /// frontmatter reader. The rest are frontmatter-level, named for the field the
 /// file was missing or carried unreadably, so the reason-keyed tally stays
 /// honest about why a task left the charts.
@@ -429,6 +429,11 @@ pub enum SkipReason {
     NotUtf8,
     /// It is larger than `MAX_TASK_FILE_BYTES`.
     Oversized,
+    /// It is a symlink whose target is not a regular file inside the configured
+    /// folder, including a target that does not resolve at all.
+    EscapingSymlink,
+    /// It is not a regular file, such as a directory, a FIFO, or a socket.
+    NonRegularEntry,
     /// It carries no frontmatter block at all.
     NoFrontmatter,
     /// Its `created` value is not a date.
@@ -448,6 +453,10 @@ impl SkipReason {
             Self::Unreadable => "could not be read",
             Self::NotUtf8 => "is not valid UTF-8",
             Self::Oversized => "is larger than the 4 MiB cap",
+            Self::EscapingSymlink => {
+                "is a symlink whose target is not a regular file inside the configured folder"
+            }
+            Self::NonRegularEntry => "is not a regular file",
             Self::NoFrontmatter => "has no frontmatter",
             Self::UnparseableCreated => "has an unparseable created value",
             Self::MissingCreated => "has no created value",
@@ -1477,6 +1486,69 @@ fn parse_batch<R: BufRead>(
     Ok(())
 }
 
+/// What the walk's type gate decided about one entry, before anything is read.
+enum EntryGate {
+    /// A regular file, or a symlink whose target is a regular file inside the
+    /// configured folder.
+    Pass,
+    /// The entry contributes no row. Its warning names the reason, the entry's
+    /// kind, and a symlink's target when it has one.
+    Reject {
+        reason: SkipReason,
+        kind: &'static str,
+        target: Option<PathBuf>,
+    },
+}
+
+/// Classify one walk entry by its own type before its target's.
+///
+/// The symlink branch runs first because the sibling task that turns on
+/// `follow_links(true)` makes `file_type()` report the target's type, so an
+/// outside file symlink would otherwise pass the `is_file()` branch with no
+/// containment check. A symlink passes only when `fs::canonicalize` resolves it
+/// to a regular file under `root`; a target that does not resolve is a dangling
+/// link, which fails the gate like any other entry instead of failing the scan.
+fn gate_entry(entry: &walkdir::DirEntry, root: &Path) -> EntryGate {
+    let file_type = entry.file_type();
+    let is_link = walkdir::DirEntry::path_is_symlink;
+    if is_link(entry) {
+        let Ok(target) = fs::canonicalize(entry.path()) else {
+            // A dangling link: its raw target names where it pointed, so the
+            // warning can say what it was looking for.
+            return EntryGate::Reject {
+                reason: SkipReason::EscapingSymlink,
+                kind: "symlink",
+                target: fs::read_link(entry.path()).ok(),
+            };
+        };
+        if target.is_file() && target.starts_with(root) {
+            return EntryGate::Pass;
+        }
+        return EntryGate::Reject {
+            reason: SkipReason::EscapingSymlink,
+            kind: "symlink",
+            target: Some(target),
+        };
+    }
+    if file_type.is_file() {
+        return EntryGate::Pass;
+    }
+    EntryGate::Reject {
+        reason: SkipReason::NonRegularEntry,
+        kind: entry_kind(file_type),
+        target: None,
+    }
+}
+
+/// The entry kind a rejection warning names.
+fn entry_kind(file_type: fs::FileType) -> &'static str {
+    if file_type.is_dir() {
+        "directory"
+    } else {
+        "special file"
+    }
+}
+
 /// The markdown files of `tasks/` as the folder holds them, for a folder
 /// outside git and for ranking the working-tree candidates inside git.
 ///
@@ -1499,6 +1571,13 @@ fn parse_batch<R: BufRead>(
 /// file is retained only while the running total stays within
 /// `MAX_WORKTREE_CACHE_BYTES`; a row past that budget keeps its path and is
 /// re-read one file at a time when it is charted.
+///
+/// A markdown entry contributes a row only when it is a regular file or a
+/// symlink whose resolved target is a regular file inside the configured
+/// folder. A directory, FIFO, socket, or other non-regular entry, and a symlink
+/// that dangles or resolves outside the folder, contributes no row, is never
+/// opened, and warns once under the same task-shape gate, naming its path and
+/// the outside target when it has one.
 fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow>, HarvestError> {
     // A folder whose working tree has no `tasks/` holds no working-tree row.
     // The ref union still supplies the rows, and the caller's `tasks/` gate
@@ -1532,6 +1611,22 @@ fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow
             continue;
         }
         let (rel, path_is_lossy) = relative_path(path, repo);
+        // Classify the entry by its own type before its target's. A rejected
+        // entry produces no row, so it cannot claim a name in `union_files`,
+        // and it is never opened, so a directory or FIFO cannot fail or hang
+        // the walk.
+        if let EntryGate::Reject {
+            reason,
+            kind,
+            target,
+        } = gate_entry(&entry, &root)
+        {
+            if has_task_name_shape(&rel) {
+                record_skip(skipped, reason);
+            }
+            warn_skipped_entry(&rel, kind, reason, target.as_deref());
+            continue;
+        }
         // The real on-disk path the walk reached, kept beside the lossy stored
         // path so an evicted row is re-read from the file it came from. It is
         // taken from the walk entry, never re-derived from `rel`, because a
@@ -1713,6 +1808,43 @@ fn warn_skipped_worktree_task(path: &str, bytes: u64, reason: SkipReason) {
             reason = reason.describe(),
             "file under tasks/ was skipped; no row charted"
         );
+    }
+}
+
+/// Report one walk entry the type gate rejected before any read, under the same
+/// task-shape gate as `warn_skipped_task`. `kind` names the entry's type and
+/// `target` carries a symlink's resolved target, or its raw target when it
+/// dangles, so the warning names what the link pointed at.
+fn warn_skipped_entry(path: &str, kind: &'static str, reason: SkipReason, target: Option<&Path>) {
+    let target = target.map(|target| target.display().to_string());
+    let task_shaped = has_task_name_shape(path);
+    match (task_shaped, target) {
+        (true, Some(target)) => tracing::warn!(
+            path = %path,
+            entry = kind,
+            target = %target,
+            reason = reason.describe(),
+            "task entry was skipped; no row charted"
+        ),
+        (true, None) => tracing::warn!(
+            path = %path,
+            entry = kind,
+            reason = reason.describe(),
+            "task entry was skipped; no row charted"
+        ),
+        (false, Some(target)) => tracing::debug!(
+            path = %path,
+            entry = kind,
+            target = %target,
+            reason = reason.describe(),
+            "entry under tasks/ was skipped; no row charted"
+        ),
+        (false, None) => tracing::debug!(
+            path = %path,
+            entry = kind,
+            reason = reason.describe(),
+            "entry under tasks/ was skipped; no row charted"
+        ),
     }
 }
 
@@ -6192,6 +6324,223 @@ mod tests {
             "the error says the link points outside the folder: {message}"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Covers: a symlink under `tasks/` whose target is a regular file inside
+    /// the configured folder charts under its `tasks/...` path.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_charts_an_inside_file_symlink_under_its_tasks_path() {
+        let repo = scratch("harvest_inside_file_symlink");
+        write_task(&repo, "real/scope_target.md", "2026-05-01", "open");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        std::os::unix::fs::symlink(
+            "../real/scope_target.md",
+            repo.join("tasks/scope_linked.md"),
+        )
+        .expect("file symlink");
+
+        let tasks = harvest_repository(&repo).expect("an inside file symlink charts");
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(
+            tasks[0].path, "tasks/scope_linked.md",
+            "the stored path names the link, not its target"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a symlink under `tasks/` whose target leaves the configured
+    /// folder charts no row, warns once naming the link and the outside target,
+    /// leaves its neighbour charting, and leaves a committed task of the same
+    /// name charting.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_skips_an_outside_file_symlink_and_charts_its_neighbours() {
+        let root = scratch("harvest_outside_file_symlink");
+        let repo = root.join("repo");
+        let outside = root.join("outside");
+        fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&outside).expect("outside");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_neighbour.md", "2026-05-01", "open");
+        write_task(&repo, "tasks/scope_escaped.md", "2026-05-01", "open");
+        write_task(&outside, "scope_escaped.md", "2026-05-02", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "committed tasks"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::remove_file(repo.join("tasks/scope_escaped.md")).expect("remove committed copy");
+        std::os::unix::fs::symlink(
+            outside.join("scope_escaped.md"),
+            repo.join("tasks/scope_escaped.md"),
+        )
+        .expect("outside symlink");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("an outside file symlink must not fail the harvest");
+        let mut paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec!["tasks/scope_escaped.md", "tasks/scope_neighbour.md"],
+            "the neighbour and the committed copy chart; the link contributes no row"
+        );
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 1, "one warning for the link: {warnings:?}");
+        assert!(
+            warnings[0].contains("tasks/scope_escaped.md"),
+            "the warning names the link: {warnings:?}"
+        );
+        let target = fs::canonicalize(outside.join("scope_escaped.md")).expect("canonical target");
+        assert!(
+            warnings[0].contains(&target.display().to_string()),
+            "the warning names the outside target: {warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Covers: a task-shaped broken symlink charts no row, warns once naming the
+    /// link and its dangling target, and leaves a committed task of the same
+    /// name charting.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_skips_a_dangling_file_symlink_and_charts_the_committed_copy() {
+        let repo = scratch("harvest_dangling_file_symlink");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_dangling.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "committed task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::remove_file(repo.join("tasks/scope_dangling.md")).expect("remove committed copy");
+        std::os::unix::fs::symlink(
+            "scope_missing_target.md",
+            repo.join("tasks/scope_dangling.md"),
+        )
+        .expect("dangling symlink");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("a dangling file symlink must not fail the harvest");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["tasks/scope_dangling.md"],
+            "the committed copy charts; the dangling link contributes no row"
+        );
+
+        let warnings = captured.take();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one warning for the dangling link: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("tasks/scope_dangling.md"),
+            "the warning names the link: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("scope_missing_target.md"),
+            "the warning names the dangling target: {warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a directory named like a task charts no row, warns once, and
+    /// leaves a committed task of the same name charting.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_skips_a_directory_named_like_a_task_and_charts_the_committed_copy() {
+        let repo = scratch("harvest_directory_named_task");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_directory.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "committed task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        fs::remove_file(repo.join("tasks/scope_directory.md")).expect("remove committed copy");
+        fs::create_dir(repo.join("tasks/scope_directory.md")).expect("directory");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("a directory named like a task must not fail the harvest");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["tasks/scope_directory.md"],
+            "the committed copy charts; the directory contributes no row"
+        );
+
+        let warnings = captured.take();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one warning for the directory: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("tasks/scope_directory.md"),
+            "the warning names the directory: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("is not a regular file"),
+            "the warning names the reason: {warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: the walk rejects a non-regular entry before any read. With one
+    /// regular task file and a directory named like a task, `files_on_disk`
+    /// returns a row only for the regular file and records exactly one read, so
+    /// the directory is never opened.
+    #[test]
+    fn harvest_walk_rejects_a_directory_before_any_read() {
+        let repo = scratch("harvest_walk_rejects_directory");
+        write_task(&repo, "tasks/scope_regular.md", "2026-05-01", "open");
+        fs::create_dir(repo.join("tasks/scope_directory.md")).expect("directory");
+        let canonical = fs::canonicalize(&repo).expect("canonical folder");
+
+        let mut tally = SkipTally::default();
+        let rows = files_on_disk(&canonical, &mut tally).expect("walk");
+        let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["tasks/scope_regular.md"],
+            "the directory yields no row"
+        );
+        assert_eq!(
+            take_worktree_read_count(&canonical),
+            1,
+            "only the regular file is read; the directory is never opened"
+        );
+        assert_eq!(
+            tally.get(&SkipReason::NonRegularEntry).copied(),
+            Some(1),
+            "the task-shaped directory counts once under its reason: {tally:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
     }
 
     fn write_task(repo: &Path, rel: &str, created: &str, status: &str) {
@@ -11718,6 +12067,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_warns_once_for_each_skipped_working_tree_task() {
         // An oversized, a non-UTF-8, and an unreadable working-tree task each
@@ -11740,10 +12090,22 @@ mod tests {
             .expect("binary metadata")
             .len();
 
-        // A directory named like a task opens but cannot be read as a file, on
-        // every platform and whatever user runs the test.
+        // An unreadable regular file cannot be opened, whatever the platform.
+        // A process that can read it anyway, such as root, cannot exercise this
+        // case, so restore the mode and skip the test.
         let unreadable = repo.join("tasks/scope_unreadable.md");
-        fs::create_dir(&unreadable).expect("unreadable directory");
+        fs::write(&unreadable, task_text("2026-05-01", "2026-05-01", "open"))
+            .expect("unreadable task");
+        let original = fs::metadata(&unreadable)
+            .expect("unreadable metadata")
+            .permissions();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("lock unreadable task");
+        if fs::read_to_string(&unreadable).is_ok() {
+            fs::set_permissions(&unreadable, original).expect("restore unreadable task");
+            let _ = fs::remove_dir_all(&repo);
+            return;
+        }
         let unreadable_bytes = fs::metadata(&unreadable)
             .expect("unreadable metadata")
             .len();
@@ -11784,13 +12146,15 @@ mod tests {
                 "the warning names {path}'s reason: {matching:?}"
             );
         }
+        fs::set_permissions(&unreadable, original).expect("restore unreadable task");
         let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn harvest_skipped_worktree_task_blocks_an_older_committed_copy() {
-        // A skipped working-tree row still claims its task name, so an older
-        // committed copy never charts under it and no second warning appears.
+        // A skipped regular working-tree row still claims its task name, so an
+        // older committed copy never charts under it, while a non-regular entry
+        // claims no name and leaves its committed copy charting.
         let repo = scratch("harvest_skip_blocks_commit");
         git(
             &repo,
@@ -11822,17 +12186,20 @@ mod tests {
 
         let captured = CapturedWarnings::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
-        let blocked = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+        let charted = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
             .expect("skipped files must not fail the harvest");
-        assert!(
-            blocked.is_empty(),
-            "each skipped path blocks its committed copy: {blocked:?}"
+        let mut charted_paths: Vec<&str> = charted.iter().map(|task| task.path.as_str()).collect();
+        charted_paths.sort_unstable();
+        assert_eq!(
+            charted_paths,
+            vec!["tasks/scope_unreadable.md"],
+            "a non-regular entry claims no name, so its committed copy charts: {charted:?}"
         );
         let warnings = captured.take();
         assert_eq!(
             warnings.len(),
             3,
-            "one warning per skipped path: {warnings:?}"
+            "one warning per rejected path: {warnings:?}"
         );
 
         // Remove the skipped working-tree entries: the committed copies chart,
@@ -12278,6 +12645,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn harvest_ref_union_keeps_the_skipped_placeholder() {
         // A skipped working-tree row still claims its task name after the ref
@@ -12303,10 +12671,20 @@ mod tests {
             "2026-05-01T12:00:00+00:00",
         );
         let path = repo.join("tasks/archive/scope_done.md");
-        fs::remove_file(&path).expect("remove readable copy");
-        fs::create_dir(&path).expect("unreadable directory");
+        let original = fs::metadata(&path)
+            .expect("archived metadata")
+            .permissions();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("lock archived copy");
+        if fs::read_to_string(&path).is_ok() {
+            // A process that can read the file anyway, such as root, cannot
+            // exercise this case.
+            fs::set_permissions(&path, original).expect("restore archived copy");
+            let _ = fs::remove_dir_all(&repo);
+            return;
+        }
 
         let tasks = harvest_repository(&repo).expect("a skipped row must not fail the harvest");
+        fs::set_permissions(&path, original).expect("restore archived copy");
         assert!(
             tasks.is_empty(),
             "the skipped row blocks the older committed copy: {tasks:?}"
