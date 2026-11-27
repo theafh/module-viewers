@@ -4213,14 +4213,14 @@ mod tests {
         AppState, Banner, BannerGuard, FLASH_CAPACITY, FlashQuery, FlashStore, GIT_ERROR,
         HarvestFn, HomeQuery, MISSING_TASKS_ERROR, PageChrome, PickerFn, PickerResult,
         PriorReadHookFn, ProjectForm, STOPPED_ERROR, ScanFailure, ScanReport, StoreHookFn,
-        add_repository, canonical_path_text, charts_csv_text, claim_banner, confirm_repository,
-        encode_query, flash_banner, git_scan_message, human_stamp, init_templates, is_local_host,
-        local_offset, osascript_outcome, query_banner, record_scan_error, refresh_one,
-        relocate_repository, remaining, remove_repository, render_blocking_thread, render_home,
-        render_repositories_at, router, scan_all, scan_core, scan_flash, scan_instant,
-        scan_label_at, scan_response, scan_worker_cap, serve, serve_until_stopped,
-        shallow_scan_message, static_version, store_hook_from, store_outcome, store_repository,
-        zenity_outcome,
+        add_repository, canonical_path_text, chart_barrier_from, charts_csv_text, claim_banner,
+        confirm_repository, encode_query, flash_banner, git_scan_message, human_stamp,
+        init_templates, is_local_host, local_offset, osascript_outcome, query_banner,
+        record_scan_error, refresh_one, relocate_repository, remaining, remove_repository,
+        render_blocking_thread, render_home, render_repositories_at, router, scan_all, scan_core,
+        scan_flash, scan_instant, scan_label_at, scan_response, scan_worker_cap, serve,
+        serve_until_stopped, shallow_scan_message, static_version, store_hook_from, store_outcome,
+        store_repository, zenity_outcome,
     };
     use crate::db;
     use crate::harvest::{self, HarvestError, ParsedTask, PriorTask, TaskKind};
@@ -4295,6 +4295,40 @@ mod tests {
         assert!(
             !marker.exists(),
             "a value that is not a whole number writes no marker"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Covers: `chart_barrier_from` arms the test-only chart barrier only when
+    /// the caller names a directory and a positive whole-number count, and
+    /// falls back to no barrier for an unset pair or a count that is zero or
+    /// not a whole number, so a stray value never holds a render.
+    #[test]
+    fn test_chart_barrier_from_arms_only_for_a_positive_whole_number() {
+        let dir = unique_temp_dir("chart_barrier_from");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        assert!(
+            chart_barrier_from(None, Some("2")).is_none(),
+            "an unset directory leaves the chart barrier off"
+        );
+        assert!(
+            chart_barrier_from(Some(dir.clone()), None).is_none(),
+            "an unset count leaves the chart barrier off"
+        );
+
+        let armed = chart_barrier_from(Some(dir.clone()), Some("2"))
+            .expect("a positive whole number arms the barrier");
+        assert_eq!(armed.count, 2, "the barrier waits for the named count");
+
+        assert!(
+            chart_barrier_from(Some(dir.clone()), Some("0")).is_none(),
+            "a zero count falls back to no barrier"
+        );
+        assert!(
+            chart_barrier_from(Some(dir.clone()), Some("not a number")).is_none(),
+            "a count that is not a whole number falls back to no barrier"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
