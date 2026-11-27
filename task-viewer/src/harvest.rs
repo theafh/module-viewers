@@ -3574,6 +3574,15 @@ fn repository_history_key(repo: &Path, git: &GitContext) -> Result<Option<String
     Ok(Some(format!("history-v1:{}", fnv1a_digest(&raw))))
 }
 
+/// The history key the current tree computes for `repo`, for tests that need to
+/// seed a stored key equal to the one a later harvest will read.
+#[cfg(test)]
+pub fn test_history_key(repo: &Path) -> Option<String> {
+    let repo = fs::canonicalize(repo).ok()?;
+    let git = GitContext::resolve(&repo).ok()?;
+    repository_history_key(&repo, &git).ok().flatten()
+}
+
 /// The sorted tip commit ids of the ref set `git log --all` actually walks:
 /// every ref under `refs/`, plus `HEAD`, with an annotated tag peeled to the
 /// commit it names, because `%(objectname)` on a tag names the tag object.
