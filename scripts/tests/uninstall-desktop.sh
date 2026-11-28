@@ -296,6 +296,7 @@ case_running_server_hint() {
 
     bash -c 'exec -a "$1" sleep 30' _ "$root/target/release/task-viewer" &
     pid=$!
+    disown "$pid" 2>/dev/null || true
     printf '%s\n' "$pid" >"$state/task-viewer.pid"
 
     out=$(HOME="$root/home" FAKE_LOGIN_HOME="$root/home" \
@@ -333,15 +334,21 @@ case_linux_removal() {
     out=$(HOME="$root/home" PATH="$root/bin:/usr/bin:/bin" \
         bash "$root/scripts/uninstall-desktop.sh" 2>&1)
     status=$?
+    second_status=0
+    if [ "$status" -eq 0 ]; then
+        HOME="$root/home" PATH="$root/bin:/usr/bin:/bin" \
+            bash "$root/scripts/uninstall-desktop.sh" >/dev/null 2>&1 ||
+            second_status=$?
+    fi
 
-    if [ "$status" -eq 0 ] &&
+    if [ "$status" -eq 0 ] && [ "$second_status" -eq 0 ] &&
         [ ! -e "$desktop" ] && [ ! -e "$icon" ] &&
         printf '%s\n' "$out" | grep -qF "Removed: $desktop" &&
         printf '%s\n' "$out" | grep -qF "Removed: $icon" &&
         printf '%s\n' "$out" | grep -q 'The database and logs were kept'; then
         pass "uninstall removes the Linux desktop entry and icon"
     else
-        fail "uninstall removes the Linux desktop entry and icon (status $status)"
+        fail "uninstall removes the Linux desktop entry and icon (status $status, second run $second_status)"
         printf '%s\n' "$out" | sed 's/^/    /'
     fi
 }
