@@ -15,7 +15,7 @@ use anyhow::Context as _;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() -> anyhow::Result<()> {
@@ -42,9 +42,46 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let deadline = runtime.block_on(serve_until_stopped())?;
-    runtime.shutdown_timeout(web::remaining(deadline));
+    run_then_shutdown(
+        runtime,
+        serve_until_stopped(),
+        web::remaining,
+        STARTUP_SHUTDOWN_BOUND,
+    )?;
     Ok(())
+}
+
+/// The fixed bound on the runtime teardown after a start-up failure, so a
+/// blocking task cannot hold the process while the runtime drops implicitly.
+const STARTUP_SHUTDOWN_BOUND: Duration = Duration::from_secs(1);
+
+/// Run `future` on `runtime`, shut the runtime down on both outcomes, and
+/// return the outcome.
+///
+/// The served path bounds its teardown by `success_bound` applied to the
+/// deadline it returned, which is near zero after a full drain and near the
+/// whole grace after an instant one. A start-up failure bounds it by
+/// `failure_bound` instead, so no exit path falls through to an unbounded
+/// implicit runtime drop.
+fn run_then_shutdown<F>(
+    runtime: tokio::runtime::Runtime,
+    future: F,
+    success_bound: impl FnOnce(Instant) -> Duration,
+    failure_bound: Duration,
+) -> anyhow::Result<Instant>
+where
+    F: Future<Output = anyhow::Result<Instant>>,
+{
+    match runtime.block_on(future) {
+        Ok(deadline) => {
+            runtime.shutdown_timeout(success_bound(deadline));
+            Ok(deadline)
+        }
+        Err(error) => {
+            runtime.shutdown_timeout(failure_bound);
+            Err(error)
+        }
+    }
 }
 
 /// The documented log filter, used when `RUST_LOG` is unset, blank, or cannot
@@ -230,12 +267,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_LOG_FILTER, bind_and_log, configured_port, log_filter, parse_port, shutdown_signal,
-        warn_log_filter_fallback,
+        DEFAULT_LOG_FILTER, STARTUP_SHUTDOWN_BOUND, bind_and_log, configured_port, log_filter,
+        parse_port, run_then_shutdown, shutdown_signal, warn_log_filter_fallback,
     };
     use std::ffi::OsStr;
     use std::net::SocketAddr;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tracing_subscriber::layer::SubscriberExt;
 
     /// The fields of one captured log event, flattened so a test can assert the
@@ -519,6 +556,44 @@ mod tests {
         assert!(
             waited.is_err(),
             "a registration error must leave the shutdown future pending"
+        );
+    }
+
+    /// Covers: a start-up failure returns the original error after shutting the
+    /// runtime down inside the fixed bound, instead of waiting for a blocking
+    /// task the way the implicit runtime drop would.
+    #[test]
+    fn run_then_shutdown_bounds_the_startup_error_path() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let outcome = run_then_shutdown(
+            runtime,
+            async move {
+                drop(tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).expect("the test waits for the start");
+                    std::thread::sleep(Duration::from_secs(30));
+                }));
+                started_rx.recv().expect("the blocking task started");
+                Err(anyhow::anyhow!("the database could not be opened"))
+            },
+            crate::web::remaining,
+            STARTUP_SHUTDOWN_BOUND,
+        );
+        let elapsed = started.elapsed();
+        let error = outcome.expect_err("the helper returns the start-up error");
+        assert!(
+            error
+                .to_string()
+                .contains("the database could not be opened"),
+            "the original error is returned: {error}"
+        );
+        assert!(
+            elapsed < STARTUP_SHUTDOWN_BOUND + Duration::from_secs(1),
+            "the error path returned {elapsed:?}, past the fixed bound"
         );
     }
 }

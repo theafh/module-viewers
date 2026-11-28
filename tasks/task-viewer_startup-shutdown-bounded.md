@@ -2,9 +2,11 @@
 description: "Call the bounded runtime shutdown on the start-up error path too, so a future blocking start-up task cannot hold the process past the launcher's stop window."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
-status: checked
+updated: 2026-11-28T13:30:56Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: true
 ---
 
 # Bound the runtime shutdown on every exit path
@@ -30,7 +32,7 @@ The `?` returns from `main` on any start-up failure — database open or migrati
 2. On `Ok(deadline)`, call `runtime.shutdown_timeout(web::remaining(deadline))` as today.
 3. On `Err`, call `runtime.shutdown_timeout` with a one-second fixed bound and then return the error.
 4. Extract the "run then always shut down" step into a helper that takes a runtime, a future, a success-bound function over the returned deadline (`FnOnce(Instant) -> Duration`, kept as `web::remaining`), and a fixed failure duration, so it can be tested without a real server. The success bound stays a function of the deadline rather than a fixed duration, because `web::remaining` is near zero after a full drain and near the whole grace after an instant one, so a hardcoded success bound would add its full length on top of an already-spent drain. The helper is private to `main.rs`, which declares no library target, so its test is an inline `#[cfg(test)]` module in `main.rs` beside it; a test under `task-viewer/tests/` could not import it.
-5. Add a test: a plain `#[test]` that builds its own current-thread runtime, because the helper calls `block_on` and a `#[tokio::test]` would nest a runtime. Its future spawns a blocking task sleeping past the bound and then returns an error; the test asserts the helper returns that same error and returns within the fixed bound plus a small margin instead of waiting for the task.
+5. Add a test: a plain `#[test]` that builds its own current-thread runtime, because the helper calls `block_on` and a `#[tokio::test]` would nest a runtime. Its future spawns a blocking task that signals its own start over a channel and then sleeps past the bound; the future awaits that signal before returning an error. The test asserts the helper returns that same error and returns within the fixed bound plus a small margin once the handshake has confirmed the blocking task is running, instead of waiting for the task's sleep to finish.
 6. Amend the existing load-bearing bullet in `ARCHITECTURE.md` that already reads "The runtime teardown is bounded by the same deadline" so it names both bounds — the served path's remaining-deadline bound and the error path's fixed bound — rather than appending a near-duplicate sentence.
 7. Extend the `Shutdown` bullet in `TESTING.md`'s coverage list to name the bounded start-up-error exit beside the SIGTERM and SIGINT cases.
 
@@ -38,8 +40,8 @@ The `?` returns from `main` on any start-up failure — database open or migrati
 
 ## Acceptance
 
-- The new test asserts the helper returns the original start-up error, and the runtime's shutdown is bounded on that error path.
-- The error path returns within one second plus a small margin when a blocking task is still running.
+- The new test's blocking closure signals its own start over a channel that the future awaits before returning its error, so a running blocking task is guaranteed at the moment the helper shuts the runtime down.
+- The new test asserts the helper returns the original start-up error, and the error path returns within one second plus a small margin once the handshake confirms the blocking task is running; the elapsed assertion fails on the current implicit runtime drop, which waits out the task's full sleep, and passes on the fixed bound.
 - The served path keeps its existing deadline and four-second grace.
 - The `ARCHITECTURE.md` load-bearing bullet names both the served path's remaining-deadline bound and the error path's fixed bound, with the prior deadline-only sentence superseded so one canonical statement remains.
 - The `TESTING.md` `Shutdown` bullet names the bounded start-up-error exit.
