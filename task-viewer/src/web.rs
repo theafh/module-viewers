@@ -14982,6 +14982,7 @@ mod tests {
   }
   button.click();
   var afterFail = message();
+  env.chartsSection.clientWidth = env.chartsSection.clientWidth + 1;
   env.window.dispatchEvent({ type: "resize" });
   var timers = env.timeouts.filter(function (timer) { return timer.delay === 100; });
   if (timers.length) timers[timers.length - 1].handler();
@@ -15985,6 +15986,9 @@ mod tests {
             r#"(function () {
   var env = globalThis.__env;
   function redraw() {
+    // The dashboard skips a resize that leaves the charts container's width
+    // unchanged, so change it before every dispatch to keep the redraw.
+    env.chartsSection.clientWidth = env.chartsSection.clientWidth + 1;
     env.window.dispatchEvent(new env.Event("resize"));
     env.timeouts[env.timeouts.length - 1].handler();
   }
@@ -16094,6 +16098,9 @@ mod tests {
     };
   }
   function redraw() {
+    // The dashboard skips a resize that leaves the charts container's width
+    // unchanged, so change it before every dispatch to keep the redraw.
+    env.chartsSection.clientWidth = env.chartsSection.clientWidth + 1;
     env.window.dispatchEvent(new env.Event("resize"));
     env.timeouts[env.timeouts.length - 1].handler();
   }
@@ -16238,6 +16245,9 @@ mod tests {
     })[0];
   }
   function redraw() {
+    // The dashboard skips a resize that leaves the charts container's width
+    // unchanged, so change it before every dispatch to keep the redraw.
+    env.chartsSection.clientWidth = env.chartsSection.clientWidth + 1;
     env.window.dispatchEvent(new env.Event("resize"));
     env.timeouts[env.timeouts.length - 1].handler();
   }
@@ -16309,6 +16319,111 @@ mod tests {
             outside["contained"],
             serde_json::json!(false),
             "the outside focus target is not inside the calendar card: {outside:?}"
+        );
+    }
+
+    /// Covers: a window resize redraws every chart card only when the charts
+    /// container's width changed. The prelude replaces each card's `.summary`
+    /// `textContent` with a counting setter, so each draw's one summary write is
+    /// one count, and the case drives the debounce by running the timers a
+    /// dispatch recorded: a same-width dispatch schedules none and runs none,
+    /// while a changed width schedules the one `renderAll` it runs.
+    #[test]
+    fn browser_resize_redraws_only_when_the_chart_width_changed() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let result = run_browser_with(
+            r#"globalThis.__draws = 0;
+(function () {
+  var env = globalThis.__env;
+  env.cardNames.forEach(function (name) {
+    var node = env.cards[name].querySelector(".summary");
+    var text = node.textContent;
+    Object.defineProperty(node, "textContent", {
+      get: function () { return text; },
+      set: function (value) {
+        text = value;
+        globalThis.__draws += 1;
+      }
+    });
+  });
+})()"#,
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function resize() {
+    var before = env.timeouts.length;
+    env.window.dispatchEvent(new env.Event("resize"));
+    var ran = 0;
+    var delay = null;
+    for (var index = before; index < env.timeouts.length; index += 1) {
+      delay = env.timeouts[index].delay;
+      env.timeouts[index].handler();
+      ran += 1;
+    }
+    return { ran: ran, delay: delay };
+  }
+  var perDraw = env.cardNames.length;
+  var afterLoad = globalThis.__draws;
+  var first = resize();
+  var afterFirst = globalThis.__draws;
+  var second = resize();
+  var afterSecond = globalThis.__draws;
+  env.chartsSection.clientWidth = env.chartsSection.clientWidth + 1;
+  var changed = resize();
+  var afterChanged = globalThis.__draws;
+  return JSON.stringify({
+    perDraw: perDraw,
+    afterLoad: afterLoad,
+    firstTimers: first.ran,
+    afterFirst: afterFirst,
+    secondTimers: second.ran,
+    afterSecond: afterSecond,
+    changedTimers: changed.ran,
+    changedDelay: changed.delay,
+    afterChanged: afterChanged
+  });
+})()"#,
+        );
+        let per_draw = result["perDraw"].as_u64().expect("cards per draw");
+        assert_eq!(
+            result["afterLoad"].as_u64(),
+            Some(per_draw),
+            "the first render draws every card: {result:?}"
+        );
+        assert_eq!(
+            result["firstTimers"].as_u64(),
+            Some(0),
+            "a same-width resize schedules no redraw: {result:?}"
+        );
+        assert_eq!(
+            result["secondTimers"].as_u64(),
+            Some(0),
+            "a second same-width resize schedules no redraw: {result:?}"
+        );
+        assert_eq!(
+            result["afterFirst"].as_u64(),
+            Some(per_draw),
+            "the first same-width resize draws no card: {result:?}"
+        );
+        assert_eq!(
+            result["afterSecond"].as_u64(),
+            Some(per_draw),
+            "two same-width resizes still draw no card: {result:?}"
+        );
+        assert_eq!(
+            result["changedTimers"].as_u64(),
+            Some(1),
+            "a changed width schedules the one debounced redraw: {result:?}"
+        );
+        assert_eq!(
+            result["changedDelay"].as_u64(),
+            Some(100),
+            "the scheduled redraw keeps the 100 ms debounce: {result:?}"
+        );
+        assert_eq!(
+            result["afterChanged"].as_u64(),
+            Some(per_draw * 2),
+            "the changed width redraws every card: {result:?}"
         );
     }
 
@@ -18922,6 +19037,9 @@ mod tests {
     mark.listeners.mousemove[0]({ type: "mousemove", clientX: 120, clientY: 80 });
   }
   function redraw() {
+    // The dashboard skips a resize that leaves the charts container's width
+    // unchanged, so change it before every dispatch to keep the redraw.
+    env.chartsSection.clientWidth = env.chartsSection.clientWidth + 1;
     env.window.dispatchEvent(new env.Event("resize"));
     env.timeouts[env.timeouts.length - 1].handler();
   }

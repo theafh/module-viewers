@@ -23,6 +23,10 @@
   // instead of rebuilding all ten charts.
   var painted = {};
 
+  // The charts container width the last render drew at, so a resize that leaves
+  // it unchanged rebuilds no chart and disturbs no open tooltip or focus.
+  var renderedWidth = null;
+
   function cssVar(name) {
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   }
@@ -1245,6 +1249,10 @@
   }
 
   function renderAll() {
+    // The width the resize handler compares against. It is recorded even when
+    // the payload is missing, because a later width change still redraws the
+    // fallback cards.
+    renderedWidth = chartsSection ? chartsSection.clientWidth : null;
     // A redraw replaces every tooltip node, so the open tooltips hide before
     // the pointerdown registry starts empty for the draw that follows. Hiding
     // them first leaves no stale count on screen while the charts redraw.
@@ -1678,6 +1686,14 @@
   pollScanStatus();
   var resizeTimer = 0;
   window.addEventListener("resize", function () {
+    // A height-only resize, a zoom that keeps the layout width, and a mobile
+    // browser's URL bar sliding during scroll all leave the charts container's
+    // width alone. Rebuilding ten SVGs for them would stale an open tooltip and
+    // drop focus, so only a real width change schedules the redraw. A page with
+    // no charts section keeps the unconditional redraw.
+    if (chartsSection && chartsSection.clientWidth === renderedWidth) {
+      return;
+    }
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(renderAll, 100);
   });

@@ -2,7 +2,7 @@
 description: "Return keyboard focus to the equivalent chart mark after a resize redraw, instead of dropping it to body on eight of the ten cards."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-27T17:27:02Z
+updated: 2026-11-28T06:04:11Z
 status: checked
 reported-by: "Andreas Hoffmann"
 ---
@@ -34,7 +34,7 @@ Verified live: focusing the cumulative overlay, a weekly bar, and a radar spoke 
 3. Apply it to `drawWeekly`, `drawLine` (refocus the overlay), `drawStaleness` (refocus the overlay), and the radar draw. The overlay's focus handler re-announces the first drawn day on focus, which the task keeps as the overlay's intended behaviour. Leave `drawCalendar` on its existing behaviour.
 4. Adding `data-focus-key` changes every non-calendar card's serialized markup; regenerate `task-viewer/testdata/dashboard_draw_snapshots.json` so `browser_chart_markup_matches_the_pre_change_snapshots` still passes. The [weekly-bars task](archive/task-viewer_weekly-bars-two-year-window.md) has finished, having refreshed the snapshot; two live siblings edit the same surface: [the shared-day-axis task](task-viewer_chart-payload-shared-day-axis.md) rewrites the daily rows and keeps the snapshot unchanged, and [the staleness-labels task](task-viewer_staleness-labels-at-least.md) refreshes the staleness entry; the focus task regenerates the snapshot and the shared-day-axis task re-derives its rows against it, whichever lands second.
 5. Record the new guarantee in `FEATURES.md`'s chart-interaction paragraph, scoped to the cards that draw fresh marks: a redraw returns focus to the mark that held it, while the calendars keep their existing rule, that a redrawn calendar puts focus on its newest day when the frame scrolls or its first day when the frame fits, whichever day held focus before.
-6. Add browser-guard cases: focus a weekly bar, dispatch `resize`, assert the same week's bar is focused; focus a line overlay, dispatch `resize`, assert the overlay is focused; focus a mark in one card and dispatch `resize`, assert a different card's active element is unchanged. Each case compares identity against a node taken from the redrawn SVG, as the calendar guard does, because the test stub leaves the detached node as `document.activeElement`; an attribute or non-null check would pass without the restore.
+6. Add browser-guard cases: focus a weekly bar, dispatch `resize`, assert the same week's bar is focused; focus a line overlay, dispatch `resize`, assert the overlay is focused; focus a mark in one card and dispatch `resize`, assert a different card's active element is unchanged. Each case changes the compared chart width, `env.chartsSection.clientWidth`, before every `resize` it dispatches, because the dashboard skips a resize that leaves the charts container's width unchanged ([the skip task](task-viewer_resize-skip-unchanged-width.md)) and a same-width dispatch would redraw nothing. Each case compares identity against a node taken from the redrawn SVG, as the calendar guard does, because the test stub leaves the detached node as `document.activeElement`; an attribute or non-null check would pass without the restore.
 
 **Out of scope:** skipping the redraw when the width did not change (a separate performance item), and changing which element is a tab stop.
 

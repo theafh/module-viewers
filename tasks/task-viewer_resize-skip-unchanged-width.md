@@ -2,9 +2,11 @@
 description: "Skip the ten-chart redraw when a resize leaves the chart width unchanged, so a mobile URL bar does not rebuild every SVG."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T17:15:33Z
-status: checked
+updated: 2026-11-28T06:04:11Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Redraw only when the chart width changed
@@ -33,8 +35,8 @@ The charts container is already held as `chartsSection` (`document.querySelector
 1. Record the rendered width of the charts container once per `renderAll`, from `chartsSection.clientWidth`, in a module-level variable.
 2. In the resize handler, compare the current `chartsSection.clientWidth` with the recorded width and return before scheduling a redraw when they match. Keep the 100 ms debounce and the full redraw on a real width change.
 3. Add a writable per-instance `clientWidth` to the fixture's `.charts` node in `task-viewer/testdata/browser_guards.js`, the way `.chart-frame` already carries one, so a guard case can change the compared width between draws.
-4. Update the five resize-driven browser-guard cases in `task-viewer/src/web.rs` — `browser_calendar_pins_again_when_a_narrow_frame_gains_a_range`, `browser_calendar_tab_stop_starts_on_the_newest_day`, `browser_calendar_redraw_keeps_focus_only_when_it_held_it`, `browser_chart_download_failure_shows_a_message`, and `browser_tooltip_hides_on_redraw_view_change_and_scroll` — so each changes the `.charts` width before every `resize` it dispatches. The two calendar cases write only `frame.clientWidth` today, so the skip would leave their `scrollLeft` and tab stop unrefreshed; the focus case changes no width at all, so with the skip in place it stops redrawing and its `activeIsStop` assertion fails rather than passing; and the download-failure and tooltip cases dispatch `resize` to trigger the redraw their assertions depend on.
-5. Add a browser-guard case: the initial render draws every card, two resize events at an unchanged width add no draw, and a changed width adds one draw.
+4. Update every browser-guard case in `task-viewer/src/web.rs` that dispatches a window `resize` event so that a redraw refreshes what it asserts — find them at implementation time by searching for the `dispatchEvent` call carrying `"resize"` — so each changes the `.charts` width before every `resize` it dispatches; the counting case from step 5 is the stated exception, because its same-width `resize` events are its assertion. The selector covers every resize-driven case present at implementation time, whichever sibling task lands first. The kinds in that set today: cases that write only `frame.clientWidth`, so the skip would leave their `scrollLeft` and tab stop unrefreshed; a focus case that changes no width at all, so with the skip in place it stops redrawing and its `activeIsStop` assertion fails rather than passing; and cases that dispatch `resize` to trigger the redraw their assertions depend on.
+5. Add a browser-guard case that counts draws: a `run_browser_with` prelude redefines `textContent` on each card's `.summary` node, reached through `globalThis.__env.cards`, with a setter that increments a `globalThis` counter. `summary(name, text)` writes that property exactly once per draw, so the counter counts draws, and `run_browser_with` already evaluates its prelude after the stub DOM and before `dashboard.js` loads. The fixture's `setTimeout` only records the callback (`task-viewer/testdata/browser_guards.js`: `timeouts.push({ handler: handler, delay: delay })`) and `clearTimeout` is a no-op, so the case drives the debounce itself: before each dispatch it records `globalThis.__env.timeouts.length`, and after the dispatch it runs every handler recorded since that marker, calling each entry's `.handler()`. A same-width dispatch records no timer, so its run covers nothing and the counter must not move. With that run the case asserts the counter equals `globalThis.__env.cardNames.length` after load, stays at that value after two `resize` events at an unchanged width, and rises by `globalThis.__env.cardNames.length` after a changed width.
 6. Update the planned browser-guard cases in [`task-viewer_chart-focus-survives-resize.md`](task-viewer_chart-focus-survives-resize.md) so each changes the compared width before every `resize` it dispatches; that sibling plans three same-width resize cases, which the skip turns into no-ops.
 7. Record the rule in `FEATURES.md`'s `## 4. Charts` paragraph and `TESTING.md`'s `- Browser guards:` bullet.
 
@@ -45,7 +47,8 @@ The charts container is already held as `chartsSection` (`document.querySelector
 - A resize with an unchanged chart width redraws no card.
 - A resize with a changed width redraws every card after the debounce.
 - The first render still draws every card.
-- The new browser-guard case draws once on load, adds no draw for two same-width resize events, and adds one for a changed width.
-- Every resize-driven browser-guard case changes the compared width before every `resize` it dispatches, so each still exercises a redraw.
+- The new browser-guard case runs the redraw the recorded timer holds: before each `resize` it records `globalThis.__env.timeouts.length`, and after the dispatch it runs every handler recorded since that marker, each entry's `.handler()`. Driven that way it reads the `.summary` `textContent` draw counter at `globalThis.__env.cardNames.length` after load, still at that value after two same-width `resize` events, and higher by `globalThis.__env.cardNames.length` after a changed width, so the case distinguishes the width-changed skip from an unconditional redraw.
+- Every browser-guard case in `task-viewer/src/web.rs` that dispatches a window `resize` event so that a redraw refreshes what it asserts, re-found by that search at verification time, changes the compared width before every `resize` it dispatches; the counting case of Approach step 5 is the stated exception, because its two same-width `resize` events are its assertion.
+- `tasks/task-viewer_chart-focus-survives-resize.md` is updated so every `resize` its planned browser-guard cases dispatch is preceded by a change to the compared chart width.
 - The `## 4. Charts` paragraph in `FEATURES.md` and the `- Browser guards:` bullet in `TESTING.md` state the unchanged-width skip and the new case.
 - The new browser-guard case, `make lint`, and `make test` pass.

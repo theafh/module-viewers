@@ -459,6 +459,19 @@
   // The charts section the busy state is set on.
   var chartsSection = new Node("section");
   chartsSection.attrs.class = "charts";
+  // The charts container's rendered width, which the dashboard compares between
+  // renders. A test writes it per instance to model a resize that changes the
+  // layout width, the way `.chart-frame` carries its own writable width.
+  var chartsWidth = width;
+  Object.defineProperty(chartsSection, "clientWidth", {
+    get: function () {
+      return chartsWidth;
+    },
+    set: function (value) {
+      var number = Number(value);
+      if (isFinite(number)) chartsWidth = number;
+    }
+  });
   // The dashboard header's scan-status line, which the poll fills with the
   // repository count while a scan runs.
   var scanStatusNode = new Node("p");
