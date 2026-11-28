@@ -2,10 +2,10 @@
 description: "Pin the Dock only when HOME is the login account's home, add a force/skip override, and keep sandboxed install runs out of the live com.apple.dock."
 scope: task-viewer
 created: 2026-11-27T09:43:52Z
-updated: 2026-11-27T13:24:40Z
+updated: 2026-11-28T01:33:38Z
 status: implemented
 implemented-by: "Andreas Hoffmann"
-design-extended: true
+design-extended: false
 reported-by: "Andreas Hoffmann"
 ---
 

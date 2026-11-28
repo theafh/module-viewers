@@ -534,26 +534,35 @@ EOS
     fi
 }
 
-# The explicit skip override skips the pin even where the guard would skip it.
+# The explicit skip override skips the pin even where the guard would pin: the
+# account database reports the case's own home, so the auto path would call
+# dockutil and only the skip branch can keep that log absent.
 case_dock_pin_skip_override_skips() {
     local root="$TMP/installer-skip" out status
     make_root "$root"
     mkdir -p "$root/bin"
     printf '#!/bin/bash\nprintf "Darwin\\n"\n' >"$root/bin/uname"
+    printf '#!/bin/bash\nprintf "fakeuser\\n"\n' >"$root/bin/id"
+    cat >"$root/bin/dscl" <<'EOS'
+#!/bin/bash
+printf 'NFSHomeDirectory: %s\n' "$FAKE_LOGIN_HOME"
+EOS
     cat >"$root/bin/dockutil" <<'EOS'
 #!/bin/bash
 printf '%s\n' "$*" >>"$DOCKUTIL_LOG"
 exit 0
 EOS
-    chmod +x "$root/bin/uname" "$root/bin/dockutil"
-    out=$(HOME="$root/home" TASK_VIEWER_DOCK_PIN=skip \
+    chmod +x "$root/bin/uname" "$root/bin/id" "$root/bin/dscl" "$root/bin/dockutil"
+    out=$(HOME="$root/home" FAKE_LOGIN_HOME="$root/home" TASK_VIEWER_DOCK_PIN=skip \
         DOCKUTIL_LOG="$root/dockutil.log" PATH="$root/bin:/usr/bin:/bin" \
         bash "$root/scripts/install-desktop.sh" 2>&1)
     status=$?
-    if [ "$status" -eq 0 ] && [ ! -e "$root/dockutil.log" ]; then
-        pass "TASK_VIEWER_DOCK_PIN=skip skips the Dock pin"
+    if [ "$status" -eq 0 ] &&
+        [ ! -e "$root/dockutil.log" ] &&
+        printf '%s\n' "$out" | grep -q 'Skipping the Dock pin: TASK_VIEWER_DOCK_PIN=skip.'; then
+        pass "TASK_VIEWER_DOCK_PIN=skip skips the Dock pin from the login home"
     else
-        fail "TASK_VIEWER_DOCK_PIN=skip skips the Dock pin (status $status)"
+        fail "TASK_VIEWER_DOCK_PIN=skip skips the Dock pin from the login home (status $status)"
         printf '%s\n' "$out" | sed 's/^/    /'
     fi
 }
