@@ -1266,7 +1266,7 @@
           "attrs": {
             "aria-label": "Week of Jan 5, 2026 · shipped 1",
             "data-tip": "Week of Jan 5, 2026 · shipped 1",
-            "href": "/tasks?project=3&kind=finished&date=shipped&to=2026-01-11",
+            "href": "/tasks?project=3&kind=finished&date=shipped&from=2026-01-05&to=2026-01-11",
             "role": "link",
             "tabindex": "0"
           },
@@ -1306,7 +1306,7 @@
           "attrs": {
             "aria-label": "Week of Jan 5, 2026 · created 2",
             "data-tip": "Week of Jan 5, 2026 · created 2",
-            "href": "/tasks?project=3&kind=all&date=created&to=2026-01-11",
+            "href": "/tasks?project=3&kind=all&date=created&from=2026-01-05&to=2026-01-11",
             "role": "link",
             "tabindex": "-1"
           },

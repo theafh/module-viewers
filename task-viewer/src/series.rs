@@ -229,8 +229,9 @@ pub fn dashboard(
 
     // One warning per row dated before the plausible floor, emitted from the
     // same single site as the after-today warnings. The row keeps its real
-    // values and folds into the first charted point, so a mistyped year stays
-    // visible while the series stay bounded.
+    // values: the cumulative and backlog charts fold it into their first
+    // charted point, while the weekly chart cuts it, so a mistyped year stays
+    // visible in the day charts and never stretches the weekly card.
     for task in tasks {
         let ship = task.ship_date.filter(|_| task.kind == TaskKind::Finished);
         // A deferred row leaves the backlog on its leave day, so that day is the
@@ -254,7 +255,7 @@ pub fn dashboard(
                 repository = %task.project,
                 path = %task.path,
                 date = %crate::dates::format_date(day),
-                "task dated before the plausible floor; counted in the first charted point"
+                "task dated before the plausible floor; folded into the first cumulative and backlog point and cut from the weekly chart"
             );
         }
     }
@@ -341,35 +342,23 @@ fn weekly_points(
     else {
         return Vec::new();
     };
+    // The card spans at most the last 104 Monday weeks ending in today's week,
+    // so an event older than the window is cut instead of folded into the first
+    // row. 103 weeks back from today's Monday opens a 104-week span.
+    let window_start = end.checked_sub_days(Days::new(103 * 7)).unwrap_or(end);
     // The start caps at today's Monday too, so a series whose only event lies
     // after today still yields one row.
-    let start = first.max(monday(series_floor())).min(end);
+    let start = first.max(window_start).min(end);
     let mut points = Vec::new();
-    // Weeks before the first charted week fold into that week's row, the way
-    // `cumulative_points` seeds its running total, so the weekly sums still
-    // reach `counts`.
-    let mut carry_created = created_weeks
-        .range(..start)
-        .map(|(_, count)| *count)
-        .sum::<i64>();
-    let mut carry_shipped = shipped_weeks
-        .range(..start)
-        .map(|(_, count)| *count)
-        .sum::<i64>();
-    let mut carry_deferred = deferred_weeks
-        .range(..start)
-        .map(|(_, count)| *count)
-        .sum::<i64>();
+    // Events before the window contribute no row: the first bar carries only
+    // its own week, so its drill-down has a real lower bound.
     let mut cur = start;
     while cur <= end {
         points.push(WeekPoint {
             week: crate::dates::format_date(cur),
-            created: std::mem::take(&mut carry_created)
-                + created_weeks.get(&cur).copied().unwrap_or(0),
-            shipped: std::mem::take(&mut carry_shipped)
-                + shipped_weeks.get(&cur).copied().unwrap_or(0),
-            deferred: std::mem::take(&mut carry_deferred)
-                + deferred_weeks.get(&cur).copied().unwrap_or(0),
+            created: created_weeks.get(&cur).copied().unwrap_or(0),
+            shipped: shipped_weeks.get(&cur).copied().unwrap_or(0),
+            deferred: deferred_weeks.get(&cur).copied().unwrap_or(0),
         });
         match cur.checked_add_days(Days::new(7)) {
             Some(next) => cur = next,
@@ -852,9 +841,11 @@ fn monday(date: NaiveDate) -> NaiveDate {
     date.checked_sub_days(Days::new(offset)).unwrap_or(date)
 }
 
-/// The day every series starts no earlier than. A git-backed task file cannot
-/// predate git's first commit, so `PLAUSIBLE_FLOOR` bounds the walk while
-/// `SERIES_FLOOR` stays the absolute lower bound it never falls below.
+/// The day the cumulative, backlog, mean-age, cycle-time, and staleness charts
+/// start no earlier than. A git-backed task file cannot predate git's first
+/// commit, so `PLAUSIBLE_FLOOR` bounds the walk while `SERIES_FLOOR` stays the
+/// absolute lower bound it never falls below. The weekly chart does not consult
+/// this floor: it spans the last 104 Monday weeks and cuts anything older.
 fn series_floor() -> NaiveDate {
     PLAUSIBLE_FLOOR.max(SERIES_FLOOR)
 }
@@ -1151,7 +1142,8 @@ mod tests {
     }
 
     /// Covers: one mistyped year cannot stretch any series, because every
-    /// walk starts at the chart floor.
+    /// day-based walk starts at the chart floor and the weekly walk at its
+    /// 104-week window.
     #[test]
     fn series_stays_bounded_when_a_task_year_is_mistyped() {
         let today = day(2026, 11, 6);
@@ -1522,11 +1514,11 @@ mod tests {
         );
     }
 
-    /// Covers: the weekly chart plots deferred tasks by leave week, folding a
-    /// pre-floor leave week into the first charted row, so the deferred bars sum
-    /// to the deferred count.
+    /// Covers: the weekly chart plots deferred tasks by leave week and cuts a
+    /// pre-window leave week, so the deferred bars no longer reach the deferred
+    /// count.
     #[test]
-    fn series_weekly_plots_deferred_by_leave_week_including_a_pre_floor_one() {
+    fn series_weekly_plots_deferred_by_leave_week_and_cuts_a_pre_window_one() {
         let today = day(2026, 6, 15);
         let tasks = vec![
             task(
@@ -1555,13 +1547,19 @@ mod tests {
             ),
         ];
         let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let window_start = monday(today)
+            .checked_sub_days(Days::new(103 * 7))
+            .expect("window start");
         let first = board.weekly.first().expect("first week");
         assert_eq!(
             first.week,
-            crate::dates::format_date(monday(PLAUSIBLE_FLOOR)),
-            "the pre-floor leave week folds into the first charted week"
+            crate::dates::format_date(window_start),
+            "the first drawn week is the window's first week"
         );
-        assert_eq!(first.deferred, 1, "the pre-floor deferred task folds once");
+        assert_eq!(
+            first.deferred, 0,
+            "the first row carries only its own deferred tasks"
+        );
         let june_first = board
             .weekly
             .iter()
@@ -1574,10 +1572,21 @@ mod tests {
             .find(|point| point.week == "2026-06-08")
             .expect("the second leave week");
         assert_eq!(june_eighth.deferred, 1);
+        assert!(
+            board
+                .weekly
+                .iter()
+                .all(|point| point.week != crate::dates::format_date(monday(day(26, 3, 5)))),
+            "the pre-window leave week contributes no row"
+        );
         assert_eq!(
             board.weekly.iter().map(|point| point.deferred).sum::<i64>(),
-            board.counts.deferred as i64,
-            "the deferred bars reach the deferred count"
+            2,
+            "the pre-window deferred task contributes no bar"
+        );
+        assert_eq!(
+            board.counts.deferred, 3,
+            "the all-time count still holds the cut task"
         );
     }
 
@@ -1657,10 +1666,10 @@ mod tests {
         );
     }
 
-    /// Covers: a task created and shipped before the chart floor folds into
-    /// the first charted week, so the weekly sums still reach `counts`.
+    /// Covers: a task created and shipped before the 104-week window is cut
+    /// from the weekly chart, so the weekly bars no longer reach `counts`.
     #[test]
-    fn series_weekly_folds_a_pre_floor_week_into_the_floor() {
+    fn series_weekly_cuts_a_pre_window_week_from_the_first_row() {
         let today = day(2026, 11, 6);
         let tasks = vec![
             task(
@@ -1681,27 +1690,171 @@ mod tests {
             ),
         ];
         let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        let end = monday(today);
+        let window_start = end
+            .checked_sub_days(Days::new(103 * 7))
+            .expect("window start");
         let first = board.weekly.first().expect("first week");
         assert_eq!(
             first.week,
-            crate::dates::format_date(monday(PLAUSIBLE_FLOOR))
+            crate::dates::format_date(window_start),
+            "the first drawn week is the window's first week"
         );
         assert_eq!(
-            first.created, 1,
-            "the pre-floor created week folds into the first row"
+            first.created, 0,
+            "the first row carries no cut created event"
         );
         assert_eq!(
-            first.shipped, 1,
-            "the pre-floor ship week folds into the first row"
+            first.shipped, 0,
+            "the pre-window ship contributes no bar to the first row"
         );
         assert_eq!(
             board.weekly.iter().map(|point| point.created).sum::<i64>(),
-            board.counts.created_events as i64
+            1,
+            "the pre-window created event contributes no bar"
         );
         assert_eq!(
             board.weekly.iter().map(|point| point.shipped).sum::<i64>(),
-            board.counts.shipped_events as i64
+            0,
+            "the pre-window ship contributes no bar"
         );
+        assert_eq!(board.counts.created_events, 2);
+        assert_eq!(board.counts.shipped_events, 1);
+    }
+
+    /// Covers: a five-year payload draws at most the last 104 Monday weeks
+    /// ending in today's week, so the first row is the Monday 103 weeks before
+    /// today.
+    #[test]
+    fn series_weekly_caps_at_the_last_104_weeks() {
+        let today = day(2026, 11, 6);
+        let end = monday(today);
+        let window_start = end
+            .checked_sub_days(Days::new(103 * 7))
+            .expect("window start");
+        let tasks = vec![
+            task(
+                "alpha",
+                "ancient",
+                TaskKind::Live,
+                day(2021, 11, 1),
+                None,
+                None,
+            ),
+            task(
+                "alpha",
+                "modern",
+                TaskKind::Live,
+                day(2026, 11, 2),
+                None,
+                None,
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        assert_eq!(
+            board.weekly.len(),
+            104,
+            "a five-year payload draws the 104-week window"
+        );
+        assert_eq!(
+            board.weekly.first().expect("first week").week,
+            crate::dates::format_date(window_start),
+            "the first row is the Monday 103 weeks before today"
+        );
+        assert_eq!(
+            board.weekly.last().expect("last week").week,
+            crate::dates::format_date(end),
+            "the last row is today's week"
+        );
+        assert_eq!(
+            board.weekly.iter().map(|point| point.created).sum::<i64>(),
+            1,
+            "only the in-window created event charts"
+        );
+        assert_eq!(board.counts.created_events, 2);
+    }
+
+    /// Covers: a payload whose earliest event sits 104 weeks before today's
+    /// Monday still opens on the Monday 103 weeks before today.
+    #[test]
+    fn series_weekly_opens_103_weeks_before_today() {
+        let today = day(2026, 11, 6);
+        let end = monday(today);
+        let window_start = end
+            .checked_sub_days(Days::new(103 * 7))
+            .expect("window start");
+        let tasks = vec![
+            task("alpha", "oldest", TaskKind::Live, window_start, None, None),
+            task("alpha", "newest", TaskKind::Live, today, None, None),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        assert_eq!(board.weekly.len(), 104, "104 weeks fit the card");
+        assert_eq!(
+            board.weekly.first().expect("first week").week,
+            crate::dates::format_date(window_start),
+            "the first row is the Monday 103 weeks before today"
+        );
+        assert_eq!(
+            board.weekly.last().expect("last week").week,
+            crate::dates::format_date(end)
+        );
+    }
+
+    /// Covers: an event one week before the 104-week window contributes no
+    /// weekly row and no folded bar, while the all-time counts still hold it.
+    #[test]
+    fn series_weekly_drops_an_event_before_the_window() {
+        let today = day(2026, 11, 6);
+        let end = monday(today);
+        let window_start = end
+            .checked_sub_days(Days::new(103 * 7))
+            .expect("window start");
+        let before = window_start
+            .checked_sub_days(Days::new(7))
+            .expect("before window");
+        let tasks = vec![
+            task(
+                "alpha",
+                "cut",
+                TaskKind::Finished,
+                before,
+                Some(before),
+                Some(before),
+            ),
+            task(
+                "alpha",
+                "kept",
+                TaskKind::Live,
+                day(2026, 11, 2),
+                None,
+                None,
+            ),
+        ];
+        let board = dashboard(&tasks, today, RadarMode::Scope, "alpha");
+        assert_eq!(
+            board.weekly.first().expect("first week").week,
+            crate::dates::format_date(window_start),
+            "the first row is the window's first week"
+        );
+        assert!(
+            board
+                .weekly
+                .iter()
+                .all(|point| point.week != crate::dates::format_date(before)),
+            "the pre-window week contributes no row"
+        );
+        assert_eq!(
+            board.weekly.iter().map(|point| point.created).sum::<i64>(),
+            1,
+            "the cut created event contributes no bar"
+        );
+        assert_eq!(
+            board.weekly.iter().map(|point| point.shipped).sum::<i64>(),
+            0,
+            "the cut ship event contributes no bar"
+        );
+        assert_eq!(board.counts.created_events, 2);
+        assert_eq!(board.counts.shipped_events, 1);
     }
 
     /// The fields of one captured warning, flattened so a test can hold the
@@ -1897,10 +2050,10 @@ mod tests {
     }
 
     /// Covers: a row dated before `PLAUSIBLE_FLOOR` folds into the first
-    /// charted point, keeps every series inside the plausible span, still
-    /// reaches the summary counts, and logs one warning naming its path and
-    /// date. `SERIES_FLOOR` stays the absolute bound at or below the plausible
-    /// one.
+    /// charted point of the cumulative and backlog charts, keeps those series
+    /// inside the plausible span, still reaches their counts, is cut from the
+    /// weekly chart, and logs one warning naming its path and date.
+    /// `SERIES_FLOOR` stays the absolute bound at or below the plausible one.
     #[test]
     fn series_warns_and_bounds_a_row_before_the_plausible_floor() {
         assert!(
@@ -1961,6 +2114,10 @@ mod tests {
             board.weekly.len(),
             span / 7
         );
+        assert!(
+            board.weekly.len() <= 104,
+            "the weekly series stays inside the 104-week window"
+        );
         assert_eq!(
             board.cumulative.first().expect("first point").date,
             "2005-04-07",
@@ -1973,20 +2130,22 @@ mod tests {
         );
         assert_eq!(
             board.weekly.iter().map(|point| point.created).sum::<i64>(),
-            board.counts.created_events as i64,
-            "the weekly created bars reach the created count"
+            1,
+            "the pre-window created event contributes no weekly bar"
         );
         assert_eq!(
             board.weekly.iter().map(|point| point.shipped).sum::<i64>(),
-            board.counts.shipped_events as i64,
-            "the weekly shipped bars reach the shipped count"
+            0,
+            "the pre-window ship contributes no weekly bar"
         );
+        assert_eq!(board.counts.created_events, 2);
+        assert_eq!(board.counts.shipped_events, 1);
     }
 
     /// Covers: a deferred row whose `created` is in range and whose leave day
     /// lies before the floor logs one warning naming its repository, path, and
-    /// leave day, while its deferred bar still folds into the first charted
-    /// week and the weekly deferred bars reach the deferred count.
+    /// leave day, while its deferred bar is cut from the weekly chart so the
+    /// weekly deferred bars no longer reach the deferred count.
     #[test]
     fn series_warns_for_a_deferred_leave_day_before_the_plausible_floor() {
         let today = day(2026, 6, 15);
@@ -2018,18 +2177,23 @@ mod tests {
         let first = board.weekly.first().expect("first week");
         assert_eq!(
             first.week,
-            crate::dates::format_date(monday(PLAUSIBLE_FLOOR)),
-            "the pre-floor leave week folds into the first charted week"
+            crate::dates::format_date(
+                monday(today)
+                    .checked_sub_days(Days::new(103 * 7))
+                    .expect("window start")
+            ),
+            "the first drawn week is the window's first week"
         );
         assert_eq!(
-            first.deferred, 1,
-            "the pre-floor leave day folds into the first week's deferred bar"
+            first.deferred, 0,
+            "the pre-window leave day contributes no bar"
         );
         assert_eq!(
             board.weekly.iter().map(|point| point.deferred).sum::<i64>(),
-            board.counts.deferred as i64,
-            "the weekly deferred bars reach the deferred count"
+            0,
+            "the pre-window deferred leave contributes no weekly bar"
         );
+        assert_eq!(board.counts.deferred, 1);
     }
 
     /// Covers: a row whose only pre-floor date is `created` and a finished row

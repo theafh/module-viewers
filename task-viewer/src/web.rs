@@ -11648,6 +11648,14 @@ mod tests {
         }
     }
 
+    /// The Monday of a day's week, so a chart test can name the week a date
+    /// lands in.
+    fn monday_of(day: chrono::NaiveDate) -> chrono::NaiveDate {
+        day - chrono::Duration::days(i64::from(
+            chrono::Datelike::weekday(&day).num_days_from_monday(),
+        ))
+    }
+
     /// Seed two repositories with four rows: two live, one finished, and one
     /// deferred, spread across scopes, repositories, and days.
     async fn seeded_task_list(name: &str) -> (AppState, PathBuf, i64, i64) {
@@ -12831,7 +12839,50 @@ mod tests {
     /// both radars by spoke label.
     #[tokio::test(flavor = "current_thread")]
     async fn web_charts_csv_has_long_format_and_the_known_weekly_row() {
-        let (state, path, alpha, _beta) = seeded_task_list("charts_csv").await;
+        // The rows are seeded from today, so the weekly window holds them
+        // whatever day the suite runs on.
+        let today = crate::dates::today();
+        let created_day = today - chrono::Duration::days(21);
+        let shipped_day = today - chrono::Duration::days(14);
+        let (state, path) = app_state("charts_csv").await;
+        let folder = unique_temp_dir("charts_csv_repo");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let alpha = db::insert_repository(&state.pool, "Alpha", &folder.to_string_lossy())
+            .await
+            .expect("repository");
+        let parts = |day: chrono::NaiveDate| {
+            (
+                chrono::Datelike::year(&day),
+                chrono::Datelike::month(&day),
+                chrono::Datelike::day(&day),
+            )
+        };
+        db::replace_tasks(
+            &state.pool,
+            alpha,
+            &[
+                stored_row(
+                    "alpha_live.md",
+                    "alpha",
+                    TaskKind::Live,
+                    parts(created_day),
+                    None,
+                    None,
+                ),
+                stored_row(
+                    "alpha_done.md",
+                    "alpha",
+                    TaskKind::Finished,
+                    parts(created_day),
+                    Some(parts(shipped_day)),
+                    Some(parts(shipped_day)),
+                ),
+            ],
+            None,
+            immediate_store_hook().as_ref(),
+        )
+        .await
+        .expect("rows");
         let uri = format!("/charts.csv?project={alpha}");
         let response = send(state.clone(), get_page(&uri, "127.0.0.1:7880")).await;
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
@@ -12858,24 +12909,26 @@ mod tests {
             "{uri} carries the fixed header"
         );
 
-        // Alpha's live row was created on 2026-05-01 and its finished row on
-        // 2026-05-02, so both sit in the week starting Monday 2026-04-27; the
-        // finished row shipped on 2026-05-10, the week starting 2026-05-04.
+        // Both rows were created three weeks before today, so both sit in that
+        // week's created bar; the finished row shipped two weeks before today,
+        // the week after the created week.
+        let created_week = monday_of(created_day).format("%Y-%m-%d").to_string();
+        let shipped_week = monday_of(shipped_day).format("%Y-%m-%d").to_string();
         let has_row = |series: &str, key: &str, value: &str| {
             rows[1..]
                 .iter()
                 .any(|row| row[0] == series && row[1] == key && row[2] == value)
         };
         assert!(
-            has_row("created", "2026-04-27", "2"),
-            "the created weekly bar sums both rows: {csv}"
+            has_row("created", &created_week, "2"),
+            "the created weekly bar sums both rows in {created_week}: {csv}"
         );
         assert!(
-            has_row("shipped", "2026-05-04", "1"),
-            "the shipped weekly bar carries the ship week: {csv}"
+            has_row("shipped", &shipped_week, "1"),
+            "the shipped weekly bar carries the ship week {shipped_week}: {csv}"
         );
         assert!(
-            has_row("deferred", "2026-04-27", "0"),
+            has_row("deferred", &created_week, "0"),
             "every charted week carries a deferred bar: {csv}"
         );
 
@@ -12933,6 +12986,7 @@ mod tests {
             has_row("radar_shipped", "alpha", "1"),
             "the shipped radar uses the scope as its spoke label: {csv}"
         );
+        let _ = std::fs::remove_dir_all(folder);
         cleanup(&path);
     }
 
@@ -13669,13 +13723,13 @@ mod tests {
         assert_eq!(weekly.len(), 4, "each week carries one link per bar");
         assert_eq!(
             weekly[0].as_str(),
-            Some("/tasks?project=3&kind=finished&date=shipped&to=2026-01-11"),
-            "the first week omits its lower bound so pre-floor ships still list"
+            Some("/tasks?project=3&kind=finished&date=shipped&from=2026-01-05&to=2026-01-11"),
+            "the first week carries a real lower bound because pre-window events are cut"
         );
         assert_eq!(
             weekly[1].as_str(),
-            Some("/tasks?project=3&kind=all&date=created&to=2026-01-11"),
-            "the first week's created bar omits its lower bound"
+            Some("/tasks?project=3&kind=all&date=created&from=2026-01-05&to=2026-01-11"),
+            "the first week's created bar carries its own lower bound"
         );
         assert_eq!(
             weekly[2].as_str(),
@@ -13739,9 +13793,10 @@ mod tests {
         assert!(!href.contains("from="), "the spoke carries no window");
     }
 
-    /// Covers: the weekly link's omitted bound reaches the rows `series.rs`
-    /// folds into the last charted week, so the list holds the bar's count even
-    /// when a task is dated after today.
+    /// Covers: the weekly last link's omitted upper bound reaches the rows
+    /// `series.rs` folds into the last charted week, so the list holds the
+    /// bar's count even when a task is dated after today, while the first
+    /// week's real lower bound reaches exactly its own count.
     #[tokio::test(flavor = "current_thread")]
     async fn web_weekly_link_lists_the_folded_last_week() {
         let (state, path) = app_state("weekly_folded").await;
@@ -13829,8 +13884,8 @@ mod tests {
 
         let first = result["first"].as_str().expect("first week link");
         assert!(
-            !first.contains("from="),
-            "the first week omits its lower bound: {first}"
+            first.contains("from=2026-01-05&to=2026-01-11"),
+            "the first week carries a real lower bound: {first}"
         );
         let first_count = result["firstCount"].as_u64().expect("first bar count");
         assert_eq!(first_count, 1);
@@ -18130,6 +18185,188 @@ mod tests {
             result["mismatches"],
             serde_json::json!([]),
             "each bar's own link region reports that bar"
+        );
+    }
+
+    /// Covers: the weekly card's summary sums the drawn weeks for every view,
+    /// while `counts.shipped_events` stays the all-time total the cumulative
+    /// series ends at.
+    #[test]
+    fn browser_weekly_summary_sums_the_drawn_rows() {
+        let payload = long_line_payload();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            false,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var parsed = JSON.parse(globalThis.__config.payloadText);
+  var rows = parsed.weekly;
+  function sum(key) {
+    return rows.reduce(function (total, row) { return total + row[key]; }, 0);
+  }
+  var select = env.document.getElementById("weekly-mode");
+  var views = {};
+  ["stacked-all", "shipped", "created", "deferred"].forEach(function (view) {
+    select.value = view;
+    select.dispatchEvent({ type: "change" });
+    views[view] = env.cards["weekly"].querySelector(".summary").textContent;
+  });
+  return JSON.stringify({
+    views: views,
+    sums: { shipped: sum("shipped"), created: sum("created"), deferred: sum("deferred") },
+    shippedEvents: parsed.counts.shipped_events
+  });
+})()"#,
+        );
+        let shipped = result["sums"]["shipped"].as_i64().expect("shipped sum");
+        let created = result["sums"]["created"].as_i64().expect("created sum");
+        let deferred = result["sums"]["deferred"].as_i64().expect("deferred sum");
+        let shipped_events = result["shippedEvents"]
+            .as_i64()
+            .expect("all-time shipped count");
+        assert_eq!(shipped_events, 3000, "the fixture keeps an all-time count");
+        assert!(
+            shipped < shipped_events,
+            "the drawn weeks sum far below the all-time count: {shipped} of {shipped_events}"
+        );
+        let views = &result["views"];
+        assert_eq!(
+            views["stacked-all"].as_str(),
+            Some(
+                format!(
+                    "{shipped} shipped · {created} created · {deferred} deferred · Monday weeks"
+                )
+                .as_str()
+            ),
+            "the stacked summary sums the drawn weeks, not `counts`"
+        );
+        assert_eq!(
+            views["shipped"].as_str(),
+            Some(format!("{shipped} shipped · Monday weeks").as_str()),
+            "the shipped view sums the drawn shipped bars"
+        );
+        assert_eq!(
+            views["created"].as_str(),
+            Some(format!("{created} created · Monday weeks").as_str()),
+            "the created view sums the drawn created bars"
+        );
+        assert_eq!(
+            views["deferred"].as_str(),
+            Some(format!("{deferred} deferred · Monday weeks").as_str()),
+            "the deferred view sums the drawn deferred bars"
+        );
+    }
+
+    /// A 104 Monday-week payload, so the narrowest fixture width gives a slot
+    /// pitch under one pixel and a bar wider than its slot would paint over a
+    /// neighbour.
+    fn weekly_window_payload() -> serde_json::Value {
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("start date");
+        let mut payload = fixture_payload();
+        payload["weekly"] = serde_json::Value::Array(
+            (0..104)
+                .map(|offset| {
+                    let week = start + chrono::Duration::weeks(offset);
+                    serde_json::json!({
+                        "week": week.format("%Y-%m-%d").to_string(),
+                        "shipped": offset % 3 + 1,
+                        "created": offset % 2 + 1,
+                        "deferred": offset % 2
+                    })
+                })
+                .collect(),
+        );
+        payload
+    }
+
+    /// Covers: at a 104-week payload and the narrowest fixture width no bar is
+    /// wider than its slot, so no two bars overlap and each bar's centre sits
+    /// in its own week's slot.
+    #[test]
+    fn browser_weekly_bars_stay_inside_their_slots() {
+        let payload = weekly_window_payload();
+        let payload_text = payload.to_string();
+        let config = browser_config(
+            true,
+            false,
+            Some(&payload_text),
+            serde_json::json!("#123456"),
+        );
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var rows = JSON.parse(globalThis.__config.payloadText).weekly;
+  var svg = env.cards["weekly"].querySelector("svg");
+  var bars = svg.children.filter(function (node) {
+    return node.name === "rect" && node.attrs.fill !== "transparent";
+  });
+  var frameLeft = 40;
+  var frameRight = Number(svg.attrs.viewBox.split(" ")[2]) - 16;
+  var slot = (frameRight - frameLeft) / rows.length;
+  // The day scale runs on local-noon dates, so a daylight-saving change shifts
+  // one week's position by well under a hundredth of a pixel; the tolerance
+  // stays far below a bar that is actually wider than its slot.
+  var tolerance = 0.05;
+  var faults = [];
+  var columns = {};
+  bars.forEach(function (bar) {
+    var x = Number(bar.attrs.x);
+    var width = Number(bar.attrs.width);
+    if (width > slot + tolerance) {
+      faults.push({ kind: "wide", x: x, width: width, slot: slot });
+    }
+    var index = Math.round((x - frameLeft) / slot);
+    var slotStart = frameLeft + index * slot;
+    if (Math.abs(x - slotStart) > tolerance) {
+      faults.push({ kind: "misplaced", x: x, slotStart: slotStart });
+    }
+    if (x + width > slotStart + slot + tolerance) {
+      faults.push({ kind: "spills", x: x, width: width });
+    }
+    columns[x.toFixed(6)] = x + width;
+  });
+  var lefts = Object.keys(columns).map(Number).sort(function (a, b) { return a - b; });
+  for (var i = 1; i < lefts.length; i++) {
+    var previousRight = columns[lefts[i - 1].toFixed(6)];
+    if (lefts[i] < previousRight - tolerance) {
+      faults.push({ kind: "overlap", left: lefts[i - 1], right: previousRight, next: lefts[i] });
+    }
+  }
+  return JSON.stringify({
+    bars: bars.length,
+    rows: rows.length,
+    slot: slot,
+    faults: faults
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["rows"].as_u64(),
+            Some(104),
+            "the fixture draws 104 weeks"
+        );
+        assert_eq!(
+            result["bars"].as_u64(),
+            Some(260),
+            "each week draws its two or three non-zero bars"
+        );
+        assert!(
+            result["slot"].as_f64().expect("slot") < 1.0,
+            "the narrow fixture gives a sub-pixel slot"
+        );
+        assert!(
+            result["faults"]
+                .as_array()
+                .is_some_and(|faults| faults.is_empty()),
+            "no bar is wider than its slot or paints over a neighbour: {}",
+            result["faults"]
         );
     }
 

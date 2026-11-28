@@ -367,17 +367,13 @@
     var svg = root.querySelector('svg[role="group"]');
     var rows = payload.weekly || [];
     var keys = WEEKLY_VIEWS[weeklyView] || WEEKLY_VIEWS["stacked-all"];
-    var counts = payload.counts || {};
-    summary(
-      "weekly",
-      keys.map(function (key) {
-        var total = key === "shipped" ? counts.shipped_events
-          : key === "created" ? counts.created_events
-          : counts.deferred;
-        return fmt(total) + " " + WEEKLY_SERIES[key].noun;
-      }).join(" · ") + " · Monday weeks"
-    );
+    function weeklySummary(totals) {
+      return keys.map(function (key) {
+        return fmt(totals[key]) + " " + WEEKLY_SERIES[key].noun;
+      }).join(" · ") + " · Monday weeks";
+    }
     if (!rows.length) {
+      summary("weekly", weeklySummary({ shipped: 0, created: 0, deferred: 0 }));
       message("weekly", svg, "No weeks yet");
       return;
     }
@@ -394,6 +390,16 @@
     };
     var frame = frameOf(svg, { top: 16, right: 16, bottom: 32, left: 40 });
     var dates = rows.map(function (row) { return parseDay(row.week); });
+    // The summary sums the drawn weeks, so it always equals the bars. The
+    // payload's `counts` stay all-time for the cumulative series and cover
+    // weeks the 104-week card cuts.
+    var totals = { shipped: 0, created: 0, deferred: 0 };
+    rows.forEach(function (row) {
+      totals.shipped += row.shipped;
+      totals.created += row.created;
+      totals.deferred += row.deferred;
+    });
+    summary("weekly", weeklySummary(totals));
     // The bars stack from the baseline, so the axis runs from zero to the
     // tallest week's total instead of through zero in both directions.
     var maxTotal = 1;
@@ -419,7 +425,11 @@
       stroke: zeroColor, "stroke-width": "1.5"
     }), { stroke: "--chart-zero" });
     var slot = (frame.right - frame.left) / rows.length;
-    var band = Math.max(3, Math.min(16, slot - 4));
+    // A bar is never wider than its slot, so no bar paints over a later week
+    // even at the 104-week window's narrowest pitch. The 16px cap keeps a wide
+    // bar slim, and the one-pixel gap separates neighbours whenever the slot
+    // leaves room for it.
+    var band = Math.min(slot, 16, Math.max(1, slot - 1));
     // The link region never reaches past its own column: a fixed 18px minimum
     // would overlap the next column once the pitch drops below it, and the
     // later anchor would report the neighbour's bar.
@@ -428,15 +438,17 @@
     var hits = [];
     rows.forEach(function (row, index) {
       var dx = x(dates[index].getTime());
-      // A slot narrower than the band would push the outermost bars past the
-      // plot, so each bar's left edge clamps inside the frame instead.
-      var barLeft = Math.min(Math.max(dx - band / 2, frame.left), frame.right - band);
+      // A bar no wider than its slot sits centred on its Monday and stays
+      // inside the plot, because the domain reaches half a slot past the first
+      // and last week.
+      var barLeft = dx - band / 2;
       var weekEnd = isoDay(new Date(dates[index].getTime() + 6 * 86400000));
-      // `weekly_points` folds every event before the first charted week into
-      // that row and every after-today event into the last row, so those two
-      // rows hold no lower or upper bound of their own. Leaving the bound out
-      // lets the list reach the folded events instead of clipping them.
-      var from = index === 0 ? null : row.week;
+      // `weekly_points` cuts every event before the first drawn week and folds
+      // every after-today event into the last row, so the first row carries a
+      // real lower bound while the last row holds no upper bound of its own.
+      // Leaving the last bound out lets the list reach the folded after-today
+      // events instead of clipping them.
+      var from = row.week;
       var to = index === rows.length - 1 ? null : weekEnd;
       var stacked = 0;
       keys.forEach(function (key) {
