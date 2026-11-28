@@ -591,8 +591,9 @@ mod tests {
                 .contains("the database could not be opened"),
             "the original error is returned: {error}"
         );
+        assert_eq!(STARTUP_SHUTDOWN_BOUND, Duration::from_secs(1));
         assert!(
-            elapsed < STARTUP_SHUTDOWN_BOUND + Duration::from_secs(1),
+            elapsed < Duration::from_secs(2),
             "the error path returned {elapsed:?}, past the fixed bound"
         );
     }
