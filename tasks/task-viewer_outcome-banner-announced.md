@@ -2,8 +2,10 @@
 description: "Give the one-shot notice and error banners a live-region role so Update, Rescan, Add, Relocate, and Remove outcomes are announced."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-26T16:18:16Z
-status: checked
+status: implemented
+implemented-by: "Andreas Hoffmann"
+design-extended: false
+updated: 2026-11-28T01:57:32Z
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -36,7 +38,7 @@ Every refresh path is a full form POST that redirects back, so the page reloads 
 1. Add `role="status"` to the notice banner on the dashboard and the repositories page, and `role="alert"` to the error banner on those two pages and on the Remove confirmation page in `repository_confirm.html` (the duplicate-clone warning banner in `repositories.html` is an error-shaped message and takes `role="alert"` too). Every outcome banner across the templates carries a live-region role.
 2. Leave each banner paragraph server-rendered with its text inside it, and keep it in the DOM; do not replace it with a script-created node. The role sits on the element that already carries the outcome.
 3. Do not add `tabindex` or call `focus()`; the announcement should not steal focus from the page.
-4. Update the four existing exact-substring banner assertions that end right after the class attribute (`Nothing to update.`, `The scan stopped before it finished.`, `Repository added.`, and `Charts updated.` in `task-viewer/src/web.rs`) to the new markup, and add template tests asserting the roles on every page for a notice and an error.
+4. Update every assertion in `task-viewer/src/web.rs` that pins a banner's exact `<p class="…">text</p>` markup — the assertions carrying `Nothing to update.`, `The scan stopped before it finished.`, `Repository added.`, and `Charts updated.` are examples of that shape — to the new markup, and add template tests asserting the roles on every page for a notice and an error.
 5. Record the rule in `FEATURES.md`'s navigation section.
 
 **Decision:** The server-rendered paragraphs carry the roles, and no script re-inserts the text. Whether a browser announces a role already populated at parse time is outside this repository's observable surface, so the task delivers and tests the role, not an assistive-technology announcement.
@@ -49,5 +51,5 @@ Every refresh path is a full form POST that redirects back, so the page reloads 
 - Each of those two pages renders an error inside a `role="alert"` banner carrying that text, and the Remove confirmation page renders its not-found error inside a `role="alert"` banner carrying that text.
 - The duplicate-clone confirmation banner carries `role="alert"`.
 - No banner takes focus on load.
-- The four existing banner assertions in `task-viewer/src/web.rs` match the new markup, and the new template tests and `make test` pass.
+- Every banner assertion in `task-viewer/src/web.rs` that pins a banner's exact `<p class="…">text</p>` markup matches the new markup, and the new template tests and `make test` pass.
 - `FEATURES.md`'s Navigation section carries one sentence stating that every one-shot outcome banner carries a live-region role.

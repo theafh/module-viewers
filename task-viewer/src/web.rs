@@ -6482,6 +6482,10 @@ mod tests {
             "the banner names the existing repository: {page}"
         );
         assert!(
+            page.contains("<p class=\"banner banner-error\" role=\"alert\">This folder is a second clone of <strong>first</strong>.</p>"),
+            "the duplicate-clone banner carries the alert role: {page}"
+        );
+        assert!(
             page.contains(&format!("/repositories/confirm/{token}")),
             "the page carries the confirm form"
         );
@@ -8872,7 +8876,7 @@ mod tests {
         let body =
             body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
         assert!(
-            body.contains("<p class=\"banner\">Nothing to update.</p>"),
+            body.contains("<p class=\"banner\" role=\"status\">Nothing to update.</p>"),
             "zero repositories render the distinct notice"
         );
         assert!(
@@ -8929,7 +8933,7 @@ mod tests {
             body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
         assert!(
             first.contains(
-                "<p class=\"banner banner-error\">The scan stopped before it finished.</p>"
+                "<p class=\"banner banner-error\" role=\"alert\">The scan stopped before it finished.</p>"
             ),
             "the first read shows the stopped banner"
         );
@@ -9027,7 +9031,7 @@ mod tests {
         )
         .await;
         assert!(
-            known.contains("<p class=\"banner\">Repository added.</p>"),
+            known.contains("<p class=\"banner\" role=\"status\">Repository added.</p>"),
             "a known code still renders its fixed text"
         );
         cleanup(&path);
@@ -9344,7 +9348,7 @@ mod tests {
         let first =
             body_text(send(state.clone(), get_page(&location, "127.0.0.1:7880")).await).await;
         assert!(
-            first.contains("<p class=\"banner\">Charts updated.</p>"),
+            first.contains("<p class=\"banner\" role=\"status\">Charts updated.</p>"),
             "the first read shows the notice"
         );
 
@@ -9895,6 +9899,50 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(folder);
+        cleanup(&path);
+    }
+
+    /// Covers: every one-shot outcome banner carries a live-region role, a
+    /// notice as `role="status"` and an error as `role="alert"`, on the
+    /// dashboard, the Repositories page, and the Remove confirmation page, and
+    /// no banner takes a tab stop or focus on load.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_outcome_banners_carry_live_region_roles() {
+        let (state, path) = app_state("banner_roles").await;
+        let cases = [
+            (
+                "/?notice=charts-updated",
+                "<p class=\"banner\" role=\"status\">Charts updated.</p>",
+            ),
+            (
+                "/?error=repository-list-unreadable",
+                "<p class=\"banner banner-error\" role=\"alert\">The repository list could not be read.</p>",
+            ),
+            (
+                "/repositories?notice=repository-added",
+                "<p class=\"banner\" role=\"status\">Repository added.</p>",
+            ),
+            (
+                "/repositories?error=repository-exists",
+                "<p class=\"banner banner-error\" role=\"alert\">That repository is already on the dashboard.</p>",
+            ),
+            (
+                "/repositories/9999/delete",
+                "<p class=\"banner banner-error\" role=\"alert\">The repository was not found.</p>",
+            ),
+        ];
+        for (route, expected) in cases {
+            let body =
+                body_text(send(state.clone(), get_page(route, "127.0.0.1:7880")).await).await;
+            let start = body
+                .find(expected)
+                .unwrap_or_else(|| panic!("{route} renders {expected}: {body}"));
+            let banner = &body[start..start + expected.len()];
+            assert!(
+                !banner.contains("tabindex") && !banner.contains("autofocus"),
+                "{route} banner takes no focus on load: {banner}"
+            );
+        }
         cleanup(&path);
     }
 

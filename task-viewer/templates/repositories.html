@@ -7,10 +7,10 @@
 {% endblock %}
 {% block content %}
 {% if notice %}
-<p class="banner">{{ notice }}</p>
+<p class="banner" role="status">{{ notice }}</p>
 {% endif %}
 {% if error %}
-<p class="banner banner-error">{{ error }}</p>
+<p class="banner banner-error" role="alert">{{ error }}</p>
 {% endif %}
 <header class="page-header">
     <div class="page-header-row">
@@ -20,7 +20,7 @@
 </header>
 {% if has_projects %}
 {% if confirm %}
-<p class="banner banner-error">This folder is a second clone of <strong>{{ confirm.existing }}</strong>.</p>
+<p class="banner banner-error" role="alert">This folder is a second clone of <strong>{{ confirm.existing }}</strong>.</p>
 <section class="card">
     <h2>Add a second clone</h2>
     <p>Adding it keeps both repositories on the dashboard, each with its own row counts.</p>

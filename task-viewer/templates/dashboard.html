@@ -26,10 +26,10 @@
 {% endblock %}
 {% block content %}
 {% if notice %}
-<p class="banner">{{ notice }}</p>
+<p class="banner" role="status">{{ notice }}</p>
 {% endif %}
 {% if error %}
-<p class="banner banner-error">{{ error }}</p>
+<p class="banner banner-error" role="alert">{{ error }}</p>
 {% endif %}
 <header class="page-header">
     <div class="page-header-row">
