@@ -19,12 +19,14 @@ use std::time::Instant;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() -> anyhow::Result<()> {
+    let (filter, warning) = log_filter(std::env::var_os("RUST_LOG").as_deref());
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "task_viewer=info".into()),
-        ))
+        .with(filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
+    if let Some(warning) = warning {
+        warn_log_filter_fallback(&warning);
+    }
 
     // Keep a panic trail in the process log (nohup captures stderr).
     let previous = std::panic::take_hook();
@@ -43,6 +45,54 @@ fn main() -> anyhow::Result<()> {
     let deadline = runtime.block_on(serve_until_stopped())?;
     runtime.shutdown_timeout(web::remaining(deadline));
     Ok(())
+}
+
+/// The documented log filter, used when `RUST_LOG` is unset, blank, or cannot
+/// be used as written.
+const DEFAULT_LOG_FILTER: &str = "task_viewer=info";
+
+/// The log filter named by the configured `RUST_LOG` value, together with at
+/// most one warning for the caller to log once the subscriber is installed.
+///
+/// An unset or whitespace-only value takes [`DEFAULT_LOG_FILTER`] silently. A
+/// value that is not valid UTF-8, or one the filter parser rejects, also takes
+/// the default and returns a warning naming `RUST_LOG`, so the fallback is
+/// never silent. Every other value is kept as written, `off` and a bare word
+/// the parser reads as a target directive included.
+fn log_filter(raw: Option<&OsStr>) -> (tracing_subscriber::EnvFilter, Option<String>) {
+    let default = || tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER);
+    let Some(raw) = raw else {
+        return (default(), None);
+    };
+    let Some(raw) = raw.to_str() else {
+        return (
+            default(),
+            Some(format!(
+                "RUST_LOG is not valid UTF-8; using the default filter {DEFAULT_LOG_FILTER}"
+            )),
+        );
+    };
+    if raw.trim().is_empty() {
+        return (default(), None);
+    }
+    match tracing_subscriber::EnvFilter::try_new(raw) {
+        Ok(filter) => (filter, None),
+        Err(_) => (
+            default(),
+            Some(format!(
+                "RUST_LOG is {raw:?}, which the log filter parser rejects; using the default filter {DEFAULT_LOG_FILTER}"
+            )),
+        ),
+    }
+}
+
+/// Log one `RUST_LOG` fallback warning.
+///
+/// Kept as a named function so a test can run the same emission `main` performs
+/// after the subscriber is installed: a warning logged before `.init()` reaches
+/// no subscriber.
+fn warn_log_filter_fallback(warning: &str) {
+    tracing::warn!("{}", warning);
 }
 
 /// Open the database, serve the dashboard, and return the deadline the drain
@@ -174,7 +224,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_and_log, configured_port, parse_port, shutdown_signal};
+    use super::{
+        DEFAULT_LOG_FILTER, bind_and_log, configured_port, log_filter, parse_port, shutdown_signal,
+        warn_log_filter_fallback,
+    };
     use std::ffi::OsStr;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -219,6 +272,100 @@ mod tests {
             if let Ok(mut lines) = self.0.lock() {
                 lines.push(fields.0);
             }
+        }
+    }
+
+    /// Covers: an unset or blank `RUST_LOG` uses the documented default filter
+    /// silently, so a blank value never narrows logging to `ERROR`.
+    #[test]
+    fn log_filter_defaults_when_unset_or_blank() {
+        for raw in [None, Some(OsStr::new("")), Some(OsStr::new("  \t "))] {
+            let (filter, warning) = log_filter(raw);
+            assert_eq!(filter.to_string(), DEFAULT_LOG_FILTER, "raw={raw:?}");
+            assert!(warning.is_none(), "raw={raw:?}");
+        }
+    }
+
+    /// Covers: a `RUST_LOG` the parser rejects falls back to the documented
+    /// default and returns one warning naming the rejected value.
+    #[test]
+    fn log_filter_warns_about_a_rejected_value() {
+        let (filter, warning) = log_filter(Some(OsStr::new("task_viewer=nope")));
+        assert_eq!(filter.to_string(), DEFAULT_LOG_FILTER);
+        let warning = warning.expect("a rejected value warns");
+        assert!(warning.contains("RUST_LOG"), "{warning}");
+        assert!(warning.contains("task_viewer=nope"), "{warning}");
+    }
+
+    /// Covers: a `RUST_LOG` that is set but not valid UTF-8 falls back to the
+    /// documented default and returns one warning naming `RUST_LOG`.
+    #[cfg(unix)]
+    #[test]
+    fn log_filter_warns_about_a_non_unicode_value() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = OsStr::from_bytes(b"task_viewer=\xff");
+        let (filter, warning) = log_filter(Some(raw));
+        assert_eq!(filter.to_string(), DEFAULT_LOG_FILTER);
+        let warning = warning.expect("a non-Unicode value warns");
+        assert!(warning.contains("RUST_LOG"), "{warning}");
+        assert!(warning.contains("UTF-8"), "{warning}");
+    }
+
+    /// Covers: a valid `off` value is honored as written, so it disables the
+    /// info level instead of falling back to the documented default.
+    #[test]
+    fn log_filter_honors_off() {
+        let (filter, warning) = log_filter(Some(OsStr::new("off")));
+        assert!(warning.is_none(), "a valid value draws no warning");
+        assert_eq!(filter.to_string(), "off");
+        assert_eq!(
+            filter.max_level_hint(),
+            Some(tracing::level_filters::LevelFilter::OFF)
+        );
+    }
+
+    /// Covers: a valid `task_viewer=debug` value is honored as written.
+    #[test]
+    fn log_filter_honors_a_valid_directive() {
+        let (filter, warning) = log_filter(Some(OsStr::new("task_viewer=debug")));
+        assert!(warning.is_none(), "a valid value draws no warning");
+        assert_eq!(filter.to_string(), "task_viewer=debug");
+    }
+
+    /// Covers: the warning `main` logs after `.init()` reaches the log, so a
+    /// rejected `RUST_LOG` is reported rather than silently narrowed.
+    #[test]
+    fn log_filter_warning_reaches_the_log() {
+        let (_, warning) = log_filter(Some(OsStr::new("task_viewer=nope")));
+        let warning = warning.expect("a rejected value warns");
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        warn_log_filter_fallback(&warning);
+        drop(guard);
+
+        let lines = captured.take();
+        assert_eq!(lines.len(), 1, "one warning emits one line: {lines:?}");
+        assert!(lines[0].contains("task_viewer=nope"), "{lines:?}");
+
+        // The non-UTF-8 fallback goes through the same emission, so its
+        // warning reaches the log the same way.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let (_, warning) = log_filter(Some(OsStr::from_bytes(b"task_viewer=\xff")));
+            let warning = warning.expect("a non-Unicode value warns");
+            let captured = CapturedLogs::default();
+            let subscriber = tracing_subscriber::registry().with(captured.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
+            warn_log_filter_fallback(&warning);
+            drop(guard);
+
+            let lines = captured.take();
+            assert_eq!(lines.len(), 1, "one warning emits one line: {lines:?}");
+            assert!(lines[0].contains("RUST_LOG"), "{lines:?}");
         }
     }
 
