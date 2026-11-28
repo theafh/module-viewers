@@ -2,8 +2,8 @@
 description: "Follow directory symlinks inside tasks/ when their target stays in the repository, and warn and ignore any target outside it."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-28T00:43:10Z
-status: implemented
+updated: 2026-11-28T00:50:15Z
+status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: true
 reported-by: "Andreas Hoffmann"
@@ -29,7 +29,7 @@ A directory symlink under `tasks/` is followed when its target stays inside the 
 6. Add tests under `#[cfg(unix)]`: an inner link to a directory inside the repository charts its tasks; an inner link outside warns, charts nothing, and leaves the rest of the scan intact; a broken inner link and a link cycle each warn and the scan completes, and the broken task-shaped link adds one `SkipReason::EscapingSymlink` entry to the skip tally.
 7. Record the rule in `ARCHITECTURE.md`'s extraction rules, `FEATURES.md`'s Update paragraph, `TESTING.md`'s `Scan:` bullet (its `tasks/`-symlink sentence), and the `files_on_disk` doc comment in `task-viewer/src/harvest.rs`, restating it so a walk error fails the scan except for a link loop, a broken link, or a directory symlink whose target leaves the folder.
 
-**Out of scope:** following a link whose target is another repository on the machine, changing the root-link failure, and the file symlink whose target resolves and the non-regular-entry cases, which the sibling [task-viewer_harvest-inner-symlink-and-special-files.md](archive/task-viewer_harvest-inner-symlink-and-special-files.md) owns. A broken link of either kind is this task's, not the sibling's: step 3's broken-link rule keys on `fs::symlink_metadata` and `fs::metadata` and so covers a dangling file symlink exactly as it covers a dangling directory symlink.
+**Out of scope:** following a link whose target is another repository on the machine, changing the root-link failure, and the file symlink whose target resolves and the non-regular-entry cases, which the sibling [task-viewer_harvest-inner-symlink-and-special-files.md](task-viewer_harvest-inner-symlink-and-special-files.md) owns. A broken link of either kind is this task's, not the sibling's: step 3's broken-link rule keys on `fs::symlink_metadata` and `fs::metadata` and so covers a dangling file symlink exactly as it covers a dangling directory symlink.
 
 ## Acceptance
 
