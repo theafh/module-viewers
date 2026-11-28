@@ -2,8 +2,8 @@
 description: "Refuse a relative state directory composed from XDG_STATE_HOME or HOME before the launcher creates it, instead of creating it in one directory and locking in another."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-28T08:48:26Z
-status: implemented
+updated: 2026-11-28T08:54:18Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: Andreas Hoffmann
 design-extended: false
@@ -27,7 +27,7 @@ The launcher derives its state directory as an absolute path or exits non-zero n
 
 The result is exit 1 with `Cannot take or reclaim the task-viewer lock in: relstate/task-viewer` and `Check that the state directory is writable, then try again.`, plus a stray `relstate/` in the caller's directory. The named directory is writable; the message sends the user to the wrong cause. The XDG spec requires a state path to be absolute and says an implementation should treat a relative one as invalid and ignore it; this task instead refuses it, so the user learns the cause from a failed command rather than a silent fallback.
 
-The launcher paragraph in `FEATURES.md`, the launcher sentence in `README.md`, and the `SECURITY.md` Data paragraph are also rewritten by [task-viewer_launcher-moved-checkout-ownership.md](archive/task-viewer_launcher-moved-checkout-ownership.md), and the `FEATURES.md` and `README.md` launcher paragraphs plus the `TESTING.md` bullet that opens `- Launcher process safety:` by [task-viewer_launcher-rebuild-progress.md](task-viewer_launcher-rebuild-progress.md); whichever lands later merges its wording into theirs.
+The launcher paragraph in `FEATURES.md`, the launcher sentence in `README.md`, and the `SECURITY.md` Data paragraph are also rewritten by [task-viewer_launcher-moved-checkout-ownership.md](task-viewer_launcher-moved-checkout-ownership.md), and the `FEATURES.md` and `README.md` launcher paragraphs plus the `TESTING.md` bullet that opens `- Launcher process safety:` by [task-viewer_launcher-rebuild-progress.md](../task-viewer_launcher-rebuild-progress.md); whichever lands later merges its wording into theirs.
 
 ## Approach
 
