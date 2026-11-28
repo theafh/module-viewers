@@ -2,8 +2,8 @@
 description: "Make the task list's scope select show the scope actually filtered on when that scope is no longer in the project's stored rows."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-28T00:00:58Z
-status: implemented
+updated: 2026-11-28T00:05:22Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -30,7 +30,7 @@ let mut scopes = tasks
 
 The page then reads `0 tasks` with "All scopes" showing, and clicking Show drops the scope instead of applying what the control displays. The existing test `web_tasks_search_and_scope_controls_narrow_the_list` sends `project=alpha&scope=beta` but asserts only the row set, not the control.
 
-Every live task whose body rewrites the `GET /tasks` paragraph in `FEATURES.md` or the task-list bullet in `TESTING.md` shares those passages with this one; find that set at implementation time by that selector and merge against every member it returns. Two illustrate the overlap: [tasks/archive/task-viewer_tasks-visible-active-filters.md](archive/task-viewer_tasks-visible-active-filters.md) and [tasks/task-viewer_tasks-invalid-date-bound-banner.md](task-viewer_tasks-invalid-date-bound-banner.md) both edit the `GET /tasks` paragraph in `FEATURES.md` and the task-list bullet in `TESTING.md`, and the second also edits `render_tasks`, `TasksPage`, and `filtered_pairs`, which feeds `export_query`, so this task's `render_tasks` change and its two doc passages land alongside theirs.
+Every live task whose body rewrites the `GET /tasks` paragraph in `FEATURES.md` or the task-list bullet in `TESTING.md` shares those passages with this one; find that set at implementation time by that selector and merge against every member it returns. Two illustrate the overlap: [tasks/archive/task-viewer_tasks-visible-active-filters.md](task-viewer_tasks-visible-active-filters.md) and [tasks/task-viewer_tasks-invalid-date-bound-banner.md](../task-viewer_tasks-invalid-date-bound-banner.md) both edit the `GET /tasks` paragraph in `FEATURES.md` and the task-list bullet in `TESTING.md`, and the second also edits `render_tasks`, `TasksPage`, and `filtered_pairs`, which feeds `export_query`, so this task's `render_tasks` change and its two doc passages land alongside theirs.
 
 ## Approach
 
