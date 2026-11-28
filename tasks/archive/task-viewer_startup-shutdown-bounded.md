@@ -2,8 +2,8 @@
 description: "Call the bounded runtime shutdown on the start-up error path too, so a future blocking start-up task cannot hold the process past the launcher's stop window."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-28T13:30:56Z
-status: implemented
+updated: 2026-11-28T13:37:29Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: true
