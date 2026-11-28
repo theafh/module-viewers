@@ -253,7 +253,7 @@ case_relative_xdg_state_home_fails_fast() {
 # Run the launcher once from a throwaway cwd with a relative HOME, under the
 # named platform stub, and assert the refusal: non-zero, an absolute-path
 # message that names HOME and not XDG_STATE_HOME, and no `relhome` directory in
-# the caller's cwd. `$3` is how XDG_STATE_HOME is set: `unset`, `empty`, or a
+# the caller's cwd. `$4` is how XDG_STATE_HOME is set: `unset`, `empty`, or a
 # literal value.
 run_relative_home_case() {
     local label="$1" tag="$2" platform="$3" xdg_mode="$4" root cwd
