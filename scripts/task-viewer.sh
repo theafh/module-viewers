@@ -16,9 +16,37 @@ unset TASK_VIEWER_PORT
 export TASK_VIEWER_PORT="$PORT"
 
 # Runtime state lives outside the checkout: the log records repository paths.
+# The variable named here is the one the chosen branch expanded, so a relative
+# path is reported against the value that actually made it relative: the Darwin
+# branch never reads XDG_STATE_HOME, and an empty XDG_STATE_HOME falls back to
+# HOME.
 case "$(uname -s)" in
-    Darwin) STATE_DIR="$HOME/Library/Logs/task-viewer" ;;
-    *)      STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/task-viewer" ;;
+    Darwin)
+        STATE_DIR="$HOME/Library/Logs/task-viewer"
+        STATE_SOURCE=HOME
+        ;;
+    *)
+        if [ -n "${XDG_STATE_HOME:-}" ]; then
+            STATE_DIR="$XDG_STATE_HOME/task-viewer"
+            STATE_SOURCE=XDG_STATE_HOME
+        else
+            STATE_DIR="$HOME/.local/state/task-viewer"
+            STATE_SOURCE=HOME
+        fi
+        ;;
+esac
+# The state directory is resolved before the launcher changes into the checkout,
+# and every path built from it is used after that. A relative value would create
+# the directory in the caller's working directory and then look for the lock
+# somewhere else, so refuse it before anything is created. The state path must
+# be absolute; this names the cause instead of falling back silently.
+case "$STATE_DIR" in
+    /*) ;;
+    *)
+        echo "The task-viewer state directory must be an absolute path, but $STATE_SOURCE makes it relative: $STATE_DIR" >&2
+        echo "Set $STATE_SOURCE to an absolute path, then try again." >&2
+        exit 1
+        ;;
 esac
 PID_FILE="$STATE_DIR/task-viewer.pid"
 LOG_FILE="$STATE_DIR/task-viewer.log"

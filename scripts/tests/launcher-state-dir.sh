@@ -214,10 +214,110 @@ case_writable_state_dir_works() {
     fi
 }
 
+# Stage a `uname` stub that prints the platform a case needs, so a case can run
+# either launcher branch wherever the suite runs. The launcher reads `uname -s`
+# through PATH, and the case puts this directory first.
+stage_uname() {
+    local root="$1" platform="$2"
+    printf '#!/bin/bash\nprintf "%%s\\n" "%s"\n' "$platform" >"$root/bin/uname"
+    chmod +x "$root/bin/uname"
+}
+
+# A relative XDG_STATE_HOME on the non-Darwin branch is refused before anything
+# is created: the message names the variable, says the path must be absolute,
+# and the caller's working directory gains no `relstate` directory. A Linux
+# `uname` stub runs that branch on every host.
+case_relative_xdg_state_home_fails_fast() {
+    local root="$TMP/relative-xdg" cwd
+    make_root "$root"
+    stage_uname "$root" Linux
+    cwd="$root/cwd"
+    mkdir -p "$cwd"
+    run_launcher "$FAST_DEADLINE" \
+        env HOME="$root/home" XDG_STATE_HOME=relstate \
+        PATH="$root/bin:/usr/bin:/bin" \
+        bash -c 'cd "$1" && shift && exec bash "$@"' _ "$cwd" "$root/scripts/task-viewer.sh" status
+    if [ "$timed_out" = 1 ]; then
+        fail "a relative XDG_STATE_HOME fails fast and names it (still running after ${FAST_DEADLINE}s)"
+    elif [ "$status" -ne 0 ] &&
+        printf '%s\n' "$out" | grep -qF 'XDG_STATE_HOME' &&
+        printf '%s\n' "$out" | grep -qi 'must be an absolute path' &&
+        [ ! -e "$cwd/relstate" ]; then
+        pass "a relative XDG_STATE_HOME fails fast and names it"
+    else
+        fail "a relative XDG_STATE_HOME fails fast and names it (status $status, ${elapsed}s)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# Run the launcher once from a throwaway cwd with a relative HOME, under the
+# named platform stub, and assert the refusal: non-zero, an absolute-path
+# message that names HOME and not XDG_STATE_HOME, and no `relhome` directory in
+# the caller's cwd. `$3` is how XDG_STATE_HOME is set: `unset`, `empty`, or a
+# literal value.
+run_relative_home_case() {
+    local label="$1" tag="$2" platform="$3" xdg_mode="$4" root cwd
+    root="$TMP/relative-home-$tag"
+    make_root "$root"
+    stage_uname "$root" "$platform"
+    cwd="$root/cwd"
+    mkdir -p "$cwd"
+    case "$xdg_mode" in
+        unset)
+            run_launcher "$FAST_DEADLINE" \
+                env -u XDG_STATE_HOME HOME=relhome \
+                PATH="$root/bin:/usr/bin:/bin" \
+                bash -c 'cd "$1" && shift && exec bash "$@"' _ "$cwd" "$root/scripts/task-viewer.sh" status
+            ;;
+        empty)
+            run_launcher "$FAST_DEADLINE" \
+                env HOME=relhome XDG_STATE_HOME= \
+                PATH="$root/bin:/usr/bin:/bin" \
+                bash -c 'cd "$1" && shift && exec bash "$@"' _ "$cwd" "$root/scripts/task-viewer.sh" status
+            ;;
+        *)
+            run_launcher "$FAST_DEADLINE" \
+                env HOME=relhome XDG_STATE_HOME="$xdg_mode" \
+                PATH="$root/bin:/usr/bin:/bin" \
+                bash -c 'cd "$1" && shift && exec bash "$@"' _ "$cwd" "$root/scripts/task-viewer.sh" status
+            ;;
+    esac
+    if [ "$timed_out" = 1 ]; then
+        fail "$label (still running after ${FAST_DEADLINE}s)"
+    elif [ "$status" -ne 0 ] &&
+        printf '%s\n' "$out" | grep -qF 'HOME' &&
+        ! printf '%s\n' "$out" | grep -qF 'XDG_STATE_HOME' &&
+        printf '%s\n' "$out" | grep -qi 'must be an absolute path' &&
+        [ ! -e "$cwd/relhome" ]; then
+        pass "$label"
+    else
+        fail "$label (status $status, ${elapsed}s)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
+# A relative HOME is refused on both branches, wherever the suite runs. The
+# Darwin branch never reads XDG_STATE_HOME, so it names HOME even when that
+# variable is set; the non-Darwin branch names HOME when XDG_STATE_HOME is
+# unset or empty, because its expansion falls back to HOME.
+case_relative_home_fails_fast() {
+    run_relative_home_case \
+        "a relative HOME fails fast on the Linux branch with XDG_STATE_HOME unset" \
+        linux-unset Linux unset
+    run_relative_home_case \
+        "a relative HOME fails fast on the Linux branch with XDG_STATE_HOME empty" \
+        linux-empty Linux empty
+    run_relative_home_case \
+        "a relative HOME fails fast on the Darwin branch even when XDG_STATE_HOME is set" \
+        darwin-xdg-set Darwin relstate
+}
+
 case_unwritable_home_fails_fast
 case_state_dir_is_a_file_fails_fast
 case_unwritable_lock_stops_the_loop
 case_writable_state_dir_works
+case_relative_xdg_state_home_fails_fast
+case_relative_home_fails_fast
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "$FAILURES launcher state-directory test(s) failed"
