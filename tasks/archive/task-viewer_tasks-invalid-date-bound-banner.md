@@ -2,8 +2,8 @@
 description: "Show a banner naming an unparseable from or to bound on the task list instead of silently widening the window."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-28T07:45:52Z
-status: implemented
+updated: 2026-11-28T07:50:45Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -17,7 +17,7 @@ design-extended: false
 
 ## Context
 
-`TaskFilter::from_query` in `task-viewer/src/web.rs` trims both bounds and turns them through `crate::dates::parse_iso_date`, so an unparseable value becomes `None` and the window silently widens. `matches` then applies only the parseable bound, and `filtered_pairs` copies the trimmed raw strings into every sort-header link and into the export link that `export_query` builds from the same pairs. The page's [active-filter summary](archive/task-viewer_tasks-visible-active-filters.md) now renders the applied window, so a bound the filter used is shown above the list; an ignored bound still appears only in this task's banner. A request such as `from=2026-05-32&to=2026-05-01` returns rows instead of an error or an empty window, and the CSV repeats the bad query.
+`TaskFilter::from_query` in `task-viewer/src/web.rs` trims both bounds and turns them through `crate::dates::parse_iso_date`, so an unparseable value becomes `None` and the window silently widens. `matches` then applies only the parseable bound, and `filtered_pairs` copies the trimmed raw strings into every sort-header link and into the export link that `export_query` builds from the same pairs. The page's [active-filter summary](task-viewer_tasks-visible-active-filters.md) now renders the applied window, so a bound the filter used is shown above the list; an ignored bound still appears only in this task's banner. A request such as `from=2026-05-32&to=2026-05-01` returns rows instead of an error or an empty window, and the CSV repeats the bad query.
 
 ## Approach
 

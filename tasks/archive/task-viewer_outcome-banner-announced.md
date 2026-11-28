@@ -43,7 +43,7 @@ Every refresh path is a full form POST that redirects back, so the page reloads 
 
 **Decision:** The server-rendered paragraphs carry the roles, and no script re-inserts the text. Whether a browser announces a role already populated at parse time is outside this repository's observable surface, so the task delivers and tests the role, not an assistive-technology announcement.
 
-**Out of scope:** moving the banners, changing their styling, or making the outcome survive a reload. The task list page's banner, added by [task-viewer_tasks-invalid-date-bound-banner.md](../task-viewer_tasks-invalid-date-bound-banner.md), carries its role under that task.
+**Out of scope:** moving the banners, changing their styling, or making the outcome survive a reload. The task list page's banner, added by [task-viewer_tasks-invalid-date-bound-banner.md](task-viewer_tasks-invalid-date-bound-banner.md), carries its role under that task.
 
 ## Acceptance
 
