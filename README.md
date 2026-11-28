@@ -35,11 +35,14 @@ Open <http://127.0.0.1:7880>.
 
 ```bash
 make install
+make uninstall
 ```
 
 - **Linux:** application-menu entry you can pin to favorites.
 - **macOS:** `~/Applications/Task Viewer.app`, pinned to the Dock automatically when `make install` runs from your own account's home.
   Click toggles start/stop and opens the browser when starting.
+
+`make uninstall` removes what `make install` wrote: the app bundle and its Dock tile on macOS, or the desktop entry and icon on Linux, together with any `.Task Viewer.app.staging.*` or `.Task Viewer.app.backup.*` directory a failed atomic install left beside the bundle. It is idempotent, prints each path it removed and a closing line saying the database and logs were kept, and leaves `~/.task-viewer` and the launcher's state directory alone. A live server named by the launcher's PID file gets a `make stop` hint while the removal continues. The Dock removal follows the same `TASK_VIEWER_DOCK_PIN` modes as the install: `auto` skips a redirected `HOME`, `force` removes from any home, and `skip` removes no tile.
 
 A reinstall builds the new bundle in a hidden `.Task Viewer.app.staging.*` directory beside `~/Applications/Task Viewer.app` and swaps it in only after its executable and `Info.plist` exist, so a failure before the swap leaves the previous app in place. A failed install can leave that staging directory beside the bundle, a restore that itself fails leaves the previous bundle in the `.Task Viewer.app.backup.*` directory the installer names, and a successful swap whose backup cleanup fails leaves that backup directory behind and names it. When the icon build fails, the install reports that the icon build was skipped and copies the PNG instead, so the bundle still carries an icon; when the Dock pin fails, it prints how to add the app by hand. The Dock pin runs only from the login account's own home: an install with a redirected `HOME`, or one whose account home cannot be determined, still installs the bundle and prints the manual-pin guidance without touching `com.apple.dock`. Set `TASK_VIEWER_DOCK_PIN=force` to pin from any home, or `TASK_VIEWER_DOCK_PIN=skip` to skip the pin.
 

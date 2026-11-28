@@ -1,4 +1,4 @@
-.PHONY: build run start stop status restart test lint format fmt fix audit install install-desktop
+.PHONY: build run start stop status restart test lint format fmt fix audit install install-desktop uninstall
 
 TEST_RUSTFLAGS=-D warnings
 LAUNCHER=./scripts/task-viewer.sh
@@ -30,6 +30,7 @@ test:
 	RUSTFLAGS="$(TEST_RUSTFLAGS)" CARGO_TARGET_DIR="$(CURDIR)/target" cargo test -p task-viewer
 	./scripts/tests/launcher-build-truth.sh
 	./scripts/tests/launcher-state-dir.sh
+	./scripts/tests/uninstall-desktop.sh
 	./scripts/tests/audit-gate.sh
 
 lint:
@@ -49,3 +50,6 @@ audit:
 
 install install-desktop:
 	./scripts/install-desktop.sh
+
+uninstall:
+	./scripts/uninstall-desktop.sh
