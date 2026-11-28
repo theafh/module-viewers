@@ -375,11 +375,13 @@ fn stored_schema_version(path: &Path) -> i64 {
         .block_on(read)
 }
 
-/// The one start-up line naming the database the server opened, if the child
-/// logged it.
-fn database_line(log: &str) -> Option<&str> {
+/// Every start-up line naming the database the server opened, so a duplicated
+/// emission surfaces as a count the cases can assert rather than being hidden
+/// by the first match.
+fn database_line(log: &str) -> Vec<&str> {
     log.lines()
-        .find(|line| line.contains("task-viewer opened its database"))
+        .filter(|line| line.contains("task-viewer opened its database"))
+        .collect()
 }
 
 /// A log line with its ANSI styling removed, so a field name, its `=`, and its
@@ -671,7 +673,13 @@ fn a_start_with_task_viewer_db_logs_the_configured_path_and_schema_version() {
     let padded = format!("  {}  ", db.display());
     let server = Server::start_with_configured_value(&scratch, "server", &padded);
     let log = server.log_text();
-    let line = plain(database_line(&log).unwrap_or_else(|| panic!("no database line\n{log}")));
+    let lines = database_line(&log);
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one line names the opened database\n{log}"
+    );
+    let line = plain(lines[0]);
     assert!(
         line.contains(&db.display().to_string()),
         "the line names the unpadded path: {line}"
@@ -707,7 +715,13 @@ fn a_start_with_the_default_path_logs_the_home_database_and_schema_version() {
     let db = home.join(".task-viewer");
     let server = Server::start_with_home(&scratch, "server", &home);
     let log = server.log_text();
-    let line = plain(database_line(&log).unwrap_or_else(|| panic!("no database line\n{log}")));
+    let lines = database_line(&log);
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one line names the opened database\n{log}"
+    );
+    let line = plain(lines[0]);
     assert!(
         line.contains(&db.display().to_string()),
         "the line names the default path: {line}"
