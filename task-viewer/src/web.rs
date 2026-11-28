@@ -1775,7 +1775,7 @@ struct TaskFilter {
     date: DateAxis,
     from: Option<NaiveDate>,
     to: Option<NaiveDate>,
-    /// The bounds the request spelled but the filter ignored, in request order.
+    /// The bounds the request spelled but the filter ignored, lower bound then upper bound.
     ignored: Vec<IgnoredBound>,
 }
 
