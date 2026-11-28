@@ -54,8 +54,9 @@ const DEFAULT_LOG_FILTER: &str = "task_viewer=info";
 /// The log filter named by the configured `RUST_LOG` value, together with at
 /// most one warning for the caller to log once the subscriber is installed.
 ///
-/// An unset or whitespace-only value takes [`DEFAULT_LOG_FILTER`] silently. A
-/// value that is not valid UTF-8, or one the filter parser rejects, also takes
+/// An unset or blank value takes [`DEFAULT_LOG_FILTER`] silently: whitespace
+/// alone, or separators with no directive between them. A value that is not
+/// valid UTF-8, or one the filter parser rejects, also takes
 /// the default and returns a warning naming `RUST_LOG`, so the fallback is
 /// never silent. Every other value is kept as written, `off` and a bare word
 /// the parser reads as a target directive included.
@@ -72,7 +73,11 @@ fn log_filter(raw: Option<&OsStr>) -> (tracing_subscriber::EnvFilter, Option<Str
             )),
         );
     };
-    if raw.trim().is_empty() {
+    // A value with no directive at all is blank: whitespace alone, or
+    // separators with nothing between them. `EnvFilter::try_new` accepts the
+    // latter shape, such as `,`, as an empty filter that silences every log
+    // line, so it must not reach the parser as a usable value.
+    if raw.trim().trim_matches(',').trim().is_empty() {
         return (default(), None);
     }
     match tracing_subscriber::EnvFilter::try_new(raw) {
@@ -276,10 +281,19 @@ mod tests {
     }
 
     /// Covers: an unset or blank `RUST_LOG` uses the documented default filter
-    /// silently, so a blank value never narrows logging to `ERROR`.
+    /// silently, so a blank value never narrows logging to `ERROR`, and a value
+    /// with no directive at all, such as `,`, never reaches the parser as an
+    /// empty filter that silences every log line.
     #[test]
     fn log_filter_defaults_when_unset_or_blank() {
-        for raw in [None, Some(OsStr::new("")), Some(OsStr::new("  \t "))] {
+        for raw in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("  \t ")),
+            Some(OsStr::new(",")),
+            Some(OsStr::new(",,")),
+            Some(OsStr::new(" , ")),
+        ] {
             let (filter, warning) = log_filter(raw);
             assert_eq!(filter.to_string(), DEFAULT_LOG_FILTER, "raw={raw:?}");
             assert!(warning.is_none(), "raw={raw:?}");
