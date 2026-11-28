@@ -2,8 +2,8 @@
 description: "Say last error (current) or last error (recovered) on the Repositories page, so the state is not carried by colour alone."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-28T02:39:32Z
-status: implemented
+updated: 2026-11-28T02:43:29Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
