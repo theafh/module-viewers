@@ -2,8 +2,8 @@
 description: "Say 30+/90+/180+ days in the staleness legend, summary, and tooltip, matching the at-least test the series actually applies."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-updated: 2026-11-28T12:55:32Z
-status: implemented
+updated: 2026-11-28T13:02:01Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -23,7 +23,7 @@ The staleness paragraph in `FEATURES.md` states the same "at least 30, 90, or 18
 
 A task exactly 30 days behind is therefore counted under a label that says more than 30.
 
-The [weekly-bars task](archive/task-viewer_weekly-bars-two-year-window.md) has finished, having refreshed `task-viewer/testdata/dashboard_draw_snapshots.json`; two live tasks share the remaining edit surface: [the shared-day-axis task](task-viewer_chart-payload-shared-day-axis.md) rewrites `drawStaleness`'s `rows`/`dates` handling in the same function while keeping that snapshot unchanged, and [chart focus across a resize](task-viewer_chart-focus-survives-resize.md) also edits `drawStaleness` and regenerates the same snapshot for its `data-focus-key`. Whichever lands later re-derives the label wiring; the focus task regenerates the snapshot and the shared-day-axis task re-derives its rows against it, whichever lands second.
+The [weekly-bars task](task-viewer_weekly-bars-two-year-window.md) has finished, having refreshed `task-viewer/testdata/dashboard_draw_snapshots.json`; two live tasks share the remaining edit surface: [the shared-day-axis task](../task-viewer_chart-payload-shared-day-axis.md) rewrites `drawStaleness`'s `rows`/`dates` handling in the same function while keeping that snapshot unchanged, and [chart focus across a resize](../task-viewer_chart-focus-survives-resize.md) also edits `drawStaleness` and regenerates the same snapshot for its `data-focus-key`. Whichever lands later re-derives the label wiring; the focus task regenerates the snapshot and the shared-day-axis task re-derives its rows against it, whichever lands second.
 
 ## Approach
 
