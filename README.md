@@ -10,7 +10,7 @@ This repository holds the programs, their guardrails, and the build tooling. It 
 
 The configuration and the parsed chart rows live in a SQLite database at `~/.task-viewer`. A successful start logs one info line naming the database file it opened, whether `TASK_VIEWER_DB` or the default set it, and the schema version it reached. Update re-reads every configured repository and replaces that repository's rows. Removing a repository from the dashboard deletes only its rows in that database. The source repository is left unchanged.
 
-Set `TASK_VIEWER_SCAN_WORKERS` to change how many repositories Update scans at once; it takes a whole number from 1 to 32 and defaults to 4, a larger value is clamped to 32, and a value below 1 or one that is not a number falls back to 4 with a warning. Set `TASK_VIEWER_GIT_TIMEOUT_SECS` to change the deadline for one read-only git command; it defaults to 30 seconds, a whole number of seconds from 1 to 600 is used as given, a larger value is clamped to 600, and a value below 1 or one that is not a number falls back to 30 seconds with a warning. Set `RUST_LOG` to change the log filter; it defaults to `task_viewer=info`, an unset or blank value uses that default silently, and a value the parser rejects, or one that is not valid UTF-8, falls back to it with one warning naming `RUST_LOG`.
+Set `TASK_VIEWER_SCAN_WORKERS` to change how many repositories Update scans at once; it takes a whole number from 1 to 32 and defaults to 4, a larger value is clamped to 32, and a value below 1 or one that is not a number falls back to 4 with a warning. Set `TASK_VIEWER_GIT_TIMEOUT_SECS` to change the deadline for one read-only git command; it defaults to 30 seconds, a whole number of seconds from 1 to 600 is used as given, a larger value is clamped to 600, and a value below 1 or one that is not a number falls back to 30 seconds with a warning. Set `RUST_LOG` to change the log filter; it defaults to `task_viewer=info`, an unset or blank value uses that default silently, and a value the parser rejects, or one that is not valid UTF-8, falls back to it with one warning naming `RUST_LOG`. Set `TASK_VIEWER_DB` to name a different database file; it defaults to `~/.task-viewer`, which is created on first launch, and spaces around the value are ignored so a padded value opens the same file.
 
 ## Run
 
@@ -26,6 +26,9 @@ Open <http://127.0.0.1:7880>.
 - **Add repository** opens a folder picker. A folder is accepted when its working tree has a `tasks/` directory, or when a branch of the repository that holds it lists a markdown task under `tasks/`.
 - **Project** filters every chart. All projects is the default. One project switches the radar charts from a spoke per project to a spoke per task scope.
 - **Update** scans every configured repository again.
+- **Task list** opens from a shipped or created weekly bar, a calendar day, or a radar spoke, and lists the stored rows behind that count. It searches the path, filters by scope, sorts by any column, and exports the current filter with `Export CSV`.
+- **Charts CSV** and **Charts JSON** export the dashboard's chart series for the selected project. The task list carries both beside its own `Export CSV`, and the dashboard's `Export` menu carries them too.
+- **Rescan** re-harvests one repository. **Relocate** re-points a repository at another folder, keeping its id and stored rows and re-harvesting them from the picked folder while both folders stay on disk. **Remove** opens a confirmation page that names the repository and asks before it deletes.
 - **Light** and **Dark** switch the page appearance. The choice stays in the browser.
 
 ### Desktop launcher (Ubuntu / macOS)
