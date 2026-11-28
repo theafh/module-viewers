@@ -2094,8 +2094,9 @@ fn applied_filters(
 struct TaskSelection {
     rows: Vec<series::TaskRecord>,
     selected: Option<i64>,
-    /// The distinct scopes the loaded project filter carries, sorted, so the
-    /// scope select offers exactly the scopes a person can reach from here.
+    /// The project's stored scopes, sorted. `render_tasks` adds an applied
+    /// scope the project does not store, so the scope select can always show
+    /// the value the list filters on.
     scopes: Vec<String>,
 }
 
@@ -2136,6 +2137,15 @@ async fn render_tasks(
     let sort = TaskSort::from_query(query);
     let filter = TaskFilter::from_query(query);
     let applied = applied_filters(&filter, query, &project, sort);
+    let selected_scope = query.scope.trim().to_string();
+    let mut scopes = selection.scopes;
+    // The select must show the scope the list filters on even when the project
+    // stores no row in it, as a scope from another project or one whose last
+    // task disappeared after a rescan; the stored list stays the project's own.
+    if !selected_scope.is_empty() && !scopes.iter().any(|scope| scope == &selected_scope) {
+        let at = scopes.partition_point(|scope| scope.as_str() < selected_scope.as_str());
+        scopes.insert(at, selected_scope.clone());
+    }
     let page = TasksPage {
         version: state.static_version.clone(),
         page: "tasks",
@@ -2146,13 +2156,13 @@ async fn render_tasks(
         project: project.clone(),
         kind: query.kind.trim().to_string(),
         q: query.q.trim().to_string(),
-        selected_scope: query.scope.trim().to_string(),
+        selected_scope,
         date: query.date.trim().to_string(),
         from: query.from.trim().to_string(),
         to: query.to.trim().to_string(),
         sort: sort.key.as_str().to_string(),
         dir: sort.dir.as_str().to_string(),
-        scopes: selection.scopes,
+        scopes,
         filter_summary: applied.summary,
         filter_chips: applied.chips,
         clear_href: applied.clear_href,
@@ -2892,7 +2902,10 @@ struct TasksPage {
     /// back on submit.
     sort: String,
     dir: String,
-    /// The distinct scopes of the current project filter, for the scope select.
+    /// The option list the scope select renders: the current project filter's
+    /// distinct stored scopes plus, when the request applies a scope the
+    /// project does not store, that applied value, so the select shows the
+    /// ghost scope the list is filtered on as its selected option.
     scopes: Vec<String>,
     /// The readable summary of the filters the request applied, empty when
     /// none is applied so the page renders no filter strip.
@@ -12042,6 +12055,28 @@ mod tests {
             .collect()
     }
 
+    /// The option values the scope select marks `selected`, HTML-decoded, in
+    /// order, so a test can assert the control shows exactly one applied value.
+    fn selected_scope_options(body: &str) -> Vec<String> {
+        let start = body
+            .find("id=\"scope\" name=\"scope\"")
+            .expect("scope select");
+        let rest = &body[start..];
+        let end = rest.find("</select>").expect("scope select end");
+        rest[..end]
+            .split("<option value=\"")
+            .skip(1)
+            .filter(|chunk| {
+                let tag = chunk.find('>').expect("option tag end");
+                chunk[..tag].contains(" selected")
+            })
+            .map(|chunk| {
+                let end = chunk.find('"').expect("option value end");
+                html_unescape(&chunk[..end])
+            })
+            .collect()
+    }
+
     /// The Export CSV link's target, HTML-decoded.
     fn export_href(body: &str) -> String {
         let start = body.find("href=\"/tasks.csv?").expect("export link") + "href=\"".len();
@@ -12353,8 +12388,10 @@ mod tests {
     }
 
     /// Covers: the search input's value reaches `q` and the scope select's value
-    /// reaches `scope`, and each narrows the visible rows. The select offers only
-    /// the current project's distinct scopes plus the All-scopes option.
+    /// reaches `scope`, and each narrows the visible rows. The select offers the
+    /// current project's distinct scopes plus the All-scopes option, and an
+    /// applied scope the project does not store joins that list as the selected
+    /// option, so the control never reads All scopes while a scope filters.
     #[tokio::test(flavor = "current_thread")]
     async fn web_tasks_search_and_scope_controls_narrow_the_list() {
         let (state, path, alpha, _beta) = seeded_task_list("tasks_controls").await;
@@ -12382,6 +12419,61 @@ mod tests {
         let body = task_list_body(&state, &format!("project={alpha}&scope=beta")).await;
         assert!(!body.contains("alpha_done.md"), "{body}");
         assert!(!body.contains("alpha_live.md"), "{body}");
+        cleanup(&path);
+    }
+
+    /// Covers: a scope the project does not store appears in the scope select as
+    /// its one selected option while the list stays filtered to it, so the
+    /// control never reads All scopes with a scope filter applied and Show
+    /// round-trips the value it displays; a stored scope still renders as the
+    /// single selected option, and a missing or empty scope keeps All scopes
+    /// selected with no extra option.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_scope_select_shows_an_applied_scope_the_project_does_not_store() {
+        let (state, path, alpha, _beta) = seeded_task_list("tasks_scope_ghost").await;
+
+        let body = task_list_body(&state, &format!("project={alpha}&scope=ghost")).await;
+        assert_eq!(scope_options(&body), vec!["", "alpha", "ghost"]);
+        assert_eq!(selected_scope_options(&body), vec!["ghost"]);
+        assert!(
+            body.contains("<option value=\"ghost\" selected>ghost</option>"),
+            "the select offers the applied ghost scope as the selected option: {body}"
+        );
+        assert!(
+            !body.contains("<option value=\"\" selected>"),
+            "All scopes is not marked while the ghost scope filters: {body}"
+        );
+        assert!(body.contains("0 tasks"), "{body}");
+        assert!(!body.contains("alpha_live.md"), "{body}");
+        assert!(!body.contains("alpha_done.md"), "{body}");
+
+        // Show submits the select's own selected value, so re-requesting with
+        // what the control displays keeps the same filter and the same control.
+        let applied = selected_scope_options(&body)
+            .pop()
+            .expect("the ghost scope is selected");
+        let body = task_list_body(&state, &format!("project={alpha}&scope={applied}")).await;
+        assert_eq!(selected_scope_options(&body), vec!["ghost"]);
+        assert!(body.contains("0 tasks"), "{body}");
+
+        // A scope the project stores still renders as the single selected option.
+        let body = task_list_body(&state, &format!("project={alpha}&scope=alpha")).await;
+        assert_eq!(scope_options(&body), vec!["", "alpha"]);
+        assert_eq!(selected_scope_options(&body), vec!["alpha"]);
+
+        // A missing or empty scope selects All scopes and adds no option.
+        for query in [
+            format!("project={alpha}"),
+            format!("project={alpha}&scope="),
+        ] {
+            let body = task_list_body(&state, &query).await;
+            assert_eq!(scope_options(&body), vec!["", "alpha"]);
+            assert_eq!(selected_scope_options(&body), vec![""]);
+            assert!(
+                body.contains("<option value=\"\" selected>All scopes</option>"),
+                "All scopes is selected while no scope filters: {body}"
+            );
+        }
         cleanup(&path);
     }
 
