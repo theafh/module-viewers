@@ -944,14 +944,25 @@ impl HarvestState {
     ///
     /// A file this reader cannot chart leaves one log line naming it and the
     /// reason, so a task that vanishes from the charts is traceable. A file
-    /// whose name lacks the task shape, such as a `README.md` under `tasks/`,
-    /// logs that line at debug level instead, because it is not a task the
-    /// person lost. A file with the task shape that is dropped here also counts
-    /// once in `tally` under the reason it was dropped, so the harvest's skip
-    /// count covers the frontmatter-level drops and not only the read-level
-    /// ones. The returned rows stay the same: a file without the fields a row
-    /// needs is still skipped.
+    /// whose name lacks the task shape, such as a `README.md` or `_draft.md`
+    /// under `tasks/`, charts no row whatever its frontmatter says, and logs
+    /// that line at debug level instead, because it is not a task the person
+    /// lost. A file with the task shape that is dropped here also counts once
+    /// in `tally` under the reason it was dropped, so the harvest's skip count
+    /// covers the frontmatter-level drops and not only the read-level ones.
+    /// The returned rows stay the same: a file without the fields a row needs
+    /// is still skipped.
     fn harvest_file(&mut self, rel: &str, text: &str, path_is_lossy: bool, tally: &mut SkipTally) {
+        if !has_task_name_shape(rel) {
+            // A stray file such as `README.md` under `tasks/` is not a task the
+            // person lost, so it charts nothing and stays out of both the
+            // warning stream and the skip tally.
+            tracing::debug!(
+                path = %rel,
+                "file under tasks/ is not a task; skipping it"
+            );
+            return;
+        }
         let Some(fields) = frontmatter(text) else {
             if has_task_name_shape(rel) {
                 record_skip(tally, SkipReason::NoFrontmatter);
@@ -1887,11 +1898,15 @@ fn relative_path(path: &Path, base: &Path) -> (String, bool) {
 }
 
 /// The task naming shape `harvest_file` splits for `scope`: a `.md` file whose
-/// name carries an `_`. A stray `README.md` under `tasks/` does not match, so a
-/// file that is not a task stays out of the warning stream.
+/// name carries an `_` behind a non-empty scope prefix. A stray `README.md` or
+/// `_draft.md` under `tasks/` does not match, so a file that is not a task
+/// charts no row and stays out of the warning stream.
 fn has_task_name_shape(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or_default();
-    name.ends_with(".md") && name.contains('_')
+    name.ends_with(".md")
+        && name
+            .split_once('_')
+            .is_some_and(|(scope, _)| !scope.is_empty())
 }
 
 /// Report one task file that contributes no row: a warning when its name has
@@ -10690,16 +10705,34 @@ mod tests {
         }
     }
 
-    /// A layer that records every `WARN` event's fields, so a test can assert
-    /// the fallback-day warning without a process-wide subscriber.
+    /// The `WARN` and `DEBUG` event fields a test's layer recorded, so a test
+    /// can assert the fallback-day warning or the stray-file debug line without
+    /// a process-wide subscriber.
+    #[derive(Default)]
+    struct CapturedLines {
+        warnings: Vec<String>,
+        debug: Vec<String>,
+    }
+
+    /// A layer that records every `WARN` and `DEBUG` event's fields, so a test
+    /// can assert the fallback-day warning without a process-wide subscriber.
     #[derive(Clone, Default)]
-    struct CapturedWarnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    struct CapturedWarnings(std::sync::Arc<std::sync::Mutex<CapturedLines>>);
 
     impl CapturedWarnings {
+        /// The recorded `WARN` lines, leaving only `DEBUG` lines behind.
         fn take(&self) -> Vec<String> {
             self.0
                 .lock()
-                .map(|mut warnings| std::mem::take(&mut *warnings))
+                .map(|mut lines| std::mem::take(&mut lines.warnings))
+                .unwrap_or_default()
+        }
+
+        /// The recorded `DEBUG` lines, leaving only `WARN` lines behind.
+        fn take_debug(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .map(|mut lines| std::mem::take(&mut lines.debug))
                 .unwrap_or_default()
         }
     }
@@ -10713,13 +10746,18 @@ mod tests {
             event: &tracing::Event<'_>,
             _context: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            if *event.metadata().level() != tracing::Level::WARN {
+            let level = *event.metadata().level();
+            if level != tracing::Level::WARN && level != tracing::Level::DEBUG {
                 return;
             }
             let mut fields = WarningFields(String::new());
             event.record(&mut fields);
-            if let Ok(mut warnings) = self.0.lock() {
-                warnings.push(fields.0);
+            if let Ok(mut lines) = self.0.lock() {
+                if level == tracing::Level::WARN {
+                    lines.warnings.push(fields.0);
+                } else {
+                    lines.debug.push(fields.0);
+                }
             }
         }
     }
@@ -11407,6 +11445,234 @@ mod tests {
                 "a stray {stray} must not warn: {warnings:?}"
             );
         }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_no_row_for_a_frontmatter_bearing_readme() {
+        // A `README.md` carrying `created` and `status` is still not a task: it
+        // charts no row, adds nothing to the tally, and logs one debug line with
+        // no warning, while a shaped task beside it charts as before.
+        let repo = scratch("harvest_readme_frontmatter");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/README.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Read me\n",
+        )
+        .expect("readme with created and status");
+        write_task(&repo, "tasks/scope_name.md", "2026-05-01", "open");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let harvested = tracing::subscriber::with_default(subscriber, || {
+            harvest_repository_with_prior(&repo, &[], None)
+        })
+        .expect("the harvest still succeeds");
+
+        assert_eq!(
+            harvested.tasks.len(),
+            1,
+            "only the shaped task charts: {:?}",
+            harvested.tasks
+        );
+        assert_eq!(harvested.tasks[0].path, "tasks/scope_name.md");
+        assert_eq!(harvested.tasks[0].scope, "scope");
+        assert_eq!(
+            harvested.skipped_count(),
+            0,
+            "the README is not a task: {:?}",
+            harvested.skipped
+        );
+
+        let warnings = captured.take();
+        assert!(
+            warnings.is_empty(),
+            "the README must not warn: {warnings:?}"
+        );
+        let debug = captured.take_debug();
+        assert_eq!(debug.len(), 1, "the README logs one debug line: {debug:?}");
+        assert!(
+            debug[0].contains("tasks/README.md"),
+            "the debug line must name the README: {debug:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_charts_no_row_for_a_committed_frontmatter_bearing_readme() {
+        // The README lives only on a branch that is not checked out, so it
+        // reaches the harvest as a committed blob. It charts no row and logs one
+        // debug line, the same outcome as its working-tree counterpart.
+        let repo = scratch("harvest_committed_readme_frontmatter");
+        git(
+            &repo,
+            &["init", "-b", "main", "--template="],
+            "2026-05-01T12:00:00+00:00",
+        );
+        write_task(&repo, "tasks/scope_name.md", "2026-05-01", "open");
+        git(&repo, &["add", "-A"], "2026-05-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "main task"],
+            "2026-05-01T12:00:00+00:00",
+        );
+        git(
+            &repo,
+            &["checkout", "-b", "feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        fs::write(
+            repo.join("tasks/README.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Read me\n",
+        )
+        .expect("readme with created and status");
+        git(&repo, &["add", "-A"], "2026-06-01T12:00:00+00:00");
+        git(
+            &repo,
+            &["commit", "-m", "stray readme on feature"],
+            "2026-06-01T12:00:00+00:00",
+        );
+        git(&repo, &["checkout", "main"], "2026-06-02T12:00:00+00:00");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let harvested = tracing::subscriber::with_default(subscriber, || {
+            harvest_repository_with_prior(&repo, &[], None)
+        })
+        .expect("the harvest still succeeds");
+
+        assert_eq!(
+            harvested.tasks.len(),
+            1,
+            "only the shaped task charts: {:?}",
+            harvested.tasks
+        );
+        assert_eq!(harvested.tasks[0].path, "tasks/scope_name.md");
+        assert_eq!(
+            harvested.skipped_count(),
+            0,
+            "the committed README is not a task: {:?}",
+            harvested.skipped
+        );
+
+        let warnings = captured.take();
+        assert!(
+            warnings.is_empty(),
+            "the committed README must not warn: {warnings:?}"
+        );
+        let debug = captured.take_debug();
+        assert_eq!(
+            debug.len(),
+            1,
+            "the committed README logs one debug line: {debug:?}"
+        );
+        assert!(
+            debug[0].contains("tasks/README.md"),
+            "the debug line must name the README: {debug:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_keeps_a_draft_out_of_the_rows_and_tally() {
+        // A `_draft.md` has no scope prefix, so it fails the name gate whatever
+        // its frontmatter says. The read-level rejects stay at debug and out of
+        // the tally for the same reason.
+        let repo = scratch("harvest_draft_name");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/_draft.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\nstatus: open\n---\n\n# Draft\n",
+        )
+        .expect("draft with chartable frontmatter");
+        write_non_utf8_task(
+            &repo,
+            "tasks/_draft_bad.md",
+            "2026-05-01",
+            "2026-05-01",
+            "open",
+        );
+        fs::write(
+            repo.join("tasks/_draft_big.md"),
+            vec![b'a'; MAX_TASK_FILE_BYTES + 1],
+        )
+        .expect("oversized draft");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let harvested = tracing::subscriber::with_default(subscriber, || {
+            harvest_repository_with_prior(&repo, &[], None)
+        })
+        .expect("the harvest still succeeds");
+
+        assert!(
+            harvested.tasks.is_empty(),
+            "a draft charts no row: {:?}",
+            harvested.tasks
+        );
+        assert_eq!(
+            harvested.skipped_count(),
+            0,
+            "a draft adds nothing to the tally: {:?}",
+            harvested.skipped
+        );
+
+        let warnings = captured.take();
+        assert!(warnings.is_empty(), "a draft must not warn: {warnings:?}");
+        let debug = captured.take_debug();
+        assert_eq!(debug.len(), 3, "one debug line per draft: {debug:?}");
+        for draft in ["_draft.md", "_draft_bad.md", "_draft_big.md"] {
+            assert!(
+                debug.iter().any(|line| line.contains(draft)),
+                "a debug line must name {draft}: {debug:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn harvest_warns_and_tallies_a_shaped_task_with_bad_frontmatter() {
+        // A file that passes the name gate but lacks `status` keeps its warning
+        // and its single tally entry.
+        let repo = scratch("harvest_shaped_bad_frontmatter");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::write(
+            repo.join("tasks/scope_bad.md"),
+            "---\ncreated: 2026-05-01T10:00:00\nupdated: 2026-05-01T10:00:00\n---\n\n# Task\n",
+        )
+        .expect("shaped task without status");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let harvested = tracing::subscriber::with_default(subscriber, || {
+            harvest_repository_with_prior(&repo, &[], None)
+        })
+        .expect("the harvest still succeeds");
+
+        assert!(
+            harvested.tasks.is_empty(),
+            "the bad task charts no row: {:?}",
+            harvested.tasks
+        );
+        assert_eq!(
+            harvested.skipped.get(&SkipReason::MissingStatus).copied(),
+            Some(1),
+            "the shaped task is tallied once: {:?}",
+            harvested.skipped
+        );
+        assert_eq!(harvested.skipped_count(), 1);
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("scope_bad.md"),
+            "the warning must name the task: {warnings:?}"
+        );
+        let debug = captured.take_debug();
+        assert!(
+            debug.is_empty(),
+            "a shaped task must not log at debug: {debug:?}"
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 
