@@ -621,9 +621,9 @@
     var svg = root.querySelector('svg[role="group"]');
     var rows = payload.staleness || [];
     var all = [
-      { key: "over_30", color: "--chart-create", label: "over 30 days" },
-      { key: "over_90", color: "--chart-age", label: "over 90 days" },
-      { key: "over_180", color: "--chart-defer", label: "over 180 days" }
+      { key: "over_30", color: "--chart-create", label: "30+ days" },
+      { key: "over_90", color: "--chart-age", label: "90+ days" },
+      { key: "over_180", color: "--chart-defer", label: "180+ days" }
     ];
     if (!rows.length) {
       summary("staleness", "No live tasks yet");

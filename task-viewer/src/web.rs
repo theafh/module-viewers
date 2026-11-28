@@ -19029,7 +19029,7 @@ mod tests {
     return node.name === "circle" && node.attrs.r === "4";
   });
   var labels = svg.children.filter(function (node) {
-    return node.name === "text" && String(node.textContent).indexOf("over ") === 0;
+    return node.name === "text" && /^\d+\+ days$/.test(String(node.textContent));
   }).map(function (node) { return node.textContent; });
   return JSON.stringify({
     summary: env.cards["staleness"].querySelector(".summary").textContent,
@@ -19047,25 +19047,25 @@ mod tests {
         );
         let summary = result["summary"].as_str().expect("the summary");
         assert!(
-            summary.contains("2 over 30 days") && summary.contains("1 over 90 days"),
+            summary.contains("2 30+ days") && summary.contains("1 90+ days"),
             "the summary states the drawn thresholds: {summary}"
         );
         assert!(
-            !summary.contains("over 180"),
+            !summary.contains("180+ days"),
             "the summary leaves the empty threshold out: {summary}"
         );
         let label = result["label"].as_str().expect("the overlay label");
         assert!(
-            label.contains("over 30 days") && label.contains("over 90 days"),
+            label.contains("30+ days") && label.contains("90+ days"),
             "the tooltip names the drawn thresholds: {label}"
         );
         assert!(
-            !label.contains("over 180"),
+            !label.contains("180+ days"),
             "the tooltip leaves the empty threshold out: {label}"
         );
         assert_eq!(
             result["labels"],
-            serde_json::json!(["over 30 days", "over 90 days"]),
+            serde_json::json!(["30+ days", "90+ days"]),
             "the legend names the drawn thresholds"
         );
         let dots = result["dots"].as_array().expect("legend dots");
@@ -19112,6 +19112,48 @@ mod tests {
         );
         assert_eq!(result["paths"].as_u64(), Some(0), "no flat lines are drawn");
         assert_eq!(result["message"].as_bool(), Some(true), "the card says why");
+    }
+
+    /// Covers: every threshold above zero carries its at-least label in the
+    /// legend, the summary, and the tooltip, including the 180-day line the
+    /// default fixture never draws.
+    #[test]
+    fn browser_staleness_card_labels_every_drawn_threshold() {
+        let payload = long_line_payload().to_string();
+        let config = browser_config(false, false, Some(&payload), serde_json::json!("#123456"));
+        let result = run_browser(
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  var svg = env.cards["staleness"].querySelector("svg");
+  var overlay = svg.children.filter(function (node) {
+    return node.name === "rect" && node.attrs.fill === "transparent";
+  })[0];
+  var labels = svg.children.filter(function (node) {
+    return node.name === "text" && /^\d+\+ days$/.test(String(node.textContent));
+  }).map(function (node) { return node.textContent; });
+  return JSON.stringify({
+    summary: env.cards["staleness"].querySelector(".summary").textContent,
+    label: overlay.attrs["aria-label"],
+    labels: labels
+  });
+})()"#,
+        );
+        assert_eq!(
+            result["labels"],
+            serde_json::json!(["30+ days", "90+ days", "180+ days"]),
+            "the legend names every drawn threshold at least"
+        );
+        let summary = result["summary"].as_str().expect("the summary");
+        assert!(
+            summary.contains("180+ days"),
+            "the summary names the drawn 180-day threshold: {summary}"
+        );
+        let label = result["label"].as_str().expect("the overlay label");
+        assert!(
+            label.contains("180+ days"),
+            "the tooltip names the drawn 180-day threshold: {label}"
+        );
     }
 
     /// Covers: the weekly view picker redraws that card alone for each view, so

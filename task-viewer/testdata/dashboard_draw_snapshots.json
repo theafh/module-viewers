@@ -1119,7 +1119,7 @@
           "children": [],
           "name": "text",
           "style": {},
-          "text": "over 30 days"
+          "text": "30+ days"
         },
         {
           "attrs": {
@@ -1211,7 +1211,7 @@
         },
         {
           "attrs": {
-            "aria-label": "Jan 5, 2026 · over 30 days 1",
+            "aria-label": "Jan 5, 2026 · 30+ days 1",
             "fill": "transparent",
             "height": "214",
             "role": "img",
