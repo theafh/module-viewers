@@ -2,10 +2,10 @@
 description: "Give the one-shot notice and error banners a live-region role so Update, Rescan, Add, Relocate, and Remove outcomes are announced."
 scope: task-viewer
 created: 2026-11-26T11:55:11Z
-status: implemented
+status: finished
 implemented-by: "Andreas Hoffmann"
 design-extended: false
-updated: 2026-11-28T01:57:32Z
+updated: 2026-11-28T02:01:57Z
 reported-by: "Andreas Hoffmann"
 ---
 
@@ -43,7 +43,7 @@ Every refresh path is a full form POST that redirects back, so the page reloads 
 
 **Decision:** The server-rendered paragraphs carry the roles, and no script re-inserts the text. Whether a browser announces a role already populated at parse time is outside this repository's observable surface, so the task delivers and tests the role, not an assistive-technology announcement.
 
-**Out of scope:** moving the banners, changing their styling, or making the outcome survive a reload. The task list page's banner, added by [task-viewer_tasks-invalid-date-bound-banner.md](task-viewer_tasks-invalid-date-bound-banner.md), carries its role under that task.
+**Out of scope:** moving the banners, changing their styling, or making the outcome survive a reload. The task list page's banner, added by [task-viewer_tasks-invalid-date-bound-banner.md](../task-viewer_tasks-invalid-date-bound-banner.md), carries its role under that task.
 
 ## Acceptance
 
