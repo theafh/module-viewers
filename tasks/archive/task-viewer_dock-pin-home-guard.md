@@ -23,7 +23,7 @@ The motivating case: a reproduction run under `$TMPDIR` installed into a throwaw
 
 `install_macos` calls `pin_to_dock "$app_bundle"` bare under `set -e`, so a non-zero return aborts the install after the bundle is already in place; a skipped pin returns 0. `dock_pin_guidance` prints `Cannot pin Task Viewer to the Dock automatically.` plus the bundle path, and `FEATURES.md`'s `make install` bullet already promises that a failed Dock pin prints how to add the app by hand.
 
-`scripts/tests/launcher-build-truth.sh` runs a copy of the installer with `HOME="$root/home"` and relies on a `dockutil` stub first on `PATH` in the cases that assert pinning. Under the new guard those runs skip the pin unless they set the override. The live [task-viewer_make-uninstall.md](../task-viewer_make-uninstall.md) will reuse this branch for the removal path, so the home check belongs in a named function it can call; that removal path stays with the uninstall task.
+`scripts/tests/launcher-build-truth.sh` runs a copy of the installer with `HOME="$root/home"` and relies on a `dockutil` stub first on `PATH` in the cases that assert pinning. Under the new guard those runs skip the pin unless they set the override. The live [task-viewer_make-uninstall.md](task-viewer_make-uninstall.md) will reuse this branch for the removal path, so the home check belongs in a named function it can call; that removal path stays with the uninstall task.
 
 The affected documentation passages are `FEATURES.md`'s `make install` bullet, `SECURITY.md`'s Data paragraph that names the desktop write targets, `README.md`'s `### Desktop launcher (Ubuntu / macOS)` section, and the `TESTING.md` sentence that enumerates the installer cases `make test` runs.
 

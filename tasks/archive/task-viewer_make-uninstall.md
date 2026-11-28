@@ -2,8 +2,8 @@
 description: "Add make uninstall that removes the macOS app bundle, Dock tile, Linux desktop entry, and icon, idempotently."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-28T15:12:44Z
-status: implemented
+updated: 2026-11-28T15:23:36Z
+status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
 design-extended: false
@@ -21,7 +21,7 @@ design-extended: false
 
 The Dock edit names the constant preference domain `com.apple.dock`, the installer reaches it through `python3` and a `plistlib` round trip, restarts the Dock with `killall Dock`, and exits non-zero when `python3` is missing, so a removal has to reach the same domain and guard the same cases (`scripts/install-desktop.sh`). `make test` runs an explicit script list, so a new test runs only once the `test` target names it.
 
-Two tasks share this surface. [task-viewer_install-desktop-atomic-bundle.md](archive/task-viewer_install-desktop-atomic-bundle.md) landed first: it stages the bundle in a directory beside `~/Applications/Task Viewer.app`, and its Context requires this task's removal set to cover a staging or backup directory a failed install leaves behind. Its documentation step also rewrites the same `README.md` desktop section, `FEATURES.md` `make install` bullet, `SECURITY.md` Data paragraph, and `TESTING.md` installer-case sentence this task's documentation step extends. [task-viewer_launcher-moved-checkout-ownership.md](archive/task-viewer_launcher-moved-checkout-ownership.md) keeps removing an installed Dock tile or `.desktop` entry out of scope and defers it to this task. [task-viewer_dock-pin-home-guard.md](archive/task-viewer_dock-pin-home-guard.md) is finished and archived: `login_account_home` and the `TASK_VIEWER_DOCK_PIN` guard are in `scripts/install-desktop.sh`, and it rewrote the same four documentation passages, so the removal path reuses its helper and lands on its wording.
+Two tasks share this surface. [task-viewer_install-desktop-atomic-bundle.md](task-viewer_install-desktop-atomic-bundle.md) landed first: it stages the bundle in a directory beside `~/Applications/Task Viewer.app`, and its Context requires this task's removal set to cover a staging or backup directory a failed install leaves behind. Its documentation step also rewrites the same `README.md` desktop section, `FEATURES.md` `make install` bullet, `SECURITY.md` Data paragraph, and `TESTING.md` installer-case sentence this task's documentation step extends. [task-viewer_launcher-moved-checkout-ownership.md](task-viewer_launcher-moved-checkout-ownership.md) keeps removing an installed Dock tile or `.desktop` entry out of scope and defers it to this task. [task-viewer_dock-pin-home-guard.md](task-viewer_dock-pin-home-guard.md) is finished and archived: `login_account_home` and the `TASK_VIEWER_DOCK_PIN` guard are in `scripts/install-desktop.sh`, and it rewrote the same four documentation passages, so the removal path reuses its helper and lands on its wording.
 
 ## Approach
 

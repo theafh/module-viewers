@@ -29,7 +29,7 @@ The icon step does not abort. `build_macos_icns` is called only as the `if` cond
 
 The Dock pin fails badly. `dockutil --add` is unguarded, so a failing `dockutil` exits right after `✓ App bundle created` with no message. Without `dockutil`, the Python block raises an uncaught `CalledProcessError` from `defaults export` or `defaults import`, or a `plistlib` error from an unreadable Dock plist, and the traceback prints after `✓ App bundle created`, so it reads like a crash rather than "the Dock pin failed".
 
-Reinstall is the repair path for a stale icon, and it is the step that can destroy the thing it repairs. The staging and backup directories this task adds sit beside `~/Applications/Task Viewer.app`, the same bundle `tasks/task-viewer_make-uninstall.md` removes; that task's removal set has to cover a staging or backup directory a failed install leaves behind, so this task lands first and the uninstall task follows it.
+Reinstall is the repair path for a stale icon, and it is the step that can destroy the thing it repairs. The staging and backup directories this task adds sit beside `~/Applications/Task Viewer.app`, the same bundle `tasks/archive/task-viewer_make-uninstall.md` removes; that task's removal set has to cover a staging or backup directory a failed install leaves behind, so this task lands first and the uninstall task follows it.
 
 ## Approach
 

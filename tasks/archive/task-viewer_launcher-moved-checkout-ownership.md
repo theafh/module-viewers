@@ -48,7 +48,7 @@ Other live tasks edit the same launcher test file and launcher regions, includin
 
 The port is shared by every checkout, so a task-viewer binary on it is this app's server and the launcher's stop owns it. An unrelated listener stays untouched.
 
-**Out of scope:** removing an installed Dock tile or `.desktop` entry, which [make uninstall](../task-viewer_make-uninstall.md) owns, changing the checkout path the launcher embeds at install time, and identifying a listener on a machine with neither `lsof` nor `ss` and no PID file, where the launcher cannot know the process.
+**Out of scope:** removing an installed Dock tile or `.desktop` entry, which [make uninstall](task-viewer_make-uninstall.md) owns, changing the checkout path the launcher embeds at install time, and identifying a listener on a machine with neither `lsof` nor `ss` and no PID file, where the launcher cannot know the process.
 
 ## Acceptance
 
