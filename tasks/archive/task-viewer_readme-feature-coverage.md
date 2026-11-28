@@ -2,7 +2,7 @@
 description: "Document the task list, the three exports, Rescan/Relocate/Remove, and TASK_VIEWER_DB in the README."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-28T14:07:30Z
+updated: 2026-11-28T14:29:56Z
 status: finished
 reported-by: "Andreas Hoffmann"
 implemented-by: "Andreas Hoffmann"
@@ -17,7 +17,7 @@ A person reading `README.md` learns that the task list exists, how to export tas
 
 ## Context
 
-The README's `## Run` bullet list, inside its `task-viewer` section, lists only Dashboard, Add repository, Project, Update, and Light/Dark. `FEATURES.md` documents `GET /tasks` with search, scope, sort, and CSV export; `/charts.csv` and `/charts.json`; Rescan, Relocate, and Remove; and `TASK_VIEWER_DB` as a supported override. The `task-viewer` prose already states that removing a repository deletes only its rows in the database, so the Remove bullet's content is settled in Approach step 3. Other tasks that edit `README.md` rewrite its launcher, Build, database, log, and configuration sentences, including [the strict RUST_LOG task](task-viewer_rust-log-parse-strict.md), which has already landed on them; keep those sentences intact while adding the new bullets, and leave the ordering to the merge. The README is the only onboarding document, so every omission reads as "not a feature".
+The README's `## Run` bullet list, inside its `task-viewer` section, lists only Dashboard, Add repository, Project, Update, and Light/Dark. `FEATURES.md` documents `GET /tasks` with search, scope, sort, and CSV export; `/charts.csv` and `/charts.json`; Rescan, Relocate, and Remove; and `TASK_VIEWER_DB` as a supported override. The `task-viewer` prose already states that removing a repository deletes only its rows in the database, so the Remove bullet's content is settled by the step that begins "Add a bullet for repository management:". Other tasks that edit `README.md` rewrite its launcher, Build, database, log, and configuration sentences, including [the strict RUST_LOG task](task-viewer_rust-log-parse-strict.md), which has already landed on them; this task kept those sentences intact while adding the new bullets, and left the ordering to the merge. The README is the only onboarding document, so every omission reads as "not a feature".
 
 ## Approach
 
@@ -34,6 +34,6 @@ The README's `## Run` bullet list, inside its `task-viewer` section, lists only 
 
 - The README names the task list and how to reach it.
 - The README names the task CSV, charts CSV, and charts JSON exports.
-- The README names Rescan, Relocate, and Remove; it says what Rescan and Relocate change, and for Remove it names the control and its confirmation page, as Approach step 3 settles.
+- The README names Rescan, Relocate, and Remove; it says what Rescan and Relocate change, and for Remove it names the control and its confirmation page — the control opens a page that asks before it deletes — without restating the deletion effect, as the step that begins "Add a bullet for repository management:" settles.
 - The README's environment paragraph — the one that documents `TASK_VIEWER_SCAN_WORKERS` and `TASK_VIEWER_GIT_TIMEOUT_SECS` — states that `TASK_VIEWER_DB` names the database file and that it defaults to `~/.task-viewer`, so a reader learns how to move the database. The database paragraph's log-line clause, which only names the variable as one of the two things that can set the opened file, does not satisfy this item.
 - Each control name `Export CSV`, `Charts CSV`, `Charts JSON`, `Rescan`, `Relocate`, and `Remove` appears verbatim in `README.md`, and each of those labels also appears in `task-viewer/templates/tasks.html` or `task-viewer/templates/repositories.html`.
