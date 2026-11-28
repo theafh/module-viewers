@@ -1774,7 +1774,7 @@ mod tests {
         assert_eq!(board.counts.created_events, 2);
     }
 
-    /// Covers: a payload whose earliest event sits 104 weeks before today's
+    /// Covers: a payload whose earliest event sits 103 weeks before today's
     /// Monday still opens on the Monday 103 weeks before today.
     #[test]
     fn series_weekly_opens_103_weeks_before_today() {
