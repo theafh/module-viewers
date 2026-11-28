@@ -16323,11 +16323,16 @@ mod tests {
     }
 
     /// Covers: a window resize redraws every chart card only when the charts
-    /// container's width changed. The prelude replaces each card's `.summary`
+    /// container's width changed, and a width bump reverted inside one debounce
+    /// window draws nothing. The prelude replaces each card's `.summary`
     /// `textContent` with a counting setter, so each draw's one summary write is
-    /// one count, and the case drives the debounce by running the timers a
-    /// dispatch recorded: a same-width dispatch schedules none and runs none,
-    /// while a changed width schedules the one `renderAll` it runs.
+    /// one count, and the case drives the debounce by running the uncancelled
+    /// timers a dispatch recorded: a same-width dispatch schedules none and runs
+    /// none, a changed width schedules the one `renderAll` it runs, and a bump
+    /// followed by a revert cancels the timer the bump scheduled, so the drain
+    /// finds nothing uncancelled and runs nothing. The fixture's `clearTimeout`
+    /// marks the record cancelled, so the bounce assertion fails if the shipped
+    /// handler moves the cancel below the unchanged-width return.
     #[test]
     fn browser_resize_redraws_only_when_the_chart_width_changed() {
         let config = browser_config(false, false, None, serde_json::json!("#123456"));
@@ -16350,17 +16355,24 @@ mod tests {
             &config,
             r#"(function () {
   var env = globalThis.__env;
-  function resize() {
+  function dispatchResize() {
     var before = env.timeouts.length;
     env.window.dispatchEvent(new env.Event("resize"));
+    return before;
+  }
+  function drain(before) {
     var ran = 0;
     var delay = null;
     for (var index = before; index < env.timeouts.length; index += 1) {
+      if (env.timeouts[index].cancelled) continue;
       delay = env.timeouts[index].delay;
       env.timeouts[index].handler();
       ran += 1;
     }
     return { ran: ran, delay: delay };
+  }
+  function resize() {
+    return drain(dispatchResize());
   }
   var perDraw = env.cardNames.length;
   var afterLoad = globalThis.__draws;
@@ -16371,6 +16383,18 @@ mod tests {
   env.chartsSection.clientWidth = env.chartsSection.clientWidth + 1;
   var changed = resize();
   var afterChanged = globalThis.__draws;
+  var base = env.chartsSection.clientWidth;
+  var bounceBefore = env.timeouts.length;
+  env.chartsSection.clientWidth = base + 1;
+  dispatchResize();
+  env.chartsSection.clientWidth = base;
+  dispatchResize();
+  var pending = 0;
+  for (var index = bounceBefore; index < env.timeouts.length; index += 1) {
+    if (!env.timeouts[index].cancelled) pending += 1;
+  }
+  var bounce = drain(bounceBefore);
+  var afterBounce = globalThis.__draws;
   return JSON.stringify({
     perDraw: perDraw,
     afterLoad: afterLoad,
@@ -16380,7 +16404,10 @@ mod tests {
     afterSecond: afterSecond,
     changedTimers: changed.ran,
     changedDelay: changed.delay,
-    afterChanged: afterChanged
+    afterChanged: afterChanged,
+    bounceTimers: bounce.ran,
+    bouncePending: pending,
+    afterBounce: afterBounce
   });
 })()"#,
         );
@@ -16424,6 +16451,24 @@ mod tests {
             result["afterChanged"].as_u64(),
             Some(per_draw * 2),
             "the changed width redraws every card: {result:?}"
+        );
+        assert_eq!(
+            result["bouncePending"].as_u64(),
+            Some(0),
+            "a width bump reverted inside one debounce window leaves no \
+             uncancelled redraw pending: {result:?}"
+        );
+        assert_eq!(
+            result["bounceTimers"].as_u64(),
+            Some(0),
+            "the revert cancels the redraw the bump scheduled, so the drain runs \
+             none: {result:?}"
+        );
+        assert_eq!(
+            result["afterBounce"].as_u64(),
+            Some(per_draw * 2),
+            "a width bump reverted inside one debounce window draws nothing: \
+             {result:?}"
         );
     }
 

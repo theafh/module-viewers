@@ -637,11 +637,20 @@
     },
     // Scheduled callbacks are recorded instead of run, so a test can drive a
     // poll's next tick by hand and assert that a finished poll schedules none.
+    // Each record carries a `cancelled` flag a test can read, so a cleared
+    // callback stays visible in the array without ever being run.
     setTimeout: function (handler, delay) {
-      timeouts.push({ handler: handler, delay: delay });
+      timeouts.push({ handler: handler, delay: delay, cancelled: false });
       return timeouts.length;
     },
-    clearTimeout: function () {}
+    // Clearing a timer marks its record cancelled instead of dropping it, the
+    // way a browser forgets a pending callback. The record keeps its place, so
+    // the id `setTimeout` returned still names it and a test can tell a
+    // cancelled callback from one that was never scheduled.
+    clearTimeout: function (id) {
+      var timer = timeouts[Number(id) - 1];
+      if (timer) timer.cancelled = true;
+    }
   };
 
   function Event(type) {

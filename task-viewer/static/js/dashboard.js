@@ -1689,12 +1689,13 @@
     // A height-only resize, a zoom that keeps the layout width, and a mobile
     // browser's URL bar sliding during scroll all leave the charts container's
     // width alone. Rebuilding ten SVGs for them would stale an open tooltip and
-    // drop focus, so only a real width change schedules the redraw. A page with
-    // no charts section keeps the unconditional redraw.
+    // drop focus, so only a real width change schedules the redraw, and a resize
+    // back to the rendered width cancels one an earlier change scheduled. A page
+    // with no charts section keeps the unconditional redraw.
+    window.clearTimeout(resizeTimer);
     if (chartsSection && chartsSection.clientWidth === renderedWidth) {
       return;
     }
-    window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(renderAll, 100);
   });
 })();
