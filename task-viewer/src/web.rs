@@ -5773,9 +5773,20 @@ mod tests {
         cleanup(&path);
     }
 
+    /// The `<li>` block one repository renders, found by its name link, so an
+    /// assertion can scope to that row when the page carries several.
+    fn repository_row<'a>(body: &'a str, name: &str) -> &'a str {
+        let marker = format!(">{name}</a>");
+        body.split("<li>")
+            .find(|row| row.contains(&marker))
+            .unwrap_or_else(|| panic!("the row for {name} renders: {body}"))
+    }
+
     /// Covers: the Repositories page renders `last success` and `last error`
-    /// with their human times, keeps the error after a later success as muted
-    /// history, and marks it as an error once a scan fails again.
+    /// with their human times, words the error state as `(current)` or
+    /// `(recovered)` so the distinction is not carried by colour alone, keeps
+    /// the error after a later success as muted history, and marks it as an
+    /// error once a scan fails again.
     #[tokio::test(flavor = "current_thread")]
     async fn web_repositories_page_renders_last_success_and_last_error_history() {
         let (state, path) = app_state("repo_history").await;
@@ -5816,13 +5827,77 @@ mod tests {
         );
         assert!(
             body.contains(
-                "last error 2026-11-10 00:45 (2 days ago): Git could not read the history."
+                "class=\"muted\">last error (recovered) 2026-11-10 00:45 (2 days ago): Git could not read the history."
             ),
-            "the error text and its own time render beside the success: {body}"
+            "a recovered repository words its stored error as recovered beside its own time: {body}"
         );
         assert!(
             !body.contains("class=\"error-text\""),
             "a recovered repository renders its stored error as history: {body}"
+        );
+
+        // A stored error with no error time renders no time and no separator.
+        let untimed_folder = live_repository("repo_history_untimed");
+        let untimed =
+            db::insert_repository(&state.pool, "untimed", &untimed_folder.to_string_lossy())
+                .await
+                .expect("insert untimed");
+        sqlx::query("UPDATE repositories SET last_error = ? WHERE repository_id = ?")
+            .bind("Git could not read the history.")
+            .bind(untimed)
+            .execute(&state.pool)
+            .await
+            .expect("store an untimed error");
+        let fresh_folder = live_repository("repo_history_fresh");
+        db::insert_repository(&state.pool, "fresh", &fresh_folder.to_string_lossy())
+            .await
+            .expect("insert fresh");
+        let body = render_repositories_at(
+            &state,
+            &FlashQuery::default(),
+            &PageChrome::default(),
+            now,
+            &zone,
+        )
+        .await
+        .expect("render");
+        let untimed_row = repository_row(&body, "untimed");
+        assert!(
+            untimed_row.contains("last error (current): Git could not read the history."),
+            "a stored error with no error time words the state and keeps no time: {untimed_row}"
+        );
+        assert!(
+            !untimed_row.contains("(current) :") && !untimed_row.contains("(current)  "),
+            "a stored error with no error time leaves no stray separator: {untimed_row}"
+        );
+        let fresh_row = repository_row(&body, "fresh");
+        assert!(
+            !fresh_row.contains("last error"),
+            "a repository with no stored error renders no error line: {fresh_row}"
+        );
+
+        sqlx::query("UPDATE repositories SET last_outcome = 'success' WHERE repository_id = ?")
+            .bind(untimed)
+            .execute(&state.pool)
+            .await
+            .expect("clear the untimed error");
+        let body = render_repositories_at(
+            &state,
+            &FlashQuery::default(),
+            &PageChrome::default(),
+            now,
+            &zone,
+        )
+        .await
+        .expect("render");
+        let untimed_row = repository_row(&body, "untimed");
+        assert!(
+            untimed_row.contains("last error (recovered): Git could not read the history."),
+            "a later success words the untimed stored error as recovered with no time: {untimed_row}"
+        );
+        assert!(
+            !untimed_row.contains("(recovered) :") && !untimed_row.contains("(recovered)  "),
+            "a recovered untimed error leaves no stray separator: {untimed_row}"
         );
 
         sqlx::query("UPDATE repositories SET last_outcome = 'error' WHERE repository_id = ?")
@@ -5840,11 +5915,15 @@ mod tests {
         .await
         .expect("render");
         assert!(
-            body.contains("class=\"error-text\">last error"),
-            "a failing repository renders its error as a current failure: {body}"
+            body.contains(
+                "class=\"error-text\">last error (current) 2026-11-10 00:45 (2 days ago): Git could not read the history."
+            ),
+            "a failing repository words its error as current beside its own time: {body}"
         );
 
         let _ = std::fs::remove_dir_all(folder);
+        let _ = std::fs::remove_dir_all(untimed_folder);
+        let _ = std::fs::remove_dir_all(fresh_folder);
         cleanup(&path);
     }
 
