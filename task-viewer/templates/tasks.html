@@ -30,6 +30,14 @@
     <a class="btn btn-secondary" href="/charts.csv?{{ charts_query }}">Charts CSV</a>
     <a class="btn btn-secondary" href="/charts.json?{{ charts_query }}">Charts JSON</a>
 </form>
+{# A `from` or `to` the filter could not read is named here, above the list, so the window it left open is visible instead of silent. The value is page-local text and passes the template auto-escaper; it never travels through the one-shot banner path. #}
+{% if ignored_bounds %}
+<div class="banner task-bounds-banner" role="status">
+    {% for message in ignored_bounds %}
+    <p>{{ message }}</p>
+    {% endfor %}
+</div>
+{% endif %}
 {% if filter_summary %}
 <div class="task-filters">
     <p class="task-filter-summary">{{ filter_summary }}</p>

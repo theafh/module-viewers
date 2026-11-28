@@ -1739,6 +1739,32 @@ enum DateAxis {
     Shipped,
 }
 
+/// One `from` or `to` bound the request carried but the filter ignored, because
+/// its trimmed value is non-empty and is not a date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IgnoredBound {
+    /// The query parameter the request spelled: `from` or `to`.
+    field: &'static str,
+    /// The trimmed value the request carried.
+    value: String,
+}
+
+impl IgnoredBound {
+    /// The banner sentence that names the ignored field and its trimmed value,
+    /// and says which edge of the window stayed open.
+    fn message(&self) -> String {
+        let edge = match self.field {
+            "from" => "lower",
+            _ => "upper",
+        };
+        format!(
+            "The {field} bound “{value}” is not a date, so the list applies no {edge} bound.",
+            field = self.field,
+            value = self.value,
+        )
+    }
+}
+
 /// The filters a `/tasks` request carries. Each one narrows the stored rows the
 /// way the dashboard's chart marks ask for, so a count opens the rows behind it.
 #[derive(Debug)]
@@ -1749,6 +1775,8 @@ struct TaskFilter {
     date: DateAxis,
     from: Option<NaiveDate>,
     to: Option<NaiveDate>,
+    /// The bounds the request spelled but the filter ignored, in request order.
+    ignored: Vec<IgnoredBound>,
 }
 
 impl TaskFilter {
@@ -1760,13 +1788,28 @@ impl TaskFilter {
             "shipped" => DateAxis::Shipped,
             _ => DateAxis::Created,
         };
+        let from_raw = query.from.trim();
+        let to_raw = query.to.trim();
+        let from = crate::dates::parse_iso_date(from_raw);
+        let to = crate::dates::parse_iso_date(to_raw);
+        // A non-empty bound that does not parse is ignored rather than fatal, so
+        // the list stays usable; the page names it instead of widening silently.
+        let ignored = [("from", from_raw, from), ("to", to_raw, to)]
+            .into_iter()
+            .filter(|(_, raw, parsed)| !raw.is_empty() && parsed.is_none())
+            .map(|(field, raw, _)| IgnoredBound {
+                field,
+                value: raw.to_string(),
+            })
+            .collect();
         Self {
             kind,
             scope: (!scope.is_empty()).then(|| scope.to_string()),
             q: (!q.is_empty()).then_some(q),
             date,
-            from: crate::dates::parse_iso_date(query.from.trim()),
-            to: crate::dates::parse_iso_date(query.to.trim()),
+            from,
+            to,
+            ignored,
         }
     }
 
@@ -2163,6 +2206,7 @@ async fn render_tasks(
         sort: sort.key.as_str().to_string(),
         dir: sort.dir.as_str().to_string(),
         scopes,
+        ignored_bounds: filter.ignored.iter().map(IgnoredBound::message).collect(),
         filter_summary: applied.summary,
         filter_chips: applied.chips,
         clear_href: applied.clear_href,
@@ -2176,7 +2220,9 @@ async fn render_tasks(
 }
 
 /// The filter pairs a `/tasks` request carries onto a header link or the export
-/// link: the project always, then every non-empty filter. Each value is
+/// link: the project always, then every applied filter. An ignored `from` or
+/// `to` bound stays out, so a header link and the CSV follow the rows the list
+/// shows instead of repeating a value the filter never used. Each value is
 /// percent-encoded when the pairs join into a query string.
 fn filtered_pairs(query: &TasksQuery, project: &str) -> Vec<(&'static str, String)> {
     let mut pairs = vec![("project", project.to_string())];
@@ -2185,10 +2231,13 @@ fn filtered_pairs(query: &TasksQuery, project: &str) -> Vec<(&'static str, Strin
         ("scope", query.scope.trim()),
         ("q", query.q.trim()),
         ("date", query.date.trim()),
-        ("from", query.from.trim()),
-        ("to", query.to.trim()),
     ] {
         if !value.is_empty() {
+            pairs.push((name, value.to_string()));
+        }
+    }
+    for (name, value) in [("from", query.from.trim()), ("to", query.to.trim())] {
+        if !value.is_empty() && crate::dates::parse_iso_date(value).is_some() {
             pairs.push((name, value.to_string()));
         }
     }
@@ -2203,8 +2252,9 @@ fn encode_pairs(pairs: &[(&'static str, String)]) -> String {
         .join("&")
 }
 
-/// The query string the Export CSV link carries: every filter the request set
-/// plus the resolved sort, so the CSV body follows the list's order.
+/// The query string the Export CSV link carries: every applied filter plus the
+/// resolved sort, so the CSV body follows the list's order and a bound the
+/// filter ignored stays out of the link.
 fn export_query(query: &TasksQuery, project: &str, sort: TaskSort) -> String {
     let mut pairs = filtered_pairs(query, project);
     pairs.push(("sort", sort.key.as_str().to_string()));
@@ -2907,6 +2957,9 @@ struct TasksPage {
     /// project does not store, that applied value, so the select shows the
     /// ghost scope the list is filtered on as its selected option.
     scopes: Vec<String>,
+    /// One banner sentence per `from` or `to` bound the request spelled but the
+    /// filter ignored, so the page names each one instead of widening silently.
+    ignored_bounds: Vec<String>,
     /// The readable summary of the filters the request applied, empty when
     /// none is applied so the page renders no filter strip.
     filter_summary: String,
@@ -11818,6 +11871,138 @@ mod tests {
         assert!(body.contains("beta_defer.md"));
         assert!(!body.contains("alpha_live.md"));
 
+        cleanup(&path);
+    }
+
+    /// Covers: a non-empty `from` or `to` the filter cannot read renders one
+    /// page-local banner naming the field and the trimmed value with
+    /// `role="status"`, applies no bound, and stays out of the sort-header and
+    /// export links, while the form still echoes it for Show; a valid bound
+    /// still narrows the rows and rides those links, so the page and the CSV
+    /// describe the same filter.
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_tasks_ignored_date_bound_renders_a_banner_and_rides_no_link() {
+        let (state, path, _alpha, _beta) = seeded_task_list("tasks_ignored_bound").await;
+        let all_rows = [
+            "alpha_done.md",
+            "alpha_live.md",
+            "beta_defer.md",
+            "gamma_live.md",
+        ];
+
+        let body = task_list_body(&state, "from=2026-05-32").await;
+        assert!(
+            body.contains("<div class=\"banner task-bounds-banner\" role=\"status\">"),
+            "the ignored bound renders one status banner: {body}"
+        );
+        assert!(
+            body.contains(
+                "The from bound “2026-05-32” is not a date, so the list applies no lower bound."
+            ),
+            "the banner names the field and the trimmed value: {body}"
+        );
+        assert_eq!(
+            task_paths(&body),
+            all_rows,
+            "an ignored bound narrows nothing: {body}"
+        );
+        assert_eq!(
+            hidden_input_value(&body, "from"),
+            "2026-05-32",
+            "the form echoes the value Show re-requests: {body}"
+        );
+        assert_eq!(
+            export_href(&body),
+            "/tasks.csv?project=all&sort=scope&dir=asc",
+            "the export link omits the ignored bound"
+        );
+        for label in [
+            "Repository",
+            "Scope",
+            "Path",
+            "Kind",
+            "Created",
+            "Ship or leave day",
+        ] {
+            let href = header_href(&body, label);
+            assert!(
+                !href.contains("from="),
+                "the {label} header link omits the ignored bound: {href}"
+            );
+        }
+
+        let body = task_list_body(&state, "to=2026-13-01").await;
+        assert!(
+            body.contains(
+                "The to bound “2026-13-01” is not a date, so the list applies no upper bound."
+            ),
+            "the banner names the ignored upper bound: {body}"
+        );
+        assert_eq!(task_paths(&body), all_rows, "{body}");
+        assert!(
+            !export_href(&body).contains("to="),
+            "the export link omits the ignored upper bound"
+        );
+
+        let body = task_list_body(&state, "from=2026-05-32&to=2026-13-01").await;
+        assert_eq!(
+            body.matches("task-bounds-banner").count(),
+            1,
+            "one banner names every ignored bound: {body}"
+        );
+        assert!(
+            body.contains("The from bound “2026-05-32”")
+                && body.contains("The to bound “2026-13-01”"),
+            "both ignored bounds are named: {body}"
+        );
+
+        // The echoed bound is text, not markup: a value holding a tag renders
+        // escaped in the banner and in the form's hidden input.
+        let body = task_list_body(&state, "from=%3Cb%3E2026-05-32").await;
+        assert!(
+            body.contains("The from bound “&lt;b&gt;2026-05-32”"),
+            "the banner echoes the bound escaped: {body}"
+        );
+        assert!(
+            !body.contains("<b>2026-05-32"),
+            "no bound reaches the page as raw markup: {body}"
+        );
+
+        // The CSV the page links to applies the same filter: with the bad bound
+        // dropped, both bodies describe every row.
+        let response = send(
+            state.clone(),
+            get_page("/tasks.csv?from=2026-05-32", "127.0.0.1:7880"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let csv = body_text(response).await;
+        assert_eq!(
+            csv_rows(&csv).len(),
+            all_rows.len() + 1,
+            "the CSV ignores the unparseable bound too: {csv}"
+        );
+
+        let body = task_list_body(&state, "from=2026-06-01").await;
+        assert!(
+            !body.contains("task-bounds-banner"),
+            "a valid bound renders no banner: {body}"
+        );
+        assert_eq!(
+            task_paths(&body),
+            vec!["gamma_live.md"],
+            "a valid bound still narrows the list: {body}"
+        );
+        assert!(
+            export_href(&body).contains("from=2026-06-01"),
+            "a valid bound rides the export link: {}",
+            export_href(&body)
+        );
+        assert!(
+            header_href(&body, "Created").contains("from=2026-06-01"),
+            "a valid bound rides the sort-header links: {}",
+            header_href(&body, "Created")
+        );
         cleanup(&path);
     }
 

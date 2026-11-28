@@ -268,6 +268,16 @@ input[type="search"] {
     color: var(--text-secondary);
 }
 
+/* An ignored `from` or `to` bound reports above the list, in the same card as
+   an outcome banner, so the window it left open is visible. */
+.task-bounds-banner {
+    margin-bottom: 1rem;
+}
+
+.task-bounds-banner p {
+    margin: 0;
+}
+
 .task-list td code {
     /* A stored path is one unbroken token, so break it anywhere rather than
        let it set the table's min-content width and scroll the page. */

@@ -2,9 +2,11 @@
 description: "Show a banner naming an unparseable from or to bound on the task list instead of silently widening the window."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-27T17:15:33Z
-status: checked
+updated: 2026-11-28T07:45:52Z
+status: implemented
 reported-by: "Andreas Hoffmann"
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 ---
 
 # Say when a task-list date bound was ignored
@@ -38,4 +40,5 @@ reported-by: "Andreas Hoffmann"
 - The export and sort-header links omit the ignored value.
 - A valid bound still narrows the list and round-trips.
 - `FEATURES.md`'s task-list paragraph states the ignored-bound rule and `TESTING.md`'s task-list bullet names the new web test.
+- `SECURITY.md`'s `## Attack Surface` carries the sentence that the task list echoes the two date bounds as escaped text, checked by grepping that file.
 - The new web test, `make lint`, and `make test` pass.
