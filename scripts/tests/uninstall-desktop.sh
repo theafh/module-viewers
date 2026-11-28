@@ -74,6 +74,27 @@ EOS
     chmod +x "$root/bin/killall"
 }
 
+# A `dockutil` stub that prints the documented tab-separated list form and drops
+# the tile on --remove, recording the arguments it saw.
+make_dockutil_stub() {
+    local root="$1"
+    cat >"$root/bin/dockutil" <<'EOS'
+#!/bin/bash
+case "$1" in
+    --list)
+        [ -f "$DOCKUTIL_STATE" ] || exit 0
+        printf 'Task Viewer\tfile:///Applications/Task%%20Viewer.app/\tpersistent-apps\tlocal.task-viewer.launcher\n'
+        printf 'Finder\tfile:///System/Library/CoreServices/Finder.app/\tpersistent-apps\tcom.apple.finder\n'
+        ;;
+    --remove)
+        printf '%s\n' "$*" >>"$DOCKUTIL_LOG"
+        rm -f "$DOCKUTIL_STATE"
+        ;;
+esac
+EOS
+    chmod +x "$root/bin/dockutil"
+}
+
 # `id` and `dscl` stubs that make login_account_home report $FAKE_LOGIN_HOME.
 make_login_home_stubs() {
     local root="$1"
@@ -353,7 +374,40 @@ case_linux_removal() {
     fi
 }
 
+# The dockutil branch: the tile is counted from the tab-separated list form and
+# the Dock restarts once a tile is actually removed.
+case_dockutil_removal() {
+    local root="$TMP/dockutil" out status
+    make_root "$root" Darwin
+    make_killall_stub "$root"
+    make_login_home_stubs "$root"
+    make_dockutil_stub "$root"
+    printf 'tile\n' >"$root/dockutil.state"
+
+    out=$(HOME="$root/home" FAKE_LOGIN_HOME="$root/home" \
+        DOCKUTIL_STATE="$root/dockutil.state" DOCKUTIL_LOG="$root/dockutil.log" \
+        KILLALL_LOG="$root/killall.log" \
+        PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/uninstall-desktop.sh" 2>&1)
+    status=$?
+
+    if [ "$status" -eq 0 ] &&
+        [ ! -f "$root/dockutil.state" ] &&
+        grep -q -- '--remove Task Viewer' "$root/dockutil.log" &&
+        [ "$(killall_count "$root/killall.log")" -eq 1 ] &&
+        grep -qx 'Dock' "$root/killall.log"; then
+        pass "the dockutil branch removes the tile and restarts the Dock once"
+    else
+        fail "the dockutil branch removes the tile and restarts the Dock once (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        for log in dockutil killall; do
+            [ -f "$root/$log.log" ] && sed 's/^/    /' "$root/$log.log"
+        done
+    fi
+}
+
 case_dock_removal
+case_dockutil_removal
 case_idempotent_second_run
 case_redirected_home_skips_dock
 case_missing_tools_reports_and_fails

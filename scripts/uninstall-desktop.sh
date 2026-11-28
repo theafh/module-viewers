@@ -212,11 +212,17 @@ dock_removal_guidance() {
 # and the user has to remove the tile by hand.
 remove_dock_tile() {
     local removed=0 before after
+    # dockutil --list prints one tab-separated line per tile, the label first,
+    # so count the label as the first field rather than as the whole line.
+    dock_tile_count() {
+        dockutil --list 2>/dev/null |
+            awk -F'\t' -v label="$APP_NAME" '$1 == label { n++ } END { print n + 0 }'
+    }
     if command -v dockutil >/dev/null 2>&1; then
         if dockutil --list >/dev/null 2>&1; then
-            before=$(dockutil --list 2>/dev/null | grep -cxF "$APP_NAME" || true)
+            before=$(dock_tile_count)
             dockutil --remove "$APP_NAME" --no-restart >/dev/null 2>&1 || true
-            after=$(dockutil --list 2>/dev/null | grep -cxF "$APP_NAME" || true)
+            after=$(dock_tile_count)
             if [ "${before:-0}" -gt "${after:-0}" ]; then
                 removed=1
             fi
