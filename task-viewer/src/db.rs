@@ -299,6 +299,12 @@ pub async fn init_at(path: &Path) -> Result<Pool<Sqlite>> {
 async fn init_at_with_source(path: &Path, source: PathSource) -> Result<Pool<Sqlite>> {
     let pool = connect(path, source).await?;
     migrate(&pool, path).await?;
+    tracing::info!(
+        database_path = %path.display(),
+        source = source.describe(),
+        schema_version = SCHEMA_VERSION,
+        "task-viewer opened its database"
+    );
     Ok(pool)
 }
 

@@ -9,6 +9,7 @@
 //! pattern the inline suites use. It also carries its own `GRACE` mirror,
 //! because `web::SHUTDOWN_GRACE` is not importable from here.
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -121,7 +122,34 @@ impl Server {
     /// Start the child on the first candidate port it can bind, retrying the
     /// next candidate when it reports that one is in use.
     fn start(scratch: &Scratch, name: &str, db: &Path, pause_ms: Option<u64>) -> Self {
-        Self::start_on(scratch, name, db, pause_ms, candidate_ports())
+        Self::spawn_on(
+            scratch,
+            name,
+            Some(db.as_os_str()),
+            None,
+            pause_ms,
+            candidate_ports(),
+        )
+    }
+
+    /// Start the child with `TASK_VIEWER_DB` set to `value`, which may carry
+    /// surrounding whitespace the server trims before opening the file.
+    fn start_with_configured_value(scratch: &Scratch, name: &str, value: &str) -> Self {
+        Self::spawn_on(
+            scratch,
+            name,
+            Some(OsStr::new(value)),
+            None,
+            None,
+            candidate_ports(),
+        )
+    }
+
+    /// Start the child with `TASK_VIEWER_DB` removed from its environment and
+    /// `HOME` set to `home`, so it resolves the default `~/.task-viewer` path
+    /// under that home directory.
+    fn start_with_home(scratch: &Scratch, name: &str, home: &Path) -> Self {
+        Self::spawn_on(scratch, name, None, Some(home), None, candidate_ports())
     }
 
     /// Start the child on the first of `candidates` it can bind, so a test can
@@ -133,6 +161,27 @@ impl Server {
         pause_ms: Option<u64>,
         candidates: impl Iterator<Item = u16>,
     ) -> Self {
+        Self::spawn_on(
+            scratch,
+            name,
+            Some(db.as_os_str()),
+            None,
+            pause_ms,
+            candidates,
+        )
+    }
+
+    /// Spawn the child with the database environment it should see: a
+    /// `TASK_VIEWER_DB` value, or the variable removed so the default path
+    /// applies, plus an optional `HOME` override.
+    fn spawn_on(
+        scratch: &Scratch,
+        name: &str,
+        database: Option<&OsStr>,
+        home: Option<&Path>,
+        pause_ms: Option<u64>,
+        candidates: impl Iterator<Item = u16>,
+    ) -> Self {
         let log = scratch.path().join(format!("{name}.log"));
         let marker = pause_ms.map(|_| scratch.path().join(format!("{name}.store-open")));
         if let Some(marker) = &marker {
@@ -141,8 +190,18 @@ impl Server {
         for port in candidates {
             let file = std::fs::File::create(&log).expect("server log");
             let mut command = Command::new(env!("CARGO_BIN_EXE_task-viewer"));
+            match database {
+                Some(database) => {
+                    command.env("TASK_VIEWER_DB", database);
+                }
+                None => {
+                    command.env_remove("TASK_VIEWER_DB");
+                }
+            }
+            if let Some(home) = home {
+                command.env("HOME", home);
+            }
             command
-                .env("TASK_VIEWER_DB", db)
                 .env("TASK_VIEWER_PORT", port.to_string())
                 .env("RUST_LOG", "task_viewer=info")
                 .stdout(Stdio::from(file.try_clone().expect("log clone")))
@@ -295,6 +354,54 @@ async fn open_database(path: &Path) -> sqlx::SqlitePool {
         .connect_with(SqliteConnectOptions::new().filename(path))
         .await
         .expect("open the child's database")
+}
+
+/// The schema version the child's database file carries, read the way the
+/// server stamps it, so a start-up case never hardcodes the number.
+fn stored_schema_version(path: &Path) -> i64 {
+    let read = async {
+        let pool = open_database(path).await;
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("read the child's schema version");
+        pool.close().await;
+        version
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(read)
+}
+
+/// The one start-up line naming the database the server opened, if the child
+/// logged it.
+fn database_line(log: &str) -> Option<&str> {
+    log.lines()
+        .find(|line| line.contains("task-viewer opened its database"))
+}
+
+/// A log line with its ANSI styling removed, so a field name, its `=`, and its
+/// value read as the plain text the server wrote. The subscriber styles the
+/// level, target, and field names even when its output is not a terminal.
+fn plain(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// One stored task row, as the charts would read it back.
@@ -551,5 +658,64 @@ fn a_panic_leaves_no_server_and_no_scratch_dir() {
     assert!(
         !alive.status.success(),
         "the server process is gone after the panic"
+    );
+}
+
+/// Covers: a start with `TASK_VIEWER_DB` set to a padded value logs one line
+/// naming the unpadded path `database_path` returned, the variable as its
+/// source, and the schema version the file reached.
+#[test]
+fn a_start_with_task_viewer_db_logs_the_configured_path_and_schema_version() {
+    let scratch = Scratch::new("startup_database_configured");
+    let db = scratch.path().join("test.db");
+    let padded = format!("  {}  ", db.display());
+    let server = Server::start_with_configured_value(&scratch, "server", &padded);
+    let log = server.log_text();
+    let line = plain(database_line(&log).unwrap_or_else(|| panic!("no database line\n{log}")));
+    assert!(
+        line.contains(&db.display().to_string()),
+        "the line names the unpadded path: {line}"
+    );
+    assert!(
+        !line.contains(&padded),
+        "the line carries no surrounding whitespace: {line}"
+    );
+    assert!(line.contains("TASK_VIEWER_DB"), "{line}");
+    let version = stored_schema_version(&db);
+    assert!(
+        line.contains(&format!("schema_version={version}")),
+        "the line carries the reached version {version}: {line}"
+    );
+    assert!(
+        !line.contains("repository"),
+        "the line names no repository: {line}"
+    );
+    assert!(
+        !line.contains("tasks/"),
+        "the line names no task path: {line}"
+    );
+}
+
+/// Covers: a start with `TASK_VIEWER_DB` removed and `HOME` set to a per-test
+/// temp dir logs one line naming the default `~/.task-viewer` path, the default
+/// as its source, and the schema version the file reached.
+#[test]
+fn a_start_with_the_default_path_logs_the_home_database_and_schema_version() {
+    let scratch = Scratch::new("startup_database_default");
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let db = home.join(".task-viewer");
+    let server = Server::start_with_home(&scratch, "server", &home);
+    let log = server.log_text();
+    let line = plain(database_line(&log).unwrap_or_else(|| panic!("no database line\n{log}")));
+    assert!(
+        line.contains(&db.display().to_string()),
+        "the line names the default path: {line}"
+    );
+    assert!(line.contains("the default database path"), "{line}");
+    let version = stored_schema_version(&db);
+    assert!(
+        line.contains(&format!("schema_version={version}")),
+        "the line carries the reached version {version}: {line}"
     );
 }
