@@ -2,8 +2,10 @@
 description: "Write the scan-status live region only when its text changes, so a screen reader does not repeat the same sentence every second."
 scope: task-viewer
 created: 2026-11-26T13:14:16Z
-updated: 2026-11-26T16:18:16Z
-status: checked
+updated: 2026-11-28T01:14:57Z
+status: implemented
+implemented-by: "Andreas Hoffmann"
+design-extended: false
 reported-by: "Andreas Hoffmann"
 ---
 

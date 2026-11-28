@@ -17208,6 +17208,141 @@ mod tests {
         );
     }
 
+    /// A stub `fetch` whose thenables resolve synchronously and whose payloads
+    /// answer in order, so a test can hold a scan open across several ticks and
+    /// change the repository count between them.
+    const SCAN_STATUS_SEQUENCE_FETCH: &str = r#"(function () {
+  globalThis.__fetchCalls = 0;
+  var payloads = [
+    { scanning: true, repositories: 3 },
+    { scanning: true, repositories: 3 },
+    { scanning: true, repositories: 4 },
+    { scanning: false, repositories: 4 }
+  ];
+  function resolved(value) {
+    if (value && typeof value.then === "function") return value;
+    return {
+      then: function (onFulfilled) {
+        try { return resolved(onFulfilled ? onFulfilled(value) : value); }
+        catch (error) { return rejected(error); }
+      },
+      catch: function () { return this; }
+    };
+  }
+  function rejected(error) {
+    return {
+      then: function () { return this; },
+      catch: function (onRejected) { if (onRejected) onRejected(error); return this; }
+    };
+  }
+  globalThis.fetch = function () {
+    var index = Math.min(globalThis.__fetchCalls, payloads.length - 1);
+    globalThis.__fetchCalls += 1;
+    var payload = payloads[index];
+    payload.worker_cap = 4;
+    payload.last_scan = null;
+    payload.failed_repositories = 0;
+    return resolved({ ok: true, json: function () { return resolved(payload); } });
+  };
+})();"#;
+
+    /// Wraps the stub scan-status node so every `textContent` write is counted,
+    /// which is how the announce-once guard is observed.
+    const COUNTING_SCAN_STATUS_WRITES: &str = r#"(function () {
+  var node = globalThis.__env.scanStatus;
+  var text = node.textContent;
+  globalThis.__scanStatusWrites = 0;
+  Object.defineProperty(node, "textContent", {
+    configurable: true,
+    get: function () { return text; },
+    set: function (value) {
+      text = String(value);
+      globalThis.__scanStatusWrites += 1;
+    }
+  });
+})();"#;
+
+    /// Covers: the live-region scan line is written only when its text changes,
+    /// so two identical polls announce once, a changed repository count
+    /// announces again, and the line still clears when the scan ends.
+    #[test]
+    fn browser_scan_status_writes_only_when_its_text_changes() {
+        let config = browser_config(false, false, None, serde_json::json!("#123456"));
+        let prelude = format!("{SCAN_STATUS_SEQUENCE_FETCH}\n{COUNTING_SCAN_STATUS_WRITES}");
+        let result = run_browser_with(
+            &prelude,
+            &config,
+            r#"(function () {
+  var env = globalThis.__env;
+  function state() {
+    return {
+      calls: globalThis.__fetchCalls,
+      writes: globalThis.__scanStatusWrites,
+      status: env.scanStatus.textContent,
+      scheduled: env.timeouts.length
+    };
+  }
+  var first = state();
+  env.timeouts[0].handler();
+  var identical = state();
+  env.timeouts[1].handler();
+  var changed = state();
+  env.timeouts[2].handler();
+  var finished = state();
+  return JSON.stringify({
+    first: first,
+    identical: identical,
+    changed: changed,
+    finished: finished
+  });
+})()"#,
+        );
+        assert_eq!(result["first"]["calls"], serde_json::json!(1));
+        assert_eq!(
+            result["first"]["writes"],
+            serde_json::json!(1),
+            "the first poll fills the empty line"
+        );
+        assert!(
+            result["first"]["status"]
+                .as_str()
+                .is_some_and(|text| text.contains('3')),
+            "the first poll names the repository count: {}",
+            result["first"]["status"]
+        );
+        assert_eq!(result["identical"]["calls"], serde_json::json!(2));
+        assert_eq!(
+            result["identical"]["writes"],
+            serde_json::json!(1),
+            "a second identical poll writes nothing"
+        );
+        assert_eq!(result["identical"]["status"], result["first"]["status"]);
+        assert_eq!(result["changed"]["calls"], serde_json::json!(3));
+        assert_eq!(
+            result["changed"]["writes"],
+            serde_json::json!(2),
+            "a changed repository count writes the line again"
+        );
+        assert!(
+            result["changed"]["status"]
+                .as_str()
+                .is_some_and(|text| text.contains('4')),
+            "the changed poll names the new repository count: {}",
+            result["changed"]["status"]
+        );
+        assert_eq!(result["finished"]["calls"], serde_json::json!(4));
+        assert_eq!(
+            result["finished"]["writes"],
+            serde_json::json!(3),
+            "the finished scan clears the line"
+        );
+        assert_eq!(result["finished"]["status"], serde_json::json!(""));
+        assert_eq!(
+            result["finished"]["scheduled"], result["changed"]["scheduled"],
+            "a finished scan schedules no poll"
+        );
+    }
+
     /// Covers: a `/status` tick that reports no scan does not clear the busy
     /// state a submit has just set, because the browser owns that navigation.
     #[test]

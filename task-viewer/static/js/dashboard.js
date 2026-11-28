@@ -1590,8 +1590,11 @@
     }
   }
 
+  // The line carries `role="status" aria-live="polite"`, so a write of the same
+  // text announces again. One poll per second would repeat the same sentence for
+  // the whole scan, so write only when the text actually changes.
   function setScanStatus(text) {
-    if (scanStatus) {
+    if (scanStatus && scanStatus.textContent !== text) {
       scanStatus.textContent = text;
     }
   }
