@@ -964,97 +964,55 @@ impl HarvestState {
             return;
         }
         let Some(fields) = frontmatter(text) else {
-            if has_task_name_shape(rel) {
-                record_skip(tally, SkipReason::NoFrontmatter);
-                tracing::warn!(
-                    path = %rel,
-                    "task file has no frontmatter; skipping it"
-                );
-            } else {
-                // A stray file such as `README.md` under `tasks/` is not a task
-                // the person lost, so it stays out of the warning stream.
-                tracing::debug!(
-                    path = %rel,
-                    "file under tasks/ has no frontmatter; skipping it"
-                );
-            }
+            record_skip(tally, SkipReason::NoFrontmatter);
+            tracing::warn!(
+                path = %rel,
+                "task file has no frontmatter; skipping it"
+            );
             return;
         };
         let created = match fields.get("created") {
             Some(value) => match parse_iso_date(value) {
                 Some(created) => created,
                 None => {
-                    if has_task_name_shape(rel) {
-                        record_skip(tally, SkipReason::UnparseableCreated);
-                        tracing::warn!(
-                            path = %rel,
-                            field = "created",
-                            value = %value,
-                            "task file has an unparseable created value; skipping it"
-                        );
-                    } else {
-                        tracing::debug!(
-                            path = %rel,
-                            field = "created",
-                            value = %value,
-                            "file under tasks/ has an unparseable created value; skipping it"
-                        );
-                    }
+                    record_skip(tally, SkipReason::UnparseableCreated);
+                    tracing::warn!(
+                        path = %rel,
+                        field = "created",
+                        value = %value,
+                        "task file has an unparseable created value; skipping it"
+                    );
                     return;
                 }
             },
             None => {
-                if has_task_name_shape(rel) {
-                    record_skip(tally, SkipReason::MissingCreated);
-                    tracing::warn!(
-                        path = %rel,
-                        field = "created",
-                        "task file has no created value; skipping it"
-                    );
-                } else {
-                    tracing::debug!(
-                        path = %rel,
-                        field = "created",
-                        "file under tasks/ has no created value; skipping it"
-                    );
-                }
+                record_skip(tally, SkipReason::MissingCreated);
+                tracing::warn!(
+                    path = %rel,
+                    field = "created",
+                    "task file has no created value; skipping it"
+                );
                 return;
             }
         };
         let status = match fields.get("status").map(|value| value.trim().to_string()) {
             Some(status) if !status.is_empty() => status,
             Some(_) => {
-                if has_task_name_shape(rel) {
-                    record_skip(tally, SkipReason::EmptyStatus);
-                    tracing::warn!(
-                        path = %rel,
-                        field = "status",
-                        "task file has an empty status value; skipping it"
-                    );
-                } else {
-                    tracing::debug!(
-                        path = %rel,
-                        field = "status",
-                        "file under tasks/ has an empty status value; skipping it"
-                    );
-                }
+                record_skip(tally, SkipReason::EmptyStatus);
+                tracing::warn!(
+                    path = %rel,
+                    field = "status",
+                    "task file has an empty status value; skipping it"
+                );
                 return;
             }
             None => {
-                if has_task_name_shape(rel) {
-                    record_skip(tally, SkipReason::MissingStatus);
-                    tracing::warn!(
-                        path = %rel,
-                        field = "status",
-                        "task file has no status value; skipping it"
-                    );
-                } else {
-                    tracing::debug!(
-                        path = %rel,
-                        field = "status",
-                        "file under tasks/ has no status value; skipping it"
-                    );
-                }
+                record_skip(tally, SkipReason::MissingStatus);
+                tracing::warn!(
+                    path = %rel,
+                    field = "status",
+                    "task file has no status value; skipping it"
+                );
                 return;
             }
         };
@@ -1062,21 +1020,12 @@ impl HarvestState {
             Some(value) => match parse_iso_date(value) {
                 Some(updated) => updated,
                 None => {
-                    if has_task_name_shape(rel) {
-                        tracing::warn!(
-                            path = %rel,
-                            field = "updated",
-                            value = %value,
-                            "task file has an unparseable updated value; charting its created day"
-                        );
-                    } else {
-                        tracing::debug!(
-                            path = %rel,
-                            field = "updated",
-                            value = %value,
-                            "file under tasks/ has an unparseable updated value; charting its created day"
-                        );
-                    }
+                    tracing::warn!(
+                        path = %rel,
+                        field = "updated",
+                        value = %value,
+                        "task file has an unparseable updated value; charting its created day"
+                    );
                     created
                 }
             },
