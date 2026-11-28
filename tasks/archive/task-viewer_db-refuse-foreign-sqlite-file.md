@@ -32,7 +32,7 @@ Reproduced with the current build: a file holding a `notes` table was opened thr
 
 `open_pool` sets `.journal_mode(SqliteJournalMode::Wal)` when it connects, and `migrate_locked` runs after that, so a refused file has already been switched to WAL. Its tables, rows, and `user_version` survive unchanged, while its journal mode and `-wal`/`-shm` sidecars may not.
 
-`migrate_locked` and `init_at_with_source` in `task-viewer/src/db.rs`, and the `ARCHITECTURE.md` `db.rs` paragraph the Approach extends, are also edited by other tasks: the shipped [db-verify-columns-at-current-version](task-viewer_db-verify-columns-at-current-version.md) task extends `migrate_locked`, while [db-file-permissions](task-viewer_db-file-permissions.md) and [startup-database-log](../task-viewer_startup-database-log.md) edit `init_at_with_source`. This task's refusal lands first, before `db-file-permissions` tightens the file's mode, so a refused foreign file is never chmod'ed, and each later edit re-reads the paragraph this task rewrites.
+`migrate_locked` and `init_at_with_source` in `task-viewer/src/db.rs`, and the `ARCHITECTURE.md` `db.rs` paragraph the Approach extends, are also edited by other tasks: the shipped [db-verify-columns-at-current-version](task-viewer_db-verify-columns-at-current-version.md) task extends `migrate_locked`, while [db-file-permissions](task-viewer_db-file-permissions.md) and [startup-database-log](task-viewer_startup-database-log.md) edit `init_at_with_source`. This task's refusal lands first, before `db-file-permissions` tightens the file's mode, so a refused foreign file is never chmod'ed, and each later edit re-reads the paragraph this task rewrites.
 
 ## Approach
 
