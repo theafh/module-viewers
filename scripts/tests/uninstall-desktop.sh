@@ -5,8 +5,8 @@
 # throwaway root and home, so no real app bundle, desktop entry, Dock
 # preference, or state directory is touched. `uname` is stubbed to report
 # Darwin or Linux, `defaults` and `killall` are recording stubs, and no case
-# keeps the real /opt/homebrew or /usr/local bin directories on PATH unless it
-# needs a tool from them.
+# keeps the real /opt/homebrew or /usr/local bin directories on PATH: the cases
+# that need python3 reach it through a private $root/pybin link.
 
 set -u
 
@@ -38,6 +38,12 @@ make_root() {
     mkdir -p "$root/scripts" "$root/home" "$root/bin" \
         "$root/task-viewer/static" "$root/target/release"
     cp "$LAUNCHER_SOURCE" "$INSTALLER_SOURCE" "$UNINSTALLER_SOURCE" "$root/scripts/"
+    # A private directory holding only python3, so a tool beside the real
+    # python3 (Homebrew's dockutil included) never reaches the uninstaller.
+    mkdir -p "$root/pybin"
+    if command -v python3 >/dev/null 2>&1; then
+        ln -sf "$(command -v python3)" "$root/pybin/python3"
+    fi
     cp "$ICON_SOURCE" "$root/task-viewer/static/task-viewer-icon.png"
     cat >"$root/bin/uname" <<EOS
 #!/bin/bash
@@ -176,14 +182,14 @@ case_dock_removal() {
     HOME="$root/home" FAKE_LOGIN_HOME="$root/home" \
         DEFAULTS_STATE="$root/dock.plist" DEFAULTS_LOG="$root/defaults.log" \
         KILLALL_LOG="$root/killall.log" \
-        PATH="$root/bin:$(dirname "$(command -v python3)"):/usr/bin:/bin" \
+        PATH="$root/bin:$root/pybin:/usr/bin:/bin" \
         bash "$root/scripts/install-desktop.sh" >/dev/null 2>&1
     before=$(killall_count "$root/killall.log")
 
     out=$(HOME="$root/home" FAKE_LOGIN_HOME="$root/home" \
         DEFAULTS_STATE="$root/dock.plist" DEFAULTS_LOG="$root/defaults.log" \
         KILLALL_LOG="$root/killall.log" \
-        PATH="$root/bin:$(dirname "$(command -v python3)"):/usr/bin:/bin" \
+        PATH="$root/bin:$root/pybin:/usr/bin:/bin" \
         bash "$root/scripts/uninstall-desktop.sh" 2>&1)
     status=$?
     after=$(killall_count "$root/killall.log")
@@ -214,19 +220,19 @@ case_idempotent_second_run() {
     HOME="$root/home" FAKE_LOGIN_HOME="$root/home" \
         DEFAULTS_STATE="$root/dock.plist" DEFAULTS_LOG="$root/defaults.log" \
         KILLALL_LOG="$root/killall.log" \
-        PATH="$root/bin:$(dirname "$(command -v python3)"):/usr/bin:/bin" \
+        PATH="$root/bin:$root/pybin:/usr/bin:/bin" \
         bash "$root/scripts/install-desktop.sh" >/dev/null 2>&1
     HOME="$root/home" FAKE_LOGIN_HOME="$root/home" \
         DEFAULTS_STATE="$root/dock.plist" DEFAULTS_LOG="$root/defaults.log" \
         KILLALL_LOG="$root/killall.log" \
-        PATH="$root/bin:$(dirname "$(command -v python3)"):/usr/bin:/bin" \
+        PATH="$root/bin:$root/pybin:/usr/bin:/bin" \
         bash "$root/scripts/uninstall-desktop.sh" >/dev/null 2>&1
     before=$(killall_count "$root/killall.log")
 
     out=$(HOME="$root/home" FAKE_LOGIN_HOME="$root/home" \
         DEFAULTS_STATE="$root/dock.plist" DEFAULTS_LOG="$root/defaults.log" \
         KILLALL_LOG="$root/killall.log" \
-        PATH="$root/bin:$(dirname "$(command -v python3)"):/usr/bin:/bin" \
+        PATH="$root/bin:$root/pybin:/usr/bin:/bin" \
         bash "$root/scripts/uninstall-desktop.sh" 2>&1)
     status=$?
     after=$(killall_count "$root/killall.log")
@@ -254,7 +260,7 @@ case_redirected_home_skips_dock() {
     out=$(HOME="$root/home" FAKE_LOGIN_HOME="$root/login-home" \
         DEFAULTS_STATE="$root/dock.plist" DEFAULTS_LOG="$root/defaults.log" \
         KILLALL_LOG="$root/killall.log" \
-        PATH="$root/bin:$(dirname "$(command -v python3)"):/usr/bin:/bin" \
+        PATH="$root/bin:$root/pybin:/usr/bin:/bin" \
         bash "$root/scripts/uninstall-desktop.sh" 2>&1)
     status=$?
 
@@ -323,7 +329,7 @@ case_running_server_hint() {
     out=$(HOME="$root/home" FAKE_LOGIN_HOME="$root/home" \
         DEFAULTS_STATE="$root/dock.plist" DEFAULTS_LOG="$root/defaults.log" \
         KILLALL_LOG="$root/killall.log" \
-        PATH="$root/bin:$(dirname "$(command -v python3)"):/usr/bin:/bin" \
+        PATH="$root/bin:$root/pybin:/usr/bin:/bin" \
         bash "$root/scripts/uninstall-desktop.sh" 2>&1)
     status=$?
     kill "$pid" 2>/dev/null || true
@@ -406,8 +412,38 @@ case_dockutil_removal() {
     fi
 }
 
+# A failed atomic install can leave a staging or backup directory beside the
+# bundle; uninstall removes both and names them.
+case_staging_and_backup_removal() {
+    local root="$TMP/leftovers" out status staging backup
+    make_root "$root" Darwin
+    make_login_home_stubs "$root"
+    staging="$root/home/Applications/.Task Viewer.app.staging.abc123"
+    backup="$root/home/Applications/.Task Viewer.app.backup.def456"
+    mkdir -p "$staging/Task Viewer.app" "$backup/Task Viewer.app"
+    printf 'bundle\n' >"$staging/Task Viewer.app/marker"
+    printf 'bundle\n' >"$backup/Task Viewer.app/marker"
+
+    out=$(HOME="$root/home" FAKE_LOGIN_HOME="$root/home" \
+        TASK_VIEWER_DOCK_PIN=skip \
+        PATH="$root/bin:/usr/bin:/bin" \
+        bash "$root/scripts/uninstall-desktop.sh" 2>&1)
+    status=$?
+
+    if [ "$status" -eq 0 ] &&
+        [ ! -e "$staging" ] && [ ! -e "$backup" ] &&
+        printf '%s\n' "$out" | grep -qF "Removed: $staging" &&
+        printf '%s\n' "$out" | grep -qF "Removed: $backup"; then
+        pass "uninstall removes the staging and backup directories a failed install left"
+    else
+        fail "uninstall removes the staging and backup directories a failed install left (status $status)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+}
+
 case_dock_removal
 case_dockutil_removal
+case_staging_and_backup_removal
 case_idempotent_second_run
 case_redirected_home_skips_dock
 case_missing_tools_reports_and_fails
