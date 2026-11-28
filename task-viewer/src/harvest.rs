@@ -1563,7 +1563,17 @@ fn entry_kind(file_type: fs::FileType) -> &'static str {
 /// A walk error fails the scan instead of shrinking the listing. An unreadable
 /// directory would otherwise yield fewer files, and the store that follows
 /// would replace the repository's rows with that smaller set. The error keeps
-/// the walk's own text, which names the path it could not read.
+/// the walk's own text, which names the path it could not read. Three walk
+/// failures are the exceptions: a link loop, a broken link, and a directory
+/// symlink whose target leaves the configured folder each warn once and are
+/// skipped, so the rest of the walk still charts.
+///
+/// A directory symlink under `tasks/` is followed when its resolved target
+/// stays inside the configured folder, so the tasks below it chart under their
+/// `tasks/<subpath>` paths. One whose target leaves the folder is rejected
+/// before its subtree is walked: it contributes no row and warns once naming
+/// the link path and the target. A broken link and a link loop warn once and
+/// are skipped the same way, and the walk carries on with its other rows.
 ///
 /// A `tasks/` symlink is charted only when its resolved target stays inside the
 /// configured folder. Walkdir follows the walk root's own symlink, so a link
@@ -1612,93 +1622,192 @@ fn files_on_disk(repo: &Path, skipped: &mut SkipTally) -> Result<Vec<WorktreeRow
     }
     let mut files = Vec::new();
     let mut retained = 0usize;
-    for entry in WalkDir::new(tasks_root) {
-        let entry = entry.map_err(|error| HarvestError::Io(std::io::Error::other(error)))?;
-        let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "md") {
-            continue;
-        }
-        let (rel, path_is_lossy) = relative_path(path, repo);
-        // Classify the entry by its own type before its target's. A rejected
-        // entry produces no row, so it cannot claim a name in `union_files`,
-        // and it is never opened, so a directory or FIFO cannot fail or hang
-        // the walk.
-        let read_path = match gate_entry(&entry, &root) {
-            EntryGate::Reject {
-                reason,
-                kind,
-                target,
-            } => {
-                if has_task_name_shape(&rel) {
-                    record_skip(skipped, reason);
+    // Directory symlinks the walk predicate rejects, recorded after the walk so
+    // the predicate can hold the iterator without borrowing the tally. A
+    // task-shaped one still counts in the skip tally under its reason.
+    let mut rejected_links: Vec<String> = Vec::new();
+    {
+        let rejected = std::cell::RefCell::new(&mut rejected_links);
+        // `follow_links(true)` charts the tasks below a directory symlink, and
+        // `filter_entry` decides a link before its subtree is entered. A
+        // directory symlink is recognised by its own link flag together with a
+        // directory target, because `file_type()` reports the target under
+        // `follow_links`. An outside target is warned about and rejected, so
+        // its subtree is never walked; a file symlink and a link that does not
+        // resolve stay for the type gate and the walk error rule.
+        let walk = WalkDir::new(&tasks_root)
+            .follow_links(true)
+            .into_iter()
+            .filter_entry(|entry| {
+                if !entry.path_is_symlink() || !entry.file_type().is_dir() {
+                    return true;
                 }
-                warn_skipped_entry(&rel, kind, reason, target.as_deref());
+                let Ok(target) = fs::canonicalize(entry.path()) else {
+                    return true;
+                };
+                if target.starts_with(&root) {
+                    return true;
+                }
+                let (rel, _) = relative_path(entry.path(), repo);
+                warn_skipped_link(&rel, Some(&target), SkipReason::EscapingSymlink.describe());
+                rejected.borrow_mut().push(rel);
+                false
+            });
+        for entry in walk {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    skip_walk_link_error(error, repo, &root, skipped)?;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "md") {
                 continue;
             }
-            EntryGate::Pass { read_path } => read_path,
-        };
-        // The real on-disk path the walk reached, or the canonical target the
-        // gate accepted for a symlink, kept beside the lossy stored path so an
-        // evicted row is re-read from the file it came from. A symlink is read
-        // through the target the gate checked, so a swap between the check and
-        // the read cannot redirect it. It is taken from the walk entry, never
-        // re-derived from `rel`, because a name that is not valid UTF-8 makes
-        // `rel` name no file.
-        let disk = read_path.unwrap_or_else(|| path.to_path_buf());
-        #[cfg(test)]
-        worktree_read_count::record(repo);
-        let read = read_worktree_file(&disk);
-        #[cfg(test)]
-        worktree_read_count::record_bytes(repo, &rel, read.bytes);
-        let row = match read.outcome {
-            Ok(text) => {
-                // Retain the text only while the cache stays within its budget.
-                // An evicted row keeps its path and is re-read one file at a
-                // time when it is charted.
-                if retained.saturating_add(text.len()) <= MAX_WORKTREE_CACHE_BYTES {
-                    retained += text.len();
-                    WorktreeRow {
-                        path: rel,
-                        lossy: path_is_lossy,
-                        disk,
-                        text: Some(text),
-                        skip: None,
+            let (rel, path_is_lossy) = relative_path(path, repo);
+            // Classify the entry by its own type before its target's. A rejected
+            // entry produces no row, so it cannot claim a name in `union_files`,
+            // and it is never opened, so a directory or FIFO cannot fail or hang
+            // the walk.
+            let read_path = match gate_entry(&entry, &root) {
+                EntryGate::Reject {
+                    reason,
+                    kind,
+                    target,
+                } => {
+                    if has_task_name_shape(&rel) {
+                        record_skip(skipped, reason);
                     }
-                } else {
+                    warn_skipped_entry(&rel, kind, reason, target.as_deref());
+                    continue;
+                }
+                EntryGate::Pass { read_path } => read_path,
+            };
+            // The real on-disk path the walk reached, or the canonical target the
+            // gate accepted for a symlink, kept beside the lossy stored path so an
+            // evicted row is re-read from the file it came from. A symlink is read
+            // through the target the gate checked, so a swap between the check and
+            // the read cannot redirect it. It is taken from the walk entry, never
+            // re-derived from `rel`, because a name that is not valid UTF-8 makes
+            // `rel` name no file.
+            let disk = read_path.unwrap_or_else(|| path.to_path_buf());
+            #[cfg(test)]
+            worktree_read_count::record(repo);
+            let read = read_worktree_file(&disk);
+            #[cfg(test)]
+            worktree_read_count::record_bytes(repo, &rel, read.bytes);
+            let row = match read.outcome {
+                Ok(text) => {
+                    // Retain the text only while the cache stays within its budget.
+                    // An evicted row keeps its path and is re-read one file at a
+                    // time when it is charted.
+                    if retained.saturating_add(text.len()) <= MAX_WORKTREE_CACHE_BYTES {
+                        retained += text.len();
+                        WorktreeRow {
+                            path: rel,
+                            lossy: path_is_lossy,
+                            disk,
+                            text: Some(text),
+                            skip: None,
+                        }
+                    } else {
+                        WorktreeRow {
+                            path: rel,
+                            lossy: path_is_lossy,
+                            disk,
+                            text: None,
+                            skip: None,
+                        }
+                    }
+                }
+                Err(reason) => {
+                    // The byte count comes from the file's metadata, so a file that
+                    // cannot be opened or is not UTF-8 still reports its real size.
+                    let bytes = fs::metadata(&disk)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+                    if has_task_name_shape(&rel) {
+                        record_skip(skipped, reason);
+                    }
+                    warn_skipped_worktree_task(&rel, bytes, reason);
                     WorktreeRow {
                         path: rel,
                         lossy: path_is_lossy,
                         disk,
                         text: None,
-                        skip: None,
+                        skip: Some(reason),
                     }
                 }
-            }
-            Err(reason) => {
-                // The byte count comes from the file's metadata, so a file that
-                // cannot be opened or is not UTF-8 still reports its real size.
-                let bytes = fs::metadata(&disk)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0);
-                if has_task_name_shape(&rel) {
-                    record_skip(skipped, reason);
-                }
-                warn_skipped_worktree_task(&rel, bytes, reason);
-                WorktreeRow {
-                    path: rel,
-                    lossy: path_is_lossy,
-                    disk,
-                    text: None,
-                    skip: Some(reason),
-                }
-            }
-        };
-        files.push(row);
-        #[cfg(test)]
-        worktree_cache_peak::record(repo, retained);
+            };
+            files.push(row);
+            #[cfg(test)]
+            worktree_cache_peak::record(repo, retained);
+        }
+    }
+    for rel in rejected_links {
+        if has_task_name_shape(&rel) {
+            record_skip(skipped, SkipReason::EscapingSymlink);
+        }
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
+}
+
+/// Warn about one walk error that names a link, and let the walk continue.
+///
+/// A link loop, a broken link, and a directory symlink whose target leaves the
+/// configured folder each contribute no row and do not fail the scan; every
+/// other walk error still fails it. The outside-link case runs before the
+/// broken-link check because walkdir opens a link's target before the entry
+/// reaches the predicate, so an unreadable outside directory arrives here as an
+/// error even though the link itself resolves.
+fn skip_walk_link_error(
+    error: walkdir::Error,
+    repo: &Path,
+    root: &Path,
+    skipped: &mut SkipTally,
+) -> Result<(), HarvestError> {
+    let Some(path) = error.path() else {
+        return Err(HarvestError::Io(std::io::Error::other(error)));
+    };
+    let (rel, _) = relative_path(path, repo);
+    let is_link = fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_link {
+        return Err(HarvestError::Io(std::io::Error::other(error)));
+    }
+    if error.loop_ancestor().is_some() {
+        if has_task_name_shape(&rel) {
+            record_skip(skipped, SkipReason::EscapingSymlink);
+        }
+        warn_skipped_link(&rel, None, "is a symlink loop inside the configured folder");
+        return Ok(());
+    }
+    match fs::canonicalize(path) {
+        Ok(target) if !target.starts_with(root) => {
+            if has_task_name_shape(&rel) {
+                record_skip(skipped, SkipReason::EscapingSymlink);
+            }
+            warn_skipped_link(&rel, Some(&target), SkipReason::EscapingSymlink.describe());
+            Ok(())
+        }
+        Ok(_) => Err(HarvestError::Io(std::io::Error::other(error))),
+        Err(_) => {
+            // A broken link, file or directory: the raw target names where it
+            // pointed, so the warning can say what it was looking for.
+            if has_task_name_shape(&rel) {
+                record_skip(skipped, SkipReason::EscapingSymlink);
+            }
+            warn_skipped_link(
+                &rel,
+                fs::read_link(path).ok().as_deref(),
+                "is a broken symlink; its target does not resolve",
+            );
+            Ok(())
+        }
+    }
 }
 
 /// One working-tree file read through `MAX_TASK_FILE_BYTES + 1` bytes.
@@ -1857,6 +1966,32 @@ fn warn_skipped_entry(path: &str, kind: &'static str, reason: SkipReason, target
             entry = kind,
             reason = reason.describe(),
             "entry under tasks/ was skipped; no row charted"
+        ),
+    }
+}
+
+/// Report one skipped link from the walk itself, always at warning level.
+///
+/// A link the walk refuses — one whose directory target leaves the configured
+/// folder, a broken link, or a loop — is a scan-level event rather than a stray
+/// file, so it warns whatever its name's shape. `target` names the resolved
+/// target, or the raw target of a broken link, so the warning says what the
+/// link pointed at.
+fn warn_skipped_link(path: &str, target: Option<&Path>, reason: &str) {
+    let target = target.map(|target| target.display().to_string());
+    match target {
+        Some(target) => tracing::warn!(
+            path = %path,
+            entry = "symlink",
+            target = %target,
+            reason = reason,
+            "task entry was skipped; no row charted"
+        ),
+        None => tracing::warn!(
+            path = %path,
+            entry = "symlink",
+            reason = reason,
+            "task entry was skipped; no row charted"
         ),
     }
 }
@@ -6471,6 +6606,125 @@ mod tests {
         assert!(
             warnings[0].contains("scope_missing_target.md"),
             "the warning names the dangling target: {warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a directory symlink under `tasks/` whose target stays inside the
+    /// configured folder charts its tasks under their `tasks/...` paths.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_follows_an_inside_directory_symlink_under_tasks_paths() {
+        let repo = scratch("harvest_inside_directory_symlink");
+        write_task(&repo, "other-tasks/scope_inner.md", "2026-05-01", "open");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        std::os::unix::fs::symlink("../other-tasks", repo.join("tasks/area"))
+            .expect("directory symlink");
+
+        let tasks = harvest_repository(&repo).expect("an inside directory link charts");
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(
+            tasks[0].path, "tasks/area/scope_inner.md",
+            "the stored path stays relative to the configured folder"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Covers: a directory symlink under `tasks/` whose target leaves the
+    /// configured folder charts nothing, warns once naming the link and the
+    /// outside target, and leaves the rest of the scan intact.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_skips_an_outside_directory_symlink_and_charts_its_neighbours() {
+        let root = scratch("harvest_outside_directory_symlink");
+        let repo = root.join("repo");
+        let outside = root.join("outside");
+        fs::create_dir_all(repo.join("tasks")).expect("tasks");
+        fs::create_dir_all(&outside).expect("outside");
+        write_task(&repo, "tasks/scope_kept.md", "2026-05-01", "open");
+        write_task(&outside, "scope_escaped.md", "2026-05-02", "open");
+        std::os::unix::fs::symlink(&outside, repo.join("tasks/area"))
+            .expect("outside directory symlink");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("an outside directory link must not fail the harvest");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["tasks/scope_kept.md"],
+            "the neighbour charts; the outside link's subtree contributes no row"
+        );
+
+        let warnings = captured.take();
+        assert_eq!(warnings.len(), 1, "one warning for the link: {warnings:?}");
+        assert!(
+            warnings[0].contains("tasks/area"),
+            "the warning names the link: {warnings:?}"
+        );
+        let target = fs::canonicalize(&outside).expect("canonical outside");
+        assert!(
+            warnings[0].contains(&target.display().to_string()),
+            "the warning names the outside target: {warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Covers: a broken inner link and a link cycle each warn once naming the
+    /// link path, the broken link's dangling target is named too, the scan
+    /// completes with its other rows, and the task-shaped broken link counts
+    /// once under `SkipReason::EscapingSymlink`.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_warns_about_a_broken_link_and_a_link_cycle_and_keeps_scanning() {
+        let repo = scratch("harvest_broken_and_loop_links");
+        write_task(&repo, "tasks/scope_kept.md", "2026-05-01", "open");
+        std::os::unix::fs::symlink(
+            "scope_missing_target.md",
+            repo.join("tasks/scope_dangling.md"),
+        )
+        .expect("dangling symlink");
+        std::os::unix::fs::symlink(".", repo.join("tasks/self")).expect("loop symlink");
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let tasks = tracing::subscriber::with_default(subscriber, || harvest_repository(&repo))
+            .expect("a broken link and a loop must not fail the harvest");
+        let paths: Vec<&str> = tasks.iter().map(|task| task.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["tasks/scope_kept.md"],
+            "the other rows still chart; neither link contributes a row"
+        );
+
+        let warnings = captured.take();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "one warning each for the broken link and the loop: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("tasks/scope_dangling.md")
+                    && warning.contains("scope_missing_target.md")),
+            "the broken link warns with its path and dangling target: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("tasks/self")),
+            "the loop warns with its path: {warnings:?}"
+        );
+
+        let canonical = fs::canonicalize(&repo).expect("canonical folder");
+        let mut tally = SkipTally::default();
+        files_on_disk(&canonical, &mut tally).expect("walk");
+        assert_eq!(
+            tally.get(&SkipReason::EscapingSymlink).copied(),
+            Some(1),
+            "the task-shaped broken link counts once; the loop adds nothing: {tally:?}"
         );
         let _ = fs::remove_dir_all(&repo);
     }
@@ -13244,8 +13498,8 @@ mod tests {
             "OsString::from_vec",
             "signal::unix::",
             "OsStrExt::",
-            "symlink(",
-            "fs::symlink",
+            "::symlink(",
+            " symlink(",
             "fake_git_script(",
             "commit_non_utf8_named_task(",
             "register_test_git(",
